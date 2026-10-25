@@ -1,0 +1,100 @@
+{
+  "timestamp": "2026-10-24T22:48:38.744071+00:00",
+  "tool": "wrk / ab / h2load",
+  "duration_s": 2.0,
+  "samples": 3,
+  "scenarios": [
+    {
+      "name": "rewrite (.htaccess)",
+      "proto": "http",
+      "path": "/htaccess/rewrite/old.html",
+      "servers": {
+        "apache": {
+          "rps": 57972.79,
+          "mean_ms": 1.55,
+          "p99_ms": 7.82,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            22,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 37218.44,
+          "mean_ms": 2.15,
+          "p99_ms": 15.05,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.6419984271931711
+    },
+    {
+      "name": "Header (.htaccess)",
+      "proto": "http",
+      "path": "/htaccess/header/hello.txt",
+      "servers": {
+        "apache": {
+          "rps": 66185.71,
+          "mean_ms": 1.32,
+          "p99_ms": 6.71,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            48,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 67836.21,
+          "mean_ms": 1.0,
+          "p99_ms": 6.08,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 1.0249374071835144
+    }
+  ],
+  "config_test_ms": {
+    "apache": 17.643219005549327,
+    "vapache": 6.617604987695813
+  },
+  "config_test_errors": {
+    "apache": "",
+    "vapache": ""
+  },
+  "memory": {
+    "apache": {
+      "processes": 1,
+      "threads": 1,
+      "pss_kb": 0
+    },
+    "vapache": {
+      "processes": 1,
+      "threads": 1,
+      "pss_kb": 0
+    }
+  }
+}

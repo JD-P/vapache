@@ -1,0 +1,162 @@
+{
+  "timestamp": "2026-10-22T10:42:02.640021+00:00",
+  "tool": "wrk",
+  "scenarios": [
+    {
+      "name": "index.html (small, keepalive)",
+      "path": "/index.html",
+      "requests": 3000,
+      "concurrency": 50,
+      "servers": {
+        "apache": {
+          "rps": null,
+          "mean_ms": null,
+          "p99_ms": null,
+          "transferred_kbps": null,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": "Usage: wrk <options> <url>                            \n  Options:                                            \n    -c, --connections <N>  Connections to keep open   \n    -d, --duration    <T>  Duration of test           \n    -t, --threads     <N>  Number of threads to use   \n                                                      \n    -s, --script      <S>  Load Lua script file       \n    -H, --header      <H>  Add header to request      \n        --latency          Print latency statistics   \n        --timeout     <T>  Socket/request timeout     \n    -v, --version          Print version details      \n                                                      \n  Numeric arguments may include a SI unit (1k, 1M, 1G)\n  Time arguments may include a time unit (2s, 2m, 2h)\n"
+        },
+        "vapache": {
+          "rps": null,
+          "mean_ms": null,
+          "p99_ms": null,
+          "transferred_kbps": null,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": "Usage: wrk <options> <url>                            \n  Options:                                            \n    -c, --connections <N>  Connections to keep open   \n    -d, --duration    <T>  Duration of test           \n    -t, --threads     <N>  Number of threads to use   \n                                                      \n    -s, --script      <S>  Load Lua script file       \n    -H, --header      <H>  Add header to request      \n        --latency          Print latency statistics   \n        --timeout     <T>  Socket/request timeout     \n    -v, --version          Print version details      \n                                                      \n  Numeric arguments may include a SI unit (1k, 1M, 1G)\n  Time arguments may include a time unit (2s, 2m, 2h)\n"
+        }
+      },
+      "ratio": null
+    },
+    {
+      "name": "hello.txt (1.1KB, keepalive)",
+      "path": "/hello.txt",
+      "requests": 3000,
+      "concurrency": 50,
+      "servers": {
+        "apache": {
+          "rps": null,
+          "mean_ms": null,
+          "p99_ms": null,
+          "transferred_kbps": null,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": "Usage: wrk <options> <url>                            \n  Options:                                            \n    -c, --connections <N>  Connections to keep open   \n    -d, --duration    <T>  Duration of test           \n    -t, --threads     <N>  Number of threads to use   \n                                                      \n    -s, --script      <S>  Load Lua script file       \n    -H, --header      <H>  Add header to request      \n        --latency          Print latency statistics   \n        --timeout     <T>  Socket/request timeout     \n    -v, --version          Print version details      \n                                                      \n  Numeric arguments may include a SI unit (1k, 1M, 1G)\n  Time arguments may include a time unit (2s, 2m, 2h)\n"
+        },
+        "vapache": {
+          "rps": null,
+          "mean_ms": null,
+          "p99_ms": null,
+          "transferred_kbps": null,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": "Usage: wrk <options> <url>                            \n  Options:                                            \n    -c, --connections <N>  Connections to keep open   \n    -d, --duration    <T>  Duration of test           \n    -t, --threads     <N>  Number of threads to use   \n                                                      \n    -s, --script      <S>  Load Lua script file       \n    -H, --header      <H>  Add header to request      \n        --latency          Print latency statistics   \n        --timeout     <T>  Socket/request timeout     \n    -v, --version          Print version details      \n                                                      \n  Numeric arguments may include a SI unit (1k, 1M, 1G)\n  Time arguments may include a time unit (2s, 2m, 2h)\n"
+        }
+      },
+      "ratio": null
+    },
+    {
+      "name": "10k.bin (10KB, keepalive)",
+      "path": "/small/10k.bin",
+      "requests": 3000,
+      "concurrency": 50,
+      "servers": {
+        "apache": {
+          "rps": null,
+          "mean_ms": null,
+          "p99_ms": null,
+          "transferred_kbps": null,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": "Usage: wrk <options> <url>                            \n  Options:                                            \n    -c, --connections <N>  Connections to keep open   \n    -d, --duration    <T>  Duration of test           \n    -t, --threads     <N>  Number of threads to use   \n                                                      \n    -s, --script      <S>  Load Lua script file       \n    -H, --header      <H>  Add header to request      \n        --latency          Print latency statistics   \n        --timeout     <T>  Socket/request timeout     \n    -v, --version          Print version details      \n                                                      \n  Numeric arguments may include a SI unit (1k, 1M, 1G)\n  Time arguments may include a time unit (2s, 2m, 2h)\n"
+        },
+        "vapache": {
+          "rps": null,
+          "mean_ms": null,
+          "p99_ms": null,
+          "transferred_kbps": null,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": "Usage: wrk <options> <url>                            \n  Options:                                            \n    -c, --connections <N>  Connections to keep open   \n    -d, --duration    <T>  Duration of test           \n    -t, --threads     <N>  Number of threads to use   \n                                                      \n    -s, --script      <S>  Load Lua script file       \n    -H, --header      <H>  Add header to request      \n        --latency          Print latency statistics   \n        --timeout     <T>  Socket/request timeout     \n    -v, --version          Print version details      \n                                                      \n  Numeric arguments may include a SI unit (1k, 1M, 1G)\n  Time arguments may include a time unit (2s, 2m, 2h)\n"
+        }
+      },
+      "ratio": null
+    },
+    {
+      "name": "1m.bin (1MB, keepalive)",
+      "path": "/large/1m.bin",
+      "requests": 300,
+      "concurrency": 10,
+      "servers": {
+        "apache": {
+          "rps": null,
+          "mean_ms": null,
+          "p99_ms": null,
+          "transferred_kbps": null,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": "Usage: wrk <options> <url>                            \n  Options:                                            \n    -c, --connections <N>  Connections to keep open   \n    -d, --duration    <T>  Duration of test           \n    -t, --threads     <N>  Number of threads to use   \n                                                      \n    -s, --script      <S>  Load Lua script file       \n    -H, --header      <H>  Add header to request      \n        --latency          Print latency statistics   \n        --timeout     <T>  Socket/request timeout     \n    -v, --version          Print version details      \n                                                      \n  Numeric arguments may include a SI unit (1k, 1M, 1G)\n  Time arguments may include a time unit (2s, 2m, 2h)\n"
+        },
+        "vapache": {
+          "rps": null,
+          "mean_ms": null,
+          "p99_ms": null,
+          "transferred_kbps": null,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": "Usage: wrk <options> <url>                            \n  Options:                                            \n    -c, --connections <N>  Connections to keep open   \n    -d, --duration    <T>  Duration of test           \n    -t, --threads     <N>  Number of threads to use   \n                                                      \n    -s, --script      <S>  Load Lua script file       \n    -H, --header      <H>  Add header to request      \n        --latency          Print latency statistics   \n        --timeout     <T>  Socket/request timeout     \n    -v, --version          Print version details      \n                                                      \n  Numeric arguments may include a SI unit (1k, 1M, 1G)\n  Time arguments may include a time unit (2s, 2m, 2h)\n"
+        }
+      },
+      "ratio": null
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+{
+  "timestamp": "2026-10-24T22:52:51.349991+00:00",
+  "tool": "wrk / ab / h2load",
+  "duration_s": 2.0,
+  "samples": 3,
+  "scenarios": [
+    {
+      "name": "rewrite (.htaccess)",
+      "proto": "http",
+      "path": "/htaccess/rewrite/old.html",
+      "servers": {
+        "apache": {
+          "rps": 54277.31,
+          "mean_ms": 1.65,
+          "p99_ms": 8.69,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            6,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 41643.55,
+          "mean_ms": 1.91,
+          "p99_ms": 13.86,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.7672368066877302
+    },
+    {
+      "name": "Header (.htaccess)",
+      "proto": "http",
+      "path": "/htaccess/header/hello.txt",
+      "servers": {
+        "apache": {
+          "rps": 71848.61,
+          "mean_ms": 1.18,
+          "p99_ms": 5.82,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            24,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 70292.82,
+          "mean_ms": 0.9,
+          "p99_ms": 3.58,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.9783462755925272
+    }
+  ],
+  "config_test_ms": {
+    "apache": 17.242763977264985,
+    "vapache": 5.747744027758017
+  },
+  "config_test_errors": {
+    "apache": "",
+    "vapache": ""
+  },
+  "memory": {
+    "apache": {
+      "processes": 7,
+      "threads": 313,
+      "pss_kb": 29291
+    },
+    "vapache": {
+      "processes": 17,
+      "threads": 20,
+      "pss_kb": 26686
+    }
+  }
+}

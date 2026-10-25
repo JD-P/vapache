@@ -1,0 +1,100 @@
+{
+  "timestamp": "2026-10-25T00:12:10.017896+00:00",
+  "tool": "wrk / ab / h2load",
+  "duration_s": 2.0,
+  "samples": 3,
+  "scenarios": [
+    {
+      "name": "CGI GET",
+      "proto": "http",
+      "path": "/cgi-bin/env.sh",
+      "servers": {
+        "apache": {
+          "rps": 2214.37,
+          "mean_ms": 16.18,
+          "p99_ms": 60.34,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 1025.59,
+          "mean_ms": 32.58,
+          "p99_ms": 102.13,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.46315204776076263
+    },
+    {
+      "name": "CGI POST",
+      "proto": "ab-post",
+      "path": "/cgi-bin/env.sh",
+      "servers": {
+        "apache": {
+          "rps": 2066.88,
+          "mean_ms": 7.741,
+          "p99_ms": 53.0,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 1101.4,
+          "mean_ms": 14.527,
+          "p99_ms": 36.0,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.5328804768540022
+    }
+  ],
+  "config_test_ms": {
+    "apache": 21.736192022217438,
+    "vapache": 6.407804990885779
+  },
+  "config_test_errors": {
+    "apache": "",
+    "vapache": ""
+  },
+  "memory": {
+    "apache": {
+      "processes": 7,
+      "threads": 313,
+      "pss_kb": 29705
+    },
+    "vapache": {
+      "processes": 33,
+      "threads": 36,
+      "pss_kb": 30458
+    }
+  }
+}

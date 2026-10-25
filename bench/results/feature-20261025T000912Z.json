@@ -1,0 +1,64 @@
+{
+  "timestamp": "2026-10-25T00:09:09.801158+00:00",
+  "tool": "wrk / ab / h2load",
+  "duration_s": 1.0,
+  "samples": 1,
+  "scenarios": [
+    {
+      "name": "CGI GET",
+      "proto": "http",
+      "path": "/cgi-bin/env.sh",
+      "servers": {
+        "apache": {
+          "rps": 1935.44,
+          "mean_ms": 17.94,
+          "p99_ms": 63.56,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 1089.76,
+          "mean_ms": 29.83,
+          "p99_ms": 106.98,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.5630554292563965
+    }
+  ],
+  "config_test_ms": {
+    "apache": 20.122171990806237,
+    "vapache": 3.7702969857491553
+  },
+  "config_test_errors": {
+    "apache": "",
+    "vapache": ""
+  },
+  "memory": {
+    "apache": {
+      "processes": 5,
+      "threads": 209,
+      "pss_kb": 20222
+    },
+    "vapache": {
+      "processes": 17,
+      "threads": 20,
+      "pss_kb": 18662
+    }
+  }
+}

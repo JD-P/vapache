@@ -1,0 +1,138 @@
+{
+  "schema": 1,
+  "updated": "2026-10-24",
+  "verus": {
+    "verified_functions": 194,
+    "errors": 0
+  },
+  "obligations": [
+    {
+      "id": "merge_assoc",
+      "title": "field-wise Scope merge",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "auth_merge_kind, option_child_wins/option_child_presence, options_apply and append_vec are mechanized/used; every container/list field merges through the verified append helper; ErrorDocument and RewriteMap are list-backed with reverse child-wins lookup; parser and Options-list construction remain outside this obligation"
+    },
+    {
+      "id": "phase_order",
+      "title": "Directory < Files < Location < Condition",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "access_plan_interleaves and the consumed plan; directory sort/pairing are outside Verus"
+    },
+    {
+      "id": "htaccess_interleave",
+      "title": "per-directory Directory; access-file interleaving",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "verified plan and collect_layers classifier; parser-to-AccessLayer refinement is assumed"
+    },
+    {
+      "id": "require_eval_sound",
+      "title": "Require/PolicyResult semantics",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "PolicyResult combinators and require_none are verified; provider/auth/expression semantics are not"
+    },
+    {
+      "id": "require_none_never_grants",
+      "title": "RequireNone cannot grant",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "require_none_result proved and consumed by access.rs"
+    },
+    {
+      "id": "override_gate",
+      "title": "AllowOverride/AllowOverrideList/Nonfatal gate",
+      "status": "open",
+      "weight": 1.0,
+      "evidence": "runtime fail-closed behavior and tests; no mechanized gate theorem"
+    },
+    {
+      "id": "prefilter_sound",
+      "title": "htaccess/cache prefilter over-approximation",
+      "status": "open",
+      "weight": 1.0,
+      "evidence": "unit/differential tests only"
+    },
+    {
+      "id": "acl_reachability",
+      "title": "ACL reachability and resource binding",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "I1a path/URL/proxy/cache grants and I1b inode binding for file/directory; proxy/cache/CGI/FastCGI full binding is open"
+    }
+  ],
+  "minimum_weighted_score": 3.5,
+  "proof_debt": {
+    "max_total": 6,
+    "unverified_security_components": [],
+    "partially_bound_sinks": [],
+    "assumptions": [
+      "regex engine implements the stated language",
+      "filesystem view and access-file metadata are stable",
+      "h2 wire framing, TLS client-certificate chain validation, and CGI/proxy protocol details are outside the model",
+      "configuration parsing refines the model",
+      "authorization backends implement their stated contracts",
+      "IP literal and authority parsing (standard/string layer)"
+    ],
+    "unmodeled_security_directive_classes": [],
+    "max_unverified_security_components": 0,
+    "max_partially_bound_sinks": 0,
+    "max_assumptions": 6,
+    "max_unmodeled_security_directive_classes": 0
+  },
+  "sinks": {
+    "total": 8,
+    "grant_required": 8,
+    "path_target_bound": 8,
+    "inode_bound": 3,
+    "policy_key_bound": 2,
+    "minimum_inode_bound": 3,
+    "backend_target_bound": 3,
+    "minimum_backend_target_bound": 3,
+    "minimum_policy_key_bound": 2
+  },
+  "adversarial": {
+    "conformance": 165,
+    "semantics": 194,
+    "random": 300,
+    "cve_replay_cases": 0,
+    "unexplained_replay_failures": 0,
+    "max_unexplained_replay_failures": 0,
+    "cve_triage_cases": 371,
+    "cve_partial": 0,
+    "cve_not_covered": 1,
+    "max_cve_not_covered": 1,
+    "cve_not_covered_high_critical": 0,
+    "max_cve_not_covered_high_critical": 0
+  },
+  "verified_subcomponents": [
+    "virtual-host exact/wildcard host matching (host_pattern_matches)",
+    "virtual-host first-match selection (first_true_index)",
+    "IPv4/IPv6 network membership (ipv4_in_net/ipv6_in_net)",
+    "RemoteIP forwarded-trust selection (first_untrusted_index)",
+    "presence-preserving child-wins merge for optional security fields (option_child_presence)",
+    "container-field merge model (append prefix/map child-wins)",
+    "debug-build runtime audit of Scope container-field merge against the container model",
+    "HTTP/2 method/head admission, monotone body state, and connection-loop-projected H2 stream/reset budget",
+    "HTTP/2 idempotent early-reset purge set and stream-ID ledger",
+    "Rewrite backreference question-mark encoding and filesystem-target admission",
+    "HTTP/2 settings, decoded-header budget and flow-control model",
+    "HTTP/DoS connection and compression resource admission",
+    "Access-log escaping",
+    "Cache lookup key/policy/freshness/Vary admission",
+    "Proxy target identity key",
+    "CGI configured-environment admission",
+    "HTTP/2 adapter stream-ID admission and local lifecycle state",
+    "TLS listener client-certificate policy identity",
+    "Scope container/list append and reverse child-wins map lookup",
+    "Rewrite target external/internal classification, internal joining and same-host authority identity",
+    "Expression value truthiness and rewrite condition-chain folding",
+    "Regex dialect admission guard for configuration and expression patterns",
+    "Directive disposition and fail-closed security fallback",
+    "Access-file rule slot translation into conditional/Files/top-level layers",
+    "Configuration front-end line-kind IR classification",
+    "Configuration section-context nesting transition"
+  ]
+}

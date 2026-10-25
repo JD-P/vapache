@@ -1,0 +1,136 @@
+{
+  "timestamp": "2026-10-25T00:15:06.190221+00:00",
+  "tool": "wrk / ab / h2load",
+  "duration_s": 2.0,
+  "samples": 3,
+  "scenarios": [
+    {
+      "name": "proxy static",
+      "proto": "http",
+      "path": "/app/foo",
+      "servers": {
+        "apache": {
+          "rps": 4003.76,
+          "mean_ms": 168.78,
+          "p99_ms": 1570.0,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            4
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 2820.29,
+          "mean_ms": 57.87,
+          "p99_ms": 933.47,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            3
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.704410354266989
+    },
+    {
+      "name": "<Proxy> deny",
+      "proto": "http",
+      "path": "/proxy-acl/foo",
+      "servers": {
+        "apache": {
+          "rps": 144133.24,
+          "mean_ms": 0.6040399999999999,
+          "p99_ms": 3.6,
+          "failed": 0,
+          "non2xx": 302588,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 184777.58,
+          "mean_ms": 0.30628,
+          "p99_ms": 1.37,
+          "failed": 0,
+          "non2xx": 387947,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 1.2819914406975101
+    },
+    {
+      "name": "<ProxyMatch> allow",
+      "proto": "http",
+      "path": "/proxy-acl-re/abc/x",
+      "servers": {
+        "apache": {
+          "rps": 3869.44,
+          "mean_ms": 159.13,
+          "p99_ms": 1470.0,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 3525.83,
+          "mean_ms": 99.21,
+          "p99_ms": 1010.0,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            2
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.9111990365530929
+    }
+  ],
+  "config_test_ms": {
+    "apache": 21.44894198863767,
+    "vapache": 6.302122987108305
+  },
+  "config_test_errors": {
+    "apache": "",
+    "vapache": ""
+  },
+  "memory": {
+    "apache": {
+      "processes": 7,
+      "threads": 313,
+      "pss_kb": 32690
+    },
+    "vapache": {
+      "processes": 33,
+      "threads": 54,
+      "pss_kb": 31631
+    }
+  }
+}

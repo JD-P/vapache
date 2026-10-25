@@ -1,0 +1,136 @@
+{
+  "timestamp": "2026-10-23T20:09:32.599985+00:00",
+  "tool": "wrk / ab / h2load",
+  "duration_s": 1.0,
+  "samples": 1,
+  "scenarios": [
+    {
+      "name": "static 1.1KB",
+      "proto": "http",
+      "path": "/hello.txt",
+      "servers": {
+        "apache": {
+          "rps": 64581.97,
+          "mean_ms": 1.23,
+          "p99_ms": 5.79,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            97,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 61420.55,
+          "mean_ms": 1.79,
+          "p99_ms": 25.64,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.9510479472831195
+    },
+    {
+      "name": "access allow (IP)",
+      "proto": "http",
+      "path": "/access/ip-ok.txt",
+      "servers": {
+        "apache": {
+          "rps": 71767.45,
+          "mean_ms": 1.09,
+          "p99_ms": 5.39,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            20,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 46803.91,
+          "mean_ms": 1.65,
+          "p99_ms": 12.35,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.652160694019364
+    },
+    {
+      "name": "access deny (IP)",
+      "proto": "http",
+      "path": "/access/ip-no.txt",
+      "servers": {
+        "apache": {
+          "rps": 127426.53,
+          "mean_ms": 0.6748999999999999,
+          "p99_ms": 4.21,
+          "failed": 0,
+          "non2xx": 140179,
+          "socket_errors": [
+            0,
+            3,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 55437.91,
+          "mean_ms": 1.42,
+          "p99_ms": 11.05,
+          "failed": 0,
+          "non2xx": 60970,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.4350578329332205
+    }
+  ],
+  "config_test_ms": {
+    "apache": 17.37367399618961,
+    "vapache": 6.616173996008001
+  },
+  "config_test_errors": {
+    "apache": "",
+    "vapache": ""
+  },
+  "memory": {
+    "apache": {
+      "processes": 6,
+      "threads": 261,
+      "pss_kb": 25671
+    },
+    "vapache": {
+      "processes": 17,
+      "threads": 20,
+      "pss_kb": 28260
+    }
+  }
+}

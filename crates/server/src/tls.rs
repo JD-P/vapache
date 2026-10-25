@@ -1,0 +1,458 @@
+//! TLS (mod_ssl-compatible subset) using Rustls.
+//!
+//! Certificates are loaded while the process is still privileged and then
+//! shared immutably.  TLS is fail-closed: enabling `SSLEngine` without a
+//! usable certificate/key pair is a startup error, and only TLS 1.2/1.3 are
+//! offered even if an old configuration mentions SSLv3/TLSv1.0.
+
+use crate::config::{vhost_port, Config, SslConfig, VHost};
+use rustls::crypto::{ring, CryptoProvider};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
+use rustls::sign::CertifiedKey;
+use rustls::{RootCertStore, ServerConfig, SupportedProtocolVersion};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+type SharedKey = Arc<RwLock<Arc<CertifiedKey>>>;
+
+#[derive(Debug)]
+struct SniResolver {
+    default: SharedKey,
+    names: HashMap<String, SharedKey>,
+    wildcards: Vec<(String, SharedKey)>,
+}
+
+fn current_key(key: &SharedKey) -> Arc<CertifiedKey> {
+    key.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+struct OcspRefresh {
+    chain: Vec<CertificateDer<'static>>,
+    force_url: Option<String>,
+    timeout: Duration,
+    interval: Duration,
+    cache_path: PathBuf,
+    key: SharedKey,
+}
+
+fn normalize_name(name: &str) -> String {
+    let name = name.trim();
+    let name = if let Some(rest) = name.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else if name.matches(':').count() == 1 {
+        name.split(':').next().unwrap_or(name)
+    } else {
+        name
+    };
+    name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+impl ResolvesServerCert for SniResolver {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let Some(name) = hello.server_name() else {
+            return Some(current_key(&self.default));
+        };
+        let name = normalize_name(name);
+        if let Some(key) = self.names.get(&name) {
+            return Some(current_key(key));
+        }
+        for (suffix, key) in &self.wildcards {
+            if let Some(prefix) = name.strip_suffix(&format!(".{suffix}")) {
+                if !prefix.is_empty() && !prefix.contains('.') {
+                    return Some(current_key(key));
+                }
+            }
+        }
+        Some(current_key(&self.default))
+    }
+}
+
+fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
+    let f =
+        File::open(path).map_err(|e| format!("cannot open certificate {}: {e}", path.display()))?;
+    let mut r = BufReader::new(f);
+    let certs = rustls_pemfile::certs(&mut r)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("cannot parse certificate {}: {e}", path.display()))?;
+    if certs.is_empty() {
+        return Err(format!("no PEM certificates found in {}", path.display()));
+    }
+    Ok(certs)
+}
+
+fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
+    let f =
+        File::open(path).map_err(|e| format!("cannot open private key {}: {e}", path.display()))?;
+    let mut r = BufReader::new(f);
+    rustls_pemfile::private_key(&mut r)
+        .map_err(|e| format!("cannot parse private key {}: {e}", path.display()))?
+        .ok_or_else(|| format!("no PEM private key found in {}", path.display()))
+}
+
+fn load_key(
+    ssl: &SslConfig,
+    provider: &CryptoProvider,
+    cache_dir: Option<&Path>,
+) -> Result<(Arc<CertifiedKey>, Option<OcspRefresh>), String> {
+    let cert_file = ssl
+        .cert_file
+        .as_ref()
+        .ok_or_else(|| "SSLEngine is on but SSLCertificateFile is missing".to_string())?;
+    let mut chain = read_certs(cert_file)?;
+    if let Some(chain_file) = &ssl.chain_file {
+        chain.extend(read_certs(chain_file)?);
+    }
+    // Apache permits the private key to be concatenated into the certificate
+    // file; fall back to that when SSLCertificateKeyFile is absent.
+    let key_file = ssl.key_file.as_ref().unwrap_or(cert_file);
+    let key = read_key(key_file)?;
+    let mut refresh = None;
+    let ocsp = if ssl.stapling {
+        let timeout = if ssl.stapling_responder_timeout.is_zero() {
+            Duration::from_secs(5)
+        } else {
+            ssl.stapling_responder_timeout
+        };
+        let dir = cache_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| std::env::temp_dir().join("vapache-ocsp-cache"));
+        let cache_path = crate::ocsp::cache_path(&dir, &chain, ssl.stapling_force_url.as_deref());
+        let cached = crate::ocsp::load_cached(&cache_path);
+        let fetched =
+            crate::ocsp::staple_response(&chain, ssl.stapling_force_url.as_deref(), timeout);
+        let response = if let Some(fresh) = fetched {
+            crate::ocsp::save_cached(&cache_path, &fresh);
+            Some(fresh)
+        } else {
+            cached
+        };
+        if response.is_none() {
+            eprintln!(
+                "vapache: OCSP stapling requested but no response could be fetched for {}",
+                cert_file.display()
+            );
+        }
+        let interval = if ssl.stapling_standard_cache_timeout.is_zero() {
+            Duration::from_secs(3600)
+        } else {
+            ssl.stapling_standard_cache_timeout
+        };
+        refresh = Some((chain.clone(), cache_path, interval, timeout));
+        response
+    } else {
+        None
+    };
+    let mut certified = CertifiedKey::from_der(chain, key, provider)
+        .map_err(|e| format!("invalid TLS certificate/key pair: {e}"))?;
+    certified.ocsp = ocsp;
+    let certified = Arc::new(certified);
+    let refresh = refresh.map(|(chain, cache_path, interval, timeout)| OcspRefresh {
+        chain,
+        force_url: ssl.stapling_force_url.clone(),
+        timeout,
+        interval,
+        cache_path,
+        key: Arc::new(RwLock::new(certified.clone())),
+    });
+    Ok((certified, refresh))
+}
+
+fn spawn_ocsp_refresh(refresh: OcspRefresh) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(refresh.interval);
+        if let Some(response) = crate::ocsp::fetch_fresh(
+            &refresh.chain,
+            refresh.force_url.as_deref(),
+            refresh.timeout,
+        ) {
+            crate::ocsp::save_cached(&refresh.cache_path, &response);
+            let mut guard = refresh.key.write().unwrap_or_else(|e| e.into_inner());
+            let mut key = (**guard).clone();
+            key.ocsp = Some(response);
+            *guard = Arc::new(key);
+        }
+    });
+}
+
+fn protocol_versions(spec: Option<&str>) -> Result<Vec<&'static SupportedProtocolVersion>, String> {
+    let mut tls12 = true;
+    let mut tls13 = true;
+    let mut replaced = false;
+    if let Some(spec) = spec {
+        for raw in spec.split_whitespace() {
+            let (enable, bare, name) = match raw.as_bytes().first() {
+                Some(b'+') => (true, false, &raw[1..]),
+                Some(b'-') => (false, false, &raw[1..]),
+                _ => (true, true, raw),
+            };
+            // Apache: a bare protocol list replaces the default; + and -
+            // modify it.  We only implement TLS 1.2/1.3.
+            if bare && !replaced {
+                tls12 = false;
+                tls13 = false;
+                replaced = true;
+            }
+            match name.to_ascii_lowercase().as_str() {
+                "all" => {
+                    tls12 = enable;
+                    tls13 = enable;
+                }
+                "tlsv1.2" => tls12 = enable,
+                "tlsv1.3" => tls13 = enable,
+                // SSLv2/3 and TLS 1.0/1.1 are intentionally unsupported.
+                "sslv2" | "sslv3" | "tlsv1" | "tlsv1.1" => {}
+                other => {
+                    return Err(format!("unsupported SSLProtocol token '{other}'"));
+                }
+            }
+        }
+    }
+    if !tls12 && !tls13 {
+        return Err("SSLProtocol disables both TLS 1.2 and TLS 1.3".into());
+    }
+    let mut out = Vec::new();
+    if tls12 {
+        out.push(&rustls::version::TLS12);
+    }
+    if tls13 {
+        out.push(&rustls::version::TLS13);
+    }
+    Ok(out)
+}
+
+fn vhost_applies(v: &VHost, port: u16) -> bool {
+    v.addrs.iter().any(|a| vhost_port(a) == port)
+}
+
+/// The client-certificate policy that Rustls applies to a listener.  A single
+/// `ServerConfig` has one client-certificate verifier, so vhosts that disagree
+/// cannot safely share a listener: doing so would either demand a certificate
+/// from a public vhost or accept one on a vhost that requires it.
+fn client_policy_mode(ssl: &SslConfig) -> u8 {
+    match ssl.verify_client {
+        None => 0,
+        Some(crate::config::ClientVerify::None) => 1,
+        Some(crate::config::ClientVerify::Optional) => 2,
+        Some(crate::config::ClientVerify::Require) => 3,
+    }
+}
+
+fn client_policy_key(ssl: &SslConfig) -> (u8, Option<Vec<u8>>) {
+    (
+        client_policy_mode(ssl),
+        ssl.ca_file
+            .as_ref()
+            .map(|path| path.as_os_str().as_bytes().to_vec()),
+    )
+}
+
+fn client_policy_equal(a: &(u8, Option<Vec<u8>>), b: &(u8, Option<Vec<u8>>)) -> bool {
+    let (a_mode, a_ca) = a;
+    let (b_mode, b_ca) = b;
+    vapache_verified::tls_client_policy_equal(
+        *a_mode,
+        a_ca.is_some(),
+        a_ca.as_deref().unwrap_or(&[]),
+        *b_mode,
+        b_ca.is_some(),
+        b_ca.as_deref().unwrap_or(&[]),
+    )
+}
+
+fn ensure_uniform_client_policy(policies: &[&SslConfig], port: u16) -> Result<(), String> {
+    let Some(first) = policies.first() else {
+        return Ok(());
+    };
+    let expected = client_policy_key(first);
+    for ssl in policies.iter().skip(1) {
+        if !client_policy_equal(&expected, &client_policy_key(ssl)) {
+            return Err(format!(
+                "TLS port {port} has virtual hosts with different client-certificate policies;                  use separate Listen directives so SSLVerifyClient/SSLCACertificateFile cannot                  be applied across vhosts"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build the TLS configuration for a listening port, if any virtual host on
+/// that port has `SSLEngine on` (or a global SSLEngine is configured).
+pub fn server_config(cfg: &Config, port: u16) -> Result<Option<Arc<ServerConfig>>, String> {
+    let provider = Arc::new(ring::default_provider());
+    let mut vhosts: Vec<&VHost> = cfg
+        .vhosts
+        .iter()
+        .filter(|v| v.ssl.engine && vhost_applies(v, port))
+        .collect();
+    let global_only = cfg.ssl.engine && vhosts.is_empty();
+    if vhosts.is_empty() && !global_only {
+        return Ok(None);
+    }
+    let policies: Vec<&SslConfig> = vhosts.iter().map(|v| &v.ssl).collect();
+    ensure_uniform_client_policy(&policies, port)?;
+
+    // Apache's first matching virtual host is the default server.
+    let default_ssl = if global_only {
+        &cfg.ssl
+    } else {
+        &vhosts[0].ssl
+    };
+    let ocsp_cache_dir = cfg.server_root.join("logs").join("ocsp-cache");
+    let (default_cert, default_refresh) = load_key(default_ssl, &provider, Some(&ocsp_cache_dir))?;
+    let default_key: SharedKey = Arc::new(RwLock::new(default_cert));
+    if let Some(mut refresh) = default_refresh {
+        refresh.key = default_key.clone();
+        spawn_ocsp_refresh(refresh);
+    }
+    let mut resolver = SniResolver {
+        default: default_key.clone(),
+        names: HashMap::new(),
+        wildcards: Vec::new(),
+    };
+    if global_only {
+        // No SNI names are known; the global certificate is the only key.
+    } else {
+        // The default vhost may be repeated; insert names for every TLS vhost.
+        for v in vhosts.drain(..) {
+            let key = if std::ptr::eq(&v.ssl, default_ssl) {
+                default_key.clone()
+            } else {
+                let (cert, refresh) = load_key(&v.ssl, &provider, Some(&ocsp_cache_dir))?;
+                let shared = Arc::new(RwLock::new(cert));
+                if let Some(mut refresh) = refresh {
+                    refresh.key = shared.clone();
+                    spawn_ocsp_refresh(refresh);
+                }
+                shared
+            };
+            let mut names = Vec::new();
+            if let Some(n) = &v.server_name {
+                names.push(n.clone());
+            }
+            names.extend(v.aliases.iter().cloned());
+            for raw in names {
+                let name = normalize_name(&raw);
+                if name.is_empty() || name == "*" || name.starts_with('_') {
+                    continue;
+                }
+                if let Some(suffix) = name.strip_prefix("*.") {
+                    if !suffix.is_empty() {
+                        resolver.wildcards.push((suffix.to_string(), key.clone()));
+                    }
+                } else if let Some(suffix) = name.strip_prefix('.') {
+                    if !suffix.is_empty() {
+                        resolver.wildcards.push((suffix.to_string(), key.clone()));
+                    }
+                } else {
+                    resolver.names.insert(name, key.clone());
+                }
+            }
+        }
+    }
+
+    let versions = protocol_versions(default_ssl.protocols.as_deref())?;
+    let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> = match default_ssl
+        .verify_client
+        .unwrap_or(crate::config::ClientVerify::None)
+    {
+        crate::config::ClientVerify::None => Arc::new(rustls::server::NoClientAuth),
+        mode => {
+            let ca = default_ssl
+                .ca_file
+                .as_ref()
+                .ok_or_else(|| "SSLVerifyClient requires SSLCACertificateFile".to_string())?;
+            let mut roots = RootCertStore::empty();
+            for cert in read_certs(ca)? {
+                roots
+                    .add(cert)
+                    .map_err(|e| format!("invalid client CA certificate: {e}"))?;
+            }
+            let builder = WebPkiClientVerifier::builder(Arc::new(roots));
+            let builder = if mode == crate::config::ClientVerify::Optional {
+                builder.allow_unauthenticated()
+            } else {
+                builder
+            };
+            builder
+                .build()
+                .map_err(|e| format!("invalid client certificate verifier: {e}"))?
+        }
+    };
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&versions)
+        .map_err(|e| format!("invalid TLS protocol configuration: {e}"))?
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(Arc::new(resolver));
+    // Prefer HTTP/2; clients that do not offer h2 fall back to HTTP/1.1.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Some(Arc::new(config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_selection_is_safe() {
+        assert_eq!(protocol_versions(None).unwrap().len(), 2);
+        assert_eq!(protocol_versions(Some("TLSv1.2")).unwrap().len(), 1);
+        assert_eq!(protocol_versions(Some("-TLSv1.3")).unwrap().len(), 1);
+        assert_eq!(protocol_versions(Some("+TLSv1.2")).unwrap().len(), 2);
+        assert!(protocol_versions(Some("-TLSv1.2 -TLSv1.3")).is_err());
+        assert!(
+            protocol_versions(Some("all -SSLv3 -TLSv1 -TLSv1.1"))
+                .unwrap()
+                .len()
+                == 2
+        );
+        assert!(protocol_versions(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn missing_certificate_is_an_error() {
+        let provider = ring::default_provider();
+        assert!(load_key(&SslConfig::default(), &provider, None).is_err());
+        let ssl = SslConfig {
+            engine: true,
+            cert_file: Some("/does/not/exist.pem".into()),
+            ..SslConfig::default()
+        };
+        assert!(load_key(&ssl, &provider, None).is_err());
+    }
+
+    #[test]
+    fn vhosts_cannot_share_a_listener_with_different_client_auth_policy() {
+        let none = SslConfig::default();
+        let require = SslConfig {
+            verify_client: Some(crate::config::ClientVerify::Require),
+            ca_file: Some("/etc/client-ca.pem".into()),
+            ..SslConfig::default()
+        };
+        assert!(ensure_uniform_client_policy(&[&none, &none], 443).is_ok());
+        assert!(ensure_uniform_client_policy(&[&none, &require], 443).is_err());
+        let require2 = SslConfig {
+            verify_client: Some(crate::config::ClientVerify::Require),
+            ca_file: Some("/etc/client-ca.pem".into()),
+            ..SslConfig::default()
+        };
+        assert!(ensure_uniform_client_policy(&[&require, &require2], 443).is_ok());
+        let require3 = SslConfig {
+            verify_client: Some(crate::config::ClientVerify::Require),
+            ca_file: Some("/etc/other-ca.pem".into()),
+            ..SslConfig::default()
+        };
+        assert!(ensure_uniform_client_policy(&[&require, &require3], 443).is_err());
+    }
+
+    #[test]
+    fn sni_names_are_normalized() {
+        assert_eq!(normalize_name("Example.COM:443"), "example.com");
+        assert_eq!(normalize_name("[::1]:443"), "::1");
+        assert_eq!(normalize_name("host.example."), "host.example");
+    }
+}

@@ -1,0 +1,8093 @@
+//! Apache HTTPD configuration parser and compiler.
+//!
+//! The parser accepts the real httpd 2.4 configuration grammar: quoted
+//! arguments, line continuations, `${VAR}` interpolation, `Include`/
+//! `IncludeOptional` globs, `Define`, `<IfDefine>`, `<IfModule>`, nested
+//! containers, virtual hosts, and per-directory scopes.
+//!
+//! Directives are compiled into an immutable typed configuration.  Unknown
+//! directives are reported as warnings (so that a stock distribution config
+//! referencing modules we do not implement still starts); directives that
+//! carry access-control semantics are *fail closed*: an access directive we
+//! cannot evaluate denies access rather than silently allowing it.
+
+use crate::scope_policy::{
+    AuthorizationPolicy, CompressionPolicy, ContentPolicy, EnvironmentPolicy, ErrorDocumentPolicy,
+    HeaderPolicy, MappingPolicy, OptionsPolicy, OverridePolicy, ProxyPolicy, RewriteCachePolicy,
+};
+use regex::Regex;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+pub(crate) use crate::config_frontend::tokenize_config;
+
+#[derive(Debug, Clone)]
+pub struct ConfigError {
+    pub file: String,
+    pub line: usize,
+    pub msg: String,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.file.is_empty() {
+            write!(f, "{}", self.msg)
+        } else {
+            write!(f, "{} line {}: {}", self.file, self.line, self.msg)
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerTokens {
+    Full,
+    Os,
+    Minimal,
+    Minor,
+    Major,
+    Prod,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerSignature {
+    Off,
+    On,
+    Email,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodedSlashes {
+    Off,
+    On,
+    NoDecode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverrideCategories(pub u32);
+
+impl OverrideCategories {
+    pub const AUTH_CONFIG: u32 = 1 << 0;
+    pub const FILE_INFO: u32 = 1 << 1;
+    pub const INDEXES: u32 = 1 << 2;
+    pub const LIMIT: u32 = 1 << 3;
+    /// The `Options` directive is allowed with any option token.
+    pub const OPTIONS: u32 = 1 << 4;
+    pub const EXEC_CGI: u32 = 1 << 5;
+    pub const INCLUDES: u32 = 1 << 6;
+    pub const INCLUDES_NOEXEC: u32 = 1 << 7;
+    pub const LANGUAGE_PRIORITY: u32 = 1 << 8;
+    /// Individual `Options=...` permissions accepted by Apache 2.4.
+    pub const OPT_FOLLOW_SYMLINKS: u32 = 1 << 9;
+    pub const OPT_INDEXES: u32 = 1 << 10;
+    pub const OPT_MULTIVIEWS: u32 = 1 << 11;
+    pub const OPT_SYMLINKS_IF_OWNER_MATCH: u32 = 1 << 12;
+    pub const OPT_NONE: u32 = 1 << 13;
+    pub const OPTION_MASK: u32 = Self::OPTIONS
+        | Self::EXEC_CGI
+        | Self::INCLUDES
+        | Self::INCLUDES_NOEXEC
+        | Self::OPT_FOLLOW_SYMLINKS
+        | Self::OPT_INDEXES
+        | Self::OPT_MULTIVIEWS
+        | Self::OPT_SYMLINKS_IF_OWNER_MATCH
+        | Self::OPT_NONE;
+
+    pub fn empty() -> Self {
+        OverrideCategories(0)
+    }
+    pub fn all() -> Self {
+        OverrideCategories(
+            Self::AUTH_CONFIG
+                | Self::FILE_INFO
+                | Self::INDEXES
+                | Self::LIMIT
+                | Self::OPTIONS
+                | Self::EXEC_CGI
+                | Self::INCLUDES
+                | Self::INCLUDES_NOEXEC
+                | Self::LANGUAGE_PRIORITY
+                | Self::OPT_FOLLOW_SYMLINKS
+                | Self::OPT_INDEXES
+                | Self::OPT_MULTIVIEWS
+                | Self::OPT_SYMLINKS_IF_OWNER_MATCH
+                | Self::OPT_NONE,
+        )
+    }
+    pub fn contains(self, flag: u32) -> bool {
+        self.0 & flag != 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverrideMode {
+    None,
+    All,
+    Categories(OverrideCategories),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NonfatalMode {
+    #[default]
+    None,
+    Override,
+    Unknown,
+    All,
+}
+
+impl NonfatalMode {
+    pub(crate) fn allows_override(self) -> bool {
+        matches!(self, Self::Override | Self::All)
+    }
+    pub(crate) fn allows_unknown(self) -> bool {
+        matches!(self, Self::Unknown | Self::All)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverrideCategory {
+    AuthConfig,
+    FileInfo,
+    Indexes,
+    Limit,
+    Options,
+    ExecCgi,
+    Includes,
+    IncludesNoExec,
+    LanguagePriority,
+}
+
+impl OverrideCategory {
+    fn flag(self) -> u32 {
+        match self {
+            Self::AuthConfig => OverrideCategories::AUTH_CONFIG,
+            Self::FileInfo => OverrideCategories::FILE_INFO,
+            Self::Indexes => OverrideCategories::INDEXES,
+            Self::Limit => OverrideCategories::LIMIT,
+            Self::Options => OverrideCategories::OPTIONS,
+            Self::ExecCgi => OverrideCategories::EXEC_CGI,
+            Self::Includes => OverrideCategories::INCLUDES,
+            Self::IncludesNoExec => OverrideCategories::INCLUDES_NOEXEC,
+            Self::LanguagePriority => OverrideCategories::LANGUAGE_PRIORITY,
+        }
+    }
+}
+
+impl OverrideMode {
+    pub fn is_enabled(self) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Categories(c) => c.0 != 0,
+        }
+    }
+
+    pub fn allows(self, category: OverrideCategory) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Categories(c) => c.contains(category.flag()),
+        }
+    }
+
+    pub fn allows_flag(self, flag: u32) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Categories(c) => c.contains(flag),
+        }
+    }
+
+    pub fn allows_any_option(self) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Categories(c) => c.0 & OverrideCategories::OPTION_MASK != 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Options(pub u32);
+
+impl Options {
+    pub const NONE: u32 = 0;
+    pub const INDEXES: u32 = 1 << 0;
+    pub const FOLLOW_SYMLINKS: u32 = 1 << 1;
+    pub const SYMLINKS_IF_OWNER_MATCH: u32 = 1 << 2;
+    pub const EXEC_CGI: u32 = 1 << 3;
+    pub const INCLUDES: u32 = 1 << 4;
+    pub const INCLUDES_NOEXEC: u32 = 1 << 5;
+    pub const MULTIVIEWS: u32 = 1 << 6;
+
+    pub fn empty() -> Self {
+        Options(0)
+    }
+    pub fn all() -> Self {
+        Options(
+            Self::INDEXES
+                | Self::FOLLOW_SYMLINKS
+                | Self::SYMLINKS_IF_OWNER_MATCH
+                | Self::EXEC_CGI
+                | Self::INCLUDES
+                | Self::INCLUDES_NOEXEC
+                | Self::MULTIVIEWS,
+        )
+    }
+    pub fn contains(self, flag: u32) -> bool {
+        self.0 & flag != 0
+    }
+    pub fn set(mut self, flag: u32, on: bool) -> Self {
+        if on {
+            self.0 |= flag;
+        } else {
+            self.0 &= !flag;
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Order {
+    AllowDeny,
+    DenyAllow,
+}
+
+#[derive(Debug, Clone)]
+pub enum Require {
+    AllGranted,
+    AllDenied,
+    Ip {
+        negate: bool,
+        nets: Vec<(IpAddr, u8)>,
+    },
+    Local {
+        negate: bool,
+    },
+    Host {
+        negate: bool,
+        names: Vec<String>,
+    },
+    Method {
+        negate: bool,
+        methods: Vec<String>,
+    },
+    ValidUser,
+    Env {
+        negate: bool,
+        name: String,
+        value: Option<String>,
+    },
+    Expr(crate::expr::Expr),
+    User {
+        negate: bool,
+        names: Vec<String>,
+    },
+    Group {
+        negate: bool,
+        names: Vec<String>,
+    },
+    /// Anything we cannot evaluate safely denies.
+    Unsupported(String),
+}
+
+/// Nested authorization expression. Multiple top-level nodes are an implicit
+/// RequireAny, matching Apache.
+#[derive(Debug, Clone)]
+pub enum RequireNode {
+    Provider(Require),
+    All(Vec<RequireNode>),
+    Any(Vec<RequireNode>),
+    None(Vec<RequireNode>),
+}
+
+/// A set of HTTP methods used by `<Limit>` / `<LimitExcept>`.
+///
+/// `Only` applies to exactly the listed methods, `Except` applies to every
+/// method not listed (including methods unknown to the server).  Apache maps
+/// `HEAD` onto the `GET` method number, so limiting GET also limits HEAD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MethodSet {
+    Only(Vec<String>),
+    Except(Vec<String>),
+}
+
+impl MethodSet {
+    pub fn all() -> Self {
+        MethodSet::Except(Vec::new())
+    }
+
+    fn listed(list: &[String], method: &str) -> bool {
+        // Apache treats HEAD as the same method number as GET for the purpose
+        // of <Limit>.  Other method names are case-sensitive.
+        let method = if method == "HEAD" { "GET" } else { method };
+        list.iter().any(|m| m == method)
+    }
+
+    pub fn matches(&self, method: &str) -> bool {
+        match self {
+            MethodSet::Only(list) => Self::listed(list, method),
+            MethodSet::Except(list) => !Self::listed(list, method),
+        }
+    }
+
+    /// Intersection used by nested `<Limit>` sections.  Every nested section
+    /// must further restrict the enclosing one.
+    pub fn intersect(&self, other: &Self) -> Self {
+        let dedup = |v: Vec<String>| {
+            let mut out: Vec<String> = Vec::new();
+            for m in v {
+                if !out.contains(&m) {
+                    out.push(m);
+                }
+            }
+            out
+        };
+        match (self, other) {
+            (MethodSet::Only(a), MethodSet::Only(b)) => {
+                MethodSet::Only(dedup(a.iter().filter(|m| b.contains(m)).cloned().collect()))
+            }
+            (MethodSet::Only(a), MethodSet::Except(b)) => MethodSet::Only(dedup(
+                a.iter().filter(|m| !b.contains(m)).cloned().collect(),
+            )),
+            (MethodSet::Except(a), MethodSet::Only(b)) => MethodSet::Only(dedup(
+                b.iter().filter(|m| !a.contains(m)).cloned().collect(),
+            )),
+            (MethodSet::Except(a), MethodSet::Except(b)) => {
+                MethodSet::Except(dedup(a.iter().chain(b.iter()).cloned().collect()))
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        matches!(self, MethodSet::Only(list) if list.is_empty())
+    }
+}
+
+/// One `Require` provider plus the methods it applies to.  A `None` limit
+/// applies to every method.
+#[derive(Debug, Clone)]
+pub struct RequireEntry {
+    pub node: RequireNode,
+    pub limit: Option<MethodSet>,
+}
+
+impl RequireEntry {
+    pub fn applies(&self, method: &str) -> bool {
+        self.limit
+            .as_ref()
+            .map(|limit| limit.matches(method))
+            .unwrap_or(true)
+    }
+}
+
+/// Authorization configuration for a scope.  `List` is the implicit
+/// `RequireAny` formed by ordinary `Require` directives.  `And`/`Or` nodes are
+/// created when a child section uses `AuthMerging And|Or` to combine its
+/// authorization logic with the preceding section's logic.
+#[derive(Debug, Clone)]
+pub enum AuthPolicy {
+    List(Vec<RequireEntry>),
+    And(Box<AuthPolicy>, Box<AuthPolicy>),
+    Or(Box<AuthPolicy>, Box<AuthPolicy>),
+}
+
+impl AuthPolicy {
+    pub fn is_list(&self) -> bool {
+        matches!(self, AuthPolicy::List(_))
+    }
+}
+
+/// Value of the `AuthMerging` directive.  It is local to the configuration
+/// section in which it appears and controls how that section's authorization
+/// is combined with its predecessor during merging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMerging {
+    Off,
+    And,
+    Or,
+}
+
+/// Parsed value of the `AllowMethods` directive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllowMethods {
+    /// `AllowMethods reset`: remove any inherited restriction.
+    Reset,
+    Only(Vec<String>),
+}
+
+impl AllowMethods {
+    pub fn allows(&self, method: &str) -> bool {
+        match self {
+            AllowMethods::Reset => true,
+            AllowMethods::Only(methods) => {
+                let method = if method == "HEAD" { "GET" } else { method };
+                methods.iter().any(|m| {
+                    let m = if m == "HEAD" { "GET" } else { m.as_str() };
+                    m == method
+                })
+            }
+        }
+    }
+
+    pub fn header(&self) -> String {
+        match self {
+            AllowMethods::Reset => String::new(),
+            AllowMethods::Only(methods) => {
+                let mut out: Vec<String> = Vec::new();
+                for method in methods {
+                    if !out.iter().any(|m| m == method) {
+                        out.push(method.clone());
+                    }
+                    // Apache treats GET and HEAD as equivalent; advertise
+                    // both so the Allow header is accurate.
+                    let counterpart = match method.as_str() {
+                        "GET" => Some("HEAD"),
+                        "HEAD" => Some("GET"),
+                        _ => None,
+                    };
+                    if let Some(counterpart) = counterpart {
+                        if !methods.iter().any(|m| m == counterpart)
+                            && !out.iter().any(|m| m == counterpart)
+                        {
+                            out.push(counterpart.to_string());
+                        }
+                    }
+                }
+                out.join(", ")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Satisfy {
+    All,
+    Any,
+}
+
+#[derive(Debug, Clone)]
+pub enum HostSpec {
+    All,
+    Net(IpAddr, u8),
+}
+
+impl HostSpec {
+    pub fn matches(&self, peer: IpAddr) -> bool {
+        match self {
+            HostSpec::All => true,
+            HostSpec::Net(net, bits) => crate::access::ip_in_net(peer, *net, *bits),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MethodScoped<T> {
+    pub limit: Option<MethodSet>,
+    pub value: T,
+}
+
+impl<T> MethodScoped<T> {
+    pub fn applies(&self, method: &str) -> bool {
+        self.limit
+            .as_ref()
+            .map(|limit| limit.matches(method))
+            .unwrap_or(true)
+    }
+}
+
+/// Legacy `mod_access_compat` configuration (`Order`/`Allow`/`Deny`) and the
+/// matching `Satisfy` policy.  As in Apache, a configuration section that
+/// contains any of these directives replaces, rather than inherits, the
+/// legacy policy from its parent.
+#[derive(Debug, Clone, Default)]
+pub struct LegacyAccess {
+    pub order: Vec<MethodScoped<Order>>,
+    pub satisfy: Vec<MethodScoped<Satisfy>>,
+    pub allow: Vec<MethodScoped<HostSpec>>,
+    pub deny: Vec<MethodScoped<HostSpec>>,
+}
+
+impl LegacyAccess {
+    pub fn method_order(&self, method: &str) -> Order {
+        self.order
+            .iter()
+            .rev()
+            .find(|entry| entry.applies(method))
+            .map(|entry| entry.value)
+            // Apache's compiled-in default is `Order Deny,Allow`.
+            .unwrap_or(Order::DenyAllow)
+    }
+
+    pub fn method_satisfy(&self, method: &str) -> Satisfy {
+        self.satisfy
+            .iter()
+            .rev()
+            .find(|entry| entry.applies(method))
+            .map(|entry| entry.value)
+            .unwrap_or(Satisfy::All)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ErrorDoc {
+    Text(String),
+    Local(String),
+    External(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct Alias {
+    pub virtual_path: String,
+    pub fs_path: PathBuf,
+    pub script: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Redirect {
+    pub from: String,
+    pub to: String,
+    pub status: u16,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RewriteFlags {
+    pub last: bool,
+    pub end: bool,
+    pub redirect: Option<u16>,
+    pub forbidden: bool,
+    pub gone: bool,
+    pub qsa: bool,
+    pub nocase: bool,
+    pub noescape: bool,
+    pub passthrough: bool,
+    pub proxy: bool,
+    pub chain: bool,
+    pub skip: Option<usize>,
+    pub next: bool,
+    pub qsd: bool,
+    pub qslast: bool,
+    pub unsafe_allow_3f: bool,
+    pub env: Vec<(String, Option<String>)>,
+    pub cookies: Vec<String>,
+    pub handler: Option<String>,
+    pub content_type: Option<String>,
+    pub escape_backrefs: bool,
+    pub escape_chars: String,
+    pub escape_controls: bool,
+    pub noescape_backrefs: bool,
+    pub noescape_chars: String,
+    pub backref_no_plus: bool,
+    pub unsafe_prefix_stat: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RewriteCondFlags {
+    pub nocase: bool,
+    /// This condition is ORed with the next condition instead of ANDed.
+    pub or: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RewriteCond {
+    pub test: String,
+    pub pattern: String,
+    pub flags: RewriteCondFlags,
+    /// Precompiled regex for ordinary condition patterns.  File tests and
+    /// string comparisons leave this as `None`.
+    pub regex: Option<Arc<Regex>>,
+    pub expr: Option<crate::expr::Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RewriteRule {
+    pub pattern: Arc<Regex>,
+    pub negated: bool,
+    pub substitution: String,
+    pub flags: RewriteFlags,
+    pub conditions: Vec<RewriteCond>,
+    /// URL prefix used to resolve relative substitutions in per-directory
+    /// context (possibly changed by `RewriteBase`).
+    pub base: String,
+    /// URL prefix that per-directory patterns are matched against.  This is
+    /// the containing directory and is not changed by `RewriteBase`.
+    pub match_base: String,
+    pub per_dir: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Handler {
+    pub ext: String,
+    pub handler: String,
+}
+
+/// Resolve the effective handler for a filename.  Apache's `SetHandler`
+/// overrides `AddHandler`; a later `AddHandler` entry wins over an earlier one.
+pub(crate) fn effective_handler<'a>(scope: &'a Scope, name: &[u8]) -> Option<&'a str> {
+    if let Some(handler) = scope
+        .mapping_policy
+        .handlers
+        .iter()
+        .rev()
+        .find(|h| h.ext == "*")
+    {
+        return Some(handler.handler.as_str());
+    }
+    let base = name.rsplit(|b| *b == b'/').next().unwrap_or(name);
+    let ext = base
+        .rsplit(|b| *b == b'.')
+        .next()
+        .and_then(|e| std::str::from_utf8(e).ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    scope
+        .mapping_policy
+        .handlers
+        .iter()
+        .rev()
+        .find(|h| h.ext.eq_ignore_ascii_case(&ext))
+        .map(|h| h.handler.as_str())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionKind {
+    Gzip,
+    Brotli,
+}
+
+impl CompressionKind {
+    pub fn encoding(self) -> &'static str {
+        match self {
+            Self::Gzip => "gzip",
+            Self::Brotli => "br",
+        }
+    }
+
+    pub fn parse_filter(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("DEFLATE") || name.eq_ignore_ascii_case("GZIP") {
+            Some(Self::Gzip)
+        } else if name.eq_ignore_ascii_case("BROTLI_COMPRESS")
+            || name.eq_ignore_ascii_case("BROTLI")
+        {
+            Some(Self::Brotli)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompressionRule {
+    /// `SetOutputFilter DEFLATE BROTLI_COMPRESS`
+    Set(Vec<CompressionKind>),
+    /// `AddOutputFilterByType DEFLATE text/html ...`
+    ByType(CompressionKind, Vec<String>),
+    /// `AddOutputFilter DEFLATE .html .css`
+    ByExt(CompressionKind, Vec<String>),
+}
+
+/// Parse filter names, recording any unimplemented filter so requests fail
+/// closed instead of serving unfiltered source.
+pub(crate) fn parse_filter_tokens(scope: &mut Scope, tokens: &[String]) -> Vec<CompressionKind> {
+    let mut kinds = Vec::new();
+    for token in tokens {
+        for part in token.split(';') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            match CompressionKind::parse_filter(part) {
+                Some(kind) => {
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
+                }
+                None => {
+                    if !scope
+                        .mapping_policy
+                        .unsupported_filters
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(part))
+                    {
+                        scope
+                            .mapping_policy
+                            .unsupported_filters
+                            .push(part.to_string());
+                    }
+                }
+            }
+        }
+    }
+    kinds
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterEtag {
+    AddSuffix,
+    NoChange,
+    Remove,
+}
+
+impl AlterEtag {
+    pub fn parse(s: &str) -> Option<Self> {
+        if s.eq_ignore_ascii_case("AddSuffix") {
+            Some(Self::AddSuffix)
+        } else if s.eq_ignore_ascii_case("NoChange") {
+            Some(Self::NoChange)
+        } else if s.eq_ignore_ascii_case("Remove") {
+            Some(Self::Remove)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HealthTemplate {
+    pub method: Option<String>,
+    pub uri: Option<String>,
+    pub interval: Option<Duration>,
+    pub passes: Option<u32>,
+    pub fails: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BalancerMember {
+    pub url: String,
+    pub hcmethod: Option<String>,
+    pub hcuri: Option<String>,
+    pub hcinterval: Option<Duration>,
+    pub hcpasses: Option<u32>,
+    pub hcfails: Option<u32>,
+    pub template: Option<String>,
+    pub route: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Balancer {
+    pub name: String,
+    pub members: Vec<BalancerMember>,
+    pub health: HealthTemplate,
+    pub sticky_cookie: Option<String>,
+    pub sticky_sep: Option<String>,
+    pub fail_on_status: Vec<u16>,
+}
+
+impl Balancer {
+    pub fn health_enabled(&self) -> bool {
+        self.health.uri.is_some()
+            || self.health.method.is_some()
+            || self
+                .members
+                .iter()
+                .any(|m| m.hcuri.is_some() || m.hcmethod.is_some() || m.template.is_some())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyRule {
+    pub pattern: Arc<Regex>,
+    pub backend: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyPassRule {
+    pub prefix: String,
+    pub backend: String,
+    pub sticky_cookie: Option<String>,
+    pub fail_on_status: Vec<u16>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyReverseRule {
+    pub front: String,
+    pub backend: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum RewriteMap {
+    Txt(HashMap<String, String>),
+    /// key -> one of several pipe-separated random choices
+    Rnd(HashMap<String, Vec<String>>),
+    Prg(String),
+    Int(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct EnvRule {
+    pub attribute: String,
+    pub pattern: Arc<Regex>,
+    pub negate: bool,
+    pub nocase: bool,
+    /// `(name, Some(value))` sets the variable; `(name, None)` unsets it.
+    pub actions: Vec<(String, Option<String>)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Scope {
+    pub options: OptionsPolicy,
+    pub override_policy: OverridePolicy,
+    pub authorization: AuthorizationPolicy,
+    pub header_policy: HeaderPolicy,
+    pub content_policy: ContentPolicy,
+    pub mapping_policy: MappingPolicy,
+    pub error_policy: ErrorDocumentPolicy,
+    pub environment_policy: EnvironmentPolicy,
+    pub rewrite_policy: RewriteCachePolicy,
+    pub compression_policy: CompressionPolicy,
+    pub proxy_policy: ProxyPolicy,
+}
+
+impl Default for Scope {
+    fn default() -> Self {
+        Scope {
+            options: OptionsPolicy::default(),
+            override_policy: OverridePolicy::default(),
+            authorization: AuthorizationPolicy::default(),
+            header_policy: HeaderPolicy::default(),
+            content_policy: ContentPolicy::default(),
+            mapping_policy: MappingPolicy::default(),
+            rewrite_policy: RewriteCachePolicy::default(),
+            compression_policy: CompressionPolicy::default(),
+            proxy_policy: ProxyPolicy::default(),
+            error_policy: ErrorDocumentPolicy::default(),
+            environment_policy: EnvironmentPolicy::default(),
+        }
+    }
+}
+
+pub const ETAG_INODE: u32 = 1;
+pub const ETAG_MTIME: u32 = 2;
+pub const ETAG_SIZE: u32 = 4;
+pub const ETAG_ALL: u32 = 7;
+
+#[cfg(debug_assertions)]
+#[derive(Debug, PartialEq, Eq)]
+struct ContainerSnapshot {
+    error_documents: Vec<(u16, u64)>,
+    aliases: Vec<u64>,
+    redirects: Vec<u64>,
+    handlers: Vec<u64>,
+    unsupported_filters: Vec<u64>,
+    add_types: Vec<u64>,
+    remove_types: Vec<u64>,
+    add_headers: Vec<u64>,
+    set_headers: Vec<u64>,
+    unset_headers: Vec<u64>,
+    expires_by_type: Vec<u64>,
+    set_env: Vec<u64>,
+    unset_env: Vec<u64>,
+    pass_env: Vec<u64>,
+    set_env_if: Vec<u64>,
+    cookies: Vec<u64>,
+    vary: Vec<u64>,
+    rewrite_maps: Vec<(String, u64)>,
+    cache_enable: Vec<u64>,
+    cache_disable: Vec<u64>,
+    rewrite_rules: Vec<u64>,
+    compression_rules: Vec<u64>,
+    proxy_rules: Vec<u64>,
+    proxy_passes: Vec<u64>,
+    proxy_reverses: Vec<u64>,
+}
+
+#[cfg(debug_assertions)]
+fn hash_item<T: std::fmt::Debug>(value: &T) -> u64 {
+    let mut h = DefaultHasher::new();
+    format!("{value:?}").hash(&mut h);
+    h.finish()
+}
+
+#[cfg(debug_assertions)]
+fn hash_vec<T: std::fmt::Debug>(values: &[T]) -> Vec<u64> {
+    values.iter().map(hash_item).collect()
+}
+
+#[cfg(debug_assertions)]
+impl Scope {
+    fn container_snapshot(&self) -> ContainerSnapshot {
+        ContainerSnapshot {
+            error_documents: self
+                .error_policy
+                .documents
+                .iter()
+                .map(|(k, v)| (*k, hash_item(v)))
+                .collect(),
+            aliases: hash_vec(&self.mapping_policy.aliases),
+            redirects: hash_vec(&self.mapping_policy.redirects),
+            handlers: hash_vec(&self.mapping_policy.handlers),
+            unsupported_filters: hash_vec(&self.mapping_policy.unsupported_filters),
+            add_types: hash_vec(&self.content_policy.add_types),
+            remove_types: hash_vec(&self.content_policy.remove_types),
+            add_headers: hash_vec(&self.header_policy.add_headers),
+            set_headers: hash_vec(&self.header_policy.set_headers),
+            unset_headers: hash_vec(&self.header_policy.unset_headers),
+            expires_by_type: hash_vec(&self.header_policy.expires_by_type),
+            set_env: hash_vec(&self.environment_policy.set_env),
+            unset_env: hash_vec(&self.environment_policy.unset_env),
+            pass_env: hash_vec(&self.environment_policy.pass_env),
+            set_env_if: hash_vec(&self.environment_policy.set_env_if),
+            cookies: hash_vec(&self.header_policy.cookies),
+            vary: hash_vec(&self.header_policy.vary),
+            rewrite_maps: self
+                .rewrite_policy
+                .rewrite_maps
+                .iter()
+                .map(|(k, v)| (k.clone(), hash_item(v)))
+                .collect(),
+            cache_enable: hash_vec(&self.rewrite_policy.cache_enable),
+            cache_disable: hash_vec(&self.rewrite_policy.cache_disable),
+            rewrite_rules: hash_vec(&self.rewrite_policy.rewrite_rules),
+            compression_rules: hash_vec(&self.compression_policy.compression_rules),
+            proxy_rules: hash_vec(&self.proxy_policy.proxy_rules),
+            proxy_passes: hash_vec(&self.proxy_policy.proxy_passes),
+            proxy_reverses: hash_vec(&self.proxy_policy.proxy_reverses),
+        }
+    }
+
+    fn container_snapshot_with_rewrite(
+        &self,
+        rewrite_rules: Option<&[RewriteRule]>,
+    ) -> ContainerSnapshot {
+        let mut snapshot = self.container_snapshot();
+        if let Some(rules) = rewrite_rules {
+            snapshot.rewrite_rules = hash_vec(rules);
+        }
+        snapshot
+    }
+
+    #[allow(dead_code)]
+    fn merge_container_snapshots(
+        parent: &ContainerSnapshot,
+        child: &ContainerSnapshot,
+    ) -> ContainerSnapshot {
+        let mut error_documents = parent.error_documents.clone();
+        error_documents.extend(child.error_documents.iter().copied());
+        let mut rewrite_maps = parent.rewrite_maps.clone();
+        rewrite_maps.extend(child.rewrite_maps.iter().cloned());
+        let append = |a: &Vec<u64>, b: &Vec<u64>| {
+            let mut out = a.clone();
+            out.extend(b.iter().copied());
+            out
+        };
+        ContainerSnapshot {
+            error_documents,
+            aliases: append(&parent.aliases, &child.aliases),
+            redirects: append(&parent.redirects, &child.redirects),
+            handlers: append(&parent.handlers, &child.handlers),
+            unsupported_filters: append(&parent.unsupported_filters, &child.unsupported_filters),
+            add_types: append(&parent.add_types, &child.add_types),
+            remove_types: append(&parent.remove_types, &child.remove_types),
+            add_headers: append(&parent.add_headers, &child.add_headers),
+            set_headers: append(&parent.set_headers, &child.set_headers),
+            unset_headers: append(&parent.unset_headers, &child.unset_headers),
+            expires_by_type: append(&parent.expires_by_type, &child.expires_by_type),
+            set_env: append(&parent.set_env, &child.set_env),
+            unset_env: append(&parent.unset_env, &child.unset_env),
+            pass_env: append(&parent.pass_env, &child.pass_env),
+            set_env_if: append(&parent.set_env_if, &child.set_env_if),
+            cookies: append(&parent.cookies, &child.cookies),
+            vary: append(&parent.vary, &child.vary),
+            rewrite_maps,
+            cache_enable: append(&parent.cache_enable, &child.cache_enable),
+            cache_disable: append(&parent.cache_disable, &child.cache_disable),
+            rewrite_rules: append(&parent.rewrite_rules, &child.rewrite_rules),
+            compression_rules: append(&parent.compression_rules, &child.compression_rules),
+            proxy_rules: append(&parent.proxy_rules, &child.proxy_rules),
+            proxy_passes: append(&parent.proxy_passes, &child.proxy_passes),
+            proxy_reverses: append(&parent.proxy_reverses, &child.proxy_reverses),
+        }
+    }
+}
+
+impl Scope {
+    /// Child scopes are appended after their parent; reverse lookup therefore
+    /// gives the child value for a duplicate status code.
+    pub fn error_document(&self, status: u16) -> Option<&ErrorDoc> {
+        self.error_policy.get(status)
+    }
+
+    pub fn request_env(&self, req: &crate::http::Request) -> Vec<(String, String)> {
+        let mut env = self.environment_policy.set_env.clone();
+        for rule in &self.environment_policy.set_env_if {
+            let attr = rule.attribute.to_ascii_lowercase();
+            let value = match attr.as_str() {
+                "request_method" | "request-method" => Some(req.method.clone()),
+                "request_uri" | "request-uri" => {
+                    Some(String::from_utf8_lossy(&req.target).into_owned())
+                }
+                "host" => req.header_str("host").map(str::to_string),
+                "user-agent" | "user_agent" => req.header_str("user-agent").map(str::to_string),
+                "referer" => req.header_str("referer").map(str::to_string),
+                "content-type" | "content_type" => {
+                    req.header_str("content-type").map(str::to_string)
+                }
+                other => req.header_str(other).map(str::to_string),
+            }
+            .unwrap_or_default();
+            let mut matches = rule.pattern.is_match(&value);
+            if rule.negate {
+                matches = !matches;
+            }
+            if !matches {
+                continue;
+            }
+            for (name, value) in &rule.actions {
+                match value {
+                    Some(v) => {
+                        env.retain(|(n, _)| n != name);
+                        env.push((name.clone(), v.clone()));
+                    }
+                    None => env.retain(|(n, _)| n != name),
+                }
+            }
+        }
+        for name in &self.environment_policy.pass_env {
+            if let Ok(v) = std::env::var(name) {
+                env.retain(|(n, _)| n != name);
+                env.push((name.clone(), v));
+            }
+        }
+        for name in &self.environment_policy.unset_env {
+            env.retain(|(n, _)| n != name);
+        }
+        env
+    }
+
+    pub fn add_require(&mut self, node: RequireNode, limit: Option<&MethodSet>) {
+        self.authorization.add_require(node, limit);
+    }
+
+    /// The `AllowMethods` restriction for this scope, if any.
+    pub fn method_allowed(&self, method: &str) -> bool {
+        self.authorization.method_allowed(method)
+    }
+
+    pub fn allow_methods_header(&self) -> Option<String> {
+        self.authorization.allow_methods_header()
+    }
+
+    fn legacy_mut(&mut self) -> &mut LegacyAccess {
+        self.authorization.legacy_mut()
+    }
+
+    pub fn add_order(&mut self, order: Order, limit: Option<&MethodSet>) {
+        self.authorization.legacy_mut().order.push(MethodScoped {
+            limit: limit.cloned(),
+            value: order,
+        });
+    }
+
+    pub fn add_satisfy(&mut self, satisfy: Satisfy, limit: Option<&MethodSet>) {
+        self.authorization.legacy_mut().satisfy.push(MethodScoped {
+            limit: limit.cloned(),
+            value: satisfy,
+        });
+    }
+
+    pub fn add_allow(&mut self, host: HostSpec, limit: Option<&MethodSet>) {
+        self.authorization.legacy_mut().allow.push(MethodScoped {
+            limit: limit.cloned(),
+            value: host,
+        });
+    }
+
+    pub fn add_deny(&mut self, host: HostSpec, limit: Option<&MethodSet>) {
+        self.authorization.legacy_mut().deny.push(MethodScoped {
+            limit: limit.cloned(),
+            value: host,
+        });
+    }
+
+    /// Apply a (possibly partial) child scope over this one.
+    pub fn merge(&mut self, child: &Scope) {
+        self.merge_inner(child, None);
+    }
+
+    /// Merge a rule delta while substituting a pre-transformed rewrite-rule
+    /// list.  Used for per-directory rewrite rules so the hot path does not
+    /// clone the whole `Scope`.
+    pub fn merge_with_rewrite_rules(&mut self, child: &Scope, rules: &[RewriteRule]) {
+        self.merge_inner(child, Some(rules));
+    }
+
+    fn merge_inner(&mut self, child: &Scope, rewrite_rules: Option<&[RewriteRule]>) {
+        #[cfg(debug_assertions)]
+        let audit_parent = self.container_snapshot();
+        #[cfg(debug_assertions)]
+        let audit_child = child.container_snapshot_with_rewrite(rewrite_rules);
+        self.content_policy.merge_child(&child.content_policy);
+        self.options.merge_child(&child.options);
+        self.override_policy.merge_child(&child.override_policy);
+        self.authorization.merge_child(&child.authorization);
+        self.mapping_policy.merge_child(&child.mapping_policy);
+        self.error_policy.merge_child(&child.error_policy);
+        self.header_policy.merge_child(&child.header_policy);
+        self.environment_policy
+            .merge_child(&child.environment_policy);
+        self.rewrite_policy
+            .merge_child_with_rules(&child.rewrite_policy, rewrite_rules);
+        self.compression_policy
+            .merge_child(&child.compression_policy);
+        self.proxy_policy.merge_child(&child.proxy_policy);
+        // Pending conditions are parser-local and must never leak from one
+        // scope into the next.
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.container_snapshot(),
+            Scope::merge_container_snapshots(&audit_parent, &audit_child),
+            "Scope::merge container-field audit failed"
+        );
+    }
+
+    pub fn effective_options(&self) -> Options {
+        // Apache's compiled-in default for a directory with no Options
+        // directive is FollowSymLinks.
+        Options(self.options.effective_bits(Options::FOLLOW_SYMLINKS))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum MatchKind {
+    Always,
+    Directory(PathBuf),
+    DirectoryMatch(Regex),
+    Files(Regex),
+    FilesMatch(Regex),
+    Location(String),
+    LocationMatch(Regex),
+}
+
+/// Canonical merge phase for a compiled rule.  This is the ordering the
+/// dispatcher and `.htaccess` walker implement; it is also the ordering a
+/// formal model should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RulePhase {
+    Directory,
+    Files,
+    Location,
+    Condition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionBranch {
+    /// `<If>` / `<IfFile>`, or an ordinary directive rule.
+    Normal,
+    /// `<ElseIf>`: applies when this expression matches and the preceding
+    /// branch of the chain did not.
+    ElseIf,
+    /// `<Else>`: applies when no preceding branch of the chain matched.
+    Else,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScopeRule {
+    pub kind: MatchKind,
+    pub delta: Scope,
+    pub order: usize,
+    pub condition: Option<crate::expr::Expr>,
+    pub branch: ConditionBranch,
+    /// Identifies the `<If>/<ElseIf>/<Else>` chain this rule belongs to.
+    pub chain: Option<usize>,
+    /// Rules nested inside the enclosing container (`<If>`, `<Directory>`,
+    /// `<Files>`, ...).  They only apply when the parent rule matches.
+    pub nested: Vec<ScopeRule>,
+}
+
+impl ScopeRule {
+    pub fn phase(&self) -> RulePhase {
+        if self.condition.is_some() || self.branch != ConditionBranch::Normal {
+            return RulePhase::Condition;
+        }
+        match self.kind {
+            MatchKind::Directory(_) | MatchKind::DirectoryMatch(_) | MatchKind::Always => {
+                RulePhase::Directory
+            }
+            MatchKind::Files(_) | MatchKind::FilesMatch(_) => RulePhase::Files,
+            MatchKind::Location(_) | MatchKind::LocationMatch(_) => RulePhase::Location,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ProxyMatchKind {
+    /// `<Proxy wildcard-url>`: prefix match unless wildcard characters are
+    /// present, in which case shell-style glob matching is used.
+    Wildcard(String),
+    /// `<ProxyMatch regex>`
+    Regex(Regex),
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyContainer {
+    pub kind: ProxyMatchKind,
+    pub delta: Scope,
+    /// Conditional rules nested inside the container (currently `<If>`).
+    pub rules: Vec<ScopeRule>,
+    pub order: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CustomLog {
+    pub path: String,
+    pub format: String,
+    pub condition: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VHost {
+    pub addrs: Vec<String>,
+    pub ports: Vec<u16>,
+    pub server_name: Option<String>,
+    pub aliases: Vec<String>,
+    pub scope: Scope,
+    pub delta: Scope,
+    pub rules: Vec<ScopeRule>,
+    pub directory_index: DirectoryRuleIndex,
+    pub proxy_containers: Vec<ProxyContainer>,
+    pub custom_logs: Vec<CustomLog>,
+    pub error_log: Option<String>,
+    pub server_admin: Option<String>,
+    pub ssl: SslConfig,
+}
+
+impl VHost {
+    pub fn matches_name(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.');
+        let matches_one = |raw_pat: &str| -> bool {
+            let pat = raw_pat.trim_end_matches('.');
+            if let Some(re) = pat.strip_prefix('~') {
+                let lower = host.to_ascii_lowercase();
+                // Invalid patterns are rejected at config load; this is a
+                // defensive fallback and must never grant a match.
+                return compile_regex(re)
+                    .map(|r| r.is_match(&lower))
+                    .unwrap_or(false);
+            }
+            crate::verified::host_pattern_matches(host.as_bytes(), pat.as_bytes())
+        };
+        if let Some(n) = &self.server_name {
+            if matches_one(n.split(':').next().unwrap_or(n)) {
+                return true;
+            }
+        }
+        self.aliases
+            .iter()
+            .any(|a| matches_one(a.split(':').next().unwrap_or(a)))
+    }
+
+    pub fn has_wildcard_default(&self) -> bool {
+        self.addrs
+            .iter()
+            .any(|a| a.starts_with("_default_") || a.starts_with('*') || a.is_empty())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MimeMap {
+    pub types: HashMap<String, String>,
+    pub encodings: HashMap<String, String>,
+}
+
+impl MimeMap {
+    pub fn new() -> Self {
+        MimeMap {
+            types: HashMap::new(),
+            encodings: HashMap::new(),
+        }
+    }
+
+    pub fn load_types_file(&mut self, path: &Path) -> Result<(), String> {
+        let data = std::fs::read(path)
+            .map_err(|e| format!("cannot read TypesConfig {}: {e}", path.display()))?;
+        for line in data.split(|b| *b == b'\n') {
+            let line = line.split(|b| *b == b'#').next().unwrap_or(b"");
+            let fields: Vec<&[u8]> = line
+                .split(|b| b.is_ascii_whitespace())
+                .filter(|x| !x.is_empty())
+                .collect();
+            if fields.len() < 2 {
+                continue;
+            }
+            let ty = String::from_utf8_lossy(fields[0]).to_string();
+            for ext in &fields[1..] {
+                let e = String::from_utf8_lossy(ext)
+                    .trim_start_matches('.')
+                    .to_ascii_lowercase();
+                if !e.is_empty() {
+                    self.types.insert(e, ty.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn add_type(&mut self, ty: &str, exts: &[String]) {
+        for e in exts {
+            let e = e.trim_start_matches('.').to_ascii_lowercase();
+            if !e.is_empty() {
+                self.types.insert(e, ty.to_string());
+            }
+        }
+    }
+
+    pub fn remove_type(&mut self, exts: &[String]) {
+        for e in exts {
+            self.types
+                .remove(&e.trim_start_matches('.').to_ascii_lowercase());
+        }
+    }
+
+    /// Look up one dot-separated extension without allocating for the common
+    /// short-ASCII case.  `mod_mime` keys are ASCII and lowercase.
+    fn lookup_type(&self, ext: &[u8]) -> Option<&str> {
+        if ext.len() <= 64 {
+            let mut buf = [0u8; 64];
+            for (i, b) in ext.iter().enumerate() {
+                buf[i] = b.to_ascii_lowercase();
+            }
+            let key = std::str::from_utf8(&buf[..ext.len()]).ok()?;
+            self.types.get(key).map(|t| t.as_str())
+        } else {
+            let key = std::str::from_utf8(ext).ok()?.to_ascii_lowercase();
+            self.types.get(&key).map(|t| t.as_str())
+        }
+    }
+
+    pub fn content_type(&self, name: &[u8]) -> Option<String> {
+        let base = name.rsplit(|b| *b == b'/').next().unwrap_or(name);
+        let mut best: Option<(usize, &str)> = None;
+        // Longest matching extension wins, as in mod_mime.  Walk the
+        // dot-separated suffixes without collecting them into a Vec.
+        let mut parts = base.split(|b| *b == b'.');
+        parts.next();
+        for part in parts {
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(t) = self.lookup_type(part) {
+                if best.map(|(l, _)| part.len() > l).unwrap_or(true) {
+                    best = Some((part.len(), t));
+                }
+            }
+        }
+        // Apache does not invent a media type for unknown extensions or for
+        // extensionless files; the response simply has no Content-Type.
+        best.map(|(_, t)| t.to_string())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ListenSpec {
+    pub raw: String,
+    pub addr: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientVerify {
+    None,
+    Optional,
+    Require,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SslConfig {
+    pub engine: bool,
+    // Distinguishes the default (inherit from the enclosing scope) from an
+    // explicit `SSLEngine off` in a virtual host.
+    pub engine_set: bool,
+    pub cert_file: Option<PathBuf>,
+    pub key_file: Option<PathBuf>,
+    pub chain_file: Option<PathBuf>,
+    pub protocols: Option<String>,
+    pub cipher_suite: Option<String>,
+    pub verify_client: Option<ClientVerify>,
+    pub ca_file: Option<PathBuf>,
+    pub stapling: bool,
+    pub stapling_set: bool,
+    pub stapling_force_url: Option<String>,
+    pub stapling_responder_timeout: Duration,
+    pub stapling_standard_cache_timeout: Duration,
+    pub stapling_return_responder_errors: bool,
+}
+
+impl SslConfig {
+    fn inherit(&mut self, parent: &SslConfig) {
+        if !self.engine_set {
+            self.engine = parent.engine;
+            self.engine_set = parent.engine_set;
+        }
+        if self.cert_file.is_none() {
+            self.cert_file = parent.cert_file.clone();
+        }
+        if self.key_file.is_none() {
+            self.key_file = parent.key_file.clone();
+        }
+        if self.chain_file.is_none() {
+            self.chain_file = parent.chain_file.clone();
+        }
+        if self.protocols.is_none() {
+            self.protocols = parent.protocols.clone();
+        }
+        if self.cipher_suite.is_none() {
+            self.cipher_suite = parent.cipher_suite.clone();
+        }
+        if self.verify_client.is_none() {
+            self.verify_client = parent.verify_client;
+        }
+        if self.ca_file.is_none() {
+            self.ca_file = parent.ca_file.clone();
+        }
+        if !self.stapling_set {
+            self.stapling = parent.stapling;
+            self.stapling_set = parent.stapling_set;
+        }
+        if self.stapling_force_url.is_none() {
+            self.stapling_force_url = parent.stapling_force_url.clone();
+        }
+        if self.stapling_responder_timeout == Duration::default() {
+            self.stapling_responder_timeout = parent.stapling_responder_timeout;
+        }
+        if self.stapling_standard_cache_timeout == Duration::default() {
+            self.stapling_standard_cache_timeout = parent.stapling_standard_cache_timeout;
+        }
+        self.stapling_return_responder_errors |= parent.stapling_return_responder_errors;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheConfig {
+    pub root: Option<PathBuf>,
+    pub default_expire: u64,
+    pub max_expire: u64,
+    pub min_expire: u64,
+    pub max_file_size: u64,
+    pub min_file_size: u64,
+    pub ignore_no_last_mod: bool,
+    pub ignore_cache_control: bool,
+    pub store_no_store: bool,
+    pub store_private: bool,
+    pub ignore_query_string: bool,
+    pub header: bool,
+    pub detail_header: bool,
+    pub last_modified_factor: f64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            root: None,
+            default_expire: 3600,
+            max_expire: 86_400,
+            min_expire: 0,
+            max_file_size: 1024 * 1024,
+            min_file_size: 0,
+            ignore_no_last_mod: false,
+            ignore_cache_control: false,
+            store_no_store: false,
+            store_private: false,
+            ignore_query_string: false,
+            header: false,
+            detail_header: false,
+            last_modified_factor: 0.1,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedPolicy {
+    scope: Scope,
+    conditionals: Arc<Vec<ScopeRule>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub server_root: PathBuf,
+    pub server_name: Option<String>,
+    pub server_admin: String,
+    pub listeners: Vec<ListenSpec>,
+    pub user: String,
+    pub group: String,
+    pub pid_file: PathBuf,
+    pub error_log: String,
+    pub log_level: String,
+    pub keep_alive: bool,
+    pub keep_alive_timeout: Duration,
+    pub timeout: Duration,
+    pub max_keep_alive_requests: usize,
+    pub server_tokens: ServerTokens,
+    pub server_signature: ServerSignature,
+    pub trace_enable: bool,
+    pub limit_request_line: usize,
+    pub limit_request_fields: usize,
+    pub limit_request_field_size: usize,
+    pub limit_request_body: u64,
+    pub max_request_workers: usize,
+    pub listen_backlog: i32,
+    pub graceful_shutdown_timeout: Duration,
+    pub request_header_timeout: Duration,
+    pub request_body_timeout: Duration,
+    pub request_header_min_rate: u64,
+    pub request_body_min_rate: u64,
+    pub encoded_slashes: EncodedSlashes,
+    pub vhosts: Vec<VHost>,
+    pub global: Scope,
+    pub global_rules: Vec<ScopeRule>,
+    pub global_directory_index: DirectoryRuleIndex,
+    pub proxy_containers: Vec<ProxyContainer>,
+    pub mime: MimeMap,
+    pub log_formats: HashMap<String, String>,
+    pub custom_logs: Vec<CustomLog>,
+    pub modules: Vec<String>,
+    pub warnings: Vec<String>,
+    pub balancers: Vec<Balancer>,
+    pub health_templates: HashMap<String, HealthTemplate>,
+    pub remoteip_header: Option<String>,
+    pub remoteip_internal: Vec<(IpAddr, u8)>,
+    pub access_file_names: Vec<String>,
+    pub directory_index: Vec<String>,
+    /// True when any compiled scope enables `AllowOverride All`.  This lets
+    /// the request path skip all `.htaccess` filesystem work in the common
+    /// case where overrides are disabled.
+    pub override_enabled: bool,
+    /// Directory prefixes whose effective `AllowOverride` is enabled.  Used to
+    /// avoid even the existence check for `.htaccess` when a request cannot be
+    /// inside an override-enabled directory.
+    pub override_prefixes: Vec<PathBuf>,
+    /// Set when an override-enabled section cannot be represented as a simple
+    /// path prefix (for example `<DirectoryMatch>` or a global/vhost scope).
+    pub override_anywhere: bool,
+    pub document_root: PathBuf,
+    pub default_charset: Option<String>,
+    pub use_canonical_name: bool,
+    pub hostname_lookups: bool,
+    pub server_software: String,
+    pub ssl: SslConfig,
+    pub cache: CacheConfig,
+    policy_cache: Arc<RwLock<HashMap<(usize, PathBuf, String), Arc<CachedPolicy>>>>,
+    dir_scope_cache: Arc<RwLock<HashMap<(usize, PathBuf, String), Arc<Scope>>>>,
+}
+
+impl Config {
+    pub fn load(
+        path: &Path,
+        server_root: &Path,
+        env: &HashMap<String, String>,
+        defines: &HashMap<String, String>,
+        strict: bool,
+    ) -> Result<Config, Vec<ConfigError>> {
+        let mut p = ParserState {
+            events: Vec::new(),
+            section_stack: Vec::new(),
+            modules: HashSet::new(),
+            module_names: HashSet::new(),
+            defines: defines.clone(),
+            env: env.clone(),
+            depth: 0,
+            warnings: Vec::new(),
+            errors: Vec::new(),
+            server_root: server_root.to_path_buf(),
+            include_count: 0,
+        };
+        p.parse_file(path, true);
+        if let Some((open, _, _)) = p.section_stack.last() {
+            p.error(
+                &SourceLoc {
+                    file: path.display().to_string(),
+                    line: 0,
+                },
+                format!("<{open}> was not closed"),
+            );
+        }
+        if !p.errors.is_empty() {
+            return Err(p.errors);
+        }
+        match Compile::new(p, strict).compile() {
+            Ok(mut c) => {
+                c.override_enabled = c.override_scan();
+                let (prefixes, anywhere) = c.override_paths();
+                c.override_prefixes = prefixes;
+                c.override_anywhere = anywhere;
+                Ok(c)
+            }
+            Err(e) => Err(vec![e]),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceLoc {
+    pub file: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum Event {
+    Directive {
+        name: String,
+        args: Vec<String>,
+        loc: SourceLoc,
+    },
+    SectionStart {
+        name: String,
+        args: Vec<String>,
+        loc: SourceLoc,
+        active: bool,
+        transparent: bool,
+    },
+    SectionEnd {
+        loc: SourceLoc,
+    },
+}
+
+struct ParserState {
+    events: Vec<Event>,
+    section_stack: Vec<(String, bool, bool)>,
+    modules: HashSet<String>,
+    module_names: HashSet<String>,
+    defines: HashMap<String, String>,
+    env: HashMap<String, String>,
+    depth: usize,
+    warnings: Vec<String>,
+    errors: Vec<ConfigError>,
+    server_root: PathBuf,
+    include_count: usize,
+}
+
+fn norm_module(name: &str) -> String {
+    let n = name.trim();
+    let n = n.strip_prefix('!').unwrap_or(n);
+    let n = n.trim_end_matches(".so");
+    let n = n.trim_end_matches(".c");
+    let n = n.strip_prefix("mod_").unwrap_or(n);
+    let n = n.strip_suffix("_module").unwrap_or(n);
+    n.to_ascii_lowercase()
+}
+
+impl ParserState {
+    fn error(&mut self, loc: &SourceLoc, msg: impl Into<String>) {
+        self.errors.push(ConfigError {
+            file: loc.file.clone(),
+            line: loc.line,
+            msg: msg.into(),
+        });
+    }
+
+    fn warn(&mut self, msg: impl Into<String>) {
+        let m = msg.into();
+        if self.warnings.len() < 500 {
+            self.warnings.push(m);
+        }
+    }
+
+    fn expand_vars(&mut self, args: &[String], loc: &SourceLoc) -> Option<Vec<String>> {
+        let mut out = Vec::with_capacity(args.len());
+        for a in args {
+            let mut s = String::with_capacity(a.len());
+            let bytes = a.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                    let end = match a[i + 2..].find('}') {
+                        Some(e) => i + 2 + e,
+                        None => {
+                            self.error(loc, "unterminated ${...} variable reference");
+                            return None;
+                        }
+                    };
+                    let name = &a[i + 2..end];
+                    if let Some(v) = self.defines.get(name) {
+                        s.push_str(v);
+                    } else if let Some(v) = self.env.get(name) {
+                        s.push_str(v);
+                    } else if name.contains(':') {
+                        // mod_rewrite map syntax (${map:key}) is expanded by
+                        // the rewrite engine, not by core config parsing.
+                        s.push_str("${");
+                        s.push_str(name);
+                        s.push('}');
+                    } else {
+                        self.error(
+                            loc,
+                            format!("AH00111: config variable ${{{name}}} is not defined"),
+                        );
+                        return None;
+                    }
+                    i = end + 1;
+                } else {
+                    s.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            out.push(s);
+        }
+        Some(out)
+    }
+
+    fn active(&self) -> bool {
+        self.section_stack.iter().all(|(_, active, _)| *active)
+    }
+
+    fn parse_file(&mut self, path: &Path, required: bool) {
+        if self.depth > 32 {
+            let loc = SourceLoc {
+                file: path.display().to_string(),
+                line: 0,
+            };
+            self.error(&loc, "Include nesting too deep");
+            return;
+        }
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                if required {
+                    let loc = SourceLoc {
+                        file: path.display().to_string(),
+                        line: 0,
+                    };
+                    self.error(&loc, format!("could not open config file: {e}"));
+                }
+                return;
+            }
+        };
+        self.depth += 1;
+        let text = String::from_utf8_lossy(&data);
+        let logical = crate::config_frontend::logical_lines_with_numbers(&text);
+
+        for (lineno, line) in logical {
+            let loc = SourceLoc {
+                file: path.display().to_string(),
+                line: lineno,
+            };
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let line_ir = match crate::config_frontend::parse_line(trimmed) {
+                Ok(line) => line,
+                Err(e) => {
+                    self.error(&loc, format!("syntax error: {e}"));
+                    continue;
+                }
+            };
+            match line_ir {
+                crate::config_frontend::ConfigLine::SectionEnd { name } => {
+                    match self.section_stack.pop() {
+                        Some((open, _, _)) if open == name => {
+                            self.events.push(Event::SectionEnd { loc });
+                        }
+                        Some((open, _, _)) => {
+                            self.error(&loc, format!("closing </{name}> does not match <{open}>"));
+                            self.section_stack.push((open, true, false));
+                        }
+                        None => self.error(&loc, format!("unexpected </{name}>")),
+                    }
+                    continue;
+                }
+                crate::config_frontend::ConfigLine::SectionStart { name, args } => {
+                    if name == "ifmodule" {
+                        for a in &args {
+                            if a.contains('>') {
+                                self.error(&loc, "malformed <IfModule>");
+                            }
+                        }
+                    }
+                    if name == "virtualhost" && args.is_empty() {
+                        self.error(&loc, "<VirtualHost> requires an address");
+                    }
+                    let parent_active = self.active();
+                    let active = if parent_active {
+                        self.eval_condition(&name, &args, &loc)
+                    } else {
+                        false
+                    };
+                    let transparent = matches!(name.as_str(), "ifmodule" | "ifdefine");
+                    self.events.push(Event::SectionStart {
+                        name: name.clone(),
+                        args: args.clone(),
+                        loc: loc.clone(),
+                        active,
+                        transparent,
+                    });
+                    self.section_stack.push((name, active, transparent));
+                    continue;
+                }
+                crate::config_frontend::ConfigLine::Directive {
+                    name: cmd,
+                    args: raw_args,
+                } => {
+                    let args = match self.expand_vars(&raw_args, &loc) {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    if !self.active() {
+                        continue;
+                    }
+                    match cmd.as_str() {
+                        "define" => {
+                            let name = args.first().cloned().unwrap_or_default();
+                            if name.is_empty() {
+                                self.error(&loc, "Define requires a name");
+                            } else {
+                                let value = args.get(1).cloned().unwrap_or_default();
+                                self.defines.insert(name, value);
+                            }
+                        }
+                        "undefine" => {
+                            if let Some(n) = args.first() {
+                                self.defines.remove(n);
+                            }
+                        }
+                        "loadmodule" => {
+                            let name = args.first().cloned().unwrap_or_default();
+                            if name.is_empty() {
+                                self.error(&loc, "LoadModule requires a module name");
+                            } else {
+                                self.modules.insert(name.clone());
+                                self.module_names.insert(norm_module(&name));
+                                if self.module_names.len() > 4096 {
+                                    self.error(&loc, "too many modules");
+                                }
+                            }
+                        }
+                        "include" | "includeoptional" => {
+                            let optional = cmd == "includeoptional";
+                            let pattern = match args.first() {
+                                Some(p) => p.clone(),
+                                None => {
+                                    self.error(&loc, "Include requires a path");
+                                    continue;
+                                }
+                            };
+                            self.include_pattern(&pattern, optional, &loc);
+                            self.events.push(Event::Directive {
+                                name: cmd,
+                                args,
+                                loc,
+                            });
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    self.events.push(Event::Directive {
+                        name: cmd,
+                        args,
+                        loc,
+                    });
+                }
+            }
+        }
+        self.depth -= 1;
+    }
+
+    fn include_pattern(&mut self, pattern: &str, optional: bool, loc: &SourceLoc) {
+        if self.include_count > 10_000 {
+            self.error(loc, "too many included files");
+            return;
+        }
+        let p = Path::new(pattern);
+        let full = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.server_root.join(p)
+        };
+        let s = full.to_string_lossy().to_string();
+        if s.contains('*') || s.contains('?') || s.contains('[') {
+            let (dir, pat) = match s.rfind('/') {
+                Some(i) => (&s[..i], &s[i + 1..]),
+                None => (".", s.as_str()),
+            };
+            let mut names: Vec<String> = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(if dir.is_empty() { "/" } else { dir }) {
+                for ent in rd.flatten() {
+                    let n = ent.file_name().to_string_lossy().to_string();
+                    if glob_match(pat.as_bytes(), n.as_bytes()) {
+                        names.push(format!("{dir}/{n}"));
+                    }
+                }
+            }
+            names.sort();
+            if names.is_empty() && !optional {
+                self.error(loc, format!("Include file not found: {pattern}"));
+                return;
+            }
+            for n in names {
+                self.include_count += 1;
+                self.parse_file(Path::new(&n), !optional);
+            }
+        } else if full.is_dir() {
+            let mut names: Vec<PathBuf> = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&full) {
+                for ent in rd.flatten() {
+                    if ent.path().is_file() {
+                        names.push(ent.path());
+                    }
+                }
+            }
+            names.sort();
+            for n in names {
+                self.include_count += 1;
+                self.parse_file(&n, !optional);
+            }
+        } else {
+            self.include_count += 1;
+            self.parse_file(&full, !optional);
+        }
+    }
+
+    fn eval_condition(&mut self, name: &str, args: &[String], loc: &SourceLoc) -> bool {
+        match name {
+            "ifmodule" => {
+                let arg = args.first().cloned().unwrap_or_default();
+                let (neg, m) = if let Some(stripped) = arg.strip_prefix('!') {
+                    (true, stripped)
+                } else {
+                    (false, arg.as_str())
+                };
+                let want = norm_module(m);
+                let found = self.module_names.contains(&want)
+                    || self.modules.iter().any(|x| norm_module(x) == want);
+                if neg {
+                    !found
+                } else {
+                    found
+                }
+            }
+            "ifdefine" => {
+                let arg = args.first().cloned().unwrap_or_default();
+                let (neg, d) = if let Some(stripped) = arg.strip_prefix('!') {
+                    (true, stripped)
+                } else {
+                    (false, arg.as_str())
+                };
+                let found = self.defines.contains_key(d);
+                if neg {
+                    !found
+                } else {
+                    found
+                }
+            }
+            "if" => true,
+            "iffile" => true,
+            _ => true,
+        }
+    }
+}
+
+fn glob_match(pat: &[u8], name: &[u8]) -> bool {
+    fn rec(p: &[u8], n: &[u8]) -> bool {
+        if p.is_empty() {
+            return n.is_empty();
+        }
+        match p[0] {
+            b'*' => {
+                for i in 0..=n.len() {
+                    if rec(&p[1..], &n[i..]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            b'?' => !n.is_empty() && rec(&p[1..], &n[1..]),
+            b'[' => {
+                if let Some(end) = p.iter().position(|&b| b == b']') {
+                    if n.is_empty() {
+                        return false;
+                    }
+                    let class = &p[1..end];
+                    let (neg, class) = if class.first() == Some(&b'!') {
+                        (true, &class[1..])
+                    } else {
+                        (false, class)
+                    };
+                    let mut matched = false;
+                    let mut i = 0;
+                    while i < class.len() {
+                        if i + 2 < class.len() && class[i + 1] == b'-' {
+                            if n[0] >= class[i] && n[0] <= class[i + 2] {
+                                matched = true;
+                            }
+                            i += 3;
+                        } else {
+                            if n[0] == class[i] {
+                                matched = true;
+                            }
+                            i += 1;
+                        }
+                    }
+                    if matched != neg {
+                        rec(&p[end + 1..], &n[1..])
+                    } else {
+                        false
+                    }
+                } else {
+                    n.first() == Some(&b'[') && rec(&p[1..], &n[1..])
+                }
+            }
+            c => !n.is_empty() && n[0] == c && rec(&p[1..], &n[1..]),
+        }
+    }
+    rec(pat, name)
+}
+
+// ---------------------------------------------------------------------------
+// Compiler
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SectionKind {
+    Server,
+    VirtualHost,
+    Directory,
+    DirectoryMatch,
+    Location,
+    Files,
+    Proxy,
+    Require,
+    Conditional,
+}
+
+fn section_kind(name: &str) -> Option<SectionKind> {
+    Some(match name {
+        "virtualhost" => SectionKind::VirtualHost,
+        "directory" => SectionKind::Directory,
+        "directorymatch" => SectionKind::DirectoryMatch,
+        "location" | "locationmatch" => SectionKind::Location,
+        "files" | "filesmatch" => SectionKind::Files,
+        "proxy" | "proxymatch" => SectionKind::Proxy,
+        _ => return None,
+    })
+}
+
+/// Apache rejects most cross-section nesting outright.  Keeping these checks
+/// in the compiler means a configuration that Apache refuses cannot silently
+/// acquire a different meaning here.
+fn section_kind_model(kind: SectionKind) -> vapache_verified::ConfigSectionKind {
+    use SectionKind::*;
+    match kind {
+        Server => vapache_verified::ConfigSectionKind::Server,
+        VirtualHost => vapache_verified::ConfigSectionKind::VirtualHost,
+        Directory => vapache_verified::ConfigSectionKind::Directory,
+        DirectoryMatch => vapache_verified::ConfigSectionKind::DirectoryMatch,
+        Location => vapache_verified::ConfigSectionKind::Location,
+        Files => vapache_verified::ConfigSectionKind::Files,
+        Proxy => vapache_verified::ConfigSectionKind::Proxy,
+        Require => vapache_verified::ConfigSectionKind::Require,
+        Conditional => vapache_verified::ConfigSectionKind::Conditional,
+    }
+}
+
+fn structural_section_allowed(parent: SectionKind, child: SectionKind) -> bool {
+    vapache_verified::config_section_nesting_allowed(
+        section_kind_model(parent),
+        section_kind_model(child),
+    )
+}
+
+fn authz_section_allowed(section: SectionKind) -> bool {
+    matches!(
+        section,
+        SectionKind::Directory
+            | SectionKind::DirectoryMatch
+            | SectionKind::Location
+            | SectionKind::Files
+            | SectionKind::Proxy
+            | SectionKind::Conditional
+            | SectionKind::Require
+    )
+}
+
+struct Compile {
+    events: Vec<Event>,
+    pos: usize,
+    cfg: Config,
+    warnings: Vec<String>,
+    errors: Vec<ConfigError>,
+    strict: bool,
+    vhosts_raw: Vec<VHost>,
+    current_vhost: Option<usize>,
+    order: usize,
+    current_balancer: Option<usize>,
+    known: HashSet<&'static str>,
+    next_condition_chain: usize,
+}
+
+impl Compile {
+    fn new(p: ParserState, strict: bool) -> Self {
+        let server_root = p.server_root.clone();
+        let modules: Vec<String> = {
+            let mut v: Vec<String> = p.modules.into_iter().collect();
+            v.sort();
+            v
+        };
+        let cfg = Config {
+            server_root: server_root.clone(),
+            server_name: None,
+            server_admin: "you@example.com".into(),
+            listeners: Vec::new(),
+            user: "www-data".into(),
+            group: "www-data".into(),
+            pid_file: PathBuf::from("/var/run/apache2/apache2.pid"),
+            error_log: "logs/error.log".into(),
+            log_level: "warn".into(),
+            keep_alive: true,
+            keep_alive_timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(60),
+            max_keep_alive_requests: 100,
+            server_tokens: ServerTokens::Full,
+            server_signature: ServerSignature::On,
+            trace_enable: false,
+            limit_request_line: 8190,
+            limit_request_fields: 100,
+            limit_request_field_size: 8190,
+            limit_request_body: 1_073_741_824,
+            max_request_workers: 512,
+            listen_backlog: 511,
+            graceful_shutdown_timeout: Duration::from_secs(30),
+            request_header_timeout: Duration::from_secs(20),
+            request_body_timeout: Duration::from_secs(30),
+            request_header_min_rate: 0,
+            request_body_min_rate: 0,
+            encoded_slashes: EncodedSlashes::Off,
+            vhosts: Vec::new(),
+            global: Scope::default(),
+            global_rules: Vec::new(),
+            global_directory_index: DirectoryRuleIndex::default(),
+            proxy_containers: Vec::new(),
+            mime: MimeMap::new(),
+            log_formats: HashMap::new(),
+            custom_logs: Vec::new(),
+            modules,
+            warnings: Vec::new(),
+            balancers: Vec::new(),
+            health_templates: HashMap::new(),
+            remoteip_header: None,
+            remoteip_internal: Vec::new(),
+            access_file_names: vec![".htaccess".into()],
+            directory_index: vec!["index.html".into()],
+            override_enabled: false,
+            override_prefixes: Vec::new(),
+            override_anywhere: false,
+            document_root: server_root.join("htdocs"),
+            default_charset: None,
+            use_canonical_name: false,
+            hostname_lookups: false,
+            server_software: "Apache".into(),
+            ssl: SslConfig::default(),
+            cache: CacheConfig::default(),
+            policy_cache: Arc::new(RwLock::new(HashMap::new())),
+            dir_scope_cache: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let known = known_directives();
+        Compile {
+            events: p.events,
+            pos: 0,
+            cfg,
+            warnings: p.warnings,
+            errors: p.errors,
+            strict,
+            vhosts_raw: Vec::new(),
+            current_vhost: None,
+            order: 0,
+            current_balancer: None,
+            known,
+            next_condition_chain: 0,
+        }
+    }
+
+    fn warn(&mut self, msg: impl Into<String>) {
+        let m = msg.into();
+        if self.warnings.len() < 500 {
+            self.warnings.push(m);
+        }
+    }
+
+    fn compile(mut self) -> Result<Config, ConfigError> {
+        let mut scope = self.cfg.global.clone();
+        let mut rules: Vec<ScopeRule> = Vec::new();
+        self.walk(
+            &mut scope,
+            &mut rules,
+            false,
+            false,
+            None,
+            SectionKind::Server,
+        );
+        if let Some(e) = self.errors.into_iter().next() {
+            return Err(e);
+        }
+        self.cfg.global = scope;
+        sort_rules(&mut rules);
+        self.cfg.global_directory_index = DirectoryRuleIndex::build(&rules);
+        self.cfg.global_rules = rules;
+
+        let global_scope = self.cfg.global.clone();
+        let global_rules = self.cfg.global_rules.clone();
+        let global_ssl = self.cfg.ssl.clone();
+
+        if self.cfg.listeners.is_empty() {
+            self.cfg.listeners.push(ListenSpec {
+                raw: "80".into(),
+                addr: "0.0.0.0".into(),
+                port: 80,
+            });
+        }
+        // Normalize default document root.
+        if let Some(dr) = &self.cfg.global.content_policy.document_root {
+            self.cfg.document_root = dr.clone();
+        }
+        if self.cfg.directory_index.is_empty() {
+            self.cfg.directory_index = vec!["index.html".into()];
+        }
+
+        for v in &mut self.vhosts_raw {
+            v.ports = v.addrs.iter().map(|a| vhost_port(a)).collect();
+            v.scope = global_scope.clone();
+            // Apache does not inherit server-level RewriteRules into a
+            // virtual host (RewriteOptions Inherit is not implemented here).
+            // Keep `<Directory>` rewrite rules in `v.rules`, but do not let a
+            // server-level URL rule silently rewrite virtual-host traffic.
+            if v.scope.rewrite_policy.rewrite_inherit != Some(true) {
+                v.scope.rewrite_policy.rewrite_rules.clear();
+                v.scope.rewrite_policy.rewrite_base = None;
+                v.scope.rewrite_policy.rewrite_match_base = None;
+            }
+            v.scope.merge(&v.delta);
+            let mut rules = global_rules.clone();
+            rules.extend(v.rules.clone());
+            sort_rules(&mut rules);
+            v.directory_index = DirectoryRuleIndex::build(&rules);
+            v.rules = rules;
+            let mut proxy_containers = self.cfg.proxy_containers.clone();
+            proxy_containers.extend(v.proxy_containers.clone());
+            v.proxy_containers = proxy_containers;
+            v.ssl.inherit(&global_ssl);
+            if v.error_log.is_none() {
+                v.error_log = Some(self.cfg.error_log.clone());
+            }
+        }
+        self.cfg.vhosts = self.vhosts_raw;
+        self.cfg.warnings = std::mem::take(&mut self.warnings);
+        Ok(self.cfg)
+    }
+
+    fn walk(
+        &mut self,
+        scope: &mut Scope,
+        rules: &mut Vec<ScopeRule>,
+        inside_vhost: bool,
+        in_directory: bool,
+        limit: Option<&MethodSet>,
+        section: SectionKind,
+    ) {
+        // Tracks the most recent <If>/<IfFile> chain in this configuration
+        // scope so a following <ElseIf>/<Else> can attach to it.
+        let mut current_chain: Option<usize> = None;
+        while self.pos < self.events.len() {
+            let ev = self.events[self.pos].clone();
+            self.pos += 1;
+            match ev {
+                Event::SectionEnd { .. } => return,
+                Event::Directive { name, args, loc } => {
+                    if matches!(
+                        name.as_str(),
+                        "include" | "includeoptional" | "loadmodule" | "define" | "undefine"
+                    ) {
+                        continue;
+                    }
+                    if section == SectionKind::Require && name != "require" {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!(
+                                "only Require directives are allowed in a Require section"
+                            ),
+                        });
+                        continue;
+                    }
+                    self.apply_directive(
+                        &name,
+                        &args,
+                        &loc,
+                        scope,
+                        inside_vhost,
+                        in_directory,
+                        limit,
+                        section,
+                    );
+                }
+                Event::SectionStart {
+                    name,
+                    args,
+                    loc,
+                    active,
+                    transparent,
+                } => {
+                    if !active {
+                        self.skip_section();
+                        continue;
+                    }
+                    if transparent {
+                        // Conditional blocks are transparent: their directives
+                        // have exactly the same scope as the surrounding text.
+                        self.walk(scope, rules, inside_vhost, in_directory, limit, section);
+                        continue;
+                    }
+                    if let Some(child) = section_kind(&name) {
+                        if !structural_section_allowed(section, child) {
+                            self.errors.push(ConfigError {
+                                file: loc.file.clone(),
+                                line: loc.line,
+                                msg: format!(
+                                    "<{name}> is not allowed in this configuration context"
+                                ),
+                            });
+                            self.skip_section();
+                            continue;
+                        }
+                    }
+                    match name.as_str() {
+                        "if" | "iffile" | "elseif" | "else" => {
+                            if limit.is_some() {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!(
+                                        "<{name}> is not allowed inside a method-limited section"
+                                    ),
+                                });
+                                self.skip_section();
+                                continue;
+                            }
+                            let (branch, chain, condition) = if name == "if" || name == "iffile" {
+                                let expression = if name == "if" {
+                                    crate::expr::parse(&args.join(" "))
+                                        .map_err(|e| {
+                                            self.errors.push(ConfigError {
+                                                file: loc.file.clone(),
+                                                line: loc.line,
+                                                msg: format!("bad <If> expression: {e}"),
+                                            });
+                                        })
+                                        .ok()
+                                } else {
+                                    Some(crate::expr::Expr::FileTest(
+                                        "-F".into(),
+                                        Box::new(crate::expr::Expr::Str(
+                                            args.first().cloned().unwrap_or_default(),
+                                        )),
+                                    ))
+                                };
+                                let Some(condition) = expression else {
+                                    self.skip_section();
+                                    continue;
+                                };
+                                let chain = self.next_condition_chain;
+                                self.next_condition_chain += 1;
+                                current_chain = Some(chain);
+                                (ConditionBranch::Normal, Some(chain), Some(condition))
+                            } else {
+                                let Some(chain) = current_chain else {
+                                    self.errors.push(ConfigError {
+                                        file: loc.file.clone(),
+                                        line: loc.line,
+                                        msg: format!(
+                                            "<{name}> has no preceding <If> in this scope"
+                                        ),
+                                    });
+                                    self.skip_section();
+                                    continue;
+                                };
+                                if name == "elseif" {
+                                    let Some(condition) = crate::expr::parse(&args.join(" "))
+                                        .map_err(|e| {
+                                            self.errors.push(ConfigError {
+                                                file: loc.file.clone(),
+                                                line: loc.line,
+                                                msg: format!("bad <ElseIf> expression: {e}"),
+                                            });
+                                        })
+                                        .ok()
+                                    else {
+                                        self.skip_section();
+                                        continue;
+                                    };
+                                    (ConditionBranch::ElseIf, Some(chain), Some(condition))
+                                } else {
+                                    if !args.is_empty() {
+                                        self.errors.push(ConfigError {
+                                            file: loc.file.clone(),
+                                            line: loc.line,
+                                            msg: "<Else> does not take arguments".into(),
+                                        });
+                                        self.skip_section();
+                                        continue;
+                                    }
+                                    current_chain = None;
+                                    (ConditionBranch::Else, Some(chain), None)
+                                }
+                            };
+                            let mut inner = Scope::default();
+                            let mut inner_rules = Vec::new();
+                            self.walk(
+                                &mut inner,
+                                &mut inner_rules,
+                                inside_vhost,
+                                true,
+                                None,
+                                SectionKind::Conditional,
+                            );
+                            let before = inner_rules.len();
+                            inner_rules.retain(|rule| matches!(rule.kind, MatchKind::Always));
+                            if inner_rules.len() != before {
+                                self.warn(format!(
+                                    "{}:{}: nested Directory/Files/Location sections inside <{name}> are ignored",
+                                    loc.file, loc.line
+                                ));
+                            }
+                            self.order += 1;
+                            rules.push(ScopeRule {
+                                kind: MatchKind::Always,
+                                delta: inner,
+                                order: self.order,
+                                condition,
+                                branch,
+                                chain,
+                                nested: inner_rules,
+                            });
+                        }
+                        "virtualhost" => {
+                            if limit.is_some() {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: "<VirtualHost> is not allowed inside a method-limited section"
+                                        .into(),
+                                });
+                                self.skip_section();
+                                continue;
+                            }
+                            let vh = VHost {
+                                addrs: args,
+                                ports: Vec::new(),
+                                server_name: None,
+                                aliases: Vec::new(),
+                                scope: Scope::default(),
+                                delta: Scope::default(),
+                                rules: Vec::new(),
+                                directory_index: DirectoryRuleIndex::default(),
+                                proxy_containers: Vec::new(),
+                                custom_logs: Vec::new(),
+                                error_log: None,
+                                server_admin: None,
+                                ssl: SslConfig::default(),
+                            };
+                            self.vhosts_raw.push(vh);
+                            let idx = self.vhosts_raw.len() - 1;
+                            let mut vdelta = Scope::default();
+                            let mut vrules = Vec::new();
+                            let prev = self.current_vhost.replace(idx);
+                            self.walk(
+                                &mut vdelta,
+                                &mut vrules,
+                                true,
+                                false,
+                                None,
+                                SectionKind::VirtualHost,
+                            );
+                            self.current_vhost = prev;
+                            self.vhosts_raw[idx].delta = vdelta;
+                            self.vhosts_raw[idx].rules = vrules;
+                        }
+                        "directory" | "files" | "filesmatch" | "location" | "locationmatch"
+                        | "directorymatch" => {
+                            if limit.is_some() {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!(
+                                        "<{name}> is not allowed inside a method-limited section"
+                                    ),
+                                });
+                                self.skip_section();
+                                continue;
+                            }
+                            let kind = match name.as_str() {
+                                "directory" | "directorymatch" => {
+                                    let p = args.first().cloned().unwrap_or_default();
+                                    let tilde_regex =
+                                        name == "directory" && p == "~" && args.len() >= 2;
+                                    if name == "directorymatch" || tilde_regex {
+                                        let pattern =
+                                            if tilde_regex { args[1..].join(" ") } else { p };
+                                        match compile_regex(&pattern) {
+                                            Ok(r) => MatchKind::DirectoryMatch(r),
+                                            Err(e) => {
+                                                self.errors.push(ConfigError {
+                                                    file: loc.file.clone(),
+                                                    line: loc.line,
+                                                    msg: format!("bad Directory regex: {e}"),
+                                                });
+                                                self.skip_section();
+                                                continue;
+                                            }
+                                        }
+                                    } else {
+                                        let pb = if Path::new(&p).is_absolute() {
+                                            PathBuf::from(&p)
+                                        } else {
+                                            self.cfg.server_root.join(&p)
+                                        };
+                                        MatchKind::Directory(clean_path(&pb))
+                                    }
+                                }
+                                "files" => match compile_files_pattern(&args) {
+                                    Ok(kind) => kind,
+                                    Err(e) => {
+                                        self.errors.push(ConfigError {
+                                            file: loc.file.clone(),
+                                            line: loc.line,
+                                            msg: e,
+                                        });
+                                        self.skip_section();
+                                        continue;
+                                    }
+                                },
+                                "filesmatch" => {
+                                    let pat = args.join(" ");
+                                    match compile_regex(&pat) {
+                                        Ok(r) => MatchKind::FilesMatch(r),
+                                        Err(e) => {
+                                            self.errors.push(ConfigError {
+                                                file: loc.file.clone(),
+                                                line: loc.line,
+                                                msg: format!("bad FilesMatch regex: {e}"),
+                                            });
+                                            self.skip_section();
+                                            continue;
+                                        }
+                                    }
+                                }
+                                "location" => MatchKind::Location(args.join(" ")),
+                                "locationmatch" => {
+                                    let pat = args.join(" ");
+                                    match compile_regex(&pat) {
+                                        Ok(r) => MatchKind::LocationMatch(r),
+                                        Err(e) => {
+                                            self.errors.push(ConfigError {
+                                                file: loc.file.clone(),
+                                                line: loc.line,
+                                                msg: format!("bad LocationMatch regex: {e}"),
+                                            });
+                                            self.skip_section();
+                                            continue;
+                                        }
+                                    }
+                                }
+                                _ => unreachable!(),
+                            };
+                            let mut delta = Scope::default();
+                            let mut nested = Vec::new();
+                            let child_section = match &kind {
+                                MatchKind::Directory(_) => SectionKind::Directory,
+                                MatchKind::DirectoryMatch(_) => SectionKind::DirectoryMatch,
+                                MatchKind::Files(_) | MatchKind::FilesMatch(_) => {
+                                    SectionKind::Files
+                                }
+                                MatchKind::Location(_) | MatchKind::LocationMatch(_) => {
+                                    SectionKind::Location
+                                }
+                                _ => SectionKind::Directory,
+                            };
+                            self.walk(
+                                &mut delta,
+                                &mut nested,
+                                inside_vhost,
+                                true,
+                                None,
+                                child_section,
+                            );
+                            self.order += 1;
+                            let order = self.order;
+                            rules.push(ScopeRule {
+                                kind,
+                                delta,
+                                order,
+                                condition: None,
+                                branch: ConditionBranch::Normal,
+                                chain: None,
+                                nested,
+                            });
+                        }
+                        "requireall" | "requireany" | "requirenone" => {
+                            if !authz_section_allowed(section) {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!(
+                                        "<{name}> requires a directory, location, files, or proxy context"
+                                    ),
+                                });
+                                self.skip_section();
+                                continue;
+                            }
+                            let mut inner = Scope::default();
+                            let mut inner_rules = Vec::new();
+                            self.walk(
+                                &mut inner,
+                                &mut inner_rules,
+                                inside_vhost,
+                                in_directory,
+                                limit,
+                                SectionKind::Require,
+                            );
+                            if !inner_rules.is_empty() {
+                                self.warn(format!(
+                                    "{}:{}: nested sections inside <{name}> are not supported and were ignored",
+                                    loc.file, loc.line
+                                ));
+                            }
+                            let mut items = Vec::new();
+                            let inner_entries = match inner.authorization.requires.take() {
+                                None => Vec::new(),
+                                Some(AuthPolicy::List(entries)) => entries,
+                                Some(_) => {
+                                    self.errors.push(ConfigError {
+                                        file: loc.file.clone(),
+                                        line: loc.line,
+                                        msg: format!(
+                                            "AuthMerging is not supported inside <{name}>"
+                                        ),
+                                    });
+                                    Vec::new()
+                                }
+                            };
+                            for entry in inner_entries {
+                                if entry.limit.as_ref() != limit {
+                                    self.errors.push(ConfigError {
+                                        file: loc.file.clone(),
+                                        line: loc.line,
+                                        msg: format!(
+                                            "nested method-limited sections are not allowed inside <{name}>"
+                                        ),
+                                    });
+                                    continue;
+                                }
+                                items.push(entry.node);
+                            }
+                            let node = match name.as_str() {
+                                "requireall" => RequireNode::All(items),
+                                "requireany" => RequireNode::Any(items),
+                                _ => RequireNode::None(items),
+                            };
+                            let has_items = match &node {
+                                RequireNode::All(v)
+                                | RequireNode::Any(v)
+                                | RequireNode::None(v) => !v.is_empty(),
+                                RequireNode::Provider(_) => true,
+                            };
+                            if has_items {
+                                scope.add_require(node, limit);
+                            } else {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!(
+                                        "<{name}> directive contains no authorization directives"
+                                    ),
+                                });
+                            }
+                        }
+                        "limit" | "limitexcept" => {
+                            if !in_directory && limit.is_none() {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!("<{name}> is only allowed in directory context"),
+                                });
+                                self.skip_section();
+                                continue;
+                            }
+                            let Some(methods) = self.parse_method_set(&name, &args, &loc, false)
+                            else {
+                                self.skip_section();
+                                continue;
+                            };
+                            let combined = match limit {
+                                Some(outer) => outer.intersect(&methods),
+                                None => methods,
+                            };
+                            if combined.is_empty() {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!("nested <{name}> excludes every HTTP method"),
+                                });
+                                self.skip_section();
+                                continue;
+                            }
+                            if matches!(limit, Some(outer) if combined == *outer) {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!(
+                                        "nested <{name}> does not further restrict the enclosing method set"
+                                    ),
+                                });
+                                self.skip_section();
+                                continue;
+                            }
+                            self.walk(
+                                scope,
+                                rules,
+                                inside_vhost,
+                                in_directory,
+                                Some(&combined),
+                                section,
+                            );
+                        }
+                        "proxy" | "proxymatch" => {
+                            if limit.is_some() {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!(
+                                        "<{name}> is not allowed inside a method-limited section"
+                                    ),
+                                });
+                                self.skip_section();
+                                continue;
+                            }
+                            let Some(pattern) = args.first().cloned() else {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!("<{name}> requires a URL or pattern"),
+                                });
+                                self.skip_section();
+                                continue;
+                            };
+                            let kind = if name == "proxymatch" {
+                                match compile_regex(&pattern) {
+                                    Ok(re) => ProxyMatchKind::Regex(re),
+                                    Err(e) => {
+                                        self.errors.push(ConfigError {
+                                            file: loc.file.clone(),
+                                            line: loc.line,
+                                            msg: format!("bad <ProxyMatch> regex: {e}"),
+                                        });
+                                        self.skip_section();
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                ProxyMatchKind::Wildcard(pattern.clone())
+                            };
+                            let mut balancer_prev = None;
+                            let mut balancer_created = false;
+                            if name == "proxy" {
+                                if let Some(balancer) = pattern.strip_prefix("balancer://") {
+                                    balancer_created = true;
+                                    let balancer = balancer.trim_end_matches('/').to_string();
+                                    self.cfg.balancers.push(Balancer {
+                                        name: balancer,
+                                        members: Vec::new(),
+                                        health: HealthTemplate::default(),
+                                        sticky_cookie: None,
+                                        sticky_sep: None,
+                                        fail_on_status: Vec::new(),
+                                    });
+                                    let idx = self.cfg.balancers.len() - 1;
+                                    balancer_prev = self.current_balancer.replace(idx);
+                                }
+                            }
+                            let mut delta = Scope::default();
+                            let mut inner_rules = Vec::new();
+                            self.walk(
+                                &mut delta,
+                                &mut inner_rules,
+                                inside_vhost,
+                                true,
+                                None,
+                                SectionKind::Proxy,
+                            );
+                            if balancer_created {
+                                self.current_balancer = balancer_prev;
+                            }
+                            if let Some(rule) = inner_rules
+                                .iter()
+                                .find(|rule| !matches!(rule.kind, MatchKind::Always))
+                            {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!(
+                                        "nested <{}> inside <{name}> is not supported",
+                                        match &rule.kind {
+                                            MatchKind::Directory(_) => "Directory",
+                                            MatchKind::DirectoryMatch(_) => "DirectoryMatch",
+                                            MatchKind::Files(_) => "Files",
+                                            MatchKind::FilesMatch(_) => "FilesMatch",
+                                            MatchKind::Location(_) => "Location",
+                                            MatchKind::LocationMatch(_) => "LocationMatch",
+                                            MatchKind::Always => "If",
+                                        }
+                                    ),
+                                });
+                                continue;
+                            }
+                            self.order += 1;
+                            let container = ProxyContainer {
+                                kind,
+                                delta,
+                                rules: inner_rules,
+                                order: self.order,
+                            };
+                            if inside_vhost {
+                                if let Some(idx) = self.current_vhost {
+                                    self.vhosts_raw[idx].proxy_containers.push(container);
+                                } else {
+                                    self.cfg.proxy_containers.push(container);
+                                }
+                            } else {
+                                self.cfg.proxy_containers.push(container);
+                            }
+                        }
+                        _ => {
+                            if limit.is_some() {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!(
+                                        "<{name}> is not allowed inside a method-limited section"
+                                    ),
+                                });
+                                self.skip_section();
+                                continue;
+                            }
+                            self.warn(format!(
+                                "{}:{}: unsupported section <{name}> treated as transparent",
+                                loc.file, loc.line
+                            ));
+                            self.walk(scope, rules, inside_vhost, in_directory, None, section);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn skip_section(&mut self) {
+        let mut depth = 1;
+        while self.pos < self.events.len() && depth > 0 {
+            match &self.events[self.pos] {
+                Event::SectionStart { .. } => depth += 1,
+                Event::SectionEnd { .. } => depth -= 1,
+                _ => {}
+            }
+            self.pos += 1;
+        }
+    }
+
+    fn parse_method_set(
+        &mut self,
+        section: &str,
+        args: &[String],
+        loc: &SourceLoc,
+        htaccess: bool,
+    ) -> Option<MethodSet> {
+        match parse_method_set_args(section, args, htaccess) {
+            Ok(set) => Some(set),
+            Err(msg) => {
+                self.errors.push(ConfigError {
+                    file: loc.file.clone(),
+                    line: loc.line,
+                    msg,
+                });
+                None
+            }
+        }
+    }
+
+    fn apply_directive(
+        &mut self,
+        name: &str,
+        args: &[String],
+        loc: &SourceLoc,
+        scope: &mut Scope,
+        inside_vhost: bool,
+        in_directory: bool,
+        limit: Option<&MethodSet>,
+        section: SectionKind,
+    ) {
+        if limit.is_some() && !matches!(name, "require" | "order" | "allow" | "deny" | "satisfy") {
+            // Apache accepts these directives inside <Limit> but they have no
+            // method-scoped meaning.  Ignore them rather than rejecting a
+            // configuration Apache accepts.
+            self.warn(format!(
+                "{}:{}: directive '{name}' inside <Limit> is ignored",
+                loc.file, loc.line
+            ));
+            return;
+        }
+        if matches!(name, "sslverifyclient" | "sslcacertificatefile")
+            && !matches!(section, SectionKind::Server | SectionKind::VirtualHost)
+        {
+            self.errors.push(ConfigError {
+                file: loc.file.clone(),
+                line: loc.line,
+                msg: format!(
+                    "'{name}' is not supported in a per-location context; Rustls applies client                      authentication to the whole TLS connection"
+                ),
+            });
+            return;
+        }
+        if matches!(section, SectionKind::Server | SectionKind::VirtualHost)
+            && matches!(
+                name,
+                "require"
+                    | "order"
+                    | "allow"
+                    | "deny"
+                    | "satisfy"
+                    | "authtype"
+                    | "authname"
+                    | "authuserfile"
+                    | "authgroupfile"
+                    | "authbasicprovider"
+                    | "authmerging"
+            )
+        {
+            self.errors.push(ConfigError {
+                file: loc.file.clone(),
+                line: loc.line,
+                msg: format!("directive '{name}' is not allowed in this configuration context"),
+            });
+            return;
+        }
+        let first = || args.first().cloned().unwrap_or_default();
+        let joined = || args.join(" ");
+        match name {
+            "serverroot" => {
+                if let Some(a) = args.first() {
+                    self.cfg.server_root = PathBuf::from(a);
+                }
+            }
+            "servername" => {
+                let v = first();
+                if inside_vhost {
+                    if let Some(i) = self.current_vhost {
+                        self.vhosts_raw[i].server_name = Some(v);
+                    }
+                } else {
+                    self.cfg.server_name = Some(v);
+                }
+            }
+            "serveralias" => {
+                if let Some(i) = self.current_vhost {
+                    for alias in args {
+                        if let Some(re) = alias.strip_prefix('~') {
+                            if let Err(e) = compile_regex(re) {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!("bad ServerAlias regex '{re}': {e}"),
+                                });
+                                continue;
+                            }
+                        }
+                        self.vhosts_raw[i].aliases.push(alias.clone());
+                    }
+                }
+            }
+            "serveradmin" => {
+                let v = first();
+                if let Some(i) = self.current_vhost {
+                    self.vhosts_raw[i].server_admin = Some(v);
+                } else {
+                    self.cfg.server_admin = v;
+                }
+            }
+            "documentroot" => {
+                let p = PathBuf::from(first());
+                scope.content_policy.document_root = Some(if p.is_absolute() {
+                    clean_path(&p)
+                } else {
+                    clean_path(&self.cfg.server_root.join(p))
+                });
+            }
+            "directoryindex" => {
+                scope.content_policy.directory_index = Some(args.to_vec());
+            }
+            "options" => {
+                if args.is_empty() {
+                    scope.options.push_set(Options::empty().0);
+                }
+                for a in args {
+                    let (sign, flag) = match a.as_bytes().first() {
+                        Some(b'+') => (1, &a[1..]),
+                        Some(b'-') => (-1, &a[1..]),
+                        _ => (0, a.as_str()),
+                    };
+                    let opt = match flag.to_ascii_lowercase().as_str() {
+                        "none" => Some(Options::empty()),
+                        "all" => Some(Options::all()),
+                        "indexes" => Some(Options(Options::INDEXES)),
+                        "followsymlinks" => Some(Options(Options::FOLLOW_SYMLINKS)),
+                        "symlinksifownermatch" => Some(Options(Options::SYMLINKS_IF_OWNER_MATCH)),
+                        "execcgi" => Some(Options(Options::EXEC_CGI)),
+                        "includes" => Some(Options(Options::INCLUDES)),
+                        "includesnoexec" => Some(Options(Options::INCLUDES_NOEXEC)),
+                        "multiviews" => Some(Options(Options::MULTIVIEWS)),
+                        _ => {
+                            self.warn(format!(
+                                "{}:{}: unsupported Options flag '{a}' (ignored)",
+                                loc.file, loc.line
+                            ));
+                            None
+                        }
+                    };
+                    if let Some(o) = opt {
+                        match sign {
+                            1 => scope.options.push_add(o.0),
+                            -1 => scope.options.push_remove(o.0),
+                            _ if flag.eq_ignore_ascii_case("none") => {
+                                scope.options.push_set(Options::empty().0)
+                            }
+                            _ if flag.eq_ignore_ascii_case("all") => {
+                                scope.options.push_set(Options::all().0)
+                            }
+                            _ => scope.options.push_add(o.0),
+                        }
+                    }
+                }
+            }
+            "allowoverride" => {
+                if section != SectionKind::Directory {
+                    if matches!(section, SectionKind::Server | SectionKind::VirtualHost) {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: "AllowOverride is only allowed in <Directory>".into(),
+                        });
+                    } else {
+                        self.warn(format!(
+                            "{}:{}: useless use of AllowOverride outside <Directory> (ignored)",
+                            loc.file, loc.line
+                        ));
+                    }
+                    return;
+                }
+                let mut all = false;
+                let mut none = false;
+                let mut nonfatal = NonfatalMode::None;
+                let mut flags = OverrideCategories::empty();
+                let mut unknown = Vec::new();
+                let mut invalid_options = Vec::new();
+                for a in args {
+                    let lower = a.to_ascii_lowercase();
+                    if let Some(mode) = lower.strip_prefix("nonfatal=") {
+                        nonfatal = match mode {
+                            "override" => NonfatalMode::Override,
+                            "unknown" => NonfatalMode::Unknown,
+                            "all" => NonfatalMode::All,
+                            _ => {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!("invalid Nonfatal mode '{mode}'"),
+                                });
+                                NonfatalMode::None
+                            }
+                        };
+                        continue;
+                    }
+                    if let Some(list) = lower.strip_prefix("options=") {
+                        if list.is_empty() {
+                            invalid_options.push(a.clone());
+                            continue;
+                        }
+                        for option in list.split(',') {
+                            match option {
+                                "all" => flags.0 |= OverrideCategories::OPTIONS,
+                                "none" => flags.0 |= OverrideCategories::OPT_NONE,
+                                "execcgi" => flags.0 |= OverrideCategories::EXEC_CGI,
+                                "includes" => flags.0 |= OverrideCategories::INCLUDES,
+                                "includesnoexec" => flags.0 |= OverrideCategories::INCLUDES_NOEXEC,
+                                "followsymlinks" => {
+                                    flags.0 |= OverrideCategories::OPT_FOLLOW_SYMLINKS
+                                }
+                                "indexes" => flags.0 |= OverrideCategories::OPT_INDEXES,
+                                "multiviews" => flags.0 |= OverrideCategories::OPT_MULTIVIEWS,
+                                "symlinksifownermatch" => {
+                                    flags.0 |= OverrideCategories::OPT_SYMLINKS_IF_OWNER_MATCH
+                                }
+                                _ => invalid_options.push(a.clone()),
+                            }
+                        }
+                        continue;
+                    }
+                    match lower.as_str() {
+                        "all" => all = true,
+                        "none" => none = true,
+                        "authconfig" => flags.0 |= OverrideCategories::AUTH_CONFIG,
+                        "fileinfo" => flags.0 |= OverrideCategories::FILE_INFO,
+                        "indexes" => flags.0 |= OverrideCategories::INDEXES,
+                        "limit" => flags.0 |= OverrideCategories::LIMIT,
+                        "options" => flags.0 |= OverrideCategories::OPTIONS,
+                        // Older Apache documentation/versions used these as
+                        // standalone categories.  Keep them as aliases for
+                        // the equivalent modern Options=... form.
+                        "execcgi" => flags.0 |= OverrideCategories::EXEC_CGI,
+                        "includes" => flags.0 |= OverrideCategories::INCLUDES,
+                        "includesnoexec" => flags.0 |= OverrideCategories::INCLUDES_NOEXEC,
+                        "languagepriority" => flags.0 |= OverrideCategories::LANGUAGE_PRIORITY,
+                        other => unknown.push(other.to_string()),
+                    }
+                }
+                for option in invalid_options {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("invalid AllowOverride option '{option}'"),
+                    });
+                }
+                scope.override_policy.set_mode(if all {
+                    OverrideMode::All
+                } else if none || flags.0 == 0 {
+                    OverrideMode::None
+                } else {
+                    OverrideMode::Categories(flags)
+                });
+                scope.override_policy.set_nonfatal(nonfatal);
+                if !all && !none && flags.0 == 0 {
+                    // Silently turning all overrides off here would make a
+                    // misspelled category bypass Require directives in a
+                    // .htaccess file.  Fail closed instead, matching Apache.
+                    let msg = if args.is_empty() {
+                        "AllowOverride requires at least one category".to_string()
+                    } else {
+                        "AllowOverride has no supported categories".to_string()
+                    };
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg,
+                    });
+                } else {
+                    for u in unknown {
+                        let msg = format!(
+                            "{}:{}: unsupported AllowOverride category '{u}' (ignored)",
+                            loc.file, loc.line
+                        );
+                        if self.strict {
+                            self.errors.push(ConfigError {
+                                file: loc.file.clone(),
+                                line: loc.line,
+                                msg,
+                            });
+                        } else {
+                            self.warn(msg);
+                        }
+                    }
+                }
+            }
+            "allowoverridelist" => {
+                if section != SectionKind::Directory {
+                    if matches!(section, SectionKind::Server | SectionKind::VirtualHost) {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: "AllowOverrideList is only allowed in <Directory>".into(),
+                        });
+                    } else {
+                        self.warn(format!(
+                            "{}:{}: useless use of AllowOverrideList outside <Directory> (ignored)",
+                            loc.file, loc.line
+                        ));
+                    }
+                    return;
+                }
+                if args.is_empty() {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "AllowOverrideList requires None or directive names".into(),
+                    });
+                    return;
+                }
+                let mut none = false;
+                let mut list = Vec::new();
+                for arg in args {
+                    if arg.eq_ignore_ascii_case("none") {
+                        none = true;
+                    } else {
+                        list.push(arg.clone());
+                    }
+                }
+                if none && !list.is_empty() {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "AllowOverrideList None cannot be combined with directive names"
+                            .into(),
+                    });
+                    return;
+                }
+                scope
+                    .override_policy
+                    .set_allow_list(if none { Vec::new() } else { list });
+            }
+            "require" => {
+                let provider = parse_require(args);
+                if let Require::Unsupported(msg) = &provider {
+                    if require_syntax_error(msg) {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: msg.clone(),
+                        });
+                        return;
+                    }
+                }
+                scope.add_require(RequireNode::Provider(provider), limit);
+            }
+            "order" => {
+                let order = match first().to_ascii_lowercase().as_str() {
+                    "allow,deny" | "mutual-failure" => Order::AllowDeny,
+                    "deny,allow" => Order::DenyAllow,
+                    other => {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!("unknown Order '{other}'"),
+                        });
+                        return;
+                    }
+                };
+                scope.add_order(order, limit);
+            }
+            "allow" | "deny" => {
+                if !args
+                    .first()
+                    .map(|s| s.eq_ignore_ascii_case("from"))
+                    .unwrap_or(false)
+                {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("{name} must be followed by 'from'"),
+                    });
+                    return;
+                }
+                for a in &args[1..] {
+                    let host = if a == "all" {
+                        HostSpec::All
+                    } else if let Some((net, bits)) = parse_ip_net(a) {
+                        HostSpec::Net(net, bits)
+                    } else {
+                        // Host-name access requires a reverse DNS lookup; keep
+                        // failing closed rather than silently widening access.
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!("unsupported {name} host '{a}'"),
+                        });
+                        return;
+                    };
+                    if name == "allow" {
+                        scope.add_allow(host, limit);
+                    } else {
+                        scope.add_deny(host, limit);
+                    }
+                }
+            }
+            "errordocument" => {
+                if args.len() >= 2 {
+                    let Ok(code) = args[0].parse::<u16>() else {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!("unsupported HTTP response code {}", args[0]),
+                        });
+                        return;
+                    };
+                    {
+                        let target = args[1..].join(" ");
+                        let doc = if target.starts_with("http://") || target.starts_with("https://")
+                        {
+                            ErrorDoc::External(target)
+                        } else if target.starts_with('/') {
+                            ErrorDoc::Local(target)
+                        } else {
+                            ErrorDoc::Text(target)
+                        };
+                        scope.error_policy.documents.push((code, doc));
+                    }
+                }
+            }
+            "alias" | "scriptalias" => {
+                if args.len() >= 2 {
+                    let vpath = args[0].clone();
+                    let mut fpath = PathBuf::from(&args[1]);
+                    if !fpath.is_absolute() {
+                        fpath = self.cfg.server_root.join(fpath);
+                    }
+                    scope.mapping_policy.aliases.push(Alias {
+                        virtual_path: vpath,
+                        fs_path: clean_path(&fpath),
+                        script: name == "scriptalias",
+                    });
+                }
+            }
+            "aliasmatch" | "scriptaliasmatch" | "redirectmatch" => {
+                self.warn(format!(
+                    "{}:{}: {name} is not implemented; directive ignored",
+                    loc.file, loc.line
+                ));
+            }
+            "redirect" => {
+                if args.len() >= 2 {
+                    let (status, rest) = match args[0].parse::<u16>() {
+                        Ok(s) if args.len() >= 3 => (s, &args[1..]),
+                        _ => (302, &args[..]),
+                    };
+                    scope.mapping_policy.redirects.push(Redirect {
+                        from: rest[0].clone(),
+                        to: rest[1..].join(" "),
+                        status,
+                    });
+                }
+            }
+            "rewritemap" => {
+                if args.len() >= 2 {
+                    let name = args[0].clone();
+                    let (kind, source) = args[1].split_once(':').unwrap_or(("txt", &args[1]));
+                    match kind.to_ascii_lowercase().as_str() {
+                        "txt" => {
+                            let path = if source.starts_with('/') {
+                                PathBuf::from(source)
+                            } else {
+                                self.cfg.server_root.join(source)
+                            };
+                            let data = std::fs::read_to_string(path).unwrap_or_default();
+                            let mut map = HashMap::new();
+                            for line in data.lines() {
+                                let line = line.trim();
+                                if line.is_empty() || line.starts_with('#') {
+                                    continue;
+                                }
+                                if let Some((k, v)) = line.split_once(char::is_whitespace) {
+                                    map.insert(k.to_string(), v.trim().to_string());
+                                }
+                            }
+                            scope
+                                .rewrite_policy
+                                .rewrite_maps
+                                .push((name, RewriteMap::Txt(map)));
+                        }
+                        "rnd" => {
+                            let path = if source.starts_with('/') {
+                                PathBuf::from(source)
+                            } else {
+                                self.cfg.server_root.join(source)
+                            };
+                            let data = std::fs::read_to_string(path).unwrap_or_default();
+                            let mut map = HashMap::new();
+                            for line in data.lines() {
+                                let line = line.trim();
+                                if line.is_empty() || line.starts_with('#') {
+                                    continue;
+                                }
+                                if let Some((k, v)) = line.split_once(char::is_whitespace) {
+                                    let choices = v
+                                        .trim()
+                                        .split('|')
+                                        .map(|s| s.trim().to_string())
+                                        .filter(|s| !s.is_empty())
+                                        .collect::<Vec<_>>();
+                                    map.insert(k.to_string(), choices);
+                                }
+                            }
+                            scope
+                                .rewrite_policy
+                                .rewrite_maps
+                                .push((name, RewriteMap::Rnd(map)));
+                        }
+                        "prg" => {
+                            scope
+                                .rewrite_policy
+                                .rewrite_maps
+                                .push((name, RewriteMap::Prg(source.to_string())));
+                        }
+                        "int" => {
+                            scope
+                                .rewrite_policy
+                                .rewrite_maps
+                                .push((name, RewriteMap::Int(source.to_ascii_lowercase())));
+                        }
+                        _ => self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!("unsupported RewriteMap type '{kind}'"),
+                        }),
+                    }
+                }
+            }
+            "rewriteengine" => {
+                let on = first().eq_ignore_ascii_case("on");
+                let off = first().eq_ignore_ascii_case("off");
+                if on || off {
+                    scope.rewrite_policy.rewrite_engine = Some(on);
+                } else {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "RewriteEngine requires On or Off".into(),
+                    });
+                }
+            }
+            "rewritebase" => {
+                scope.rewrite_policy.rewrite_base = Some(normalize_rewrite_base(&first()));
+            }
+            "rewritecond" => match parse_rewrite_cond(args) {
+                Ok(c) => scope.rewrite_policy.pending_rewrite_conds.push(c),
+                Err(e) => self.errors.push(ConfigError {
+                    file: loc.file.clone(),
+                    line: loc.line,
+                    msg: e,
+                }),
+            },
+            "rewriterule" => {
+                let base = scope.rewrite_policy.rewrite_base.as_deref().unwrap_or("/");
+                match parse_rewrite_rule(args, base, false) {
+                    Ok(mut rule) => {
+                        rule.conditions =
+                            std::mem::take(&mut scope.rewrite_policy.pending_rewrite_conds);
+                        scope.rewrite_policy.rewrite_rules.push(rule);
+                    }
+                    Err(e) => self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: e,
+                    }),
+                }
+            }
+            "rewriteoptions" => {
+                scope.rewrite_policy.rewrite_inherit =
+                    Some(args.iter().any(|a| a.eq_ignore_ascii_case("Inherit")));
+            }
+            "addtype" => {
+                if args.len() >= 2 {
+                    scope
+                        .content_policy
+                        .add_types
+                        .push((args[0].clone(), args[1..].join(" ")));
+                }
+            }
+            "removetype" => {
+                scope
+                    .content_policy
+                    .remove_types
+                    .extend(args.iter().cloned());
+            }
+            "addhandler" => {
+                if args.len() >= 2 {
+                    for ext in &args[1..] {
+                        scope.mapping_policy.handlers.push(Handler {
+                            ext: ext.trim_start_matches('.').to_ascii_lowercase(),
+                            handler: args[0].clone(),
+                        });
+                    }
+                }
+            }
+            "sethandler" => {
+                scope.mapping_policy.handlers.push(Handler {
+                    ext: "*".into(),
+                    handler: first(),
+                });
+            }
+            "forcetype" => scope.content_policy.force_type = Some(first()),
+            "adddefaultcharset" => {
+                let a = first();
+                if !a.eq_ignore_ascii_case("off") {
+                    scope.content_policy.default_charset = Some(a);
+                }
+            }
+            "defaultruntime" => {}
+            "fileetag" => {
+                let mut v = 0u32;
+                for a in args {
+                    match a.to_ascii_lowercase().as_str() {
+                        "none" => v = 0,
+                        "all" => v = ETAG_ALL,
+                        "inode" => v |= ETAG_INODE,
+                        "mtime" => v |= ETAG_MTIME,
+                        "size" => v |= ETAG_SIZE,
+                        _ => {}
+                    }
+                }
+                scope.content_policy.file_etag = Some(v);
+            }
+            "enablesendfile" => {
+                scope.content_policy.enable_sendfile = Some(first().eq_ignore_ascii_case("on"));
+            }
+            "directoryslash" => {
+                scope.content_policy.directory_slash = Some(first().eq_ignore_ascii_case("on"));
+            }
+            "accessfilename" => {
+                scope.content_policy.access_file_names = Some(args.to_vec());
+            }
+            "header" => {
+                if args.len() >= 2 {
+                    let action = args[0].to_ascii_lowercase();
+                    if action == "set" || action == "add" {
+                        let name = args[1].trim_end_matches(':').to_string();
+                        let value = args[2..].join(" ");
+                        if action == "set" {
+                            scope.header_policy.set_headers.push((name, value));
+                        } else {
+                            scope.header_policy.add_headers.push((name, value));
+                        }
+                    } else if action == "unset" {
+                        scope.header_policy.unset_headers.push(args[1].clone());
+                    }
+                }
+            }
+            "expiresactive" => {
+                scope.header_policy.expires_active = Some(first().eq_ignore_ascii_case("on"));
+            }
+            "expiresdefault" => {
+                scope.header_policy.expires_default = Some(joined());
+            }
+            "expiresbytype" => {
+                if args.len() >= 2 {
+                    scope
+                        .header_policy
+                        .expires_by_type
+                        .push((args[0].to_ascii_lowercase(), args[1..].join(" ")));
+                }
+            }
+            "typesconfig" => {
+                let p = PathBuf::from(first());
+                let full = if p.is_absolute() {
+                    p
+                } else {
+                    self.cfg.server_root.join(p)
+                };
+                if let Err(e) = self.cfg.mime.load_types_file(&full) {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: e,
+                    });
+                }
+            }
+            "cacheenable" => {
+                if args.len() >= 2 {
+                    scope
+                        .rewrite_policy
+                        .cache_enable
+                        .push((args[0].to_ascii_lowercase(), args[1].clone()));
+                }
+            }
+            "cachedisable" => {
+                if let Some(prefix) = args.first() {
+                    scope.rewrite_policy.cache_disable.push(prefix.clone());
+                }
+            }
+            "cacheroot" => {
+                let p = PathBuf::from(first());
+                self.cfg.cache.root = Some(if p.is_absolute() {
+                    p
+                } else {
+                    self.cfg.server_root.join(p)
+                });
+            }
+            "cachedefaultexpire" => {
+                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                    self.cfg.cache.default_expire = n;
+                }
+            }
+            "cachemaxexpire" => {
+                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                    self.cfg.cache.max_expire = n;
+                }
+            }
+            "cacheminexpire" => {
+                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                    self.cfg.cache.min_expire = n;
+                }
+            }
+            "cachemaxfilesize" => {
+                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                    self.cfg.cache.max_file_size = n;
+                }
+            }
+            "cacheminsize" => {
+                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                    self.cfg.cache.min_file_size = n;
+                }
+            }
+            "cacheignorenolastmod" => {
+                self.cfg.cache.ignore_no_last_mod = first().eq_ignore_ascii_case("on");
+            }
+            "cacheignorecachecontrol" => {
+                self.cfg.cache.ignore_cache_control = first().eq_ignore_ascii_case("on");
+            }
+            "cachestorenostore" => {
+                self.cfg.cache.store_no_store = first().eq_ignore_ascii_case("on");
+            }
+            "cachestoreprivate" => {
+                self.cfg.cache.store_private = first().eq_ignore_ascii_case("on");
+            }
+            "cacheignorequerystring" => {
+                self.cfg.cache.ignore_query_string = first().eq_ignore_ascii_case("on");
+            }
+            "cacheheader" => {
+                self.cfg.cache.header = first().eq_ignore_ascii_case("on");
+            }
+            "cachedetailheader" => {
+                self.cfg.cache.detail_header = first().eq_ignore_ascii_case("on");
+            }
+            "cachelastmodifiedfactor" => {
+                if let Ok(v) = first().parse::<f64>() {
+                    self.cfg.cache.last_modified_factor = v.clamp(0.0, 1.0);
+                }
+            }
+            "proxypass" => {
+                if args.len() >= 2
+                    && !args[0].starts_with('!')
+                    && !supported_proxy_backend(&args[1], false)
+                {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("unsupported ProxyPass backend '{}'", args[1]),
+                    });
+                } else if args.len() >= 2 && !args[0].starts_with('!') {
+                    let mut rule = ProxyPassRule {
+                        prefix: args[0].clone(),
+                        backend: args[1].clone(),
+                        sticky_cookie: None,
+                        fail_on_status: Vec::new(),
+                    };
+                    for item in &args[2..] {
+                        if let Some((key, value)) = item.split_once('=') {
+                            match key.to_ascii_lowercase().as_str() {
+                                "stickysession" => rule.sticky_cookie = Some(value.to_string()),
+                                "failonstatus" => rule.fail_on_status = parse_status_list(value),
+                                _ => {}
+                            }
+                        }
+                    }
+                    scope.proxy_policy.proxy_passes.push(rule);
+                }
+            }
+            "proxypassreverse" => {
+                if args.len() >= 2 {
+                    if !supported_proxy_backend(&args[1], false) {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!("unsupported ProxyPassReverse backend '{}'", args[1]),
+                        });
+                    } else {
+                        scope.proxy_policy.proxy_reverses.push(ProxyReverseRule {
+                            front: args[0].clone(),
+                            backend: args[1].clone(),
+                        });
+                    }
+                }
+            }
+            "proxypassmatch" => {
+                if args.len() >= 2 && !supported_proxy_backend(&args[1], true) {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("unsupported ProxyPassMatch backend '{}'", args[1]),
+                    });
+                } else if args.len() >= 2 && !proxy_template_authority_safe(&args[1]) {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!(
+                            "ProxyPassMatch backend authority may not be derived from a capture: '{}'",
+                            args[1]
+                        ),
+                    });
+                } else if args.len() >= 2 {
+                    match compile_regex(&args[0]) {
+                        Ok(pattern) => scope.proxy_policy.proxy_rules.push(ProxyRule {
+                            pattern: Arc::new(pattern),
+                            backend: args[1].clone(),
+                        }),
+                        Err(e) => self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!("bad ProxyPassMatch regex: {e}"),
+                        }),
+                    }
+                }
+            }
+            "addoutputfilterbytype" => {
+                if args.len() >= 2 {
+                    let kinds = parse_filter_tokens(scope, &args[..1]);
+                    for kind in kinds {
+                        scope
+                            .compression_policy
+                            .compression_rules
+                            .push(CompressionRule::ByType(
+                                kind,
+                                args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
+                            ));
+                    }
+                }
+            }
+            "addoutputfilter" => {
+                if args.len() >= 2 {
+                    let kinds = parse_filter_tokens(scope, &args[..1]);
+                    for kind in kinds {
+                        scope
+                            .compression_policy
+                            .compression_rules
+                            .push(CompressionRule::ByExt(
+                                kind,
+                                args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
+                            ));
+                    }
+                }
+            }
+            "setoutputfilter" => {
+                let kinds = parse_filter_tokens(scope, args);
+                if !kinds.is_empty() {
+                    scope
+                        .compression_policy
+                        .compression_rules
+                        .push(CompressionRule::Set(kinds));
+                }
+            }
+            "setinputfilter" | "addinputfilter" => {
+                for token in args {
+                    for part in token.split(';') {
+                        let part = part.trim();
+                        if !part.is_empty()
+                            && !scope
+                                .mapping_policy
+                                .unsupported_filters
+                                .iter()
+                                .any(|f| f.eq_ignore_ascii_case(part))
+                        {
+                            scope
+                                .mapping_policy
+                                .unsupported_filters
+                                .push(part.to_string());
+                        }
+                    }
+                }
+            }
+            "deflatefilternote" | "deflatebuffersize" | "deflatememlevel"
+            | "deflatewindowssize" => {}
+            "deflatecompressionlevel" => {
+                if let Some(n) = parse_u32_arg(args) {
+                    if n <= 9 {
+                        scope.compression_policy.deflate_level = Some(n);
+                    }
+                }
+            }
+            "brotlicompressionquality" => {
+                if let Some(n) = parse_u32_arg(args) {
+                    if n <= 11 {
+                        scope.compression_policy.brotli_quality = Some(n);
+                    }
+                }
+            }
+            "deflatealteretag" => {
+                if let Some(v) = args.first().and_then(|s| AlterEtag::parse(s)) {
+                    scope.compression_policy.deflate_alter_etag = Some(v);
+                }
+            }
+            "brotlialteretag" | "brotlicompressionalteretag" => {
+                if let Some(v) = args.first().and_then(|s| AlterEtag::parse(s)) {
+                    scope.compression_policy.brotli_alter_etag = Some(v);
+                }
+            }
+            "addcharset" | "addencoding" | "addlanguage" => {
+                if name == "addencoding" && args.len() >= 2 {
+                    for e in &args[1..] {
+                        self.cfg.mime.encodings.insert(
+                            e.trim_start_matches('.').to_ascii_lowercase(),
+                            args[0].clone(),
+                        );
+                    }
+                }
+            }
+            "listen" => {
+                // Apache allows a protocol hint after the address, e.g.
+                // `Listen 443 https`; the hint does not enable TLS by itself.
+                for a in args.iter().take(1) {
+                    match parse_listen(a) {
+                        Ok(l) => self.cfg.listeners.push(l),
+                        Err(e) => self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: e,
+                        }),
+                    }
+                }
+            }
+            "user" => self.cfg.user = first(),
+            "group" => self.cfg.group = first(),
+            "pidfile" => self.cfg.pid_file = PathBuf::from(first()),
+            "errorlog" => {
+                let p = first();
+                if let Some(i) = self.current_vhost {
+                    self.vhosts_raw[i].error_log = Some(p);
+                } else {
+                    self.cfg.error_log = p;
+                }
+            }
+            "loglevel" => self.cfg.log_level = first(),
+            "logformat" => {
+                if args.len() >= 2 {
+                    let fmt = args[0].clone();
+                    let nick = args[1].clone();
+                    self.cfg.log_formats.insert(nick, fmt);
+                }
+            }
+            "customlog" => {
+                if args.len() >= 2 {
+                    let cl = CustomLog {
+                        path: args[0].clone(),
+                        format: args[1].clone(),
+                        condition: args.get(2).cloned(),
+                    };
+                    if let Some(i) = self.current_vhost {
+                        self.vhosts_raw[i].custom_logs.push(cl);
+                    } else {
+                        self.cfg.custom_logs.push(cl);
+                    }
+                }
+            }
+            "setenv" => {
+                if args.len() >= 2 {
+                    scope
+                        .environment_policy
+                        .set_env
+                        .push((args[0].clone(), args[1..].join(" ")));
+                }
+            }
+            "unsetenv" => scope
+                .environment_policy
+                .unset_env
+                .extend(args.iter().cloned()),
+            "passenv" => scope
+                .environment_policy
+                .pass_env
+                .extend(args.iter().cloned()),
+            "setenvif" | "setenvifnocase" | "browsermatch" | "browsermatchnocase" => {
+                let nocase = name.ends_with("nocase");
+                let (attribute, pattern_idx, actions_idx) = if name.starts_with("browsermatch") {
+                    ("User-Agent".to_string(), 0, 1)
+                } else {
+                    (args.first().cloned().unwrap_or_default(), 1, 2)
+                };
+                if let Some(pattern) = args.get(pattern_idx) {
+                    let pattern = if nocase {
+                        format!("(?i:{pattern})")
+                    } else {
+                        pattern.clone()
+                    };
+                    match compile_regex(&pattern) {
+                        Ok(pattern) => {
+                            let mut actions = Vec::new();
+                            for action in &args[actions_idx..] {
+                                if let Some(name) = action.strip_prefix('!') {
+                                    actions.push((name.to_string(), None));
+                                } else if let Some((k, v)) = action.split_once('=') {
+                                    actions.push((k.to_string(), Some(v.to_string())));
+                                } else {
+                                    actions.push((action.to_string(), Some(String::new())));
+                                }
+                            }
+                            scope.environment_policy.set_env_if.push(EnvRule {
+                                attribute,
+                                pattern: Arc::new(pattern),
+                                negate: false,
+                                nocase,
+                                actions,
+                            });
+                        }
+                        Err(e) => self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!("bad SetEnvIf regex: {e}"),
+                        }),
+                    }
+                }
+            }
+            "remoteipheader" => {
+                self.cfg.remoteip_header = Some(first());
+            }
+            "remoteipinternalproxy" | "remoteiptrustedproxy" => {
+                for a in args {
+                    if a.eq_ignore_ascii_case("all") {
+                        self.cfg
+                            .remoteip_internal
+                            .push(("0.0.0.0".parse().unwrap(), 0));
+                    } else if let Some(net) = parse_ip_net(a) {
+                        self.cfg.remoteip_internal.push(net);
+                    } else if let Ok(ip) = a.parse::<IpAddr>() {
+                        let bits = if ip.is_ipv4() { 32 } else { 128 };
+                        self.cfg.remoteip_internal.push((ip, bits));
+                    } else {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!("bad RemoteIPInternalProxy address '{a}'"),
+                        });
+                    }
+                }
+            }
+            "timeout" => {
+                if let Some(n) = parse_u32_arg(args) {
+                    let d = Duration::from_secs(n as u64);
+                    self.cfg.timeout = d;
+                    self.cfg.request_header_timeout = d;
+                    self.cfg.request_body_timeout = d;
+                }
+            }
+            "keepalive" => self.cfg.keep_alive = !first().eq_ignore_ascii_case("off"),
+            "keepalivetimeout" => {
+                if let Some(n) = parse_u32_arg(args) {
+                    self.cfg.keep_alive_timeout = Duration::from_secs(n as u64);
+                }
+            }
+            "maxkeepaliverequests" => {
+                if let Some(n) = parse_u32_arg(args) {
+                    self.cfg.max_keep_alive_requests = n as usize;
+                }
+            }
+            "hostnamelookups" => self.cfg.hostname_lookups = first().eq_ignore_ascii_case("on"),
+            "usecanonicalname" => self.cfg.use_canonical_name = first().eq_ignore_ascii_case("on"),
+            "servertokens" => {
+                self.cfg.server_tokens = match first().to_ascii_lowercase().as_str() {
+                    "full" => ServerTokens::Full,
+                    "os" => ServerTokens::Os,
+                    "minimal" => ServerTokens::Minimal,
+                    "minor" => ServerTokens::Minor,
+                    "major" => ServerTokens::Major,
+                    "prod" => ServerTokens::Prod,
+                    _ => ServerTokens::Full,
+                };
+                self.cfg.server_software = match self.cfg.server_tokens {
+                    ServerTokens::Full => format!(
+                        "Apache/2.4.62 (Debian) vapache/{}",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                    ServerTokens::Os => "Apache/2.4.62 (Debian)".into(),
+                    ServerTokens::Minimal => "Apache/2.4.62".into(),
+                    ServerTokens::Minor => "Apache/2.4".into(),
+                    ServerTokens::Major => "Apache/2".into(),
+                    ServerTokens::Prod => "Apache".into(),
+                };
+            }
+            "serversignature" => {
+                self.cfg.server_signature = match first().to_ascii_lowercase().as_str() {
+                    "off" => ServerSignature::Off,
+                    "email" => ServerSignature::Email,
+                    _ => ServerSignature::On,
+                };
+            }
+            "traceenable" => {
+                self.cfg.trace_enable = !first().eq_ignore_ascii_case("off");
+            }
+            "limitrequestline" => {
+                if let Some(n) = parse_u32_arg(args) {
+                    self.cfg.limit_request_line = n as usize;
+                }
+            }
+            "limitrequestfields" => {
+                if let Some(n) = parse_u32_arg(args) {
+                    self.cfg.limit_request_fields = n as usize;
+                }
+            }
+            "limitrequestfieldsize" => {
+                if let Some(n) = parse_u32_arg(args) {
+                    self.cfg.limit_request_field_size = n as usize;
+                }
+            }
+            "maxrequestworkers" | "serverlimit" => {
+                if let Some(n) = parse_u32_arg(args) {
+                    self.cfg.max_request_workers = n.max(1) as usize;
+                }
+            }
+            "listenbacklog" => {
+                if let Some(n) = parse_u32_arg(args) {
+                    self.cfg.listen_backlog = n.max(1) as i32;
+                }
+            }
+            "gracefulshutdowntimeout" => {
+                if let Some(n) = parse_u32_arg(args) {
+                    self.cfg.graceful_shutdown_timeout = Duration::from_secs(n as u64);
+                }
+            }
+            "requestreadtimeout" => {
+                let raw = args.join(" ");
+                if let Some((header, body, header_rate, body_rate)) =
+                    parse_request_read_timeout(&raw)
+                {
+                    if let Some(header) = header {
+                        self.cfg.request_header_timeout = header;
+                    }
+                    if let Some(body) = body {
+                        self.cfg.request_body_timeout = body;
+                    }
+                    if let Some(rate) = header_rate {
+                        self.cfg.request_header_min_rate = rate;
+                    }
+                    if let Some(rate) = body_rate {
+                        self.cfg.request_body_min_rate = rate;
+                    }
+                }
+            }
+            "limitrequestbody" => {
+                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                    self.cfg.limit_request_body = n;
+                }
+            }
+            "allowencodedslashes" => {
+                self.cfg.encoded_slashes = match first().to_ascii_lowercase().as_str() {
+                    "on" => EncodedSlashes::On,
+                    "nodecode" => EncodedSlashes::NoDecode,
+                    _ => EncodedSlashes::Off,
+                };
+            }
+            "satisfy" => {
+                let satisfy = match first().to_ascii_lowercase().as_str() {
+                    "all" => Satisfy::All,
+                    "any" => Satisfy::Any,
+                    _ => {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: "Satisfy requires 'all' or 'any'".into(),
+                        });
+                        return;
+                    }
+                };
+                scope.add_satisfy(satisfy, limit);
+            }
+            "allowmethods" => {
+                if !in_directory {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "AllowMethods is only allowed in directory context".into(),
+                    });
+                    return;
+                }
+                match parse_allow_methods(args) {
+                    Ok(allowed) => scope.authorization.allow_methods = Some(allowed),
+                    Err(msg) => {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg,
+                        });
+                    }
+                }
+            }
+            "authmerging" => {
+                if !in_directory {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "AuthMerging is only allowed in directory context".into(),
+                    });
+                    return;
+                }
+                let merging = match first().to_ascii_lowercase().as_str() {
+                    "off" => AuthMerging::Off,
+                    "and" => AuthMerging::And,
+                    "or" => AuthMerging::Or,
+                    _ => {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: "AuthMerging requires Off, And or Or".into(),
+                        });
+                        return;
+                    }
+                };
+                scope.authorization.auth_merging = Some(merging);
+            }
+            "sslrequiressl" => {
+                self.errors.push(ConfigError {
+                    file: loc.file.clone(),
+                    line: loc.line,
+                    msg: "SSLRequireSSL is not implemented; refusing to weaken TLS policy".into(),
+                });
+            }
+            "sslrequire" => {
+                self.errors.push(ConfigError {
+                    file: loc.file.clone(),
+                    line: loc.line,
+                    msg: "SSLRequire is not implemented; refusing to weaken TLS policy".into(),
+                });
+            }
+            "secruleengine" => {
+                if !first().eq_ignore_ascii_case("off") {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg:
+                            "SecRuleEngine is not implemented; refusing to silently disable the WAF"
+                                .into(),
+                    });
+                }
+            }
+            "defaultruntimedir" => {}
+            "sslengine" => {
+                let on = !first().eq_ignore_ascii_case("off");
+                if let Some(i) = self.current_vhost {
+                    self.vhosts_raw[i].ssl.engine = on;
+                    self.vhosts_raw[i].ssl.engine_set = true;
+                } else {
+                    self.cfg.ssl.engine = on;
+                    self.cfg.ssl.engine_set = true;
+                }
+            }
+            "sslcertificatefile" | "sslcertificatekeyfile" | "sslcertificatechainfile" => {
+                let p = PathBuf::from(first());
+                let full = if p.is_absolute() {
+                    p
+                } else {
+                    self.cfg.server_root.join(p)
+                };
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
+                } else {
+                    &mut self.cfg.ssl
+                };
+                match name {
+                    "sslcertificatefile" => target.cert_file = Some(full),
+                    "sslcertificatekeyfile" => target.key_file = Some(full),
+                    _ => target.chain_file = Some(full),
+                }
+            }
+            "sslusestapling" => {
+                let on = first().eq_ignore_ascii_case("on");
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
+                } else {
+                    &mut self.cfg.ssl
+                };
+                target.stapling = on;
+                target.stapling_set = true;
+            }
+            "sslstaplingforceurl" => {
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
+                } else {
+                    &mut self.cfg.ssl
+                };
+                target.stapling_force_url = Some(first());
+            }
+            "sslstaplingrespondertimeout" => {
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
+                } else {
+                    &mut self.cfg.ssl
+                };
+                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                    target.stapling_responder_timeout = Duration::from_secs(n.max(1));
+                }
+            }
+            "sslstaplingstandardcachetimeout" => {
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
+                } else {
+                    &mut self.cfg.ssl
+                };
+                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                    target.stapling_standard_cache_timeout = Duration::from_secs(n.max(1));
+                }
+            }
+            "sslstaplingreturnrespondererrors" => {
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
+                } else {
+                    &mut self.cfg.ssl
+                };
+                target.stapling_return_responder_errors = first().eq_ignore_ascii_case("on");
+            }
+            "sslstaplingcache" => {}
+            "sslproxycacertificatefile" => {
+                let p = PathBuf::from(first());
+                scope.proxy_policy.proxy_ca_file = Some(if p.is_absolute() {
+                    p
+                } else {
+                    self.cfg.server_root.join(p)
+                });
+            }
+            "balancermember" => {
+                if let Some(i) = self.current_balancer {
+                    if let Some(url) = args.first() {
+                        let mut member = BalancerMember {
+                            url: url.clone(),
+                            ..BalancerMember::default()
+                        };
+                        for item in &args[1..] {
+                            if let Some((key, value)) = item.split_once('=') {
+                                match key.to_ascii_lowercase().as_str() {
+                                    "hcmethod" => member.hcmethod = Some(value.to_string()),
+                                    "hcuri" => member.hcuri = Some(value.to_string()),
+                                    "hcinterval" => member.hcinterval = parse_duration(value),
+                                    "hcpasses" => member.hcpasses = value.parse().ok(),
+                                    "hcfails" => member.hcfails = value.parse().ok(),
+                                    "template" => member.template = Some(value.to_string()),
+                                    "route" => member.route = Some(value.to_string()),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        self.cfg.balancers[i].members.push(member);
+                    }
+                }
+            }
+            "proxyset" => {
+                if let Some(i) = self.current_balancer {
+                    for item in args {
+                        let Some((key, value)) = item.split_once('=') else {
+                            continue;
+                        };
+                        match key.to_ascii_lowercase().as_str() {
+                            "hcmethod" => {
+                                self.cfg.balancers[i].health.method = Some(value.to_string())
+                            }
+                            "hcuri" => self.cfg.balancers[i].health.uri = Some(value.to_string()),
+                            "hcinterval" => {
+                                self.cfg.balancers[i].health.interval = parse_duration(value)
+                            }
+                            "hcpasses" => self.cfg.balancers[i].health.passes = value.parse().ok(),
+                            "hcfails" => self.cfg.balancers[i].health.fails = value.parse().ok(),
+                            "stickysession" => {
+                                self.cfg.balancers[i].sticky_cookie = Some(value.to_string())
+                            }
+                            "stickysessionsep" => {
+                                self.cfg.balancers[i].sticky_sep = Some(value.to_string())
+                            }
+                            "failonstatus" => {
+                                self.cfg.balancers[i].fail_on_status = parse_status_list(value)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            "proxyhctemplate" => {
+                if let Some(name) = args.first() {
+                    let mut template = HealthTemplate::default();
+                    for item in &args[1..] {
+                        let Some((key, value)) = item.split_once('=') else {
+                            continue;
+                        };
+                        match key.to_ascii_lowercase().as_str() {
+                            "hcmethod" => template.method = Some(value.to_string()),
+                            "hcuri" => template.uri = Some(value.to_string()),
+                            "hcinterval" => template.interval = parse_duration(value),
+                            "hcpasses" => template.passes = value.parse().ok(),
+                            "hcfails" => template.fails = value.parse().ok(),
+                            _ => {}
+                        }
+                    }
+                    self.cfg.health_templates.insert(name.clone(), template);
+                }
+            }
+            "sslverifyclient" => {
+                let raw = first().to_ascii_lowercase();
+                let verify = match raw.as_str() {
+                    "none" => ClientVerify::None,
+                    "optional" => ClientVerify::Optional,
+                    "require" => ClientVerify::Require,
+                    "optional_no_ca" => ClientVerify::Optional,
+                    _ => {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg:
+                                "SSLVerifyClient must be none, optional, require or optional_no_ca"
+                                    .into(),
+                        });
+                        ClientVerify::None
+                    }
+                };
+                if raw == "optional_no_ca" {
+                    self.warn(format!(
+                        "{}:{}: SSLVerifyClient optional_no_ca is treated as optional",
+                        loc.file, loc.line
+                    ));
+                }
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
+                } else {
+                    &mut self.cfg.ssl
+                };
+                target.verify_client = Some(verify);
+            }
+            "sslcacertificatefile" => {
+                let p = PathBuf::from(first());
+                let full = if p.is_absolute() {
+                    p
+                } else {
+                    self.cfg.server_root.join(p)
+                };
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
+                } else {
+                    &mut self.cfg.ssl
+                };
+                target.ca_file = Some(full);
+            }
+            "sslprotocol" => {
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
+                } else {
+                    &mut self.cfg.ssl
+                };
+                target.protocols = Some(joined());
+            }
+            "sslciphersuite" | "sslciphersuitetls13" => {
+                let target = if let Some(i) = self.current_vhost {
+                    &mut self.vhosts_raw[i].ssl
+                } else {
+                    &mut self.cfg.ssl
+                };
+                target.cipher_suite = Some(joined());
+                self.warn(format!(
+                    "{}:{}: {name} is not supported by the Rustls backend; secure default cipher suites are used",
+                    loc.file, loc.line
+                ));
+            }
+            "authtype" => scope.authorization.auth_type = Some(first().to_ascii_lowercase()),
+            "authname" => scope.authorization.auth_name = Some(first()),
+            "authuserfile" => {
+                let p = PathBuf::from(first());
+                scope.authorization.auth_user_file = Some(if p.is_absolute() {
+                    p
+                } else {
+                    self.cfg.server_root.join(p)
+                });
+            }
+            "authgroupfile" => {
+                let p = PathBuf::from(first());
+                scope.authorization.auth_group_file = Some(if p.is_absolute() {
+                    p
+                } else {
+                    self.cfg.server_root.join(p)
+                });
+            }
+            "authbasicprovider" => {
+                if !first().eq_ignore_ascii_case("file") {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!(
+                            "AuthBasicProvider '{}' is not implemented; refusing to fall back to the file provider",
+                            first()
+                        ),
+                    });
+                }
+            }
+            "defaulttype" => { /* removed in 2.4; accepted for compat */ }
+            _ => match vapache_verified::directive_disposition(
+                is_security_directive(name),
+                self.known.contains(name),
+                self.strict,
+            ) {
+                vapache_verified::DirectiveDisposition::FailClosedSecurity => {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!(
+                            "security-sensitive directive '{name}' is not implemented; refusing to start"
+                        ),
+                    });
+                }
+                vapache_verified::DirectiveDisposition::WarnKnown => {
+                    // Recognised Apache directive from a module we do not
+                    // implement yet: harmless for static hosting, warn once.
+                    self.warn(format!(
+                        "{}:{}: directive '{name}' is recognised but not implemented (ignored)",
+                        loc.file, loc.line
+                    ));
+                }
+                vapache_verified::DirectiveDisposition::FailClosedStrict => {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("Invalid command '{name}', perhaps misspelled or defined by a module not included in the server configuration"),
+                    });
+                }
+                vapache_verified::DirectiveDisposition::WarnUnknown => {
+                    self.warn(format!(
+                        "{}:{}: unknown directive '{name}' ignored (compat mode)",
+                        loc.file, loc.line
+                    ));
+                }
+            },
+        }
+        let _ = joined;
+    }
+}
+
+fn parse_status_list(value: &str) -> Vec<u16> {
+    value
+        .split(',')
+        .filter_map(|v| v.trim().parse::<u16>().ok())
+        .collect()
+}
+
+fn parse_request_read_timeout(
+    raw: &str,
+) -> Option<(Option<Duration>, Option<Duration>, Option<u64>, Option<u64>)> {
+    let part = |prefix: &str| -> Option<(Duration, Option<u64>)> {
+        let start = raw.find(prefix)? + prefix.len();
+        let mut values = raw[start..]
+            .split(|c: char| c == ',' || c == ' ' || c == '\t')
+            .filter(|v| !v.is_empty());
+        let time = values
+            .next()?
+            .split('-')
+            .next()?
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_secs)?;
+        let mut rate = None;
+        for value in values {
+            if let Some(v) = value.strip_prefix("MinRate=") {
+                rate = v.parse::<u64>().ok();
+                break;
+            }
+        }
+        Some((time, rate))
+    };
+    let header = part("header=");
+    let body = part("body=");
+    if header.is_none() && body.is_none() {
+        None
+    } else {
+        Some((
+            header.as_ref().map(|v| v.0),
+            body.as_ref().map(|v| v.0),
+            header.and_then(|v| v.1),
+            body.and_then(|v| v.1),
+        ))
+    }
+}
+
+fn parse_duration(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Some(ms) = value.strip_suffix("ms") {
+        return ms.parse::<u64>().ok().map(Duration::from_millis);
+    }
+    if let Some(s) = value.strip_suffix('s') {
+        return s.parse::<u64>().ok().map(Duration::from_secs);
+    }
+    if let Some(m) = value.strip_suffix('m') {
+        return m.parse::<u64>().ok().map(|v| Duration::from_secs(v * 60));
+    }
+    value.parse::<u64>().ok().map(Duration::from_secs)
+}
+
+fn parse_u32_arg(args: &[String]) -> Option<u32> {
+    args.first().and_then(|s| s.parse().ok())
+}
+
+fn clean_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        use std::path::Component::*;
+        match c {
+            Prefix(_) | RootDir => out.push(c.as_os_str()),
+            CurDir => {}
+            ParentDir => {
+                out.pop();
+            }
+            Normal(x) => out.push(x),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// Evaluate a configuration rule's `<If>`/`<ElseIf>`/`<Else>` condition.
+/// `chain_state` records whether an earlier branch of each chain matched.
+pub(crate) fn rule_condition_matches(
+    rule: &ScopeRule,
+    req: &crate::http::Request,
+    env: &[(String, String)],
+    peer: IpAddr,
+    docroot: &Path,
+    chain_state: &mut HashMap<usize, bool>,
+) -> bool {
+    let eval = |expr: &crate::expr::Expr| {
+        let mut ctx = crate::expr::Context::new(req, env, peer, docroot);
+        expr.eval(&mut ctx).map(|v| v.truthy()).unwrap_or(false)
+    };
+    match rule.branch {
+        ConditionBranch::Normal => match &rule.condition {
+            None => true,
+            Some(expr) => {
+                let matched = eval(expr);
+                if let Some(chain) = rule.chain {
+                    chain_state.insert(chain, matched);
+                }
+                matched
+            }
+        },
+        ConditionBranch::ElseIf => {
+            let (Some(chain), Some(expr)) = (rule.chain, rule.condition.as_ref()) else {
+                return false;
+            };
+            let prior = chain_state.get(&chain).copied().unwrap_or(false);
+            let matched = !prior && eval(expr);
+            chain_state.insert(chain, prior || matched);
+            matched
+        }
+        ConditionBranch::Else => {
+            let Some(chain) = rule.chain else {
+                return false;
+            };
+            let prior = chain_state.get(&chain).copied().unwrap_or(false);
+            chain_state.insert(chain, true);
+            !prior
+        }
+    }
+}
+
+fn path_has_prefix(path: &Path, prefix: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let path = path.as_os_str().as_bytes();
+    let prefix = prefix.as_os_str().as_bytes();
+    if prefix.is_empty() {
+        return true;
+    }
+    if !path.starts_with(prefix) {
+        return false;
+    }
+    path.len() == prefix.len() || prefix.ends_with(b"/") || path.get(prefix.len()) == Some(&b'/')
+}
+
+fn wildcard_path_matches(pattern: &Path, path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let p = pattern.as_os_str().as_bytes();
+    let n = path.as_os_str().as_bytes();
+    if !p.iter().any(|b| matches!(b, b'*' | b'?' | b'[')) {
+        return path_has_prefix(path, pattern);
+    }
+    let pc: Vec<&[u8]> = p.split(|b| *b == b'/').filter(|c| !c.is_empty()).collect();
+    let nc: Vec<&[u8]> = n.split(|b| *b == b'/').filter(|c| !c.is_empty()).collect();
+    if pc.len() != nc.len() {
+        return false;
+    }
+    pc.iter()
+        .zip(nc.iter())
+        .all(|(pat, name)| glob_match(pat, name))
+}
+
+pub(crate) fn directory_wildcard_matches(pattern: &Path, fs_path: &Path) -> bool {
+    // A <Directory> pattern matches directory ancestors, not the final file
+    // name.  Include fs_path itself only when it names a directory.
+    for (i, ancestor) in fs_path.ancestors().enumerate() {
+        if i == 0 && !fs_path.is_dir() {
+            continue;
+        }
+        if wildcard_path_matches(pattern, ancestor) {
+            return true;
+        }
+    }
+    false
+}
+
+fn directory_pattern_matches_exact(pattern: &Path, dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let pattern_bytes = pattern.as_os_str().as_bytes();
+    if pattern_bytes
+        .iter()
+        .any(|b| matches!(b, b'*' | b'?' | b'['))
+    {
+        wildcard_path_matches(pattern, dir)
+    } else {
+        // Configuration directory patterns are canonicalized; compare bytes
+        // with trailing-slash normalization so non-matching rules do not pay
+        // for repeated `Path::components` parsing on every request.
+        let d = dir.as_os_str().as_bytes();
+        let d = d.strip_suffix(b"/").unwrap_or(d);
+        let p = pattern_bytes.strip_suffix(b"/").unwrap_or(pattern_bytes);
+        d == p
+    }
+}
+
+fn rule_kind_matches(kind: &MatchKind, fs_path: &Path, url_path: &str, fname: &str) -> bool {
+    match kind {
+        MatchKind::Always => true,
+        MatchKind::Directory(p) => {
+            use std::os::unix::ffi::OsStrExt;
+            if p.as_os_str()
+                .as_bytes()
+                .iter()
+                .any(|b| matches!(b, b'*' | b'?' | b'['))
+            {
+                directory_wildcard_matches(p, fs_path)
+            } else {
+                path_has_prefix(fs_path, p)
+            }
+        }
+        MatchKind::DirectoryMatch(re) => re.is_match(&fs_path.to_string_lossy()),
+        MatchKind::Files(re) | MatchKind::FilesMatch(re) => re.is_match(fname),
+        MatchKind::Location(prefix) => {
+            if prefix.is_empty() || prefix == "/" {
+                return true;
+            }
+            if prefix.ends_with('/') {
+                // A Location ending in "/" is a distinct prefix from the same
+                // path without the slash.  Apache does not let
+                // <Location "/admin/"> match the file "/admin".
+                url_path.starts_with(prefix)
+            } else {
+                url_path == prefix
+                    || (url_path.starts_with(prefix)
+                        && url_path.as_bytes().get(prefix.len()) == Some(&b'/'))
+            }
+        }
+        MatchKind::LocationMatch(re) => re.is_match(url_path),
+    }
+}
+
+fn merge_rule_delta(s: &mut Scope, rule: &ScopeRule, fs_path: &Path, url_path: &str) {
+    let mut transformed_rules = None;
+    if !rule.delta.rewrite_policy.rewrite_rules.is_empty() {
+        if let MatchKind::Directory(dir) = &rule.kind {
+            if let Some(base) = Config::url_base_for_directory(dir, fs_path, url_path) {
+                let mut rules = rule.delta.rewrite_policy.rewrite_rules.clone();
+                for rr in &mut rules {
+                    rr.per_dir = true;
+                    rr.match_base = base.clone();
+                    if rr.base == "/" {
+                        rr.base = base.clone();
+                    }
+                }
+                transformed_rules = Some(rules);
+            }
+        }
+    }
+    match transformed_rules {
+        Some(rules) => s.merge_with_rewrite_rules(&rule.delta, &rules),
+        None => s.merge(&rule.delta),
+    }
+}
+
+pub(crate) fn apply_rules_config(
+    rules: &[ScopeRule],
+    s: &mut Scope,
+    fs_path: &Path,
+    url_path: &str,
+    fname: &str,
+) {
+    for rule in rules {
+        if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
+            continue;
+        }
+        if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
+            continue;
+        }
+        merge_rule_delta(s, rule, fs_path, url_path);
+        apply_rules_config(&rule.nested, s, fs_path, url_path, fname);
+    }
+}
+
+/// Apply normal directory/file/location rules first, then all `<If>`-style
+/// conditionals.  Apache documents that `<If>`, `<ElseIf>` and `<Else>` are
+/// applied last; applying them in section order can let a later
+/// `<Directory>` or `<Location>` grant override a conditional denial.
+pub(crate) fn apply_rules_req(
+    rules: &[ScopeRule],
+    s: &mut Scope,
+    req: &crate::http::Request,
+    peer: IpAddr,
+    docroot: &Path,
+    fs_path: &Path,
+    url_path: &str,
+    fname: &str,
+    chain_state: &mut HashMap<usize, bool>,
+) {
+    let mut deferred: Vec<ScopeRule> = Vec::new();
+    collect_rules_req(
+        rules,
+        s,
+        req,
+        peer,
+        docroot,
+        fs_path,
+        url_path,
+        fname,
+        &mut deferred,
+    );
+    deferred.sort_by_key(|rule| rule.order);
+    apply_deferred_req(
+        s,
+        &deferred,
+        req,
+        peer,
+        docroot,
+        fs_path,
+        url_path,
+        fname,
+        chain_state,
+    );
+}
+
+/// Apply every normal rule immediately and collect conditional rules for a
+/// later pass.  Apache applies `<If>`-style sections after Directory, Files
+/// and Location merges; this lets a caller merge `.htaccess` normal rules
+/// before evaluating conditionals from the configuration and from parent
+/// access files.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_rules_req(
+    rules: &[ScopeRule],
+    s: &mut Scope,
+    req: &crate::http::Request,
+    peer: IpAddr,
+    docroot: &Path,
+    fs_path: &Path,
+    url_path: &str,
+    fname: &str,
+    deferred: &mut Vec<ScopeRule>,
+) {
+    for rule in rules {
+        if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
+            continue;
+        }
+        if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
+            deferred.push(rule.clone());
+            continue;
+        }
+        merge_rule_delta(s, rule, fs_path, url_path);
+        collect_rules_req(
+            &rule.nested,
+            s,
+            req,
+            peer,
+            docroot,
+            fs_path,
+            url_path,
+            fname,
+            deferred,
+        );
+    }
+}
+
+/// Apply literal Directory/DirectoryMatch rules and defer Files, Location and
+/// conditional rules.  Apache processes Files after Directory/.htaccess and
+/// Location after Files, so callers must not merge those sections early.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_directory_phase(
+    rules: &[ScopeRule],
+    s: &mut Scope,
+    req: &crate::http::Request,
+    peer: IpAddr,
+    docroot: &Path,
+    fs_path: &Path,
+    url_path: &str,
+    fname: &str,
+    files: &mut Vec<ScopeRule>,
+    locations: &mut Vec<ScopeRule>,
+    conditionals: &mut Vec<ScopeRule>,
+) {
+    for rule in rules {
+        if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
+            continue;
+        }
+        if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
+            conditionals.push(rule.clone());
+            continue;
+        }
+        match rule.kind {
+            MatchKind::Directory(_) | MatchKind::DirectoryMatch(_) => {
+                merge_rule_delta(s, rule, fs_path, url_path);
+                for nested in &rule.nested {
+                    if nested.condition.is_some() || nested.branch != ConditionBranch::Normal {
+                        conditionals.push(nested.clone());
+                    } else {
+                        match nested.kind {
+                            MatchKind::Files(_) | MatchKind::FilesMatch(_) => {
+                                files.push(nested.clone())
+                            }
+                            MatchKind::Location(_) | MatchKind::LocationMatch(_) => {
+                                locations.push(nested.clone())
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            MatchKind::Files(_) | MatchKind::FilesMatch(_) => files.push(rule.clone()),
+            MatchKind::Location(_) | MatchKind::LocationMatch(_) => locations.push(rule.clone()),
+            MatchKind::Always => conditionals.push(rule.clone()),
+        }
+    }
+}
+
+/// Apply a pre-collected Files or Location rule list in order, collecting any
+/// nested conditional sections for the final pass.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_normal_rule_list(
+    rules: &[ScopeRule],
+    s: &mut Scope,
+    req: &crate::http::Request,
+    peer: IpAddr,
+    docroot: &Path,
+    fs_path: &Path,
+    url_path: &str,
+    fname: &str,
+    conditionals: &mut Vec<ScopeRule>,
+) {
+    for rule in rules {
+        if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
+            continue;
+        }
+        if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
+            conditionals.push(rule.clone());
+            continue;
+        }
+        merge_rule_delta(s, rule, fs_path, url_path);
+        for nested in &rule.nested {
+            if nested.condition.is_some() || nested.branch != ConditionBranch::Normal {
+                conditionals.push(nested.clone());
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_deferred_req(
+    s: &mut Scope,
+    rules: &[ScopeRule],
+    req: &crate::http::Request,
+    peer: IpAddr,
+    docroot: &Path,
+    fs_path: &Path,
+    url_path: &str,
+    fname: &str,
+    chain_state: &mut HashMap<usize, bool>,
+) {
+    for rule in rules {
+        apply_conditional_rule(
+            rule,
+            s,
+            req,
+            peer,
+            docroot,
+            fs_path,
+            url_path,
+            fname,
+            chain_state,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_conditional_rule(
+    rule: &ScopeRule,
+    s: &mut Scope,
+    req: &crate::http::Request,
+    peer: IpAddr,
+    docroot: &Path,
+    fs_path: &Path,
+    url_path: &str,
+    fname: &str,
+    chain_state: &mut HashMap<usize, bool>,
+) {
+    let env = s.request_env(req);
+    if !rule_condition_matches(rule, req, &env, peer, docroot, chain_state) {
+        return;
+    }
+    merge_rule_delta(s, rule, fs_path, url_path);
+    apply_rules_req(
+        &rule.nested,
+        s,
+        req,
+        peer,
+        docroot,
+        fs_path,
+        url_path,
+        fname,
+        chain_state,
+    );
+}
+
+fn sort_rules(rules: &mut [ScopeRule]) {
+    rules.sort_by(|a, b| {
+        // Apache's merge order is: <Directory> (least specific first),
+        // then <Files>/<FilesMatch>, then <Location>, then <If> sections.
+        // More specific paths override less specific ones within a class.
+        let ka = match &a.kind {
+            MatchKind::Always => (5, 0),
+            MatchKind::Directory(p) => (0, p.as_os_str().len()),
+            MatchKind::DirectoryMatch(_) => (1, 0),
+            MatchKind::Files(_) | MatchKind::FilesMatch(_) => (2, 0),
+            MatchKind::Location(p) => (3, p.len()),
+            MatchKind::LocationMatch(_) => (4, 0),
+        };
+        let kb = match &b.kind {
+            MatchKind::Always => (5, 0),
+            MatchKind::Directory(p) => (0, p.as_os_str().len()),
+            MatchKind::DirectoryMatch(_) => (1, 0),
+            MatchKind::Files(_) | MatchKind::FilesMatch(_) => (2, 0),
+            MatchKind::Location(p) => (3, p.len()),
+            MatchKind::LocationMatch(_) => (4, 0),
+        };
+        ka.cmp(&kb).then(a.order.cmp(&b.order))
+    });
+}
+
+pub(crate) fn parse_allow_methods(args: &[String]) -> Result<AllowMethods, String> {
+    if args.is_empty() {
+        return Err("AllowMethods requires a method or 'reset'".into());
+    }
+    if args.len() == 1 && args[0].eq_ignore_ascii_case("reset") {
+        return Ok(AllowMethods::Reset);
+    }
+    let mut methods: Vec<String> = Vec::new();
+    for arg in args {
+        if arg.eq_ignore_ascii_case("reset") {
+            return Err("AllowMethods: 'reset' cannot be combined with methods".into());
+        }
+        if !valid_method_token(arg) || !known_http_method(arg) {
+            return Err(format!("AllowMethods: invalid method '{arg}'"));
+        }
+        if !methods.iter().any(|m| m == arg) {
+            methods.push(arg.clone());
+        }
+    }
+    Ok(AllowMethods::Only(methods))
+}
+
+/// Compile a configuration-supplied regex only after the verified dialect
+/// admission check.  The external engine is assumed to implement the accepted
+/// regular subset; PCRE-only constructs are rejected at load time rather than
+/// silently changing meaning.
+pub(crate) fn guard_regex(pattern: &str) -> Result<(), String> {
+    if vapache_verified::regex_dialect_admit(pattern.as_bytes()) {
+        Ok(())
+    } else {
+        Err("unsupported regex dialect: backreferences/look-around/control bytes".into())
+    }
+}
+
+pub(crate) fn compile_regex(pattern: &str) -> Result<Regex, String> {
+    guard_regex(pattern)?;
+    Regex::new(pattern).map_err(|e| e.to_string())
+}
+
+pub(crate) fn compile_files_pattern(args: &[String]) -> Result<MatchKind, String> {
+    if args.is_empty() {
+        return Err("<Files> requires a filename pattern".into());
+    }
+    if args[0] == "~" {
+        let pattern = args[1..].join(" ");
+        return compile_regex(&pattern)
+            .map(MatchKind::FilesMatch)
+            .map_err(|e| format!("bad Files regex: {e}"));
+    }
+    let pattern = args.join(" ");
+    let regex = files_glob_to_regex(&pattern)?;
+    compile_regex(&regex)
+        .map(MatchKind::Files)
+        .map_err(|e| format!("bad Files pattern: {e}"))
+}
+
+/// Translate Apache's <Files> shell-style pattern into an anchored regex.
+/// `*` and `?` match within a basename; `[]`/`[!...]` classes are preserved.
+fn files_glob_to_regex(pattern: &str) -> Result<String, String> {
+    let mut out = String::from("^");
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            '[' => {
+                let mut class = String::new();
+                let mut closed = false;
+                while let Some(cc) = chars.next() {
+                    if cc == ']' {
+                        closed = true;
+                        break;
+                    }
+                    class.push(cc);
+                }
+                if !closed {
+                    out.push_str("\\[");
+                    out.push_str(&regex::escape(&class));
+                    continue;
+                }
+                if let Some(rest) = class.strip_prefix('!') {
+                    class = format!("^{rest}");
+                } else if class.starts_with('^') {
+                    class = format!("\\{class}");
+                }
+                class = class.replace('\\', "\\\\").replace(']', "\\]");
+                out.push('[');
+                out.push_str(&class);
+                out.push(']');
+            }
+            '\\' => match chars.next() {
+                Some(next) => out.push_str(&regex::escape(&next.to_string())),
+                None => out.push_str("\\\\"),
+            },
+            _ => out.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    out.push('$');
+    Ok(out)
+}
+
+pub(crate) fn parse_method_set_args(
+    section: &str,
+    args: &[String],
+    htaccess: bool,
+) -> Result<MethodSet, String> {
+    if args.is_empty() {
+        return Err(format!("<{section}> requires at least one HTTP method"));
+    }
+    let mut methods: Vec<String> = Vec::new();
+    for arg in args {
+        if !valid_method_token(arg) {
+            return Err(format!("invalid HTTP method '{arg}' in <{section}>"));
+        }
+        // Apache maps HEAD onto the GET method number.
+        let method = if arg == "HEAD" { "GET" } else { arg.as_str() };
+        if section == "limit" && method == "TRACE" {
+            return Err("TRACE cannot be controlled by <Limit>, see TraceEnable".into());
+        }
+        // Unknown methods are only registrable from the main configuration;
+        // in .htaccess Apache rejects them.  Rejecting a typo is safer than
+        // silently creating a restriction that never matches.
+        if htaccess && !known_http_method(method) {
+            return Err(format!(
+                "could not register method '{arg}' for <{section}> from .htaccess"
+            ));
+        }
+        if !methods.iter().any(|m| m == method) {
+            methods.push(method.to_string());
+        }
+    }
+    Ok(if section == "limit" {
+        MethodSet::Only(methods)
+    } else {
+        MethodSet::Except(methods)
+    })
+}
+
+fn valid_method_token(method: &str) -> bool {
+    !method.is_empty()
+        && method.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn known_http_method(method: &str) -> bool {
+    matches!(
+        method,
+        "GET"
+            | "HEAD"
+            | "POST"
+            | "PUT"
+            | "DELETE"
+            | "CONNECT"
+            | "OPTIONS"
+            | "TRACE"
+            | "PATCH"
+            | "PROPFIND"
+            | "PROPPATCH"
+            | "MKCOL"
+            | "COPY"
+            | "MOVE"
+            | "LOCK"
+            | "UNLOCK"
+    )
+}
+
+pub(crate) fn require_syntax_error(msg: &str) -> bool {
+    msg.starts_with("bad Require ip")
+        || msg.starts_with("Require ip needs")
+        || msg.starts_with("bad Require method")
+        || msg.starts_with("Require all needs")
+        || msg.starts_with("empty Require")
+        || msg.starts_with("incomplete Require")
+        || msg.starts_with("Require env requires")
+        || msg.starts_with("empty Require env variable")
+        || msg.starts_with("bad Require expr")
+        || msg.starts_with("unknown Require provider")
+}
+
+pub(crate) fn parse_require(args: &[String]) -> Require {
+    if args.is_empty() {
+        return Require::Unsupported("empty Require".into());
+    }
+    let mut idx = 0;
+    let mut negate = false;
+    if args[0].eq_ignore_ascii_case("not") {
+        negate = true;
+        idx = 1;
+    }
+    if idx >= args.len() {
+        return Require::Unsupported("incomplete Require".into());
+    }
+    let kind = args[idx].to_ascii_lowercase();
+    let rest = &args[idx + 1..];
+    match kind.as_str() {
+        "all" if !negate => {
+            if rest
+                .first()
+                .map(|s| s.eq_ignore_ascii_case("granted"))
+                .unwrap_or(false)
+            {
+                Require::AllGranted
+            } else if rest
+                .first()
+                .map(|s| s.eq_ignore_ascii_case("denied"))
+                .unwrap_or(false)
+            {
+                Require::AllDenied
+            } else {
+                Require::Unsupported("Require all needs granted/denied".into())
+            }
+        }
+        "ip" => {
+            if rest.is_empty() {
+                return Require::Unsupported("Require ip needs an address".into());
+            }
+            let mut nets = Vec::new();
+            for a in rest {
+                match parse_ip_net(a) {
+                    Some(n) => nets.push(n),
+                    None => return Require::Unsupported(format!("bad Require ip '{a}'")),
+                }
+            }
+            Require::Ip { negate, nets }
+        }
+        "local" => Require::Local { negate },
+        "host" => Require::Host {
+            negate,
+            names: rest.to_vec(),
+        },
+        "method" => {
+            let methods: Vec<String> = rest.iter().map(|s| s.to_ascii_uppercase()).collect();
+            if methods.is_empty() || methods.iter().any(|m| !known_http_method(m)) {
+                return Require::Unsupported("bad Require method".into());
+            }
+            Require::Method { negate, methods }
+        }
+        "env" => {
+            let Some(item) = args.get(1) else {
+                return Require::Unsupported("Require env requires a variable".into());
+            };
+            let (name, value) = match item.split_once('=') {
+                Some((n, v)) => (n.to_string(), Some(v.to_string())),
+                None => (item.to_string(), None),
+            };
+            if name.is_empty() {
+                return Require::Unsupported("empty Require env variable".into());
+            }
+            Require::Env {
+                negate,
+                name,
+                value,
+            }
+        }
+        "expr" => {
+            let text = args[1..].join(" ");
+            match crate::expr::parse(&text) {
+                Ok(e) => Require::Expr(e),
+                Err(e) => Require::Unsupported(format!("bad Require expr: {e}")),
+            }
+        }
+        "valid-user" => Require::ValidUser,
+        "user" => Require::User {
+            negate,
+            names: rest.to_vec(),
+        },
+        "group" => Require::Group {
+            negate,
+            names: rest.to_vec(),
+        },
+        "dbm" | "dbd" | "ldap" | "file" => {
+            Require::Unsupported("this authentication provider is not implemented".into())
+        }
+        other => Require::Unsupported(format!("unknown Require provider '{other}'")),
+    }
+}
+
+pub(crate) fn parse_rewrite_flags(args: &[String]) -> Result<RewriteFlags, String> {
+    let raw = args.join(",");
+    let raw = raw.trim().replace('[', "").replace(']', "");
+    let mut out = RewriteFlags::default();
+    if raw.is_empty() {
+        return Ok(out);
+    }
+    for flag in raw.split(',') {
+        let flag = flag.trim();
+        if flag.is_empty() {
+            continue;
+        }
+        let upper = flag.to_ascii_uppercase();
+        match upper.as_str() {
+            "L" => out.last = true,
+            "END" => {
+                out.last = true;
+                out.end = true;
+            }
+            "QSA" => out.qsa = true,
+            "NC" => out.nocase = true,
+            "NE" => out.noescape = true,
+            "PT" => out.passthrough = true,
+            "P" => out.proxy = true,
+            "C" => out.chain = true,
+            "N" => out.next = true,
+            "QSD" => out.qsd = true,
+            "QSL" => out.qslast = true,
+            "UNSAFEALLOW3F" => out.unsafe_allow_3f = true,
+            "B" => out.escape_backrefs = true,
+            "BNE" => out.noescape_backrefs = true,
+            "BNP" => out.backref_no_plus = true,
+            "BCTLS" => {
+                out.escape_backrefs = true;
+                out.escape_controls = true;
+            }
+            "UNSAFEPREFIXSTAT" => out.unsafe_prefix_stat = true,
+            "DPI" => {}
+            "F" => out.forbidden = true,
+            "G" => out.gone = true,
+            "R" => out.redirect = Some(302),
+            _ if upper.starts_with("R=") => {
+                let value = &upper[2..];
+                let code = match value {
+                    "PERMANENT" => 301,
+                    "TEMP" => 302,
+                    "SEEOTHER" => 303,
+                    _ => value
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid RewriteRule redirect status '{value}'"))?,
+                };
+                if !(300..=599).contains(&code) {
+                    return Err(format!("invalid RewriteRule redirect status '{value}'"));
+                }
+                out.redirect = Some(code);
+            }
+            _ if upper.starts_with("B=") => {
+                out.escape_backrefs = true;
+                out.escape_chars = flag[2..].to_string();
+            }
+            _ if upper.starts_with("BNE=") => {
+                out.noescape_backrefs = true;
+                out.noescape_chars = flag[4..].to_string();
+            }
+            _ if upper.starts_with("E=") => {
+                let raw = &flag[2..];
+                if let Some(name) = raw.strip_prefix('!') {
+                    out.env.push((name.to_string(), None));
+                } else if let Some((k, v)) = raw.split_once(':') {
+                    out.env.push((k.to_string(), Some(v.to_string())));
+                } else {
+                    out.env.push((raw.to_string(), Some(String::new())));
+                }
+            }
+            _ if upper.starts_with("CO=") => {
+                out.cookies.push(flag[3..].to_string());
+            }
+            _ if upper.starts_with("H=") => {
+                out.handler = Some(flag[2..].to_string());
+            }
+            _ if upper.starts_with("T=") => {
+                out.content_type = Some(flag[2..].to_string());
+            }
+            _ if upper.starts_with("S=") => {
+                out.skip = Some(
+                    upper[2..]
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid RewriteRule skip value '{flag}'"))?,
+                );
+            }
+            // These flags affect environment/filter bookkeeping or subrequests,
+            // not URL resolution or access decisions.  They are accepted for
+            // compatibility and intentionally have no effect.
+            "NS" => {}
+            _ => return Err(format!("unsupported RewriteRule flag '[{flag}]'")),
+        }
+    }
+    Ok(out)
+}
+
+fn reject_rewrite_lookahead(value: &str) -> Result<(), String> {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("%{la-") || lower.contains("${la-") {
+        return Err("mod_rewrite lookahead (%{LA-...}) is unsupported and fails closed".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_rewrite_cond(args: &[String]) -> Result<RewriteCond, String> {
+    for arg in args {
+        reject_rewrite_lookahead(arg)?;
+    }
+    if args.first().map(|a| a.eq_ignore_ascii_case("expr")) == Some(true) {
+        let mut flags = RewriteCondFlags::default();
+        let mut end = args.len();
+        if let Some(raw) = args.last() {
+            if raw.trim_start().starts_with('[') {
+                let raw = raw.trim().replace(['[', ']'], "");
+                for flag in raw.split(',') {
+                    match flag.trim().to_ascii_uppercase().as_str() {
+                        "NC" => flags.nocase = true,
+                        "OR" => flags.or = true,
+                        other => return Err(format!("unsupported RewriteCond flag '[{other}]'")),
+                    }
+                }
+                end -= 1;
+            }
+        }
+        let expr = crate::expr::parse(&args[1..end].join(" "))
+            .map_err(|e| format!("bad RewriteCond expr: {e}"))?;
+        return Ok(RewriteCond {
+            test: String::new(),
+            pattern: String::new(),
+            flags,
+            regex: None,
+            expr: Some(expr),
+        });
+    }
+    if args.len() < 2 {
+        return Err("RewriteCond requires a test string and a pattern".into());
+    }
+    let mut flags = RewriteCondFlags::default();
+    let raw = args[2..].join(",");
+    let raw = raw.trim().replace('[', "").replace(']', "");
+    if !raw.is_empty() {
+        for flag in raw.split(',') {
+            match flag.trim().to_ascii_uppercase().as_str() {
+                "NC" => flags.nocase = true,
+                "OR" => flags.or = true,
+                "AND" => {}
+                "" => {}
+                other => return Err(format!("unsupported RewriteCond flag '[{other}]'")),
+            }
+        }
+    }
+    let raw_pattern = args[1].as_str();
+    if raw_pattern.contains("%{") || raw_pattern.contains("${") {
+        return Err("variables are not supported in RewriteCond patterns".into());
+    }
+    let stripped = raw_pattern.strip_prefix('!').unwrap_or(raw_pattern);
+    let regex = if stripped.starts_with("-f")
+        || stripped.starts_with("-d")
+        || stripped.starts_with("-s")
+        || stripped.starts_with("-l")
+        || stripped.starts_with('=')
+    {
+        None
+    } else {
+        {
+            guard_regex(stripped)?;
+            Some(Arc::new(
+                regex::RegexBuilder::new(stripped)
+                    .case_insensitive(flags.nocase)
+                    .build()
+                    .map_err(|e| format!("invalid RewriteCond pattern: {e}"))?,
+            ))
+        }
+    };
+    Ok(RewriteCond {
+        test: args[0].clone(),
+        pattern: args[1].clone(),
+        flags,
+        regex,
+        expr: None,
+    })
+}
+
+pub(crate) fn parse_rewrite_rule(
+    args: &[String],
+    base: &str,
+    per_dir: bool,
+) -> Result<RewriteRule, String> {
+    if args.len() < 2 {
+        return Err("RewriteRule requires a pattern and substitution".into());
+    }
+    for arg in args.iter().take(2) {
+        reject_rewrite_lookahead(arg)?;
+    }
+    let flags = parse_rewrite_flags(&args[2..])?;
+    if flags.proxy && !proxy_template_authority_safe(&args[1]) {
+        return Err(
+            "RewriteRule [P] authority may not be derived from a request capture or variable"
+                .into(),
+        );
+    }
+    let raw_pattern = &args[0];
+    if raw_pattern.contains("%{") || raw_pattern.contains("${") {
+        return Err("variables are not supported in RewriteRule patterns".into());
+    }
+    let (negated, pattern) = match raw_pattern.strip_prefix('!') {
+        Some(p) => (true, p),
+        None => (false, raw_pattern.as_str()),
+    };
+    guard_regex(pattern)?;
+    let pattern = regex::RegexBuilder::new(pattern)
+        .case_insensitive(flags.nocase)
+        .build()
+        .map_err(|e| format!("invalid RewriteRule pattern: {e}"))?;
+    Ok(RewriteRule {
+        pattern: Arc::new(pattern),
+        negated,
+        substitution: args[1].clone(),
+        flags,
+        conditions: Vec::new(),
+        base: normalize_rewrite_base(base),
+        match_base: normalize_rewrite_base(base),
+        per_dir,
+    })
+}
+
+pub(crate) fn normalize_rewrite_base(base: &str) -> String {
+    if base.is_empty() {
+        return "/".into();
+    }
+    let mut out = String::with_capacity(base.len() + 2);
+    if !base.starts_with('/') {
+        out.push('/');
+    }
+    out.push_str(base);
+    if !out.ends_with('/') {
+        out.push('/');
+    }
+    out
+}
+
+pub(crate) fn parse_ip_net(s: &str) -> Option<(IpAddr, u8)> {
+    let (ip, bits) = match s.split_once('/') {
+        Some((ip, b)) => (ip, Some(b)),
+        None => (s, None),
+    };
+    let addr: IpAddr = ip.parse().ok()?;
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    let bits = match bits {
+        Some(b) => b.parse::<u8>().ok()?,
+        None => max,
+    };
+    if bits > max {
+        return None;
+    }
+    Some((addr, bits))
+}
+
+fn parse_listen(s: &str) -> Result<ListenSpec, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty Listen".into());
+    }
+    let (addr, port) = if let Some(rest) = s.strip_prefix('[') {
+        let end = rest.find(']').ok_or("bad IPv6 Listen address")?;
+        let a = &rest[..end];
+        let after = &rest[end + 1..];
+        let p = after.strip_prefix(':').unwrap_or("80");
+        (a.to_string(), p.to_string())
+    } else if let Some((a, p)) = s.rsplit_once(':') {
+        if a.contains(':') {
+            // IPv6 without brackets.
+            (s.to_string(), "80".to_string())
+        } else {
+            (a.to_string(), p.to_string())
+        }
+    } else {
+        ("0.0.0.0".to_string(), s.to_string())
+    };
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("invalid Listen port in '{s}'"))?;
+    let addr = if addr.is_empty() || addr == "*" {
+        "0.0.0.0".to_string()
+    } else {
+        addr
+    };
+    Ok(ListenSpec {
+        raw: s.to_string(),
+        addr,
+        port,
+    })
+}
+
+/// Directives whose absence would silently weaken an access, authorization,
+/// proxy, filter or path policy.  These must fail closed even in compatibility
+/// mode; a harmless module directive may be ignored, but a security control
+/// may not.
+/// Security-relevant directives whose absence would silently weaken a
+/// policy.  Handled directives never reach the fallback; this classifier is
+/// deliberately broader than the explicit list so an unknown member of an
+/// auth/TLS/proxy/filter/DAV/LDAP/cache family fails closed too.
+fn is_security_directive(name: &str) -> bool {
+    if fail_closed_directives().contains(name) {
+        return true;
+    }
+    [
+        "acceptpathinfo",
+        "allowconnect",
+        "auth",
+        "cache",
+        "dav",
+        "extfilter",
+        "filter",
+        "ldap",
+        "proxy",
+        "requestheader",
+        "sec",
+        "setenvifexpr",
+        "ssl",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+}
+
+fn fail_closed_directives() -> HashSet<&'static str> {
+    [
+        "acceptpathinfo",
+        "authnprovideralias",
+        "authzprovideralias",
+        "extfilterdefine",
+        "extfilteroptions",
+        "filterchain",
+        "filterdeclare",
+        "filterprovider",
+        "outputfilterbytype",
+        "proxyblock",
+        "requestheader",
+        "setenvifexpr",
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn proxy_template_authority_safe(value: &str) -> bool {
+    let value = value.trim();
+    let Some((_, rest)) = value.split_once("://") else {
+        // Non-URL backends (notably Unix FastCGI sockets) must not be
+        // derivable from a rewrite capture either.
+        return !value.contains("$") && !value.contains("%{");
+    };
+    let end = rest
+        .find(|c| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
+    let authority = &rest[..end];
+    !authority.is_empty()
+        && !authority.contains('$')
+        && !authority.contains('%')
+        && !authority.contains('@')
+}
+
+fn supported_proxy_backend(value: &str, allow_fastcgi: bool) -> bool {
+    let value = value.trim();
+    value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("ws://")
+        || value.starts_with("wss://")
+        || value.starts_with("balancer://")
+        || (allow_fastcgi && value.starts_with("unix:"))
+}
+
+fn known_directives() -> HashSet<&'static str> {
+    // Directives from modules not yet implemented.  Keeping an explicit list
+    // (rather than accepting every unknown token) means a typo in a security
+    // directive is still a startup error under --strict-config.
+    [
+        "acceptfilter",
+        "acceptpathinfo",
+        "accessfilename",
+        "action",
+        "addalt",
+        "addaltbyencoding",
+        "addaltbytype",
+        "addcharset",
+        "adddefaultcharset",
+        "adddescription",
+        "addencoding",
+        "addhandler",
+        "addicon",
+        "addiconbyencoding",
+        "addiconbytype",
+        "addlanguage",
+        "addmoduleinfo",
+        "addoutputfilter",
+        "addoutputfilterbytype",
+        "addtype",
+        "alias",
+        "aliasmatch",
+        "allow",
+        "allowconnect",
+        "allowencodedslashes",
+        "allowmethods",
+        "allowoverride",
+        "allowoverridelist",
+        "authbasicauthoritative",
+        "authbasicfake",
+        "authbasicprovider",
+        "authbasicusedigestalgorithm",
+        "authcache",
+        "authdbmtype",
+        "authdbmuserfile",
+        "authdigestalgorithm",
+        "authdigestdomain",
+        "authdigestnccheck",
+        "authdigestnonceformat",
+        "authdigestnoncelifetime",
+        "authdigestprovider",
+        "authdigestqop",
+        "authdigestshmemsize",
+        "authformauthoritative",
+        "authformbody",
+        "authformfakebasicauth",
+        "authformlocation",
+        "authformlogintimeout",
+        "authformmethod",
+        "authformmimetype",
+        "authformpassword",
+        "authformprovider",
+        "authformsitepassphrase",
+        "authformsize",
+        "authformusername",
+        "authgroupfile",
+        "authldapbindauthoritative",
+        "authldapbinddn",
+        "authldapbindpassword",
+        "authldapcharsetconfig",
+        "authldapcompareasuser",
+        "authldapcomparednonserver",
+        "authldapderefaliases",
+        "authldapgroupattribute",
+        "authldapgroupattributeisdn",
+        "authldapinitialbindasuser",
+        "authldapinitialbindpattern",
+        "authldapmaxsubgroupdepth",
+        "authldapreferrals",
+        "authldapremoteuserattribute",
+        "authldapremoteuserisdn",
+        "authldapurl",
+        "authmerging",
+        "authname",
+        "authnprovideralias",
+        "authntrace",
+        "authtype",
+        "authuserfile",
+        "authzprovideralias",
+        "browsermatch",
+        "browseripmatch",
+        "buffersize",
+        "cachedefaultexpire",
+        "cachedetailheader",
+        "cachedirlength",
+        "cachedirlevels",
+        "cachedisable",
+        "cacheenable",
+        "cachefile",
+        "cacheheader",
+        "cacheignorecachecontrol",
+        "cacheignoreheaders",
+        "cacheignorenolastmod",
+        "cacheignorequerystring",
+        "cachelastmodifiedfactor",
+        "cachelock",
+        "cachemaxexpire",
+        "cachemaxfilesize",
+        "cacheminsize",
+        "cacheminexpire",
+        "cachenegotiateddocs",
+        "cachequickhandler",
+        "cachereadsize",
+        "cachereadsize",
+        "cacheremote",
+        "cacheroot",
+        "cachesocache",
+        "cachesocachemaxobjectsize",
+        "cachesocachemaxstreamingbuffersize",
+        "cachesocacheminobjectsize",
+        "cachesochereadsize",
+        "cachestorenostore",
+        "cachestoreprivate",
+        "cachestoresession",
+        "cachettl",
+        "cgidscripttimeout",
+        "charsetdefault",
+        "charsetoptions",
+        "charsetsourceenc",
+        "checkcaseonly",
+        "checkspelling",
+        "contentdigest",
+        "cookiedomain",
+        "cookieexpires",
+        "cookiename",
+        "cookiestyle",
+        "cookietracking",
+        "coredumpdirectory",
+        "customlog",
+        "dav",
+        "davdepthinfinity",
+        "davgenericlockdb",
+        "davlockdb",
+        "davmintimeout",
+        "dbdexptime",
+        "dbdkeep",
+        "dbdmax",
+        "dbdmin",
+        "dbdparams",
+        "dbdpersist",
+        "dbdpreparesql",
+        "dbdriver",
+        "defaulticon",
+        "defaultlanguage",
+        "defaultruntimedir",
+        "defaulttype",
+        "deflatebuffersize",
+        "deflatecompressionlevel",
+        "deflatefilternote",
+        "deflatememlevel",
+        "deflatewindowssize",
+        "definemodule",
+        "definemodulesql",
+        "deny",
+        "directory",
+        "directoryindex",
+        "directorymatch",
+        "directoryslash",
+        "disableimagemaps",
+        "documentroot",
+        "dumpioinput",
+        "dumpiooutput",
+        "enablemmap",
+        "enablesendfile",
+        "enableexceptionhook",
+        "errordocument",
+        "errorlog",
+        "errorlogformat",
+        "expiresactive",
+        "expiresbytype",
+        "expiresdefault",
+        "extendedstatus",
+        "extfilterdefine",
+        "extfilteroptions",
+        "fallbackresource",
+        "fileetag",
+        "files",
+        "filesmatch",
+        "filterchain",
+        "filterdeclare",
+        "filterprotocol",
+        "filterprovider",
+        "filtertrace",
+        "forceauthoritative",
+        "forcelanguagepriority",
+        "forcetype",
+        "forensiclog",
+        "globalmutex",
+        "group",
+        "header",
+        "headerif",
+        "headername",
+        "heartbeataddress",
+        "heartbeatlisten",
+        "heartbeatserver",
+        "heartbeatstorage",
+        "hostnamelookups",
+        "identitycheck",
+        "identitychecktimeout",
+        "imapbase",
+        "imapdefault",
+        "imapmenu",
+        "include",
+        "includeoptional",
+        "indexignore",
+        "indexlegend",
+        "indexoptions",
+        "indexorderdefault",
+        "indexstylesheet",
+        "inputfilter",
+        "isapiimplements",
+        "isapilognotsupported",
+        "isapireadaheadbuffer",
+        "keepalive",
+        "keepalivetimeout",
+        "keptbodysize",
+        "languagepriority",
+        "ldapcacheentries",
+        "ldapcachettl",
+        "ldapconnectiontimeout",
+        "ldapopcacheentries",
+        "ldapopcachettl",
+        "ldapreferralhoplimit",
+        "ldapreferrals",
+        "ldapretries",
+        "ldapretrydelay",
+        "ldapsharedcachefile",
+        "ldapsharedcachesize",
+        "ldaptrustedca",
+        "ldaptrustedcatype",
+        "ldaptrustedclientcert",
+        "ldaptrustedglobalcert",
+        "ldaptrustedmode",
+        "ldapverifyservercert",
+        "limit",
+        "limitexcept",
+        "limitinternalrecursion",
+        "limitrequestbody",
+        "limitrequestfields",
+        "limitrequestfieldsize",
+        "limitrequestline",
+        "limitxmlrequestbody",
+        "listen",
+        "gracefulshutdowntimeout",
+        "gracefulshutdowntimeout",
+        "maxconnectionsperchild",
+        "listenbacklog",
+        "loadfile",
+        "loadmodule",
+        "logformat",
+        "loglevel",
+        "logmessage",
+        "maxclients",
+        "maxkeepaliverequests",
+        "maxmemfree",
+        "maxrangeoverlaps",
+        "maxranges",
+        "maxrequestworkers",
+        "maxspareservers",
+        "maxsparethreads",
+        "maxthreads",
+        "maxthreadsperchild",
+        "mcachemaxobjectcount",
+        "mcachemaxobjectsize",
+        "mcachemaxstreamingbuffersize",
+        "mcacheminobjectsize",
+        "mcacheremovalalgorithm",
+        "mcachesize",
+        "metadir",
+        "metafiles",
+        "metasuffix",
+        "mimemagicfile",
+        "minspareservers",
+        "minsparethreads",
+        "modmimeuseapachemagic",
+        "multiviewsmatch",
+        "mutex",
+        "namevirtualhost",
+        "negotiationengine",
+        "nwssltrustedcerts",
+        "nwsslupgradeable",
+        "options",
+        "order",
+        "outputfilterbytype",
+        "passenv",
+        "pidfile",
+        "privilegesmode",
+        "protocol",
+        "protocols",
+        "protocolshonororder",
+        "proxy",
+        "proxybadheader",
+        "proxyblock",
+        "proxydomain",
+        "proxyerroroverride",
+        "proxyfcgibackendtype",
+        "proxyfcgisendenv",
+        "proxyftpallowmdtm",
+        "proxyiobuffersize",
+        "proxymatch",
+        "proxymaxforwards",
+        "proxyhccheck",
+        "proxyhctemplate",
+        "proxypass",
+        "proxypassinherit",
+        "proxypassinterpolateenv",
+        "proxypassmatch",
+        "proxypassnobuffer",
+        "proxypassreverse",
+        "proxypassreversecookiepath",
+        "proxypassreversecookiedomain",
+        "proxypreservehost",
+        "proxyreceivebuffersize",
+        "proxyremote",
+        "proxyremotematch",
+        "proxyrequests",
+        "proxyset",
+        "proxysource",
+        "proxystatus",
+        "proxytimeout",
+        "proxyvia",
+        "readmename",
+        "redirect",
+        "redirectmatch",
+        "redirectpermanent",
+        "redirecttemp",
+        "reflectorheader",
+        "refurl",
+        "removetype",
+        "removecharset",
+        "removeencoding",
+        "removehandler",
+        "removeinputfilter",
+        "removeoutputfilter",
+        "requestheader",
+        "requestreadtimeout",
+        "require",
+        "rewritebase",
+        "rewritecond",
+        "rewriteengine",
+        "rewriteinherit",
+        "rewritelock",
+        "rewriteloglevel",
+        "rewritemap",
+        "rewriteoptions",
+        "rewriterule",
+        "rlimitcpu",
+        "rlimitmem",
+        "rlimitnofile",
+        "rlimitnproc",
+        "satisfy",
+        "scoreboardfile",
+        "script",
+        "scriptalias",
+        "scriptaliasmatch",
+        "scriptinterpretersource",
+        "scriptlog",
+        "scriptlogbuffer",
+        "scriptloglength",
+        "seccacherequestheader",
+        "seccacherequestheader",
+        "seccacherequestheaders",
+        "seccacherequesttime",
+        "seccachesocache",
+        "seccachesocacheexpiry",
+        "seccheckerreq",
+        "seccheckerreq",
+        "secdebuglog",
+        "secdebugloglevel",
+        "secdefaultaction",
+        "secrule",
+        "secruleengine",
+        "secruleinheritance",
+        "secruleremovebyid",
+        "secruleremovetargetbyid",
+        "secrulevariables",
+        "secserverlocale",
+        "secuploaddir",
+        "secuploadfilelimit",
+        "secdownloaddir",
+        "secauditengine",
+        "secauditlog",
+        "secauditlogparts",
+        "secauditlogtype",
+        "secbodyinspectionlimit",
+        "seccollectiontimeout",
+        "seccookieformat",
+        "seccontentinjection",
+        "secdatadirstorage",
+        "secstatusengine",
+        "serveradmin",
+        "serverlimit",
+        "serveralias",
+        "servername",
+        "serverpath",
+        "serverroot",
+        "serversignature",
+        "servertokens",
+        "session",
+        "sessioncookiename",
+        "sessioncookiessecure",
+        "sessioncookiepath",
+        "sessionmaxage",
+        "setenv",
+        "setenvif",
+        "setenvifexpr",
+        "setenvifnocase",
+        "sethandler",
+        "singlelisten",
+        "sslcacertificatefile",
+        "sslcacertificatepath",
+        "sslcarevocationfile",
+        "sslcarevocationpath",
+        "sslciphersuite",
+        "sslcompression",
+        "sslcryptodevice",
+        "sslengine",
+        "sslfips",
+        "sslhonorcipherorder",
+        "sslinsecurerenegotiation",
+        "sslocspdefaultresponder",
+        "sslocspenable",
+        "sslocspnoverify",
+        "sslocspoverrideresponder",
+        "sslocsprespondertimeout",
+        "sslocspuserequestnonce",
+        "sslopensslconfcmd",
+        "ssloptions",
+        "sslpassphrasedialog",
+        "sslprotocol",
+        "sslrequire",
+        "sslproxycacertificatefile",
+        "sslproxycacertificatepath",
+        "sslproxycarevocationfile",
+        "sslproxycarevocationpath",
+        "sslproxycheckpeercn",
+        "sslproxycheckpeerexpire",
+        "sslproxyciphersuite",
+        "sslproxyengine",
+        "sslproxymachinecertificatechainfile",
+        "sslproxymachinecertificatefile",
+        "sslproxymachinecertificatepath",
+        "sslproxyprotocol",
+        "sslproxyverify",
+        "sslproxyverifydepth",
+        "sslrandomseed",
+        "sslrenegbuffersize",
+        "sslrequiressl",
+        "sslsessioncache",
+        "sslsessioncachetimeout",
+        "sslsessionticketkeyfile",
+        "sslsessionticketkeys",
+        "sslsessiontickets",
+        "sslstaplingcache",
+        "sslstaplingforceurl",
+        "sslstaplingrespondertimeout",
+        "sslstaplingreturnrespondererrors",
+        "sslstaplingstandardcachetimeout",
+        "sslstaplingstaplingnoverify",
+        "sslstrictpeernamecheck",
+        "sslstrictpeernamecheck",
+        "sslusername",
+        "sslusestapling",
+        "sslverifyclient",
+        "sslverifydepth",
+        "sslcertificatechainfile",
+        "sslcertificatefile",
+        "sslcertificatekeyfile",
+        "sslcrlfile",
+        "sslproxycrlfile",
+        "sslcertificatefile",
+        "startservers",
+        "status",
+        "substitute",
+        "substituteinheritance",
+        "suexec",
+        "suexecusergroup",
+        "threadlimit",
+        "threadsperchild",
+        "threadstacksize",
+        "timeout",
+        "traceenable",
+        "transferlog",
+        "typesconfig",
+        "undefine",
+        "unsetenv",
+        "usecanonicalname",
+        "usecanonicalphysicalport",
+        "user",
+        "userdir",
+        "userdirnegotiation",
+        "variantname",
+        "virtualhost",
+        "xml2encalias",
+        "xml2encdefault",
+        "xml2encrequires",
+        "xsltengine",
+        "xsltlocale",
+        "xsltprocenv",
+        "sslstaplingcache",
+        "sslcertificatefile",
+        "protocols",
+        "protocoldirective",
+    ]
+    .into_iter()
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regex_dialect_guard_rejects_unsupported_constructs() {
+        assert!(compile_regex("^/index\\.html$").is_ok());
+        assert!(compile_regex("(?i:index)").is_ok());
+        assert!(compile_regex("(?=index)").is_err());
+        assert!(compile_regex("(index)\\1").is_err());
+        assert!(compile_regex("(?<!x)y").is_err());
+    }
+
+    fn require_entries(policy: Option<AuthPolicy>) -> Vec<RequireEntry> {
+        match policy {
+            Some(AuthPolicy::List(entries)) => entries,
+            other => panic!("expected a flat Require list, got {other:?}"),
+        }
+    }
+
+    fn test_request(method: &str) -> crate::http::Request {
+        crate::http::Request {
+            method: method.into(),
+            target: b"/x".to_vec(),
+            raw_path: b"/x".to_vec(),
+            query: Vec::new(),
+            version: crate::http::Version::Http11,
+            headers: crate::http::Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        }
+    }
+
+    #[test]
+    fn globs() {
+        assert!(glob_match(b"*.conf", b"site.conf"));
+        assert!(!glob_match(b"*.conf", b"site.txt"));
+        assert!(glob_match(b"a?c", b"abc"));
+        assert!(glob_match(b"[abc]x", b"bx"));
+        assert!(glob_match(b"[!abc]x", b"dx"));
+    }
+
+    #[test]
+    fn require_parse() {
+        let r = parse_require(&["all".into(), "granted".into()]);
+        assert!(matches!(r, Require::AllGranted));
+        let r = parse_require(&["ip".into(), "10.0.0.0/8".into()]);
+        match r {
+            Require::Ip { nets, .. } => assert_eq!(nets.len(), 1),
+            _ => panic!(),
+        }
+        let r = parse_require(&["expr".into(), "true".into()]);
+        assert!(matches!(r, Require::Expr(_)));
+        let r = parse_require(&["env".into(), "ALLOW_ME".into()]);
+        assert!(matches!(r, Require::Env { .. }));
+    }
+
+    #[test]
+    fn listen_parse() {
+        assert_eq!(parse_listen("8080").unwrap().port, 8080);
+        assert_eq!(parse_listen("127.0.0.1:8081").unwrap().addr, "127.0.0.1");
+        assert_eq!(parse_listen("[::1]:8082").unwrap().addr, "::1");
+    }
+
+    fn load_text(text: &str, strict: bool) -> Result<Config, Vec<ConfigError>> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "vapache-config-test-{}-{}.conf",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, text).unwrap();
+        let result = Config::load(
+            &path,
+            std::env::temp_dir().as_path(),
+            &HashMap::new(),
+            &HashMap::new(),
+            strict,
+        );
+        let _ = std::fs::remove_file(path);
+        result
+    }
+
+    #[test]
+    fn ssl_directives_and_listen_protocol() {
+        let cfg = "Listen 127.0.0.1:443 https\n\
+<VirtualHost *:443>\n\
+SSLEngine on\n\
+SSLCertificateFile /etc/ssl/cert.pem\n\
+SSLCertificateKeyFile /etc/ssl/key.pem\n\
+SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
+</VirtualHost>\n";
+        let c = load_text(cfg, false).unwrap();
+        assert_eq!(c.listeners.len(), 1);
+        assert_eq!(c.listeners[0].port, 443);
+        let v = &c.vhosts[0];
+        assert!(v.ssl.engine);
+        assert_eq!(
+            v.ssl.cert_file.as_deref(),
+            Some(std::path::Path::new("/etc/ssl/cert.pem"))
+        );
+        assert_eq!(
+            v.ssl.key_file.as_deref(),
+            Some(std::path::Path::new("/etc/ssl/key.pem"))
+        );
+        assert!(v.ssl.protocols.as_deref().unwrap().contains("TLSv1.1"));
+    }
+
+    #[test]
+    fn ssl_engine_off_is_not_overridden_by_global_on() {
+        let cfg = "SSLEngine on\nListen 127.0.0.1:443\n\
+<VirtualHost *:443>\nSSLEngine off\n</VirtualHost>\n";
+        let c = load_text(cfg, false).unwrap();
+        assert!(!c.vhosts[0].ssl.engine);
+    }
+
+    #[test]
+    fn allow_override_all_is_supported() {
+        let cfg = "Listen 127.0.0.1:0\n<Directory /srv>\nAllowOverride All\n</Directory>\n";
+        let c = load_text(cfg, false).unwrap();
+        assert!(!c.warnings.iter().any(|w| w.contains("AllowOverride")));
+        assert!(load_text(cfg, true).is_ok());
+
+        let cfg = "Listen 127.0.0.1:0\n<Directory /srv>\nAllowOverride None\n</Directory>\n";
+        let c = load_text(cfg, false).unwrap();
+        assert!(!c.warnings.iter().any(|w| w.contains("AllowOverride")));
+        assert!(load_text(cfg, true).is_ok());
+
+        let cfg = "Listen 127.0.0.1:0\n<Directory /srv>\nAllowOverride AuthConfig FileInfo Options\n</Directory>\n";
+        let c = load_text(cfg, false).unwrap();
+        assert!(!c.warnings.iter().any(|w| w.contains("AllowOverride")));
+        let s = c.effective_scope(None, Path::new("/srv/file"), "/file");
+        assert_eq!(
+            s.override_policy.raw_mode(),
+            Some(OverrideMode::Categories(OverrideCategories(
+                OverrideCategories::AUTH_CONFIG
+                    | OverrideCategories::FILE_INFO
+                    | OverrideCategories::OPTIONS
+            )))
+        );
+        assert!(load_text(cfg, true).is_ok());
+
+        let cfg =
+            "Listen 127.0.0.1:0\n<Directory /srv>\nAllowOverride NotACategory\n</Directory>\n";
+        assert!(load_text(cfg, false).is_err());
+        assert!(load_text(cfg, true).is_err());
+
+        let cfg = "Listen 127.0.0.1:0\n<Directory /srv>\nAllowOverride AuthConfig NotACategory\n</Directory>\n";
+        let c = load_text(cfg, false).unwrap();
+        assert!(c
+            .warnings
+            .iter()
+            .any(|w| w.contains("unsupported AllowOverride")));
+        assert!(load_text(cfg, true).is_err());
+    }
+
+    #[test]
+    fn per_location_client_authentication_is_rejected() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:443 https\n",
+            "<VirtualHost *:443>\n",
+            "SSLEngine on\n",
+            "SSLCertificateFile /etc/ssl/cert.pem\n",
+            "SSLCertificateKeyFile /etc/ssl/key.pem\n",
+            "<Location />\n",
+            "SSLVerifyClient require\n",
+            "</Location>\n",
+            "</VirtualHost>\n",
+        );
+        assert!(load_text(cfg, false).is_err());
+    }
+
+    #[test]
+    fn rewrite_directives_compile_and_validate() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "RewriteEngine On\n",
+            "RewriteCond %{QUERY_STRING} ^x=1$ [NC]\n",
+            "RewriteRule ^/old$ /new [L,QSA]\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let s = c.effective_scope(None, Path::new("/srv/file"), "/old");
+        assert_eq!(s.rewrite_policy.rewrite_engine, Some(true));
+        assert_eq!(s.rewrite_policy.rewrite_rules.len(), 1);
+        assert_eq!(s.rewrite_policy.rewrite_rules[0].match_base, "/");
+        assert!(!s.rewrite_policy.rewrite_rules[0].per_dir);
+        assert_eq!(s.rewrite_policy.rewrite_rules[0].conditions.len(), 1);
+        assert!(s.rewrite_policy.rewrite_rules[0].conditions[0].flags.nocase);
+
+        for bad in [
+            "Listen 127.0.0.1:0\nRewriteEngine Maybe\n",
+            "Listen 127.0.0.1:0\nRewriteRule ^x y [UNKNOWN]\n",
+            "Listen 127.0.0.1:0\nRewriteCond %{REQUEST_URI} [\nRewriteRule ^x y\n",
+        ] {
+            assert!(load_text(bad, false).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn allow_override_option_sets_compile() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Directory /srv>\n",
+            "AllowOverride Options=ExecCGI,Includes Options=Indexes\n",
+            "</Directory>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let mode = c
+            .effective_scope(None, Path::new("/srv/file"), "/file")
+            .override_policy
+            .raw_mode()
+            .expect("override mode");
+        assert!(mode.allows_flag(OverrideCategories::EXEC_CGI));
+        assert!(mode.allows_flag(OverrideCategories::INCLUDES));
+        assert!(mode.allows_flag(OverrideCategories::OPT_INDEXES));
+        assert!(!mode.allows_flag(OverrideCategories::OPT_FOLLOW_SYMLINKS));
+
+        let bad = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Directory /srv>\nAllowOverride Options=NotAnOption\n</Directory>\n",
+        );
+        assert!(load_text(bad, false).is_err());
+    }
+
+    #[test]
+    fn override_prefilter_covers_every_enabled_directory() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Directory /srv>\n",
+            "AllowOverride All\n",
+            "</Directory>\n",
+            "<Directory /srv/sub>\n",
+            "AllowOverride AuthConfig\n",
+            "</Directory>\n",
+            "<Directory /opt/*/public>\n",
+            "AllowOverride All\n",
+            "</Directory>\n",
+            "<VirtualHost *:80>\n",
+            "ServerName vhost.test\n",
+            "DocumentRoot /srv/vhost\n",
+            "<Directory /srv/vhost/private>\n",
+            "AllowOverride Options\n",
+            "</Directory>\n",
+            "</VirtualHost>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let vhost = c
+            .vhosts
+            .iter()
+            .find(|v| v.server_name.as_deref() == Some("vhost.test"));
+        for (vhost, path, url) in [
+            (None, "/srv/file", "/file"),
+            (None, "/srv/sub/file", "/sub/file"),
+            (None, "/opt/a/public/file", "/file"),
+            (None, "/opt/a/private/file", "/file"),
+            (vhost, "/srv/vhost/private/file", "/private/file"),
+            (vhost, "/srv/vhost/elsewhere/file", "/elsewhere/file"),
+        ] {
+            let scope = c.effective_scope(vhost, Path::new(path), url);
+            if scope
+                .override_policy
+                .raw_mode()
+                .map(OverrideMode::is_enabled)
+                .unwrap_or(false)
+            {
+                let covered = c.override_applicable(Path::new(path));
+                assert!(
+                    covered,
+                    "override prefilter would skip {path} despite enabled AllowOverride"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn directory_wildcards_match_whole_components() {
+        assert!(directory_wildcard_matches(
+            Path::new("/srv/*/public"),
+            Path::new("/srv/alice/public/file")
+        ));
+        assert!(!directory_wildcard_matches(
+            Path::new("/srv/*/public"),
+            Path::new("/srv/alice/private/file")
+        ));
+        assert!(directory_wildcard_matches(
+            Path::new("/srv/wild?/public"),
+            Path::new("/srv/wild1/public/file")
+        ));
+        assert!(!directory_wildcard_matches(
+            Path::new("/srv/wild?/public"),
+            Path::new("/srv/wild12/public/file")
+        ));
+    }
+
+    #[test]
+    fn files_patterns_support_apache_globs_and_regex() {
+        let kind = compile_files_pattern(&["secret*".into()]).unwrap();
+        assert!(rule_kind_matches(
+            &kind,
+            Path::new("/srv/secret.txt"),
+            "/secret.txt",
+            "secret.txt"
+        ));
+        assert!(!rule_kind_matches(
+            &kind,
+            Path::new("/srv/public.txt"),
+            "/public.txt",
+            "public.txt"
+        ));
+        let kind = compile_files_pattern(&["secret?.txt".into()]).unwrap();
+        assert!(rule_kind_matches(
+            &kind,
+            Path::new("/srv/secret1.txt"),
+            "/secret1.txt",
+            "secret1.txt"
+        ));
+        let kind = compile_files_pattern(&["~".into(), "^secret\\..*$".into()]).unwrap();
+        assert!(rule_kind_matches(
+            &kind,
+            Path::new("/srv/secret.txt"),
+            "/secret.txt",
+            "secret.txt"
+        ));
+    }
+
+    #[test]
+    fn location_trailing_slash_is_a_distinct_prefix() {
+        let slash = MatchKind::Location("/admin/".into());
+        assert!(rule_kind_matches(
+            &slash,
+            Path::new("/srv/admin/file"),
+            "/admin/file",
+            "file"
+        ));
+        assert!(!rule_kind_matches(
+            &slash,
+            Path::new("/srv/admin"),
+            "/admin",
+            "admin"
+        ));
+        let no_slash = MatchKind::Location("/admin".into());
+        assert!(rule_kind_matches(
+            &no_slash,
+            Path::new("/srv/admin"),
+            "/admin",
+            "admin"
+        ));
+        assert!(!rule_kind_matches(
+            &no_slash,
+            Path::new("/srv/administrator"),
+            "/administrator",
+            "administrator"
+        ));
+    }
+
+    #[test]
+    fn method_set_intersection_is_exact() {
+        let sets = [
+            MethodSet::all(),
+            MethodSet::Only(vec![]),
+            MethodSet::Only(vec!["GET".into()]),
+            MethodSet::Only(vec!["GET".into(), "POST".into()]),
+            MethodSet::Except(vec!["GET".into()]),
+            MethodSet::Except(vec!["POST".into(), "PUT".into()]),
+        ];
+        for a in &sets {
+            for b in &sets {
+                let i = a.intersect(b);
+                for m in ["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"] {
+                    assert_eq!(
+                        i.matches(m),
+                        a.matches(m) && b.matches(m),
+                        "intersection mismatch for {m}: {a:?} ∩ {b:?} = {i:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rule_phases_match_documented_merge_order() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Directory /srv>\n",
+            "Require all granted\n",
+            "</Directory>\n",
+            "<Files \"secret.txt\">\n",
+            "Require all denied\n",
+            "</Files>\n",
+            "<Location \"/x\">\n",
+            "Require local\n",
+            "</Location>\n",
+            "<If \"true\">\n",
+            "Require all denied\n",
+            "</If>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let mut phases: Vec<RulePhase> = c.global_rules.iter().map(|r| r.phase()).collect();
+        assert_eq!(
+            phases,
+            vec![
+                RulePhase::Directory,
+                RulePhase::Files,
+                RulePhase::Location,
+                RulePhase::Condition
+            ]
+        );
+        phases.sort();
+        assert_eq!(
+            phases,
+            vec![
+                RulePhase::Directory,
+                RulePhase::Files,
+                RulePhase::Location,
+                RulePhase::Condition
+            ]
+        );
+    }
+
+    #[test]
+    fn conditionals_are_applied_after_directory_grants() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<If \"%{REQUEST_METHOD} == 'GET'\">\n",
+            "Require all denied\n",
+            "</If>\n",
+            "<Directory /srv>\n",
+            "Require all granted\n",
+            "</Directory>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let req = test_request("GET");
+        let s = c.effective_scope_req(
+            None,
+            Path::new("/srv/file"),
+            "/file",
+            &req,
+            "127.0.0.1".parse().unwrap(),
+        );
+        assert!(matches!(
+            s.authorization.requires,
+            Some(AuthPolicy::List(ref entries))
+                if entries.iter().any(|e| matches!(e.node, RequireNode::Provider(Require::AllDenied)))
+        ));
+    }
+
+    #[test]
+    fn global_rewrite_rules_do_not_leak_into_vhosts() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "RewriteEngine On\n",
+            "RewriteRule ^/global$ /hello.txt [L]\n",
+            "<VirtualHost *:80>\n",
+            "ServerName vhost.test\n",
+            "DocumentRoot /srv/vhost\n",
+            "RewriteEngine On\n",
+            "RewriteRule ^/vhost$ /vhost.txt [L]\n",
+            "</VirtualHost>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let v = c
+            .vhosts
+            .iter()
+            .find(|v| v.server_name.as_deref() == Some("vhost.test"))
+            .unwrap();
+        let s = c.effective_scope(Some(v), Path::new("/srv/vhost/file"), "/vhost");
+        assert_eq!(s.rewrite_policy.rewrite_rules.len(), 1);
+        assert_eq!(s.rewrite_policy.rewrite_rules[0].substitution, "/vhost.txt");
+        let s = c.effective_scope(Some(v), Path::new("/srv/vhost/file"), "/global");
+        assert_eq!(s.rewrite_policy.rewrite_rules.len(), 1);
+        assert_eq!(s.rewrite_policy.rewrite_rules[0].substitution, "/vhost.txt");
+    }
+
+    #[test]
+    fn directory_rewrite_rules_use_a_per_directory_base() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "RewriteEngine On\n",
+            "<Directory /srv/www/sub>\n",
+            "RewriteRule ^old$ new [L]\n",
+            "</Directory>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let s = c.effective_scope(None, Path::new("/srv/www/sub/old"), "/sub/old");
+        assert_eq!(s.rewrite_policy.rewrite_rules.len(), 1);
+        assert!(s.rewrite_policy.rewrite_rules[0].per_dir);
+        assert_eq!(s.rewrite_policy.rewrite_rules[0].match_base, "/sub/");
+        assert_eq!(s.rewrite_policy.rewrite_rules[0].base, "/sub/");
+
+        let s = c.effective_scope(None, Path::new("/srv/www/sub"), "/sub");
+        assert_eq!(s.rewrite_policy.rewrite_rules[0].match_base, "/sub/");
+    }
+
+    #[test]
+    fn limit_sections_compile_method_scoped_rules() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Directory /srv>\n",
+            "<Limit POST PUT>\n",
+            "Require valid-user\n",
+            "Order allow,deny\n",
+            "Allow from 10.0.0.0/8\n",
+            "Satisfy any\n",
+            "</Limit>\n",
+            "</Directory>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let s = c.effective_scope(None, Path::new("/srv/file"), "/file");
+        let entries = require_entries(s.authorization.requires);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].limit,
+            Some(MethodSet::Only(vec!["POST".into(), "PUT".into()]))
+        );
+        assert!(entries[0].applies("POST"));
+        assert!(entries[0].applies("PUT"));
+        assert!(!entries[0].applies("GET"));
+        let legacy = s.authorization.legacy.expect("limited legacy rules");
+        assert_eq!(legacy.order.len(), 1);
+        assert_eq!(legacy.allow.len(), 1);
+        assert_eq!(legacy.satisfy.len(), 1);
+        assert!(!legacy.order[0].applies("GET"));
+
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Directory /srv>\n",
+            "<LimitExcept GET HEAD>\n",
+            "Require all denied\n",
+            "</LimitExcept>\n",
+            "</Directory>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let s = c.effective_scope(None, Path::new("/srv/file"), "/file");
+        let entries = require_entries(s.authorization.requires);
+        assert!(entries[0].applies("POST"));
+        assert!(!entries[0].applies("GET"));
+        assert!(!entries[0].applies("HEAD"));
+
+        // Nested limits intersect, and restricting names must not appear in
+        // server/vhost scope.
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Directory /srv>\n",
+            "<Limit POST PUT>\n",
+            "<Limit POST>\n",
+            "Require all denied\n",
+            "</Limit>\n",
+            "</Limit>\n",
+            "</Directory>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let s = c.effective_scope(None, Path::new("/srv/file"), "/file");
+        let entries = require_entries(s.authorization.requires);
+        assert_eq!(entries[0].limit, Some(MethodSet::Only(vec!["POST".into()])));
+        assert!(load_text(
+            "Listen 127.0.0.1:0\n<Limit GET>\nRequire all denied\n</Limit>\n",
+            false
+        )
+        .is_err());
+        let c = load_text(
+            "Listen 127.0.0.1:0\n<Directory /srv>\n<Limit GET>\nOptions Indexes\n</Limit>\n</Directory>\n",
+            false,
+        )
+        .unwrap();
+        assert!(c.warnings.iter().any(|w| w.contains("inside <Limit>")));
+        assert!(load_text(
+            "Listen 127.0.0.1:0\n<Directory /srv>\n<Limit TRACE>\nRequire all denied\n</Limit>\n</Directory>\n",
+            false
+        )
+        .is_err());
+        assert!(load_text(
+            "Listen 127.0.0.1:0\n<Directory /srv>\n<Limit POST PUT>\n<Limit POST PUT>\nRequire all denied\n</Limit>\n</Limit>\n</Directory>\n",
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn default_runtime_dir_is_strict_compatible() {
+        assert!(load_text("Listen 127.0.0.1:0\nDefaultRuntimeDir /tmp\n", true).is_ok());
+    }
+
+    #[test]
+    fn proxy_target_authority_cannot_come_from_request_capture() {
+        assert!(load_text(
+            "Listen 127.0.0.1:0\nProxyPassMatch ^/(.*)$ http://$1/\n",
+            false
+        )
+        .is_err());
+        assert!(load_text(
+            "Listen 127.0.0.1:0\nProxyPassMatch ^/(.*)$ http://127.0.0.1:9000/$1\n",
+            false
+        )
+        .is_ok());
+        assert!(load_text(
+            "Listen 127.0.0.1:0\nRewriteRule ^/(.*)$ http://$1/ [P]\n",
+            false
+        )
+        .is_err());
+        assert!(load_text(
+            "Listen 127.0.0.1:0\nRewriteRule ^/(.*)$ http://127.0.0.1:9000/$1 [P]\n",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn unsupported_proxy_transports_fail_closed() {
+        for directive in [
+            "ProxyPass /x ftp://127.0.0.1/pub/",
+            "ProxyPassReverse /x ftp://127.0.0.1/pub/",
+            "ProxyPassMatch ^/x$ udp://127.0.0.1:9000/",
+        ] {
+            let text = format!("Listen 127.0.0.1:0\n{directive}\n");
+            assert!(
+                load_text(&text, false).is_err(),
+                "unsupported proxy transport must fail: {directive}"
+            );
+        }
+        assert!(load_text(
+            "Listen 127.0.0.1:0\nProxyPass /x http://127.0.0.1:9000/\n",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn vhost_name_patterns_use_verified_boundary_matching() {
+        assert!(crate::verified::host_pattern_matches(
+            b"example.com",
+            b"*.example.com"
+        ));
+        assert!(crate::verified::host_pattern_matches(
+            b"a.example.com",
+            b"*.example.com"
+        ));
+        assert!(!crate::verified::host_pattern_matches(
+            b"badexample.com",
+            b"*.example.com"
+        ));
+        assert!(crate::verified::host_pattern_matches(
+            b"EXAMPLE.COM",
+            b"example.com"
+        ));
+        assert!(crate::verified::host_pattern_matches(
+            b"a.example.com",
+            b".example.com"
+        ));
+        assert!(load_text(
+            "Listen 127.0.0.1:0\n<VirtualHost *:0>\nServerAlias ~[bad\n</VirtualHost>\n",
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn security_sensitive_directives_fail_closed() {
+        for cfg in [
+            "Listen 127.0.0.1:0\nAllowMethods GET\n",
+            "Listen 127.0.0.1:0\nSSLRequireSSL\n",
+            "Listen 127.0.0.1:0\nSSLRequire %{SSL_PROTOCOL} eq 'TLSv1.2'\n",
+            "Listen 127.0.0.1:0\nSecRuleEngine On\n",
+        ] {
+            assert!(load_text(cfg, false).is_err(), "{cfg}");
+        }
+        assert!(load_text("Listen 127.0.0.1:0\nSecRuleEngine Off\n", false).is_ok());
+        // Satisfy is supported only in a directory context, with a valid argument.
+        assert!(load_text(
+            "Listen 127.0.0.1:0\n<Directory /srv>\nSatisfy any\n</Directory>\n",
+            false
+        )
+        .is_ok());
+        assert!(load_text(
+            "Listen 127.0.0.1:0\n<Directory /srv>\nSatisfy sometimes\n</Directory>\n",
+            false
+        )
+        .is_err());
+        assert!(load_text("Listen 127.0.0.1:0\nSatisfy any\n", false).is_err());
+    }
+
+    #[test]
+    fn security_sensitive_unimplemented_directives_fail_closed() {
+        for directive in [
+            "ProxyBlock 169.254.169.254",
+            "RequestHeader unset Authorization",
+            "SetEnvIfExpr \"true\" X=1",
+            "AcceptPathInfo Off",
+            "AuthzProviderAlias ldap-group foo",
+            "FilterProvider foo bar",
+        ] {
+            let text = format!("Listen 127.0.0.1:0\n{directive}\n");
+            assert!(
+                load_text(&text, false).is_err(),
+                "compat mode must reject security directive: {directive}"
+            );
+        }
+        for directive in [
+            "ProxyRequests On",
+            "SSLOptions +StdEnvVars",
+            "LDAPTrustedCA /etc/ssl/ca.pem",
+            "DAVDepthInfinity On",
+            "CacheSocache shmcb",
+            "AllowConnect 443",
+        ] {
+            let text = format!("Listen 127.0.0.1:0\n{directive}\n");
+            assert!(
+                load_text(&text, false).is_err(),
+                "security family must fail closed: {directive}"
+            );
+        }
+        // Non-security unimplemented module directives remain warnings.
+        let ok = load_text("Listen 127.0.0.1:0\nAddDescription \"x\" .txt\n", false);
+        assert!(ok.is_ok());
+        assert!(ok
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|w| w.contains("recognised but not implemented")));
+    }
+
+    #[test]
+    fn non_file_auth_provider_fails_closed() {
+        let err = load_text("Listen 127.0.0.1:0\nAuthBasicProvider ldap\n", false);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn unknown_and_unimplemented_directives() {
+        let unknown = "Listen 127.0.0.1:0\nDefinitelyNotADirective on\n";
+        let c = load_text(unknown, false).unwrap();
+        assert!(c.warnings.iter().any(|w| w.contains("unknown directive")));
+        assert!(load_text(unknown, true).is_err());
+
+        let known = "Listen 127.0.0.1:0\nAddDescription \"x\" .txt\n";
+        let c = load_text(known, false).unwrap();
+        assert!(c
+            .warnings
+            .iter()
+            .any(|w| w.contains("recognised but not implemented")));
+        assert!(load_text(known, true).is_ok());
+    }
+
+    #[test]
+    fn auth_location_scope_is_applied() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Location \"/auth/\">\n",
+            "AuthType Basic\n",
+            "AuthName \"Realm\"\n",
+            "AuthUserFile /tmp/users\n",
+            "Require valid-user\n",
+            "</Location>\n",
+            "<VirtualHost *:0>\n",
+            "ServerName localhost\n",
+            "</VirtualHost>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let vh = c.vhosts.first();
+        let s = c.effective_scope(
+            vh,
+            Path::new("/srv/www/auth/protected.txt"),
+            "/auth/protected.txt",
+        );
+        let entries = require_entries(s.authorization.requires);
+        assert!(matches!(
+            entries.as_slice(),
+            [RequireEntry {
+                node: RequireNode::Provider(Require::ValidUser),
+                limit: None,
+            }]
+        ));
+        assert_eq!(s.authorization.auth_type.as_deref(), Some("basic"));
+    }
+
+    #[test]
+    fn scope_merge_applies_each_policy_once() {
+        let mut parent = Scope::default();
+        parent
+            .content_policy
+            .add_types
+            .push(("parent".into(), "ptype".into()));
+        parent
+            .header_policy
+            .set_headers
+            .push(("X-Parent".into(), "1".into()));
+        parent
+            .environment_policy
+            .set_env
+            .push(("PARENT".into(), "1".into()));
+
+        let mut child = Scope::default();
+        child
+            .content_policy
+            .add_types
+            .push(("child".into(), "ctype".into()));
+        child
+            .header_policy
+            .set_headers
+            .push(("X-Child".into(), "2".into()));
+        child
+            .environment_policy
+            .set_env
+            .push(("CHILD".into(), "2".into()));
+        child.content_policy.document_root = Some("/child".into());
+
+        parent.merge(&child);
+        assert_eq!(
+            parent.content_policy.add_types,
+            vec![
+                ("parent".into(), "ptype".into()),
+                ("child".into(), "ctype".into())
+            ]
+        );
+        assert_eq!(
+            parent.content_policy.document_root.as_deref(),
+            Some(Path::new("/child"))
+        );
+        assert_eq!(parent.header_policy.set_headers.len(), 2);
+        assert_eq!(parent.environment_policy.set_env.len(), 2);
+    }
+
+    #[test]
+    fn tokenizer() {
+        assert_eq!(
+            crate::config_frontend::tokenize("a \"b c\" d").unwrap(),
+            vec!["a", "b c", "d"]
+        );
+        assert_eq!(
+            crate::config_frontend::tokenize("a\\ b").unwrap(),
+            vec!["a b"]
+        );
+        assert_eq!(
+            crate::config_frontend::tokenize("\"^\\.ht\"").unwrap(),
+            vec!["^\\.ht"]
+        );
+        assert_eq!(
+            crate::config_frontend::tokenize("\"a \\\"b\\\"\"").unwrap(),
+            vec!["a \"b\""]
+        );
+        assert!(crate::config_frontend::tokenize("\"unterminated").is_err());
+    }
+
+    #[test]
+    fn proxy_directives_are_compiled_into_scopes() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "ProxyPass /app http://127.0.0.1:9000/\n",
+            "ProxyPassReverse /app http://127.0.0.1:9000/\n",
+            "ProxyPassMatch ^/(.*\\.php)$ unix:/run/php.sock|fcgi://localhost/var/www/\n",
+            "<VirtualHost *:8080>\n",
+            "ServerName localhost\n",
+            "</VirtualHost>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let s = c.effective_scope(c.vhosts.first(), Path::new("/srv/app/x"), "/app/x");
+        assert_eq!(s.proxy_policy.proxy_passes.len(), 1);
+        assert_eq!(s.proxy_policy.proxy_reverses.len(), 1);
+        assert_eq!(s.proxy_policy.proxy_rules.len(), 1);
+    }
+
+    #[test]
+    fn iffile_section_is_applied_per_request() {
+        let file = std::env::temp_dir().join(format!("vapache-iffile-{}", std::process::id()));
+        std::fs::write(&file, "x").unwrap();
+        let cfg = format!(
+            "Listen 127.0.0.1:0\n<IfFile \"{}\" >\nHeader set X-IfFile yes\n</IfFile>\n",
+            file.display()
+        );
+        let c = load_text(&cfg, false).unwrap();
+        let req = crate::http::Request {
+            method: "GET".into(),
+            target: b"/x".to_vec(),
+            raw_path: b"/x".to_vec(),
+            query: Vec::new(),
+            version: crate::http::Version::Http11,
+            headers: crate::http::Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        };
+        let s = c.effective_scope_req(
+            None,
+            Path::new("/srv/x"),
+            "/x",
+            &req,
+            "127.0.0.1".parse().unwrap(),
+        );
+        assert!(s
+            .header_policy
+            .set_headers
+            .iter()
+            .any(|(n, _)| n == "X-IfFile"));
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn if_section_expression_is_applied_per_request() {
+        let cfg = "Listen 127.0.0.1:0\n\
+<If \"%{HTTP:X-Test} == 'yes'\">\n\
+Header set X-If yes\n\
+</If>\n\
+<VirtualHost *:8080>\nServerName localhost\n</VirtualHost>\n";
+        let c = load_text(cfg, false).unwrap();
+        let mut req = crate::http::Request {
+            method: "GET".into(),
+            target: b"/x".to_vec(),
+            raw_path: b"/x".to_vec(),
+            query: Vec::new(),
+            version: crate::http::Version::Http11,
+            headers: crate::http::Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        };
+        let plain = c.effective_scope_req(
+            c.vhosts.first(),
+            Path::new("/srv/x"),
+            "/x",
+            &req,
+            "127.0.0.1".parse().unwrap(),
+        );
+        assert!(plain.header_policy.set_headers.is_empty());
+        req.headers.insert("x-test", b"yes".to_vec());
+        let matched = c.effective_scope_req(
+            c.vhosts.first(),
+            Path::new("/srv/x"),
+            "/x",
+            &req,
+            "127.0.0.1".parse().unwrap(),
+        );
+        assert!(matched
+            .header_policy
+            .set_headers
+            .iter()
+            .any(|(n, _)| n == "X-If"));
+    }
+
+    #[test]
+    fn compression_directives_survive_ifmodule_and_vhost_merge() {
+        let cfg = "LoadModule deflate_module /usr/lib/apache2/modules/mod_deflate.so\n\
+Listen 127.0.0.1:0\n\
+<IfModule mod_deflate.c>\n\
+AddOutputFilterByType DEFLATE text/plain\n\
+DeflateCompressionLevel 7\n\
+</IfModule>\n\
+<VirtualHost *:8080>\n\
+ServerName localhost\n\
+</VirtualHost>\n";
+        let c = load_text(cfg, false).unwrap();
+        let vh = c.vhosts.first();
+        let s = c.effective_scope(vh, Path::new("/srv/a.txt"), "/a.txt");
+        assert!(!s.compression_policy.compression_rules.is_empty());
+        assert_eq!(s.compression_policy.deflate_level, Some(7));
+    }
+
+    #[test]
+    fn has_cgi_detects_dispatch_paths() {
+        assert!(!load_text("Listen 127.0.0.1:0\n", false).unwrap().has_cgi());
+
+        let c = load_text(
+            "Listen 127.0.0.1:0\nScriptAlias /cgi-bin/ /srv/cgi-bin/\n",
+            false,
+        )
+        .unwrap();
+        assert!(c.has_cgi());
+
+        let c = load_text(
+            "Listen 127.0.0.1:0\n<Directory /srv>\nOptions +ExecCGI\n</Directory>\n",
+            false,
+        )
+        .unwrap();
+        assert!(c.has_cgi());
+
+        let c = load_text(
+            "Listen 127.0.0.1:0\nAddHandler cgi-script .cgi .sh\n",
+            false,
+        )
+        .unwrap();
+        assert!(c.has_cgi());
+
+        let c = load_text(
+            "Listen 127.0.0.1:0\n<VirtualHost *:8080>\nScriptAlias /cgi/ /srv/cgi/\n</VirtualHost>\n",
+            false,
+        )
+        .unwrap();
+        assert!(c.has_cgi());
+    }
+
+    #[test]
+    fn auth_merging_and_allowmethods_are_compiled() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Directory /srv>\n",
+            "Require ip 10.0.0.0/8\n",
+            "</Directory>\n",
+            "<Directory /srv/sub>\n",
+            "AuthMerging And\n",
+            "Require user alice\n",
+            "AllowMethods GET HEAD OPTIONS\n",
+            "</Directory>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let s = c.effective_scope(None, Path::new("/srv/sub/file"), "/sub/file");
+        assert!(matches!(
+            s.authorization.requires,
+            Some(AuthPolicy::And(_, _))
+        ));
+        assert_eq!(
+            s.authorization.allow_methods,
+            Some(AllowMethods::Only(vec![
+                "GET".into(),
+                "HEAD".into(),
+                "OPTIONS".into()
+            ]))
+        );
+        assert!(s.method_allowed("GET"));
+        assert!(s.method_allowed("HEAD"));
+        assert!(!s.method_allowed("POST"));
+        assert_eq!(
+            s.authorization.allow_methods_header().as_deref(),
+            Some("GET, HEAD, OPTIONS")
+        );
+
+        let s = c.effective_scope(None, Path::new("/srv/plain"), "/plain");
+        assert_eq!(s.authorization.allow_methods, None);
+        assert!(s.method_allowed("POST"));
+
+        assert!(load_text("Listen 127.0.0.1:0\nAuthMerging And\n", false).is_err());
+        assert!(load_text("Listen 127.0.0.1:0\nAllowMethods GET\n", false).is_err());
+        assert!(load_text("Listen 127.0.0.1:0\nAllowMethods BOGUS\n", false).is_err());
+    }
+
+    #[test]
+    fn unsupported_filters_and_handlers_are_recorded() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Directory /srv>\n",
+            "SetOutputFilter INCLUDES\n",
+            "AddHandler application/x-httpd-php .php\n",
+            "</Directory>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let s = c.effective_scope(None, Path::new("/srv/x.php"), "/x.php");
+        assert!(s
+            .mapping_policy
+            .unsupported_filters
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case("INCLUDES")));
+        assert_eq!(
+            crate::config::effective_handler(&s, b"x.php"),
+            Some("application/x-httpd-php")
+        );
+
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Directory /srv>\n",
+            "AddOutputFilterByType DEFLATE text/plain\n",
+            "AddHandler cgi-script .cgi\n",
+            "</Directory>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let s = c.effective_scope(None, Path::new("/srv/x.cgi"), "/x.cgi");
+        assert!(s.mapping_policy.unsupported_filters.is_empty());
+        assert_eq!(
+            crate::config::effective_handler(&s, b"x.cgi"),
+            Some("cgi-script")
+        );
+    }
+
+    #[test]
+    fn elseif_and_else_follow_the_if_chain() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Directory /srv>\n",
+            "<If \"%{HTTP:X-Test} == 'a'\">\n",
+            "Header set X-Branch a\n",
+            "</If>\n",
+            "<ElseIf \"%{HTTP:X-Test} == 'b'\">\n",
+            "Header set X-Branch b\n",
+            "</ElseIf>\n",
+            "<Else>\n",
+            "Header set X-Branch c\n",
+            "</Else>\n",
+            "</Directory>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        for (header, expected) in [(Some("a"), "a"), (Some("b"), "b"), (None, "c")] {
+            let mut req = test_request("GET");
+            if let Some(value) = header {
+                req.headers.insert("x-test", value.as_bytes().to_vec());
+            }
+            let s = c.effective_scope_req(
+                None,
+                Path::new("/srv/file"),
+                "/file",
+                &req,
+                "127.0.0.1".parse().unwrap(),
+            );
+            let value = s
+                .header_policy
+                .set_headers
+                .iter()
+                .find(|(name, _)| name == "X-Branch")
+                .map(|(_, value)| value.as_str());
+            assert_eq!(value, Some(expected), "header {header:?}");
+        }
+
+        assert!(load_text(
+            "Listen 127.0.0.1:0\n<Directory /srv>\n<Else>\nHeader set X-Test no\n</Else>\n</Directory>\n",
+            false
+        )
+        .is_err());
+        let c = load_text(
+            "Listen 127.0.0.1:0\n<Directory /srv>\n<If \"1\">\n<If \"1\">\nHeader set X-Nested yes\n</If>\n</If>\n</Directory>\n",
+            false,
+        )
+        .unwrap();
+        let req = test_request("GET");
+        let s = c.effective_scope_req(
+            None,
+            Path::new("/srv/file"),
+            "/file",
+            &req,
+            "127.0.0.1".parse().unwrap(),
+        );
+        assert!(s
+            .header_policy
+            .set_headers
+            .iter()
+            .any(|(n, _)| n == "X-Nested"));
+    }
+
+    #[test]
+    fn proxy_containers_apply_access_rules() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Proxy \"http://backend/app/*\">\n",
+            "Require ip 10.0.0.0/8\n",
+            "</Proxy>\n",
+            "<ProxyMatch \"^http://other/[0-9]+/\">\n",
+            "<If \"%{HTTP:X-Allow} == 'yes'\">\n",
+            "Require all granted\n",
+            "</If>\n",
+            "</ProxyMatch>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        assert_eq!(c.proxy_containers.len(), 2);
+        let req = test_request("GET");
+        let mut scope = Scope::default();
+        c.apply_proxy_access(
+            None,
+            &mut scope,
+            "http://backend/app/file",
+            &req,
+            "127.0.0.1".parse().unwrap(),
+        );
+        assert_eq!(
+            crate::access::check(&scope, &req, "127.0.0.1".parse().unwrap(), None),
+            crate::access::Access::Denied
+        );
+        assert!(
+            crate::access::check(&scope, &req, "10.1.2.3".parse().unwrap(), None)
+                == crate::access::Access::Allowed
+        );
+
+        let mut scope = Scope::default();
+        c.apply_proxy_access(
+            None,
+            &mut scope,
+            "http://other/42/x",
+            &req,
+            "127.0.0.1".parse().unwrap(),
+        );
+        // The <If> did not match; no authorization rule was added.
+        assert!(scope.authorization.requires.is_none());
+        let mut req_allowed = test_request("GET");
+        req_allowed.headers.insert("x-allow", b"yes".to_vec());
+        let mut scope = Scope::default();
+        c.apply_proxy_access(
+            None,
+            &mut scope,
+            "http://other/42/x",
+            &req_allowed,
+            "127.0.0.1".parse().unwrap(),
+        );
+        assert_eq!(
+            crate::access::check(&scope, &req_allowed, "127.0.0.1".parse().unwrap(), None),
+            crate::access::Access::Allowed
+        );
+    }
+}
+
+/// Strip a port from an HTTP authority without corrupting IPv6 literals.
+fn authority_host(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(host);
+    }
+    if host.matches(':').count() == 1 {
+        return host.split(':').next().unwrap_or(host);
+    }
+    host
+}
+
+impl Config {
+    /// Select the virtual host for a connection.  `host` is the Host header
+    /// value (possibly with port), `port` the local listening port.
+    /// Apply `mod_remoteip`-style client-address rewriting.  The immediate
+    /// peer must be listed as an internal proxy before its header is trusted.
+    pub fn client_addr(
+        &self,
+        peer: std::net::SocketAddr,
+        req: &crate::http::Request,
+    ) -> std::net::SocketAddr {
+        let Some(header) = &self.remoteip_header else {
+            return peer;
+        };
+        let trusted = self
+            .remoteip_internal
+            .iter()
+            .any(|(net, bits)| crate::access::ip_in_net(peer.ip(), *net, *bits));
+        if !trusted {
+            return peer;
+        }
+        let header = header.to_ascii_lowercase();
+        let Some(value) = req.header(&header) else {
+            return peer;
+        };
+        let text = String::from_utf8_lossy(value);
+        // Parse the proxy chain once, then let the verified selector choose
+        // the first address not belonging to a trusted proxy.  Invalid
+        // entries are skipped; a chain of only trusted proxies keeps the
+        // real peer address.
+        let mut parsed: Vec<(IpAddr, bool)> = Vec::new();
+        for part in text.split(',').rev() {
+            let part = part.trim();
+            if let Ok(ip) = part.parse::<IpAddr>() {
+                let internal = self
+                    .remoteip_internal
+                    .iter()
+                    .any(|(net, bits)| crate::access::ip_in_net(ip, *net, *bits));
+                parsed.push((ip, internal));
+            }
+        }
+        let trusted: Vec<bool> = parsed.iter().map(|(_, trusted)| *trusted).collect();
+        match crate::verified::first_untrusted_index(&trusted) {
+            Some(index) => std::net::SocketAddr::new(parsed[index].0, peer.port()),
+            None => peer,
+        }
+    }
+
+    pub fn select_vhost(&self, port: u16, host: Option<&str>) -> Option<&VHost> {
+        let candidates: Vec<&VHost> = self
+            .vhosts
+            .iter()
+            .filter(|v| v.addrs.is_empty() || v.ports.iter().any(|p| *p == 0 || *p == port))
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        if let Some(h) = host {
+            let bare = authority_host(h);
+            let matches: Vec<bool> = candidates.iter().map(|v| v.matches_name(bare)).collect();
+            if let Some(index) = crate::verified::first_true_index(&matches) {
+                return Some(candidates[index]);
+            }
+        }
+        // Apache uses the first configured vhost for the address as default.
+        Some(candidates[0])
+    }
+
+    pub fn resolve_log_format(&self, name: &str) -> String {
+        if name.starts_with('"') && name.ends_with('"') && name.len() >= 2 {
+            name[1..name.len() - 1].to_string()
+        } else {
+            self.log_formats
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.to_string())
+        }
+    }
+
+    /// True when the compiled configuration can dispatch a CGI request.
+    /// Used to avoid starting CGI worker processes for static-only servers.
+    pub fn has_cgi(&self) -> bool {
+        fn scope_has_cgi(s: &Scope) -> bool {
+            s.mapping_policy.aliases.iter().any(|a| a.script)
+                || s.effective_options().contains(Options::EXEC_CGI)
+                || s.mapping_policy
+                    .handlers
+                    .iter()
+                    .any(|h| h.handler.eq_ignore_ascii_case("cgi-script"))
+        }
+        scope_has_cgi(&self.global)
+            || self.global_rules.iter().any(|r| scope_has_cgi(&r.delta))
+            || self
+                .vhosts
+                .iter()
+                .any(|v| scope_has_cgi(&v.scope) || v.rules.iter().any(|r| scope_has_cgi(&r.delta)))
+    }
+
+    fn override_scan(&self) -> bool {
+        let enabled = |s: &Scope| s.override_policy.is_enabled();
+        enabled(&self.global)
+            || self.global_rules.iter().any(|r| enabled(&r.delta))
+            || self
+                .vhosts
+                .iter()
+                .any(|v| enabled(&v.scope) || v.rules.iter().any(|r| enabled(&r.delta)))
+    }
+
+    /// Collect the directory prefixes where `.htaccess` handling can apply.
+    /// A request whose filesystem path is not below one of these prefixes (and
+    /// which is not covered by `override_anywhere`) cannot read any access file,
+    /// so the request path can skip the whole directory walk.
+    fn override_paths(&self) -> (Vec<PathBuf>, bool) {
+        fn enabled(s: &Scope) -> bool {
+            s.override_policy.is_enabled()
+        }
+        fn collect(rule: &ScopeRule, prefixes: &mut Vec<PathBuf>, anywhere: &mut bool) {
+            if enabled(&rule.delta) {
+                match &rule.kind {
+                    MatchKind::Directory(path) => prefixes.push(path.clone()),
+                    _ => *anywhere = true,
+                }
+            }
+            for nested in &rule.nested {
+                collect(nested, prefixes, anywhere);
+            }
+        }
+
+        let mut prefixes = Vec::new();
+        let mut anywhere = false;
+        if enabled(&self.global) {
+            anywhere = true;
+        }
+        for rule in &self.global_rules {
+            collect(rule, &mut prefixes, &mut anywhere);
+        }
+        for vhost in &self.vhosts {
+            if enabled(&vhost.scope) {
+                anywhere = true;
+            }
+            for rule in &vhost.rules {
+                collect(rule, &mut prefixes, &mut anywhere);
+            }
+        }
+        prefixes.sort();
+        prefixes.dedup();
+        // A parent prefix subsumes all literal children.  Keeping every
+        // `<Directory>` that enables overrides would make the per-request
+        // access-file gate scan a large list for deeply nested trees.
+        let mut collapsed: Vec<PathBuf> = Vec::new();
+        for candidate in prefixes {
+            let wildcard = {
+                use std::os::unix::ffi::OsStrExt;
+                candidate
+                    .as_os_str()
+                    .as_bytes()
+                    .iter()
+                    .any(|b| matches!(b, b'*' | b'?' | b'['))
+            };
+            if !wildcard
+                && collapsed.iter().any(|parent| {
+                    use std::os::unix::ffi::OsStrExt;
+                    let parent_wildcard = parent
+                        .as_os_str()
+                        .as_bytes()
+                        .iter()
+                        .any(|b| matches!(b, b'*' | b'?' | b'['));
+                    !parent_wildcard && candidate.starts_with(parent)
+                })
+            {
+                continue;
+            }
+            collapsed.push(candidate);
+        }
+        (collapsed, anywhere)
+    }
+
+    /// True when `.htaccess` handling can apply to this filesystem path.
+    /// Wildcard `<Directory>` patterns are matched with the same logic as the
+    /// request-time rule matcher; a plain `starts_with` would silently skip
+    /// override-enabled trees such as `<Directory "/srv/*/public">`.
+    pub fn override_applicable(&self, fs_path: &Path) -> bool {
+        !self.override_enabled
+            || self.override_anywhere
+            || self
+                .override_prefixes
+                .iter()
+                .any(|prefix| directory_wildcard_matches(prefix, fs_path))
+    }
+
+    /// True when an access file could affect this request.  When false the
+    /// dispatcher can use the one-pass Directory merge and skip the per-
+    /// directory walk entirely.
+    pub fn htaccess_may_apply(&self, fs_path: &Path) -> bool {
+        self.override_enabled && self.override_applicable(fs_path)
+    }
+
+    /// The effective server header value for this configuration.
+    pub fn server_header(&self) -> String {
+        self.server_software.clone()
+    }
+
+    /// Compute the effective scope for a filesystem path and URL path.
+    pub fn effective_scope(&self, vhost: Option<&VHost>, fs_path: &Path, url_path: &str) -> Scope {
+        let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
+        let mut s = base.clone();
+        let rules: &[ScopeRule] = vhost
+            .map(|v| v.rules.as_slice())
+            .unwrap_or(self.global_rules.as_slice());
+        let fname = fs_path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        apply_rules_config(rules, &mut s, fs_path, url_path, &fname);
+        s
+    }
+
+    /// Cached request-independent scope for a directory.  `collect_layers`
+    /// only needs the inherited override policy for each ancestor; recomputing
+    /// the full scope per request is unnecessary.
+    pub fn effective_scope_cached(
+        &self,
+        vhost: Option<&VHost>,
+        dir: &Path,
+        url_path: &str,
+    ) -> Arc<Scope> {
+        let key = (
+            vhost.map(|v| v as *const VHost as usize).unwrap_or(0),
+            dir.to_path_buf(),
+            url_path.to_string(),
+        );
+        if let Ok(guard) = self.dir_scope_cache.read() {
+            if let Some(scope) = guard.get(&key) {
+                return Arc::clone(scope);
+            }
+        }
+        let scope = Arc::new(self.effective_scope(vhost, dir, url_path));
+        if let Ok(mut guard) = self.dir_scope_cache.write() {
+            if guard.len() >= 4096 {
+                guard.clear();
+            }
+            guard.insert(key, Arc::clone(&scope));
+        }
+        scope
+    }
+
+    /// Apply matching `<Proxy>` / `<ProxyMatch>` container configuration to a
+    /// request that is about to be proxied.  `proxy_url` is the backend URL
+    /// (for example `http://backend/app/x`), matching Apache's proxy-section
+    /// matching semantics.
+    pub fn apply_proxy_access(
+        &self,
+        vhost: Option<&VHost>,
+        scope: &mut Scope,
+        proxy_url: &str,
+        req: &crate::http::Request,
+        peer: IpAddr,
+    ) {
+        let containers: &[ProxyContainer] = vhost
+            .map(|v| v.proxy_containers.as_slice())
+            .unwrap_or(self.proxy_containers.as_slice());
+        let docroot = self.documentation_root_for(vhost);
+        for container in containers {
+            let matched = match &container.kind {
+                ProxyMatchKind::Wildcard(pattern) => {
+                    if pattern
+                        .as_bytes()
+                        .iter()
+                        .any(|b| matches!(b, b'*' | b'?' | b'['))
+                    {
+                        glob_match(pattern.as_bytes(), proxy_url.as_bytes())
+                    } else {
+                        proxy_url.starts_with(pattern.as_str())
+                    }
+                }
+                ProxyMatchKind::Regex(re) => re.is_match(proxy_url),
+            };
+            if !matched {
+                continue;
+            }
+            scope.merge(&container.delta);
+            let mut chain_state: HashMap<usize, bool> = HashMap::new();
+            apply_rules_req(
+                &container.rules,
+                scope,
+                req,
+                peer,
+                &docroot,
+                Path::new(""),
+                "",
+                "",
+                &mut chain_state,
+            );
+        }
+    }
+
+    pub fn effective_scope_req(
+        &self,
+        vhost: Option<&VHost>,
+        fs_path: &Path,
+        url_path: &str,
+        req: &crate::http::Request,
+        peer: std::net::IpAddr,
+    ) -> Scope {
+        let mut deferred: Vec<ScopeRule> = Vec::new();
+        let mut s =
+            self.effective_scope_req_deferred(vhost, fs_path, url_path, req, peer, &mut deferred);
+        deferred.sort_by_key(|rule| rule.order);
+        let fname = fs_path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let docroot = self.documentation_root_for(vhost);
+        let mut chain_state: HashMap<usize, bool> = HashMap::new();
+        apply_deferred_req(
+            &mut s,
+            &deferred,
+            req,
+            peer,
+            &docroot,
+            fs_path,
+            url_path,
+            &fname,
+            &mut chain_state,
+        );
+        s
+    }
+
+    /// Start a request scope at the inherited base and collect only the
+    /// top-level Files, Location and conditional rules.  Literal Directory
+    /// rules are applied by `htaccess::apply_req_deferred` as it walks each
+    /// directory, so they can be interleaved with that directory's access
+    /// files exactly as Apache does.
+    pub fn effective_scope_req_base_deferred(
+        &self,
+        vhost: Option<&VHost>,
+        fs_path: &Path,
+        url_path: &str,
+        req: &crate::http::Request,
+        peer: std::net::IpAddr,
+        files: &mut Vec<ScopeRule>,
+        locations: &mut Vec<ScopeRule>,
+        conditionals: &mut Vec<ScopeRule>,
+    ) -> Scope {
+        let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
+        let mut s = base.clone();
+        let rules: &[ScopeRule] = vhost
+            .map(|v| v.rules.as_slice())
+            .unwrap_or(self.global_rules.as_slice());
+        let fname = fs_path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        for rule in rules {
+            if !rule_kind_matches(&rule.kind, fs_path, url_path, &fname) {
+                continue;
+            }
+            if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
+                conditionals.push(rule.clone());
+            } else {
+                match rule.kind {
+                    MatchKind::Files(_) | MatchKind::FilesMatch(_) => files.push(rule.clone()),
+                    MatchKind::Location(_) | MatchKind::LocationMatch(_) => {
+                        locations.push(rule.clone())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        files.sort_by_key(|rule| rule.order);
+        locations.sort_by_key(|rule| rule.order);
+        s
+    }
+
+    /// Apply literal/wildcard `<Directory>` rules for one ancestor directory.
+    pub fn apply_directory_rules_for_dir(
+        &self,
+        vhost: Option<&VHost>,
+        scope: &mut Scope,
+        req: &crate::http::Request,
+        peer: std::net::IpAddr,
+        dir: &Path,
+        fs_path: &Path,
+        url_path: &str,
+        files: &mut Vec<ScopeRule>,
+        locations: &mut Vec<ScopeRule>,
+        conditionals: &mut Vec<ScopeRule>,
+    ) {
+        let rules: &[ScopeRule] = vhost
+            .map(|v| v.rules.as_slice())
+            .unwrap_or(self.global_rules.as_slice());
+        let index = vhost
+            .map(|v| &v.directory_index)
+            .unwrap_or(&self.global_directory_index);
+        let _ = req;
+        let _ = peer;
+        let mut apply_rule = |rule: &ScopeRule| {
+            merge_rule_delta(scope, rule, fs_path, url_path);
+            for nested in &rule.nested {
+                if nested.condition.is_some() || nested.branch != ConditionBranch::Normal {
+                    conditionals.push(nested.clone());
+                } else {
+                    match nested.kind {
+                        MatchKind::Files(_) | MatchKind::FilesMatch(_) => {
+                            files.push(nested.clone())
+                        }
+                        MatchKind::Location(_) | MatchKind::LocationMatch(_) => {
+                            locations.push(nested.clone())
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        };
+        if index.wildcard.is_empty() {
+            if let Some(indices) = index.exact.get(dir) {
+                for &i in indices {
+                    apply_rule(&rules[i]);
+                }
+            }
+            return;
+        }
+        for rule in rules {
+            if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
+                continue;
+            }
+            let MatchKind::Directory(pattern) = &rule.kind else {
+                continue;
+            };
+            if !directory_pattern_matches_exact(pattern, dir) {
+                continue;
+            }
+            apply_rule(rule);
+        }
+    }
+
+    /// Apply `<DirectoryMatch>` rules after `<Directory>` and access files.
+    pub fn apply_directory_match_rules(
+        &self,
+        vhost: Option<&VHost>,
+        scope: &mut Scope,
+        fs_path: &Path,
+        url_path: &str,
+        files: &mut Vec<ScopeRule>,
+        locations: &mut Vec<ScopeRule>,
+        conditionals: &mut Vec<ScopeRule>,
+    ) {
+        let rules: &[ScopeRule] = vhost
+            .map(|v| v.rules.as_slice())
+            .unwrap_or(self.global_rules.as_slice());
+        for rule in rules {
+            if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
+                continue;
+            }
+            let MatchKind::DirectoryMatch(re) = &rule.kind else {
+                continue;
+            };
+            if !re.is_match(&fs_path.to_string_lossy()) {
+                continue;
+            }
+            merge_rule_delta(scope, rule, fs_path, url_path);
+            for nested in &rule.nested {
+                if nested.condition.is_some() || nested.branch != ConditionBranch::Normal {
+                    conditionals.push(nested.clone());
+                } else {
+                    match nested.kind {
+                        MatchKind::Files(_) | MatchKind::FilesMatch(_) => {
+                            files.push(nested.clone())
+                        }
+                        MatchKind::Location(_) | MatchKind::LocationMatch(_) => {
+                            locations.push(nested.clone())
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cached normal scope for paths that cannot read an access file.  Normal
+    /// configuration rules do not depend on request headers or method; only
+    /// the deferred conditional rules do.  Cache the normal scope and the
+    /// matching conditional list, then apply the conditionals per request.
+    pub fn effective_scope_req_cached(
+        &self,
+        vhost: Option<&VHost>,
+        fs_path: &Path,
+        url_path: &str,
+        req: &crate::http::Request,
+        peer: std::net::IpAddr,
+    ) -> (Scope, Arc<Vec<ScopeRule>>) {
+        let key = (
+            vhost.map(|v| v as *const VHost as usize).unwrap_or(0),
+            fs_path.to_path_buf(),
+            url_path.to_string(),
+        );
+        if let Ok(guard) = self.policy_cache.read() {
+            if let Some(cached) = guard.get(&key) {
+                return (cached.scope.clone(), Arc::clone(&cached.conditionals));
+            }
+        }
+        let mut conditionals = Vec::new();
+        let scope = self.effective_scope_req_deferred(
+            vhost,
+            fs_path,
+            url_path,
+            req,
+            peer,
+            &mut conditionals,
+        );
+        let conditionals = Arc::new(conditionals);
+        if let Ok(mut guard) = self.policy_cache.write() {
+            if guard.len() >= 4096 {
+                guard.clear();
+            }
+            guard.insert(
+                key,
+                Arc::new(CachedPolicy {
+                    scope: scope.clone(),
+                    conditionals: Arc::clone(&conditionals),
+                }),
+            );
+        }
+        (scope, conditionals)
+    }
+
+    pub fn effective_scope_req_deferred(
+        &self,
+        vhost: Option<&VHost>,
+        fs_path: &Path,
+        url_path: &str,
+        req: &crate::http::Request,
+        peer: std::net::IpAddr,
+        deferred: &mut Vec<ScopeRule>,
+    ) -> Scope {
+        let (scope, conditionals) =
+            crate::policy_ref::effective_scope_req(self, vhost, fs_path, url_path, req, peer);
+        deferred.extend(conditionals);
+        scope
+    }
+
+    fn url_base_for_directory(dir: &Path, fs_path: &Path, url_path: &str) -> Option<String> {
+        let rel = fs_path.strip_prefix(dir).ok()?;
+        let depth = rel.components().count();
+        let mut parts: Vec<&str> = url_path
+            .trim_matches('/')
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.len() < depth {
+            return None;
+        }
+        if depth > 0 {
+            parts.truncate(parts.len() - depth);
+        }
+        let mut base = String::from("/");
+        base.push_str(&parts.join("/"));
+        if !base.ends_with('/') {
+            base.push('/');
+        }
+        Some(normalize_rewrite_base(&base))
+    }
+
+    /// Human-readable inventory of the matching top-level rules in canonical
+    /// merge order.  This is for `--explain`; it does not evaluate runtime
+    /// conditions or access-file sections.
+    pub fn rule_inventory(
+        &self,
+        vhost: Option<&VHost>,
+        fs_path: &Path,
+        url_path: &str,
+        req: &crate::http::Request,
+        peer: std::net::IpAddr,
+    ) -> Vec<String> {
+        let rules: &[ScopeRule] = vhost
+            .map(|v| v.rules.as_slice())
+            .unwrap_or(self.global_rules.as_slice());
+        let fname = fs_path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
+        let env = base.request_env(req);
+        let docroot = self.documentation_root_for(vhost);
+        let mut chain_state = HashMap::new();
+        let mut out = Vec::new();
+        fn walk(
+            rules: &[ScopeRule],
+            depth: usize,
+            fs_path: &Path,
+            url_path: &str,
+            fname: &str,
+            req: &crate::http::Request,
+            env: &[(String, String)],
+            peer: std::net::IpAddr,
+            docroot: &Path,
+            chain_state: &mut HashMap<usize, bool>,
+            out: &mut Vec<String>,
+        ) {
+            for rule in rules {
+                if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
+                    continue;
+                }
+                let conditional =
+                    rule.condition.is_some() || rule.branch != ConditionBranch::Normal;
+                let matched = if conditional {
+                    rule_condition_matches(rule, req, env, peer, docroot, chain_state)
+                } else {
+                    true
+                };
+                let condition = if conditional {
+                    format!(" condition={matched}")
+                } else {
+                    String::new()
+                };
+                out.push(format!(
+                    "{} {:?} order={} kind={:?}{condition} nested={}",
+                    " ".repeat(depth),
+                    rule.phase(),
+                    rule.order,
+                    rule.kind,
+                    rule.nested.len()
+                ));
+                if matched {
+                    walk(
+                        &rule.nested,
+                        depth + 1,
+                        fs_path,
+                        url_path,
+                        fname,
+                        req,
+                        env,
+                        peer,
+                        docroot,
+                        chain_state,
+                        out,
+                    );
+                }
+            }
+        }
+        walk(
+            rules,
+            0,
+            fs_path,
+            url_path,
+            &fname,
+            req,
+            &env,
+            peer,
+            &docroot,
+            &mut chain_state,
+            &mut out,
+        );
+        out
+    }
+
+    pub fn documentation_root_for(&self, vhost: Option<&VHost>) -> PathBuf {
+        vhost
+            .and_then(|v| v.scope.content_policy.document_root.clone())
+            .or_else(|| self.global.content_policy.document_root.clone())
+            .unwrap_or_else(|| self.document_root.clone())
+    }
+
+    pub fn directory_index_for(&self, scope: &Scope) -> Vec<String> {
+        scope
+            .content_policy
+            .directory_index
+            .clone()
+            .unwrap_or_else(|| self.directory_index.clone())
+    }
+
+    pub fn access_file_names_for(&self, scope: &Scope) -> Vec<String> {
+        scope
+            .content_policy
+            .access_file_names
+            .clone()
+            .unwrap_or_else(|| self.access_file_names.clone())
+    }
+}
+
+pub(crate) fn vhost_port(addr: &str) -> u16 {
+    let a = addr.trim();
+    if a.starts_with("_default_") {
+        return a
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse().ok())
+            .unwrap_or(0);
+    }
+    if a.starts_with('[') {
+        return a
+            .rsplit_once("]:")
+            .and_then(|(_, p)| p.parse().ok())
+            .unwrap_or(0);
+    }
+    match a.rsplit_once(':') {
+        Some((_, p)) => p.parse().unwrap_or(0),
+        None => 80,
+    }
+}
+
+/// Precomputed index for literal `<Directory>` rules.  Wildcard patterns stay
+/// in a fallback list because their match order is part of configuration
+/// semantics.
+#[derive(Debug, Clone, Default)]
+pub struct DirectoryRuleIndex {
+    exact: HashMap<PathBuf, Vec<usize>>,
+    wildcard: Vec<usize>,
+}
+
+impl DirectoryRuleIndex {
+    fn build(rules: &[ScopeRule]) -> Self {
+        use std::os::unix::ffi::OsStrExt;
+        let mut index = Self::default();
+        for (i, rule) in rules.iter().enumerate() {
+            if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
+                continue;
+            }
+            let MatchKind::Directory(pattern) = &rule.kind else {
+                continue;
+            };
+            let wildcard = pattern
+                .as_os_str()
+                .as_bytes()
+                .iter()
+                .any(|b| matches!(b, b'*' | b'?' | b'['));
+            if wildcard {
+                index.wildcard.push(i);
+            } else {
+                index.exact.entry(pattern.clone()).or_default().push(i);
+            }
+        }
+        index
+    }
+}

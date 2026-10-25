@@ -1,0 +1,76 @@
+{
+  "timestamp": "2026-10-22T22:58:36.516378+00:00",
+  "tool": "wrk / ab / h2load",
+  "duration_s": 2.0,
+  "samples": 3,
+  "scenarios": [
+    {
+      "name": "HTTP/2 1MB",
+      "proto": "tls-h2",
+      "path": "/large/1m.bin",
+      "servers": {
+        "apache": {
+          "rps": 3866.0,
+          "mean_ms": 10.98,
+          "p99_ms": null,
+          "failed": 0,
+          "non2xx": 0,
+          "statuses": {
+            "2xx": 7754,
+            "3xx": 0,
+            "4xx": 0,
+            "5xx": 0
+          },
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 3279.5,
+          "mean_ms": 11.01,
+          "p99_ms": null,
+          "failed": 0,
+          "non2xx": 0,
+          "statuses": {
+            "2xx": 6565,
+            "3xx": 0,
+            "4xx": 0,
+            "5xx": 0
+          },
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.8482928091050181
+    }
+  ],
+  "config_test_ms": {
+    "apache": 16.096109999125474,
+    "vapache": 3.481907999230316
+  },
+  "config_test_errors": {
+    "apache": "",
+    "vapache": ""
+  },
+  "memory": {
+    "apache": {
+      "processes": 5,
+      "threads": 217,
+      "pss_kb": 80732
+    },
+    "vapache": {
+      "processes": 17,
+      "threads": 18,
+      "pss_kb": 113026
+    }
+  }
+}

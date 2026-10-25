@@ -1,0 +1,162 @@
+{
+  "timestamp": "2026-10-22T10:42:50.387335+00:00",
+  "tool": "wrk",
+  "scenarios": [
+    {
+      "name": "index.html (small, keepalive)",
+      "path": "/index.html",
+      "requests": 3000,
+      "concurrency": 50,
+      "servers": {
+        "apache": {
+          "rps": 95039.81,
+          "mean_ms": 0.59527,
+          "p99_ms": 2.5,
+          "transferred_kbps": 27381.76,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 208240.9,
+          "mean_ms": 0.20815,
+          "p99_ms": 1.07,
+          "transferred_kbps": 56535.04,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": ""
+        }
+      },
+      "ratio": 2.19109129111264
+    },
+    {
+      "name": "hello.txt (1.1KB, keepalive)",
+      "path": "/hello.txt",
+      "requests": 3000,
+      "concurrency": 50,
+      "servers": {
+        "apache": {
+          "rps": 95403.09,
+          "mean_ms": 0.6427200000000001,
+          "p99_ms": 2.98,
+          "transferred_kbps": 133324.8,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 206907.74,
+          "mean_ms": 0.21161000000000002,
+          "p99_ms": 1.06,
+          "transferred_kbps": 285716.48,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": ""
+        }
+      },
+      "ratio": 2.168773988347757
+    },
+    {
+      "name": "10k.bin (10KB, keepalive)",
+      "path": "/small/10k.bin",
+      "requests": 3000,
+      "concurrency": 50,
+      "servers": {
+        "apache": {
+          "rps": 90428.57,
+          "mean_ms": 0.64837,
+          "p99_ms": 2.98,
+          "transferred_kbps": 922746.88,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 192960.14,
+          "mean_ms": 0.20785,
+          "p99_ms": 0.98,
+          "transferred_kbps": 1971322.88,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": ""
+        }
+      },
+      "ratio": 2.1338404444524555
+    },
+    {
+      "name": "1m.bin (1MB, keepalive)",
+      "path": "/large/1m.bin",
+      "requests": 300,
+      "concurrency": 10,
+      "servers": {
+        "apache": {
+          "rps": 7209.01,
+          "mean_ms": 1.38,
+          "p99_ms": 6.34,
+          "transferred_kbps": 7381975.04,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 11509.5,
+          "mean_ms": 0.57678,
+          "p99_ms": 1.0,
+          "transferred_kbps": 11785994.24,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "timeout": 0
+          },
+          "raw": ""
+        }
+      },
+      "ratio": 1.5965437695328484
+    }
+  ]
+}

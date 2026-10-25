@@ -1,0 +1,129 @@
+{
+  "timestamp": "2026-10-22T10:22:25.706618+00:00",
+  "scenarios": [
+    {
+      "name": "index.html (small, keepalive)",
+      "path": "/index.html",
+      "requests": 3000,
+      "concurrency": 50,
+      "servers": {
+        "apache": {
+          "rps": 50178.13,
+          "mean_ms": 0.996,
+          "p50_ms": 1.0,
+          "p95_ms": 3.0,
+          "p99_ms": 4.0,
+          "failed": 0,
+          "non2xx": null,
+          "transferred_kbps": 17298.55,
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 84925.69,
+          "mean_ms": 0.589,
+          "p50_ms": 1.0,
+          "p95_ms": 1.0,
+          "p99_ms": 2.0,
+          "failed": 0,
+          "non2xx": null,
+          "transferred_kbps": 25046.44,
+          "raw": ""
+        }
+      },
+      "ratio": 1.6924841559460269
+    },
+    {
+      "name": "hello.txt (1.1KB, keepalive)",
+      "path": "/hello.txt",
+      "requests": 3000,
+      "concurrency": 50,
+      "servers": {
+        "apache": {
+          "rps": 74391.85,
+          "mean_ms": 0.672,
+          "p50_ms": 0.0,
+          "p95_ms": 2.0,
+          "p99_ms": 3.0,
+          "failed": 0,
+          "non2xx": null,
+          "transferred_kbps": 108174.51,
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 106458.48,
+          "mean_ms": 0.47,
+          "p50_ms": 0.0,
+          "p95_ms": 1.0,
+          "p99_ms": 1.0,
+          "failed": 0,
+          "non2xx": null,
+          "transferred_kbps": 149499.31,
+          "raw": ""
+        }
+      },
+      "ratio": 1.4310503099465868
+    },
+    {
+      "name": "10k.bin (10KB, keepalive)",
+      "path": "/small/10k.bin",
+      "requests": 3000,
+      "concurrency": 50,
+      "servers": {
+        "apache": {
+          "rps": 71830.48,
+          "mean_ms": 0.696,
+          "p50_ms": 0.0,
+          "p95_ms": 2.0,
+          "p99_ms": 3.0,
+          "failed": 0,
+          "non2xx": null,
+          "transferred_kbps": 739700.79,
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 98879.37,
+          "mean_ms": 0.506,
+          "p50_ms": 0.0,
+          "p95_ms": 1.0,
+          "p99_ms": 1.0,
+          "failed": 0,
+          "non2xx": null,
+          "transferred_kbps": 1013320.39,
+          "raw": ""
+        }
+      },
+      "ratio": 1.3765656306347946
+    },
+    {
+      "name": "1m.bin (1MB, keepalive)",
+      "path": "/large/1m.bin",
+      "requests": 300,
+      "concurrency": 10,
+      "servers": {
+        "apache": {
+          "rps": 6484.94,
+          "mean_ms": 1.542,
+          "p50_ms": 1.0,
+          "p95_ms": 3.0,
+          "p99_ms": 4.0,
+          "failed": 0,
+          "non2xx": null,
+          "transferred_kbps": 6642527.21,
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 5402.58,
+          "mean_ms": 1.851,
+          "p50_ms": 2.0,
+          "p95_ms": 4.0,
+          "p99_ms": 6.0,
+          "failed": 0,
+          "non2xx": null,
+          "transferred_kbps": 5533605.61,
+          "raw": ""
+        }
+      },
+      "ratio": 0.8330963740605156
+    }
+  ]
+}

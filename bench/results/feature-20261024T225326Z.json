@@ -1,0 +1,64 @@
+{
+  "timestamp": "2026-10-24T22:53:23.861471+00:00",
+  "tool": "wrk / ab / h2load",
+  "duration_s": 1.0,
+  "samples": 1,
+  "scenarios": [
+    {
+      "name": "rewrite (.htaccess)",
+      "proto": "http",
+      "path": "/htaccess/rewrite/old.html",
+      "servers": {
+        "apache": {
+          "rps": 46410.69,
+          "mean_ms": 1.76,
+          "p99_ms": 8.47,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            52,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 35774.24,
+          "mean_ms": 2.92,
+          "p99_ms": 33.66,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.7708189643377419
+    }
+  ],
+  "config_test_ms": {
+    "apache": 18.94945200183429,
+    "vapache": 6.421373982448131
+  },
+  "config_test_errors": {
+    "apache": "",
+    "vapache": ""
+  },
+  "memory": {
+    "apache": {
+      "processes": 5,
+      "threads": 209,
+      "pss_kb": 22258
+    },
+    "vapache": {
+      "processes": 17,
+      "threads": 20,
+      "pss_kb": 24458
+    }
+  }
+}

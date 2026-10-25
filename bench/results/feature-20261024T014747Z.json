@@ -1,0 +1,64 @@
+{
+  "timestamp": "2026-10-24T01:47:44.850726+00:00",
+  "tool": "wrk / ab / h2load",
+  "duration_s": 1.0,
+  "samples": 1,
+  "scenarios": [
+    {
+      "name": "static 1MB",
+      "proto": "http",
+      "path": "/large/1m.bin",
+      "servers": {
+        "apache": {
+          "rps": 7207.65,
+          "mean_ms": 2.45,
+          "p99_ms": 13.33,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 15246.98,
+          "mean_ms": 0.71258,
+          "p99_ms": 1.99,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 2.1153885108183665
+    }
+  ],
+  "config_test_ms": {
+    "apache": 19.410388005780987,
+    "vapache": 6.313404010143131
+  },
+  "config_test_errors": {
+    "apache": "",
+    "vapache": ""
+  },
+  "memory": {
+    "apache": {
+      "processes": 5,
+      "threads": 209,
+      "pss_kb": 18661
+    },
+    "vapache": {
+      "processes": 17,
+      "threads": 20,
+      "pss_kb": 18095
+    }
+  }
+}

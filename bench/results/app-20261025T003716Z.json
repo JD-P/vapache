@@ -1,0 +1,26 @@
+{
+  "timestamp": "2026-10-25T00:37:16.652956+00:00",
+  "sample_seconds": 3.0,
+  "samples": 3,
+  "scenarios": [
+    {
+      "name": "Gunicorn /app/hello",
+      "path": "/app/hello",
+      "servers": {
+        "apache": {
+          "rps": 19283.19,
+          "mean_ms": 1.66,
+          "p99_ms": 2.58,
+          "raw": "Running 3s test @ http://127.0.0.1:19080/app/hello\n  4 threads and 32 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.66ms  290.98us   7.65ms   79.65%\n    Req/Sec     4.85k   231.29     5.51k    78.23%\n  Latency Distribution\n     50%    1.63ms\n     75%    1.76ms\n     90%    1.96ms\n     99%    2.58ms\n  59773 requests in 3.10s, 11.46MB read\nRequests/sec:  19283.19\nTransfer/sec:      3.70MB\n"
+        },
+        "vapache": {
+          "rps": 23136.61,
+          "mean_ms": 1.39,
+          "p99_ms": 4.43,
+          "raw": "Running 3s test @ http://127.0.0.1:19081/app/hello\n  4 threads and 32 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.39ms  659.04us  13.98ms   88.80%\n    Req/Sec     5.96k     1.78k   22.75k    90.91%\n  Latency Distribution\n     50%    1.29ms\n     75%    1.42ms\n     90%    1.78ms\n     99%    4.43ms\n  71712 requests in 3.10s, 13.68MB read\nRequests/sec:  23136.61\nTransfer/sec:      4.41MB\n"
+        }
+      },
+      "ratio": 1.1998331188978588
+    }
+  ]
+}

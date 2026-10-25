@@ -1,0 +1,172 @@
+{
+  "timestamp": "2026-10-25T00:07:54.840441+00:00",
+  "tool": "wrk / ab / h2load",
+  "duration_s": 2.0,
+  "samples": 3,
+  "scenarios": [
+    {
+      "name": "DirectoryIndex CGI",
+      "proto": "http",
+      "path": "/dir-cgi/",
+      "servers": {
+        "apache": {
+          "rps": 2688.44,
+          "mean_ms": 13.64,
+          "p99_ms": 53.46,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 895.2,
+          "mean_ms": 36.64,
+          "p99_ms": 107.95,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.3329812084331434
+    },
+    {
+      "name": "ErrorDocument CGI",
+      "proto": "http",
+      "path": "/errorcgi/missing",
+      "servers": {
+        "apache": {
+          "rps": 2494.49,
+          "mean_ms": 15.09,
+          "p99_ms": 63.45,
+          "failed": 0,
+          "non2xx": 5006,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 1024.65,
+          "mean_ms": 31.43,
+          "p99_ms": 100.47,
+          "failed": 0,
+          "non2xx": 2152,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.4107653267802237
+    },
+    {
+      "name": "CGI GET",
+      "proto": "http",
+      "path": "/cgi-bin/env.sh",
+      "servers": {
+        "apache": {
+          "rps": 2228.16,
+          "mean_ms": 17.29,
+          "p99_ms": 65.73,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 957.77,
+          "mean_ms": 34.1,
+          "p99_ms": 101.95,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.42984794628751977
+    },
+    {
+      "name": "CGI POST",
+      "proto": "ab-post",
+      "path": "/cgi-bin/env.sh",
+      "servers": {
+        "apache": {
+          "rps": 2022.16,
+          "mean_ms": 7.912,
+          "p99_ms": 54.0,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 1023.61,
+          "mean_ms": 15.631,
+          "p99_ms": 37.0,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 0.5061963445029077
+    }
+  ],
+  "config_test_ms": {
+    "apache": 22.15361100388691,
+    "vapache": 6.90708399633877
+  },
+  "config_test_errors": {
+    "apache": "",
+    "vapache": ""
+  },
+  "memory": {
+    "apache": {
+      "processes": 7,
+      "threads": 313,
+      "pss_kb": 31411
+    },
+    "vapache": {
+      "processes": 17,
+      "threads": 20,
+      "pss_kb": 23140
+    }
+  }
+}

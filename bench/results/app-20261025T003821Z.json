@@ -1,0 +1,45 @@
+{
+  "timestamp": "2026-10-25T00:38:21.600269+00:00",
+  "sample_seconds": 3.0,
+  "samples": 5,
+  "scenarios": [
+    {
+      "name": "PHP-FPM /index.php",
+      "path": "/index.php",
+      "servers": {
+        "apache": {
+          "rps": 46009.63,
+          "mean_ms": 0.80222,
+          "p99_ms": 4.49,
+          "raw": "Running 3s test @ http://127.0.0.1:19080/index.php\n  4 threads and 32 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   802.22us    0.87ms  18.63ms   91.21%\n    Req/Sec    11.85k     1.96k   31.26k    99.17%\n  Latency Distribution\n     50%  548.00us\n     75%    0.89ms\n     90%    1.55ms\n     99%    4.49ms\n  142626 requests in 3.10s, 32.10MB read\nRequests/sec:  46009.63\nTransfer/sec:     10.36MB\n"
+        },
+        "vapache": {
+          "rps": 57267.52,
+          "mean_ms": 0.80098,
+          "p99_ms": 7.08,
+          "raw": "Running 3s test @ http://127.0.0.1:19081/index.php\n  4 threads and 32 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   800.98us    1.25ms  18.12ms   92.85%\n    Req/Sec    14.62k     1.87k   25.88k    82.79%\n  Latency Distribution\n     50%  433.00us\n     75%  725.00us\n     90%    1.52ms\n     99%    7.08ms\n  177537 requests in 3.10s, 34.03MB read\nRequests/sec:  57267.52\nTransfer/sec:     10.98MB\n"
+        }
+      },
+      "ratio": 1.244685514749847
+    },
+    {
+      "name": "Gunicorn /app/hello",
+      "path": "/app/hello",
+      "servers": {
+        "apache": {
+          "rps": 25389.88,
+          "mean_ms": 1.25,
+          "p99_ms": 2.21,
+          "raw": "Running 3s test @ http://127.0.0.1:19080/app/hello\n  4 threads and 32 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.25ms  278.54us   7.35ms   82.16%\n    Req/Sec     6.43k   333.27     8.06k    86.18%\n  Latency Distribution\n     50%    1.22ms\n     75%    1.33ms\n     90%    1.50ms\n     99%    2.21ms\n  78706 requests in 3.10s, 15.09MB read\nRequests/sec:  25389.88\nTransfer/sec:      4.87MB\n"
+        },
+        "vapache": {
+          "rps": 25260.57,
+          "mean_ms": 6.34,
+          "p99_ms": 7.19,
+          "raw": "Running 3s test @ http://127.0.0.1:19081/app/hello\n  4 threads and 32 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     6.34ms   58.40ms   1.02s    99.06%\n    Req/Sec     6.35k   505.35     7.05k    67.74%\n  Latency Distribution\n     50%    1.19ms\n     75%    1.32ms\n     90%    1.59ms\n     99%    7.19ms\n  78311 requests in 3.10s, 14.94MB read\nRequests/sec:  25260.57\nTransfer/sec:      4.82MB\n"
+        }
+      },
+      "ratio": 0.9949070259489213
+    }
+  ]
+}

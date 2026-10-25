@@ -1,0 +1,208 @@
+{
+  "timestamp": "2026-10-23T00:17:07.536920+00:00",
+  "tool": "wrk / ab / h2load",
+  "duration_s": 2.0,
+  "samples": 3,
+  "scenarios": [
+    {
+      "name": "HEAD 1.1KB",
+      "proto": "ab-head",
+      "path": "/hello.txt",
+      "servers": {
+        "apache": {
+          "rps": 126908.38,
+          "mean_ms": 0.504,
+          "p99_ms": 1.0,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 132285.63,
+          "mean_ms": 0.484,
+          "p99_ms": 1.0,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 1.042371118439933
+    },
+    {
+      "name": "directory redirect",
+      "proto": "http",
+      "path": "/dir",
+      "servers": {
+        "apache": {
+          "rps": 158910.66,
+          "mean_ms": 0.36355,
+          "p99_ms": 1.26,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            7,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 165625.83,
+          "mean_ms": 0.3707,
+          "p99_ms": 2.04,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 1.0422575175258852
+    },
+    {
+      "name": "301 redirect",
+      "proto": "http",
+      "path": "/old",
+      "servers": {
+        "apache": {
+          "rps": 174268.07,
+          "mean_ms": 0.34187,
+          "p99_ms": 1.36,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            29,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 196400.61,
+          "mean_ms": 0.30768,
+          "p99_ms": 1.7,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 1.1270028410827064
+    },
+    {
+      "name": "Basic auth 401",
+      "proto": "http",
+      "path": "/auth/protected.txt",
+      "servers": {
+        "apache": {
+          "rps": 167505.14,
+          "mean_ms": 0.35375999999999996,
+          "p99_ms": 1.36,
+          "failed": 0,
+          "non2xx": 351770,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 187353.23,
+          "mean_ms": 0.31212,
+          "p99_ms": 1.61,
+          "failed": 0,
+          "non2xx": 393335,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 1.118492423575778
+    },
+    {
+      "name": "Header (.htaccess)",
+      "proto": "http",
+      "path": "/htaccess/header/hello.txt",
+      "servers": {
+        "apache": {
+          "rps": 76194.19,
+          "mean_ms": 1.06,
+          "p99_ms": 4.95,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            18,
+            0,
+            0
+          ],
+          "raw": ""
+        },
+        "vapache": {
+          "rps": 134437.73,
+          "mean_ms": 0.46852,
+          "p99_ms": 2.66,
+          "failed": 0,
+          "non2xx": 0,
+          "socket_errors": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "raw": ""
+        }
+      },
+      "ratio": 1.7644092023289442
+    }
+  ],
+  "config_test_ms": {
+    "apache": 16.106641998703708,
+    "vapache": 3.5117740007990506
+  },
+  "config_test_errors": {
+    "apache": "",
+    "vapache": ""
+  },
+  "memory": {
+    "apache": {
+      "processes": 7,
+      "threads": 313,
+      "pss_kb": 26871
+    },
+    "vapache": {
+      "processes": 17,
+      "threads": 18,
+      "pss_kb": 19184
+    }
+  }
+}

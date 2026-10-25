@@ -1,0 +1,445 @@
+//! Small, dependency-free helpers shared by the server.
+//!
+//! Everything here is pure and heavily unit-tested; it is deliberately kept
+//! free of I/O so that it can be moved into the verified crate as proofs are
+//! written.
+
+use std::cell::RefCell;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Format a Unix timestamp as an IMF-fixdate (RFC 9110 §5.6.7), e.g.
+/// `Sun, 06 Nov 1994 08:49:37 GMT`.
+pub fn http_date(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let weekday = weekday_from_days(days);
+    let (hh, mm, ss) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    if !(0..=9999).contains(&year) {
+        // RFC 9110 only defines four-digit years; keep the formatting
+        // machinery for the out-of-range edge rather than silently wrapping.
+        return format!(
+            "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+            WEEKDAYS[weekday],
+            day,
+            MONTHS[month as usize - 1],
+            year,
+            hh,
+            mm,
+            ss
+        );
+    }
+    // IMF-fixdate is fixed-width (29 bytes).  Building it directly avoids the
+    // formatting machinery on every response.
+    let mut buf = [0u8; 29];
+    buf[..3].copy_from_slice(WEEKDAYS[weekday].as_bytes());
+    buf[3] = b',';
+    buf[4] = b' ';
+    buf[5] = b'0' + (day / 10) as u8;
+    buf[6] = b'0' + (day % 10) as u8;
+    buf[7] = b' ';
+    buf[8..11].copy_from_slice(MONTHS[month as usize - 1].as_bytes());
+    buf[11] = b' ';
+    let y = year as u32;
+    buf[12] = b'0' + (y / 1000) as u8;
+    buf[13] = b'0' + ((y / 100) % 10) as u8;
+    buf[14] = b'0' + ((y / 10) % 10) as u8;
+    buf[15] = b'0' + (y % 10) as u8;
+    buf[16] = b' ';
+    buf[17] = b'0' + (hh / 10) as u8;
+    buf[18] = b'0' + (hh % 10) as u8;
+    buf[19] = b':';
+    buf[20] = b'0' + (mm / 10) as u8;
+    buf[21] = b'0' + (mm % 10) as u8;
+    buf[22] = b':';
+    buf[23] = b'0' + (ss / 10) as u8;
+    buf[24] = b'0' + (ss % 10) as u8;
+    buf[25] = b' ';
+    buf[26..].copy_from_slice(b"GMT");
+    // Every byte written above is ASCII.
+    String::from_utf8(buf.to_vec()).unwrap()
+}
+
+pub fn http_date_now() -> String {
+    http_date(unix_now())
+}
+
+thread_local! {
+    /// The `Date` header only changes once per second.  Formatting it for
+    /// every response is a measurable cost at keep-alive request rates, so
+    /// each connection thread keeps the current second's value and reuses it.
+    static HTTP_DATE_CACHE: RefCell<(i64, String)> = const { RefCell::new((i64::MIN, String::new())) };
+}
+
+/// Call `f` with the current IMF-fixdate, reusing a per-thread cached string
+/// when the wall-clock second has not changed.
+pub fn with_http_date_now<F: FnOnce(&str)>(f: F) {
+    let now = unix_now();
+    HTTP_DATE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.0 != now {
+            cache.0 = now;
+            cache.1 = http_date(now);
+        }
+        f(&cache.1);
+    });
+}
+
+pub fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64
+}
+
+pub fn system_time_secs(t: SystemTime) -> i64 {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    }
+}
+
+const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Days since 1970-01-01 -> (year, month, day). Howard Hinnant's algorithm.
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+/// Days since epoch -> weekday index (0 = Thursday, matching WEEKDAYS).
+fn weekday_from_days(z: i64) -> usize {
+    z.rem_euclid(7) as usize
+}
+
+/// Inverse of `civil_from_days`.
+pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Parse the three HTTP date formats accepted by RFC 9110. Returns Unix seconds.
+pub fn parse_http_date(s: &[u8]) -> Option<i64> {
+    let s = std::str::from_utf8(s).ok()?.trim();
+    // IMF-fixdate: Sun, 06 Nov 1994 08:49:37 GMT
+    if let Some((_, rest)) = s.split_once(", ") {
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() == 5 && parts[4] == "GMT" {
+            let day: u32 = parts[0].parse().ok()?;
+            let month = month_num(parts[1])?;
+            let year: i64 = parts[2].parse().ok()?;
+            let (hh, mm, ss) = parse_hms(parts[3])?;
+            return Some(
+                days_from_civil(year, month, day) * 86_400 + (hh * 3600 + mm * 60 + ss) as i64,
+            );
+        }
+        // RFC 850: Sunday, 06-Nov-94 08:49:37 GMT
+        if parts.len() == 3 && parts[2] == "GMT" {
+            let dmy: Vec<&str> = parts[0].split('-').collect();
+            if dmy.len() == 3 {
+                let day: u32 = dmy[0].parse().ok()?;
+                let month = month_num(dmy[1])?;
+                let mut year: i64 = dmy[2].parse().ok()?;
+                year += if year < 70 { 2000 } else { 1900 };
+                let (hh, mm, ss) = parse_hms(parts[1])?;
+                return Some(
+                    days_from_civil(year, month, day) * 86_400 + (hh * 3600 + mm * 60 + ss) as i64,
+                );
+            }
+        }
+    }
+    // asctime: Sun Nov  6 08:49:37 1994
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() == 5 {
+        let month = month_num(parts[1])?;
+        let day: u32 = parts[2].parse().ok()?;
+        let (hh, mm, ss) = parse_hms(parts[3])?;
+        let year: i64 = parts[4].parse().ok()?;
+        return Some(
+            days_from_civil(year, month, day) * 86_400 + (hh * 3600 + mm * 60 + ss) as i64,
+        );
+    }
+    None
+}
+
+fn parse_hms(s: &str) -> Option<(u32, u32, u32)> {
+    let mut it = s.split(':');
+    let h = it.next()?.parse().ok()?;
+    let m = it.next()?.parse().ok()?;
+    let sec = it.next()?.parse().ok()?;
+    if it.next().is_some() || h > 23 || m > 59 || sec > 60 {
+        return None;
+    }
+    Some((h, m, sec))
+}
+
+fn month_num(s: &str) -> Option<u32> {
+    MONTHS.iter().position(|m| *m == s).map(|i| i as u32 + 1)
+}
+
+/// Case-insensitive ASCII comparison.
+pub fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+}
+
+pub fn trim_ascii(s: &[u8]) -> &[u8] {
+    let start = s
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t'))
+        .unwrap_or(s.len());
+    let end = s
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t'))
+        .map(|i| i + 1)
+        .unwrap_or(start);
+    &s[start..end]
+}
+
+/// Split a comma-separated header value into trimmed, non-empty elements.
+pub fn comma_list(v: &[u8]) -> Vec<Vec<u8>> {
+    v.split(|b| *b == b',')
+        .map(trim_ascii)
+        .filter(|x| !x.is_empty())
+        .map(|x| x.to_vec())
+        .collect()
+}
+
+#[inline]
+fn is_safe_path_byte(b: u8) -> bool {
+    (0x20..=0x7e).contains(&b) && b != b'\\'
+}
+
+/// Independent runtime checker for the canonical-path invariant.
+///
+/// The normalizer itself is the Verus-verified `normalize_uri_path`; this
+/// checker is retained as a cheap defense-in-depth assertion (and is unit
+/// tested against the verified implementation) before filesystem access.
+pub fn is_canonical_path(s: &[u8]) -> bool {
+    if s.is_empty() || s[0] != b'/' {
+        return false;
+    }
+    if s.iter().any(|b| !is_safe_path_byte(*b)) {
+        return false;
+    }
+    if s.len() > 1 && s[s.len() - 1] == b'/' {
+        return false;
+    }
+    let mut segs = s[1..].split(|b| *b == b'/');
+    if s.len() == 1 {
+        return true;
+    }
+    for seg in segs.by_ref() {
+        if seg.is_empty() || seg == b"." || seg == b".." {
+            return false;
+        }
+    }
+    true
+}
+
+/// Map a URL path to a relative filesystem path (without leading slash),
+/// refusing anything that is not canonical.  Returned as bytes so arbitrary
+/// (non-UTF-8) file names work exactly as they do in Apache.
+pub fn path_to_rel(url_path: &[u8]) -> Option<Vec<u8>> {
+    if !is_canonical_path(url_path) {
+        return None;
+    }
+    if url_path == b"/" {
+        return Some(Vec::new());
+    }
+    Some(url_path[1..].to_vec())
+}
+
+/// URL-encode a path for use in a redirect or directory listing, leaving `/`
+/// and RFC 3986 pchar characters alone.
+pub fn url_encode_path(path: &[u8]) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &b in path {
+        if b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_'
+                    | b'.'
+                    | b'~'
+                    | b'/'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+            )
+        {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0xf) as usize] as char);
+        }
+    }
+    out
+}
+
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+/// HTML-escape file names for autoindex output.
+pub fn html_escape(s: &[u8]) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s {
+        match b {
+            b'&' => out.push_str("&amp;"),
+            b'<' => out.push_str("&lt;"),
+            b'>' => out.push_str("&gt;"),
+            b'"' => out.push_str("&quot;"),
+            b'\'' => out.push_str("&#39;"),
+            _ if b.is_ascii_graphic() || b == b' ' => out.push(b as char),
+            _ => out.push('\u{fffd}'),
+        }
+    }
+    out
+}
+
+/// Parse a hexadecimal `u64`, rejecting signs and overflow.
+pub fn parse_hex_u64(s: &[u8]) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for &b in s {
+        let d = match b {
+            b'0'..=b'9' => (b - b'0') as u64,
+            b'a'..=b'f' => (b - b'a' + 10) as u64,
+            b'A'..=b'F' => (b - b'A' + 10) as u64,
+            _ => return None,
+        };
+        v = v.checked_mul(16)?.checked_add(d)?;
+    }
+    Some(v)
+}
+
+/// Parse a decimal `u64`, rejecting signs and overflow.
+pub fn parse_u64(s: &[u8]) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for &b in s {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::verified::normalize_uri_path;
+
+    #[test]
+    fn date_roundtrip() {
+        let cases = [0, 784_111_777, 1_700_000_000, 2_147_483_647, 951_782_400];
+        for t in cases {
+            let s = http_date(t);
+            assert_eq!(parse_http_date(s.as_bytes()), Some(t), "{s}");
+        }
+        assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+    }
+
+    #[test]
+    fn old_date_formats() {
+        assert_eq!(
+            parse_http_date(b"Sunday, 06-Nov-94 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        assert_eq!(
+            parse_http_date(b"Sun Nov  6 08:49:37 1994"),
+            Some(784_111_777)
+        );
+        assert_eq!(parse_http_date(b"garbage"), None);
+    }
+
+    #[test]
+    fn normalize_basics() {
+        assert_eq!(normalize_uri_path(b"/").unwrap(), b"/");
+        assert_eq!(normalize_uri_path(b"/a/b").unwrap(), b"/a/b");
+        assert_eq!(normalize_uri_path(b"//a///b/").unwrap(), b"/a/b");
+        assert_eq!(normalize_uri_path(b"/a/./b").unwrap(), b"/a/b");
+        assert_eq!(normalize_uri_path(b"/a/../b").unwrap(), b"/b");
+        assert_eq!(normalize_uri_path(b"/../../etc/passwd"), None);
+        assert_eq!(normalize_uri_path(b"/a/%2e%2e/b").unwrap(), b"/a/%2e%2e/b");
+        assert_eq!(normalize_uri_path(b"a/b"), None);
+        assert_eq!(normalize_uri_path(b"/a\\b"), None);
+        assert_eq!(normalize_uri_path(b"/a\x00b"), None);
+        assert_eq!(normalize_uri_path(b"/a\x7fb"), None);
+        // Dot-prefixed names are ordinary segments; only exact `.`/`..` are
+        // special.  Empty segments are collapsed, and a trailing `..` may
+        // climb back to the root but never above it.
+        assert_eq!(normalize_uri_path(b"/a/...").unwrap(), b"/a/...");
+        assert_eq!(normalize_uri_path(b"/a/..b").unwrap(), b"/a/..b");
+        assert_eq!(normalize_uri_path(b"/a/.b").unwrap(), b"/a/.b");
+        assert_eq!(normalize_uri_path(b"/a//../b").unwrap(), b"/b");
+        assert_eq!(normalize_uri_path(b"/a/../").unwrap(), b"/");
+        assert_eq!(normalize_uri_path(b"/.").unwrap(), b"/");
+        assert_eq!(normalize_uri_path(b"/.."), None);
+        assert_eq!(normalize_uri_path(b"/a/../../b"), None);
+    }
+
+    #[test]
+    fn canonical_checker_matches_normalizer() {
+        let inputs: &[&[u8]] = &[
+            b"/", b"/a", b"/a/b", b"//a", b"/a/../b", b"/a/./b", b"/../", b"/a//", b"/a\\b",
+            b"/a%20b", b"/a?b", b"/a#b", b"/.", b"/..", b"///",
+        ];
+        for input in inputs {
+            if let Some(out) = normalize_uri_path(input) {
+                assert!(is_canonical_path(&out), "{:?} -> {:?}", input, out);
+                assert!(path_to_rel(&out).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_rejects_traversal() {
+        assert!(!is_canonical_path(b"/../etc"));
+        assert!(!is_canonical_path(b"/a/../b"));
+        assert!(!is_canonical_path(b"/a/./b"));
+        assert!(!is_canonical_path(b"/a//b"));
+        assert!(!is_canonical_path(b"//etc"));
+        assert!(!is_canonical_path(b"/a/"));
+        assert!(is_canonical_path(b"/a/b"));
+    }
+
+    #[test]
+    fn url_encoding() {
+        assert_eq!(url_encode_path(b"/a b"), "/a%20b");
+        assert_eq!(url_encode_path(b"/caf\xc3\xa9"), "/caf%C3%A9");
+        assert_eq!(url_encode_path(b"/a?b"), "/a%3Fb");
+    }
+}

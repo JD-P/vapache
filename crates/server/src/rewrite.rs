@@ -1,0 +1,2102 @@
+//! A fail-closed `mod_rewrite` implementation.
+//!
+//! Supported: server and per-directory rules, `RewriteBase`,
+//! `RewriteOptions Inherit`, regex/comparison/file-test conditions,
+//! `RewriteCond expr`, `RewriteMap` (`txt`, `rnd`, `prg`, `int`), and the
+//! common rule flags including `[L]`, `[END]`, `[R]`, `[P]`, `[F]`, `[G]`,
+//! `[C]`, `[S]`, `[N]`, `[QSA]`, `[QSD]`, `[QSL]`, `[B]`, `[BNE]`, `[BCTLS]`,
+//! `[BNP]`, `[CO]`, `[E]`, `[H]`, `[T]`, `[NE]`, `[PT]`, `[NS]`,
+//! `[UnsafeAllow3F]`, and `[UnsafePrefixStat]`.  Unsupported syntax is
+//! rejected while parsing the configuration rather than silently skipped;
+//! `[DPI]` is accepted but path-info is resolved later by the request mapper.
+
+use crate::config::{RewriteCond, RewriteMap, RewriteRule, Scope};
+use crate::http::Request;
+use std::fs;
+use std::io::Write;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+pub struct Context<'a> {
+    pub url_path: &'a str,
+    pub fs_path: &'a Path,
+    pub docroot: &'a Path,
+    pub server_root: &'a Path,
+    pub query: &'a [u8],
+    pub peer: IpAddr,
+    pub port: u16,
+    pub https: bool,
+    pub server_name: &'a str,
+}
+
+/// Side effects of the rewrite rules that matched during a pass.  These are
+/// deliberately kept separate from the URL rewrite itself: the caller applies
+/// them to the effective scope of the *final* target after all rewrite rounds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Effects {
+    /// `[E=NAME:VALUE]` / `[E=!NAME]`; `None` means unset.
+    pub env: Vec<(String, Option<String>)>,
+    /// Fully constructed `Set-Cookie` header values from `[CO=...]`.
+    pub cookies: Vec<String>,
+    /// `[H=handler]`
+    pub handler: Option<String>,
+    /// `[T=content-type]`
+    pub content_type: Option<String>,
+    /// Request header names referenced by matching rewrite conditions, used
+    /// to emit `Vary` without adding unrelated headers.
+    pub vary: Vec<String>,
+}
+
+impl Effects {
+    pub fn is_empty(&self) -> bool {
+        self.env.is_empty()
+            && self.cookies.is_empty()
+            && self.handler.is_none()
+            && self.content_type.is_none()
+            && self.vary.is_empty()
+    }
+
+    pub fn merge(&mut self, other: Effects) {
+        self.env.extend(other.env);
+        self.cookies.extend(other.cookies);
+        if other.handler.is_some() {
+            self.handler = other.handler;
+        }
+        if other.content_type.is_some() {
+            self.content_type = other.content_type;
+        }
+        for name in other.vary {
+            if !self.vary.iter().any(|v| v.eq_ignore_ascii_case(&name)) {
+                self.vary.push(name);
+            }
+        }
+    }
+}
+
+struct EscapeSpec {
+    custom: Option<Vec<u8>>,
+    controls: bool,
+    preserve: Vec<u8>,
+    no_plus: bool,
+}
+
+fn escape_spec(flags: &crate::config::RewriteFlags) -> Option<EscapeSpec> {
+    if !flags.escape_backrefs {
+        return None;
+    }
+    Some(EscapeSpec {
+        custom: if flags.escape_chars.is_empty() {
+            None
+        } else {
+            Some(flags.escape_chars.as_bytes().to_vec())
+        },
+        controls: flags.escape_controls,
+        preserve: if flags.noescape_backrefs {
+            if flags.noescape_chars.is_empty() {
+                b"&".to_vec()
+            } else {
+                flags.noescape_chars.as_bytes().to_vec()
+            }
+        } else {
+            Vec::new()
+        },
+        no_plus: flags.backref_no_plus,
+    })
+}
+
+fn escape_backref_value(value: &str, spec: &EscapeSpec) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(value.len());
+    for b in value.bytes() {
+        let escaped = if spec.preserve.contains(&b) {
+            false
+        } else if let Some(custom) = &spec.custom {
+            custom.contains(&b) || (spec.controls && (b <= b' ' || b == 0x7f))
+        } else if spec.controls {
+            b <= b' ' || b == 0x7f
+        } else {
+            !b.is_ascii_alphanumeric()
+        };
+        if escaped {
+            if b == b' ' && !spec.no_plus {
+                out.push(b'+');
+            } else {
+                out.extend_from_slice(format!("%{b:02x}").as_bytes());
+            }
+        } else {
+            out.push(b);
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Build an Apache-shaped `Set-Cookie` value for `[CO=name:value:domain:
+/// lifetime:path:secure:httponly:samesite]`.  The caller has already expanded
+/// backreferences in the raw flag text.
+fn build_cookie(raw: &str) -> Result<String, String> {
+    let fields: Vec<&str> = if let Some(rest) = raw.strip_prefix(';') {
+        rest.split(';').collect()
+    } else {
+        raw.splitn(8, ':').collect()
+    };
+    let name = fields.first().copied().unwrap_or("").trim();
+    if name.is_empty() {
+        return Err("RewriteRule [CO] cookie has an empty name".into());
+    }
+    let value = fields.get(1).copied().unwrap_or("");
+    let mut out = format!("{name}={value}");
+    if let Some(domain) = fields.get(2).map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        out.push_str("; Domain=");
+        out.push_str(domain);
+    }
+    if let Some(lifetime) = fields.get(3).map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        let minutes: i64 = lifetime
+            .parse()
+            .map_err(|_| format!("invalid RewriteRule [CO] lifetime '{lifetime}'"))?;
+        if minutes > 0 {
+            out.push_str("; Max-Age=");
+            out.push_str(&(minutes.saturating_mul(60)).to_string());
+        } else if minutes < 0 {
+            out.push_str("; Max-Age=0");
+        }
+    }
+    if let Some(path) = fields.get(4).map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        out.push_str("; Path=");
+        out.push_str(path);
+    }
+    if let Some(secure) = fields.get(5) {
+        let secure = secure.trim();
+        if secure.eq_ignore_ascii_case("secure")
+            || secure.eq_ignore_ascii_case("true")
+            || secure == "1"
+        {
+            out.push_str("; Secure");
+        }
+    }
+    if let Some(http_only) = fields.get(6) {
+        let http_only = http_only.trim();
+        if http_only.eq_ignore_ascii_case("httponly")
+            || http_only.eq_ignore_ascii_case("true")
+            || http_only == "1"
+        {
+            out.push_str("; HttpOnly");
+        }
+    }
+    if let Some(same_site) = fields.get(7).map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        if !matches!(same_site.to_ascii_lowercase().as_str(), "0" | "false") {
+            out.push_str("; SameSite=");
+            out.push_str(same_site);
+        }
+    }
+    if out.chars().any(|c| c.is_control()) {
+        return Err("control character in RewriteRule [CO] cookie".into());
+    }
+    Ok(out)
+}
+
+fn rule_effects(
+    rule: &RewriteRule,
+    caps: &[String],
+    cond_caps: &[String],
+    req: &Request,
+    ctx: &Context<'_>,
+    path: &str,
+    query: &[u8],
+    maps: &[(String, RewriteMap)],
+    env: &[(String, String)],
+) -> Result<Effects, String> {
+    let mut effects = Effects::default();
+    for (name, value) in &rule.flags.env {
+        let name = expand_backrefs(
+            name, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
+        )?;
+        if name.is_empty() {
+            return Err("RewriteRule [E] has an empty variable name".into());
+        }
+        let value = match value {
+            Some(v) => Some(expand_backrefs(
+                v, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
+            )?),
+            None => None,
+        };
+        effects.env.push((name, value));
+    }
+    for cookie in &rule.flags.cookies {
+        let cookie = expand_backrefs(
+            cookie, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
+        )?;
+        effects.cookies.push(build_cookie(&cookie)?);
+    }
+    if let Some(handler) = &rule.flags.handler {
+        effects.handler = Some(expand_backrefs(
+            handler, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
+        )?);
+    }
+    if let Some(content_type) = &rule.flags.content_type {
+        effects.content_type = Some(expand_backrefs(
+            content_type,
+            caps,
+            cond_caps,
+            req,
+            ctx,
+            path,
+            query,
+            maps,
+            env,
+            true,
+            None,
+        )?);
+    }
+    Ok(effects)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    None,
+    Internal {
+        path: String,
+        query: Vec<u8>,
+        /// `[END]` was used: the caller should not start another rewrite pass.
+        final_pass: bool,
+        effects: Effects,
+        /// An absolute filesystem path selected by a prefix-stat rewrite.
+        /// When present the caller serves this file instead of resolving the
+        /// URL path under the document root.
+        filesystem: Option<PathBuf>,
+    },
+    Redirect {
+        status: u16,
+        /// Either an absolute URL or an absolute path beginning with `/`.
+        location: String,
+        effects: Effects,
+    },
+    /// `[P]`: proxy the request to an absolute URL.
+    Proxy {
+        url: String,
+        effects: Effects,
+    },
+    Forbidden,
+    Gone,
+    Error(String),
+}
+
+pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
+    if scope.rewrite_policy.rewrite_engine != Some(true)
+        || scope.rewrite_policy.rewrite_rules.is_empty()
+    {
+        return Outcome::None;
+    }
+    let mut path = ctx.url_path.to_string();
+    let mut query = ctx.query.to_vec();
+    let mut changed = false;
+    let mut final_pass = false;
+    let mut cond_caps: Vec<String> = Vec::new();
+    let mut effects = Effects::default();
+    let mut filesystem_override: Option<PathBuf> = None;
+    let mut env: Vec<(String, String)> = scope.request_env(req);
+    let mut vary: Vec<String> = Vec::new();
+    let mut idx = 0usize;
+    let mut skip_next = 0usize;
+    let mut loops = 0usize;
+
+    while idx < scope.rewrite_policy.rewrite_rules.len() {
+        let rule = &scope.rewrite_policy.rewrite_rules[idx];
+        idx += 1;
+        if skip_next > 0 {
+            skip_next -= 1;
+            continue;
+        }
+        vary.clear();
+        let Some(subject) = subject_for(rule, &path) else {
+            if rule.flags.chain {
+                skip_next = 1;
+            }
+            continue;
+        };
+        let conds = match conditions_match(
+            rule,
+            req,
+            ctx,
+            &path,
+            &query,
+            &mut cond_caps,
+            &scope.rewrite_policy.rewrite_maps,
+            &env,
+            &mut vary,
+        ) {
+            Ok(v) => v,
+            Err(e) => return Outcome::Error(e),
+        };
+        if !conds {
+            if rule.flags.chain {
+                skip_next = 1;
+            }
+            continue;
+        }
+        let caps = rule.pattern.captures(subject);
+        let cap_strings: Vec<String> = if rule.negated {
+            if caps.is_some() {
+                if rule.flags.chain {
+                    skip_next = 1;
+                }
+                continue;
+            }
+            Vec::new()
+        } else {
+            match caps {
+                Some(c) => c
+                    .iter()
+                    .map(|m| m.map(|m| m.as_str().to_string()).unwrap_or_default())
+                    .collect(),
+                None => {
+                    if rule.flags.chain {
+                        skip_next = 1;
+                    }
+                    continue;
+                }
+            }
+        };
+
+        for name in vary.drain(..) {
+            if !effects.vary.iter().any(|v| v.eq_ignore_ascii_case(&name)) {
+                effects.vary.push(name);
+            }
+        }
+        match rule_effects(
+            rule,
+            &cap_strings,
+            &cond_caps,
+            req,
+            ctx,
+            &path,
+            &query,
+            &scope.rewrite_policy.rewrite_maps,
+            &env,
+        ) {
+            Ok(e) => {
+                for (name, value) in &e.env {
+                    env.retain(|(n, _)| n != name);
+                    if let Some(value) = value {
+                        env.push((name.clone(), value.clone()));
+                    }
+                }
+                effects.merge(e);
+            }
+            Err(e) => return Outcome::Error(e),
+        }
+
+        if rule.flags.forbidden {
+            return Outcome::Forbidden;
+        }
+        if rule.flags.gone {
+            return Outcome::Gone;
+        }
+        if rule.substitution == "-" {
+            if rule.flags.qsd {
+                query.clear();
+            }
+            if let Some(n) = rule.flags.skip {
+                idx = idx.saturating_add(n);
+            }
+            if rule.flags.next {
+                loops += 1;
+                if loops > 10 {
+                    return Outcome::Error("rewrite [N] loop limit exceeded".into());
+                }
+                idx = 0;
+                continue;
+            }
+            if rule.flags.last {
+                break;
+            }
+            continue;
+        }
+
+        let spec = escape_spec(&rule.flags);
+        let expanded = match expand_backrefs(
+            &rule.substitution,
+            &cap_strings,
+            &cond_caps,
+            req,
+            ctx,
+            &path,
+            &query,
+            &scope.rewrite_policy.rewrite_maps,
+            &env,
+            rule.flags.unsafe_allow_3f,
+            spec.as_ref(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return Outcome::Error(e),
+        };
+        if expanded.chars().any(|c| c.is_control()) {
+            return Outcome::Error("control character in rewrite substitution".into());
+        }
+        let (mut new_path, mut new_query, has_target_query) = if rule.flags.qslast {
+            match expanded.rsplit_once('?') {
+                Some((path, query)) => (path.to_string(), query.to_string(), true),
+                None => (expanded.clone(), String::new(), false),
+            }
+        } else {
+            match expanded.split_once('?') {
+                Some((path, query)) => (path.to_string(), query.to_string(), true),
+                None => (expanded.clone(), String::new(), false),
+            }
+        };
+        if rule.flags.qslast {
+            let encoded = vapache_verified::rewrite_backref_no_qmark(new_path.as_bytes());
+            new_path = String::from_utf8_lossy(&encoded).into_owned();
+        }
+        if new_path.is_empty() {
+            return Outcome::Error("empty rewrite substitution".into());
+        }
+        let mut new_path = new_path;
+        let mut external = is_external_url(&new_path);
+        if external && rule.flags.redirect.is_none() && !rule.flags.proxy {
+            if let Some(internal) = same_host_internal(ctx, req, &new_path) {
+                new_path = internal;
+                external = false;
+            }
+        }
+        let joined = if external {
+            new_path
+        } else if new_path.starts_with('/') {
+            new_path
+        } else if rule.per_dir {
+            format!("{}{}", rule.base, new_path)
+        } else {
+            format!("/{new_path}")
+        };
+        if has_target_query {
+            if rule.flags.qsa && !rule.flags.qsd && !query.is_empty() {
+                new_query = if new_query.is_empty() {
+                    String::from_utf8_lossy(&query).into_owned()
+                } else {
+                    format!("{}&{}", new_query, String::from_utf8_lossy(&query))
+                };
+            }
+        } else if !rule.flags.qsd {
+            // Apache copies the original query string when the substitution
+            // does not contain a replacement query string.
+            new_query = String::from_utf8_lossy(&query).into_owned();
+        }
+        if new_query.chars().any(|c| c.is_control()) {
+            return Outcome::Error("control character in rewrite query".into());
+        }
+
+        let filesystem = if !external && Path::new(&joined).is_absolute() {
+            let candidate = fs::canonicalize(&joined).ok();
+            let docroot = fs::canonicalize(ctx.docroot).ok();
+            let server_root = fs::canonicalize(ctx.server_root).ok();
+            match (candidate, docroot, server_root) {
+                (Some(candidate), Some(docroot), Some(server_root)) => {
+                    let is_file = candidate.is_file();
+                    let under_docroot = candidate.starts_with(&docroot);
+                    let under_server_root = candidate.starts_with(&server_root);
+                    if vapache_verified::rewrite_filesystem_admit(
+                        is_file,
+                        under_docroot,
+                        under_server_root,
+                        rule.flags.unsafe_prefix_stat,
+                    ) {
+                        Some(candidate)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if filesystem.is_some() {
+            filesystem_override = filesystem;
+        }
+
+        if rule.flags.proxy {
+            let mut url = joined;
+            if !new_query.is_empty() {
+                url.push(if url.contains('?') { '&' } else { '?' });
+                url.push_str(&new_query);
+            }
+            return Outcome::Proxy { url, effects };
+        }
+        if external || rule.flags.redirect.is_some() {
+            let status = rule.flags.redirect.unwrap_or(302);
+            let mut location = joined;
+            if !new_query.is_empty() {
+                location.push(if location.contains('?') { '&' } else { '?' });
+                location.push_str(&new_query);
+            }
+            if !rule.flags.noescape {
+                location = escape_redirect_location(&location);
+            }
+            return Outcome::Redirect {
+                status,
+                location,
+                effects,
+            };
+        }
+
+        path = new_path_from_joined(&joined);
+        query = new_query.into_bytes();
+        changed = true;
+        if let Some(n) = rule.flags.skip {
+            idx = idx.saturating_add(n);
+        }
+        if rule.flags.next {
+            loops += 1;
+            if loops > 10 {
+                return Outcome::Error("rewrite [N] loop limit exceeded".into());
+            }
+            idx = 0;
+            continue;
+        }
+        if rule.flags.last {
+            final_pass = rule.flags.end;
+            break;
+        }
+    }
+
+    if changed || query != ctx.query || !effects.is_empty() {
+        Outcome::Internal {
+            path,
+            query,
+            final_pass,
+            effects,
+            filesystem: filesystem_override,
+        }
+    } else {
+        Outcome::None
+    }
+}
+
+fn new_path_from_joined(joined: &str) -> String {
+    // The caller re-canonicalizes this.  Keep a single leading slash and
+    // preserve a meaningful trailing slash.
+    let out = vapache_verified::rewrite_internal_path(joined.as_bytes());
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn subject_for<'a>(rule: &RewriteRule, path: &'a str) -> Option<&'a str> {
+    if rule.per_dir {
+        let rel = path.strip_prefix(&rule.match_base)?;
+        Some(rel.trim_start_matches('/'))
+    } else {
+        Some(path)
+    }
+}
+
+fn conditions_match(
+    rule: &RewriteRule,
+    req: &Request,
+    ctx: &Context<'_>,
+    path: &str,
+    query: &[u8],
+    cond_caps: &mut Vec<String>,
+    maps: &[(String, RewriteMap)],
+    env: &[(String, String)],
+    vary: &mut Vec<String>,
+) -> Result<bool, String> {
+    if rule.conditions.is_empty() {
+        return Ok(true);
+    }
+    // `[OR]` joins the current condition with the next one.  Groups of
+    // OR-linked conditions are ANDed with the other groups, so evaluate each
+    // group separately instead of folding left-to-right (which would make
+    // `A, B[OR], C` mean `(A && B) || C`).
+    let mut matches: Vec<bool> = Vec::with_capacity(rule.conditions.len());
+    let mut ors: Vec<bool> = Vec::with_capacity(rule.conditions.len());
+    let mut matched_headers: Vec<String> = Vec::new();
+    for cond in &rule.conditions {
+        if let Some(expr) = &cond.expr {
+            let mut ectx = crate::expr::Context::new(req, env, ctx.peer, ctx.docroot);
+            let r = expr.eval(&mut ectx).map(|v| v.truthy()).unwrap_or(false);
+            matches.push(r);
+            ors.push(cond.flags.or);
+            continue;
+        }
+        let value = expand_vars(&cond.test, req, ctx, path, query, cond_caps, maps, env)?;
+        let r = eval_cond(cond, &value, ctx, cond_caps)?;
+        if r {
+            if let Some(name) = condition_header(&cond.test) {
+                if !name.eq_ignore_ascii_case("host")
+                    && !matched_headers
+                        .iter()
+                        .any(|v| v.eq_ignore_ascii_case(&name))
+                {
+                    matched_headers.push(name);
+                }
+            }
+        }
+        matches.push(r);
+        ors.push(cond.flags.or);
+    }
+    let overall = vapache_verified::cond_chain_eval(&matches, &ors);
+    if overall {
+        for name in matched_headers {
+            if !vary.iter().any(|v| v.eq_ignore_ascii_case(&name)) {
+                vary.push(name);
+            }
+        }
+    }
+    Ok(overall)
+}
+
+fn condition_header(test: &str) -> Option<String> {
+    let mut rest = test;
+    while let Some(start) = rest.find("%{HTTP") {
+        let after = &rest[start + 2..];
+        let end = after.find('}')?;
+        let inner = &after[..end];
+        let name = if let Some(name) = inner.strip_prefix("HTTP:") {
+            name
+        } else if let Some(name) = inner.strip_prefix("HTTP_") {
+            name
+        } else {
+            rest = &after[end + 1..];
+            continue;
+        };
+        if !name.is_empty() {
+            let name = name.replace('_', "-");
+            return Some(
+                name.split('-')
+                    .map(|part| {
+                        let mut chars = part.chars();
+                        match chars.next() {
+                            Some(first) => {
+                                first.to_ascii_uppercase().to_string()
+                                    + &chars.as_str().to_ascii_lowercase()
+                            }
+                            None => String::new(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("-"),
+            );
+        }
+        rest = &after[end + 1..];
+    }
+    None
+}
+
+fn eval_cond(
+    cond: &RewriteCond,
+    value: &str,
+    ctx: &Context<'_>,
+    cond_caps: &mut Vec<String>,
+) -> Result<bool, String> {
+    let (negated, pattern) = match cond.pattern.strip_prefix('!') {
+        Some(p) => (true, p),
+        None => (false, cond.pattern.as_str()),
+    };
+    let result = if let Some(rest) = pattern.strip_prefix("-f") {
+        rest.is_empty() && file_test(value, ctx, |p| p.is_file())
+    } else if let Some(rest) = pattern.strip_prefix("-d") {
+        rest.is_empty() && file_test(value, ctx, |p| p.is_dir())
+    } else if let Some(rest) = pattern.strip_prefix("-s") {
+        rest.is_empty()
+            && file_test(value, ctx, |p| {
+                fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
+            })
+    } else if let Some(rest) = pattern.strip_prefix("-l") {
+        rest.is_empty()
+            && file_test(value, ctx, |p| {
+                fs::symlink_metadata(p)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
+            })
+    } else if let Some(rest) = pattern.strip_prefix(">=") {
+        compare_cond(value, rest, cond.flags.nocase) != std::cmp::Ordering::Less
+    } else if let Some(rest) = pattern.strip_prefix("<=") {
+        compare_cond(value, rest, cond.flags.nocase) != std::cmp::Ordering::Greater
+    } else if let Some(rest) = pattern.strip_prefix('>') {
+        compare_cond(value, rest, cond.flags.nocase) == std::cmp::Ordering::Greater
+    } else if let Some(rest) = pattern.strip_prefix('<') {
+        compare_cond(value, rest, cond.flags.nocase) == std::cmp::Ordering::Less
+    } else if let Some(rest) = pattern.strip_prefix('=') {
+        if cond.flags.nocase {
+            value.eq_ignore_ascii_case(rest)
+        } else {
+            value == rest
+        }
+    } else if let Some(rest) = pattern.strip_prefix('!') {
+        if cond.flags.nocase {
+            !value.eq_ignore_ascii_case(rest)
+        } else {
+            value != rest
+        }
+    } else {
+        let re = cond
+            .regex
+            .as_ref()
+            .ok_or_else(|| "internal error: RewriteCond regex was not compiled".to_string())?;
+        let caps: Vec<String> = re
+            .captures(value)
+            .map(|c| {
+                c.iter()
+                    .map(|m| m.map(|m| m.as_str().to_string()).unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if caps.is_empty() {
+            cond_caps.clear();
+            false
+        } else {
+            *cond_caps = caps;
+            true
+        }
+    };
+    Ok(if negated { !result } else { result })
+}
+
+fn compare_cond(value: &str, expected: &str, nocase: bool) -> std::cmp::Ordering {
+    if let (Ok(a), Ok(b)) = (value.parse::<i64>(), expected.parse::<i64>()) {
+        return a.cmp(&b);
+    }
+    if nocase {
+        value
+            .to_ascii_lowercase()
+            .cmp(&expected.to_ascii_lowercase())
+    } else {
+        value.cmp(expected)
+    }
+}
+
+fn file_test(value: &str, ctx: &Context<'_>, test: impl Fn(&Path) -> bool) -> bool {
+    let p = PathBuf::from(value);
+    let p = if p.is_absolute() {
+        p
+    } else {
+        ctx.docroot.join(p)
+    };
+    // A condition can be fed an attacker-controlled value such as
+    // `%{REQUEST_URI}`.  Never let a file test probe paths outside this
+    // request's document/alias root, and reject lexical traversal before
+    // touching the filesystem.
+    if !p.starts_with(ctx.docroot)
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    test(&p)
+}
+
+fn expand_vars(
+    test: &str,
+    req: &Request,
+    ctx: &Context<'_>,
+    path: &str,
+    query: &[u8],
+    cond_caps: &[String],
+    maps: &[(String, RewriteMap)],
+    env: &[(String, String)],
+) -> Result<String, String> {
+    let mut out = String::with_capacity(test.len());
+    let mut i = 0;
+    let bytes = test.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(end) = test[i + 2..].find('}') {
+                let name = expand_caps(&test[i + 2..i + 2 + end], &[], cond_caps);
+                out.push_str(&variable_value(&name, req, ctx, path, query, maps, env)?);
+                i += 2 + end + 1;
+                continue;
+            }
+        }
+        if bytes[i] == b'%' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(end) = test[i + 2..].find('}') {
+                let name = expand_caps(&test[i + 2..i + 2 + end], &[], cond_caps);
+                out.push_str(&variable_value(&name, req, ctx, path, query, maps, env)?);
+                i += 2 + end + 1;
+                continue;
+            }
+        }
+        if bytes[i] == b'%' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let n = (bytes[i + 1] - b'0') as usize;
+            if let Some(v) = cond_caps.get(n) {
+                out.push_str(v);
+            }
+            i += 2;
+            continue;
+        }
+        let ch = test[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    Ok(out)
+}
+
+/// Reverse lookup gives the child map precedence after merge appended child
+/// entries to the parent list.
+fn rewrite_map_lookup<'a>(maps: &'a [(String, RewriteMap)], name: &str) -> Option<&'a RewriteMap> {
+    maps.iter()
+        .rev()
+        .find(|(map_name, _)| map_name == name)
+        .map(|(_, map)| map)
+}
+
+fn variable_value(
+    name: &str,
+    req: &Request,
+    ctx: &Context<'_>,
+    path: &str,
+    query: &[u8],
+    maps: &[(String, RewriteMap)],
+    env: &[(String, String)],
+) -> Result<String, String> {
+    Ok(match name {
+        n if n.starts_with("ENV:") => env
+            .iter()
+            .rev()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&n[4..]))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default(),
+        "REQUEST_URI" => {
+            let mut s = path.to_string();
+            if !query.is_empty() {
+                s.push('?');
+                s.push_str(&String::from_utf8_lossy(query));
+            }
+            s
+        }
+        "REQUEST_FILENAME" | "SCRIPT_FILENAME" => ctx.fs_path.to_string_lossy().into_owned(),
+        "DOCUMENT_ROOT" => ctx.docroot.to_string_lossy().into_owned(),
+        "QUERY_STRING" => String::from_utf8_lossy(query).into_owned(),
+        "HTTP_HOST" => req
+            .header_str("host")
+            .unwrap_or(ctx.server_name)
+            .to_string(),
+        "REMOTE_ADDR" => ctx.peer.to_string(),
+        "SERVER_PORT" => ctx.port.to_string(),
+        "HTTPS" => if ctx.https { "on" } else { "off" }.to_string(),
+        "REQUEST_METHOD" => req.method.clone(),
+        "SERVER_NAME" => ctx.server_name.to_string(),
+        "REQUEST_SCHEME" => if ctx.https { "https" } else { "http" }.to_string(),
+        "SERVER_PROTOCOL" => req.version.as_str().to_string(),
+        n if n.starts_with("HTTP_") => {
+            let header = n[5..].replace('_', "-").to_ascii_lowercase();
+            req.header_str(&header).unwrap_or("").to_string()
+        }
+        n if n.starts_with("HTTP:") => req
+            .header_str(&n[5..].to_ascii_lowercase())
+            .unwrap_or("")
+            .to_string(),
+        n if n.contains(':')
+            && rewrite_map_lookup(maps, n.split_once(':').unwrap().0).is_some() =>
+        {
+            let (map_name, key) = n.split_once(':').unwrap();
+            match rewrite_map_lookup(maps, map_name) {
+                Some(RewriteMap::Txt(m)) => m.get(key).cloned().unwrap_or_default(),
+                Some(RewriteMap::Rnd(m)) => m
+                    .get(key)
+                    .and_then(|choices| {
+                        choices.get(
+                            key.bytes().map(|b| b as usize).sum::<usize>() % choices.len().max(1),
+                        )
+                    })
+                    .cloned()
+                    .unwrap_or_default(),
+                Some(RewriteMap::Prg(program)) => run_prg_map(program, key),
+                Some(RewriteMap::Int(function)) => int_map(function, key),
+                None => String::new(),
+            }
+        }
+        "THE_REQUEST" => format!(
+            "{} {} {}",
+            req.method,
+            String::from_utf8_lossy(&req.target),
+            req.version.as_str()
+        ),
+        _ => return Err(format!("unsupported mod_rewrite variable '%{{{name}}}'")),
+    })
+}
+
+fn int_map(function: &str, key: &str) -> String {
+    match function {
+        "tolower" => key.to_lowercase(),
+        "toupper" => key.to_uppercase(),
+        "escape" => key
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+                    (b as char).to_string()
+                } else if b == b' ' {
+                    "+".into()
+                } else {
+                    format!("%{b:02x}")
+                }
+            })
+            .collect(),
+        "unescape" => {
+            let bytes = key.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' && i + 2 < bytes.len() {
+                    let hex = |b: u8| -> Option<u8> {
+                        match b {
+                            b'0'..=b'9' => Some(b - b'0'),
+                            b'a'..=b'f' => Some(b - b'a' + 10),
+                            b'A'..=b'F' => Some(b - b'A' + 10),
+                            _ => None,
+                        }
+                    };
+                    if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                        out.push(hi * 16 + lo);
+                        i += 3;
+                        continue;
+                    }
+                }
+                if bytes[i] == b'+' {
+                    out.push(b' ');
+                } else {
+                    out.push(bytes[i]);
+                }
+                i += 1;
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        }
+        _ => String::new(),
+    }
+}
+
+fn run_prg_map(program: &str, key: &str) -> String {
+    let mut parts = program.split_whitespace();
+    let Some(command) = parts.next() else {
+        return String::new();
+    };
+    let mut child = match Command::new(command)
+        .args(parts)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return String::new(),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(key.as_bytes()).is_err() || stdin.write_all(b"\n").is_err() {
+            let _ = child.kill();
+            return String::new();
+        }
+    }
+    match child.wait_with_output() {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+fn expand_caps(name: &str, caps: &[String], cond_caps: &[String]) -> String {
+    let mut out = String::new();
+    let b = name.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if (b[i] == b'$' || b[i] == b'%' || b[i] == b'\\')
+            && i + 1 < b.len()
+            && b[i + 1].is_ascii_digit()
+        {
+            let n = (b[i + 1] - b'0') as usize;
+            let pool = if b[i] == b'%' { cond_caps } else { caps };
+            if let Some(v) = pool.get(n) {
+                out.push_str(v);
+            }
+            i += 2;
+        } else {
+            let ch = name[i..].chars().next().unwrap_or('\u{fffd}');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+fn expand_backrefs(
+    s: &str,
+    caps: &[String],
+    cond_caps: &[String],
+    req: &Request,
+    ctx: &Context<'_>,
+    path: &str,
+    query: &[u8],
+    maps: &[(String, RewriteMap)],
+    env: &[(String, String)],
+    allow_3f: bool,
+    escape: Option<&EscapeSpec>,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(end) = s[i + 2..].find('}') {
+                let name = expand_caps(&s[i + 2..i + 2 + end], caps, cond_caps);
+                let value = variable_value(&name, req, ctx, path, query, maps, env)?;
+                if let Some(spec) = escape {
+                    out.push_str(&escape_backref_value(&value, spec));
+                } else if allow_3f {
+                    out.push_str(&value);
+                } else {
+                    let encoded = vapache_verified::rewrite_backref_no_qmark(value.as_bytes());
+                    out.push_str(&String::from_utf8_lossy(&encoded));
+                }
+                i += 2 + end + 1;
+                continue;
+            }
+        }
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(end) = s[i + 2..].find('}') {
+                let name = expand_caps(&s[i + 2..i + 2 + end], caps, cond_caps);
+                let value = variable_value(&name, req, ctx, path, query, maps, env)?;
+                if let Some(spec) = escape {
+                    out.push_str(&escape_backref_value(&value, spec));
+                } else if allow_3f {
+                    out.push_str(&value);
+                } else {
+                    let encoded = vapache_verified::rewrite_backref_no_qmark(value.as_bytes());
+                    out.push_str(&String::from_utf8_lossy(&encoded));
+                }
+                i += 2 + end + 1;
+                continue;
+            }
+        }
+        if (bytes[i] == b'$' || bytes[i] == b'%' || bytes[i] == b'\\')
+            && i + 1 < bytes.len()
+            && bytes[i + 1].is_ascii_digit()
+        {
+            let n = (bytes[i + 1] - b'0') as usize;
+            let pool = if bytes[i] == b'%' { cond_caps } else { caps };
+            if let Some(v) = pool.get(n) {
+                if let Some(spec) = escape {
+                    out.push_str(&escape_backref_value(v, spec));
+                } else if !allow_3f {
+                    let encoded = vapache_verified::rewrite_backref_no_qmark(v.as_bytes());
+                    out.push_str(&String::from_utf8_lossy(&encoded));
+                } else {
+                    out.push_str(v);
+                }
+            }
+            i += 2;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    Ok(out)
+}
+
+fn escape_redirect_location(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        let unsafe_byte = b <= b' '
+            || b == 0x7f
+            || matches!(
+                b,
+                b'"' | b'<' | b'>' | b'\\' | b'^' | b'`' | b'{' | b'|' | b'}'
+            );
+        if unsafe_byte {
+            out.push('%');
+            out.push_str(&format!("{b:02x}"));
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
+fn same_host_internal(ctx: &Context<'_>, req: &Request, url: &str) -> Option<String> {
+    let rest = if let Some(rest) = url.strip_prefix("//") {
+        rest
+    } else {
+        url.split_once("://")?.1
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (rest, "/".to_string()),
+    };
+    let host = req
+        .header_str("host")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}:{}", ctx.server_name, ctx.port));
+    if vapache_verified::rewrite_authority_equal(authority.as_bytes(), host.as_bytes()) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn is_external_url(s: &str) -> bool {
+    vapache_verified::rewrite_target_external(s.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{normalize_rewrite_base, parse_rewrite_cond, parse_rewrite_rule};
+
+    fn req() -> Request {
+        Request {
+            method: "GET".into(),
+            target: b"/old.html?x=1".to_vec(),
+            raw_path: b"/old.html".to_vec(),
+            query: b"x=1".to_vec(),
+            version: crate::http::Version::Http11,
+            headers: crate::http::Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        }
+    }
+
+    fn ctx<'a>(path: &'a str, fs: &'a Path, root: &'a Path) -> Context<'a> {
+        Context {
+            url_path: path,
+            fs_path: fs,
+            docroot: root,
+            server_root: root,
+            query: b"x=1",
+            peer: "127.0.0.1".parse().unwrap(),
+            port: 80,
+            https: false,
+            server_name: "localhost",
+        }
+    }
+
+    #[test]
+    fn rewrite_env_is_visible_to_later_conditions() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope
+            .rewrite_policy
+            .rewrite_maps
+            .push(("lower".into(), RewriteMap::Int("tolower".into())));
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &[
+                    "^/old$".into(),
+                    "-".into(),
+                    "[C,E=MAPTYPE:${lower:ABC}]".into(),
+                ],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let mut rule = parse_rewrite_rule(
+            &["^/old$".into(), "/mapped".into(), "[L]".into()],
+            "/",
+            false,
+        )
+        .unwrap();
+        rule.conditions
+            .push(parse_rewrite_cond(&["%{ENV:MAPTYPE}".into(), "^abc$".into()]).unwrap());
+        scope.rewrite_policy.rewrite_rules.push(rule);
+        let r = req();
+        let root = Path::new("/tmp");
+        match process(&scope, &r, &ctx("/old", &root.join("old"), root)) {
+            Outcome::Internal { path, effects, .. } => {
+                assert_eq!(path, "/mapped");
+                assert_eq!(effects.env[0].0, "MAPTYPE");
+                assert_eq!(effects.env[0].1.as_deref(), Some("abc"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qslast_and_unsafe_3f_flags_work() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/x/(.*)$".into(), "/$1?".into(), "[R,QSA,QSL]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        let xdir = root.join("x");
+        let mut c = ctx("/x/foo/?bar/", &xdir, root);
+        c.query = b"preserve-me";
+        match process(&scope, &r, &c) {
+            Outcome::Redirect { location, .. } => {
+                assert_eq!(location, "/foo/%3fbar/?preserve-me")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/bad/(.*)$".into(), "/bad$1".into(), "[PT]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let bad = root.join("bad");
+        let mut bad_ctx = ctx("/bad/?theval", &bad, root);
+        bad_ctx.query = b"";
+        match process(&scope, &r, &bad_ctx) {
+            Outcome::Internal { path, query, .. } => {
+                assert_eq!(path, "/bad%3ftheval");
+                assert!(query.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &[
+                    "^/bad/(.*)$".into(),
+                    "/bad$1".into(),
+                    "[PT,UnsafeAllow3F]".into(),
+                ],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let mut bad_ctx = ctx("/bad/?theval", &bad, root);
+        bad_ctx.query = b"";
+        match process(&scope, &r, &bad_ctx) {
+            Outcome::Internal { path, query, .. } => {
+                assert_eq!(path, "/bad");
+                assert_eq!(query, b"theval");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_condition_or_groups_are_folded_by_verified_chain() {
+        assert!(vapache_verified::cond_chain_eval(
+            &[true, false, true],
+            &[false, true, false]
+        ));
+        assert!(!vapache_verified::cond_chain_eval(
+            &[true, false, false],
+            &[false, true, false]
+        ));
+        assert!(vapache_verified::cond_chain_eval(
+            &[false, true, false],
+            &[true, true, false]
+        ));
+        assert!(vapache_verified::cond_chain_eval(&[], &[]));
+    }
+
+    #[test]
+    fn rewrite_authority_comparison_handles_case_and_ports() {
+        assert!(vapache_verified::rewrite_authority_equal(
+            b"LOCALHOST:80",
+            b"localhost"
+        ));
+        assert!(vapache_verified::rewrite_authority_equal(
+            b"localhost:80",
+            b"localhost:443"
+        ));
+        assert!(!vapache_verified::rewrite_authority_equal(
+            b"other.test:80",
+            b"localhost:80"
+        ));
+        assert!(!vapache_verified::rewrite_authority_equal(
+            b"[::1]:443",
+            b"[::2]:443"
+        ));
+    }
+
+    #[test]
+    fn same_host_absolute_url_is_internal() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/old$".into(), "http://localhost/new".into(), "[L]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        match process(&scope, &r, &ctx("/old", &root.join("old"), root)) {
+            Outcome::Internal { path, query, .. } => {
+                assert_eq!(path, "/new");
+                assert_eq!(query, b"x=1");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &[
+                    "^/old$".into(),
+                    "http://other.test/new".into(),
+                    "[L]".into(),
+                ],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            process(&scope, &r, &ctx("/old", &root.join("old"), root)),
+            Outcome::Redirect { status: 302, .. }
+        ));
+    }
+
+    #[test]
+    fn proxy_flag_produces_a_proxy_outcome() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &[
+                    "^/old$".into(),
+                    "http://127.0.0.1:9/new?x=1".into(),
+                    "[P,L]".into(),
+                ],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        match process(&scope, &r, &ctx("/old", &root.join("old"), root)) {
+            Outcome::Proxy { url, .. } => assert_eq!(url, "http://127.0.0.1:9/new?x=1"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qsa_keeps_substitution_query_first() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/old$".into(), "/new?foo=bar".into(), "[QSA,L]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        let old = root.join("old");
+        let mut c = ctx("/old", &old, root);
+        c.query = b"bloo=blar";
+        match process(&scope, &r, &c) {
+            Outcome::Internal { path, query, .. } => {
+                assert_eq!(path, "/new");
+                assert_eq!(query, b"foo=bar&bloo=blar");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn original_query_is_copied_by_default() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(&["^/old$".into(), "/new".into(), "[L]".into()], "/", false)
+                .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        match process(&scope, &r, &ctx("/old", &root.join("old"), root)) {
+            Outcome::Internal { path, query, .. } => {
+                assert_eq!(path, "/new");
+                assert_eq!(query, b"x=1");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comparison_conditions_work() {
+        let r = req();
+        let root = Path::new("/tmp");
+        for (query, expected) in [(&b"7"[..], Outcome::Gone), (&b"5"[..], Outcome::None)] {
+            let mut scope = Scope::default();
+            scope.rewrite_policy.rewrite_engine = Some(true);
+            let mut rule =
+                parse_rewrite_rule(&["^/old$".into(), "-".into(), "[G]".into()], "/", false)
+                    .unwrap();
+            rule.conditions
+                .push(parse_rewrite_cond(&["%{QUERY_STRING}".into(), ">6".into()]).unwrap());
+            scope.rewrite_policy.rewrite_rules.push(rule);
+            let old = root.join("old");
+            let mut c = ctx("/old", &old, root);
+            c.query = query;
+            assert_eq!(process(&scope, &r, &c), expected);
+        }
+    }
+
+    #[test]
+    fn prefix_stat_filesystem_override_respects_safety_flag() {
+        let base = std::env::temp_dir().join(format!("vp-prefix-{}", std::process::id()));
+        let docroot = base.join("www");
+        let conf = base.join("conf");
+        fs::create_dir_all(&docroot).unwrap();
+        fs::create_dir_all(&conf).unwrap();
+        let inside = docroot.join("index.html");
+        let outside = conf.join("core.conf");
+        fs::write(&inside, "inside").unwrap();
+        fs::write(&outside, "outside").unwrap();
+        let inside_query = inside.to_string_lossy().as_bytes().to_vec();
+        let outside_query = outside.to_string_lossy().as_bytes().to_vec();
+        let r = req();
+
+        let run = |query: &[u8], flag: &str| {
+            let mut scope = Scope::default();
+            scope.rewrite_policy.rewrite_engine = Some(true);
+            scope.rewrite_policy.rewrite_rules.push(
+                parse_rewrite_rule(
+                    &["^/q$".into(), "%{QUERY_STRING}".into(), flag.into()],
+                    "/",
+                    false,
+                )
+                .unwrap(),
+            );
+            let c = Context {
+                url_path: "/q",
+                fs_path: &docroot,
+                docroot: &docroot,
+                server_root: &base,
+                query,
+                peer: "127.0.0.1".parse().unwrap(),
+                port: 80,
+                https: false,
+                server_name: "localhost",
+            };
+            process(&scope, &r, &c)
+        };
+        assert!(matches!(
+            run(&inside_query, "[L]"),
+            Outcome::Internal { filesystem: Some(path), .. } if path == inside
+        ));
+        assert!(matches!(
+            run(&outside_query, "[L]"),
+            Outcome::Internal {
+                filesystem: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            run(&outside_query, "[L,UnsafePrefixStat]"),
+            Outcome::Internal { filesystem: Some(path), .. } if path == outside
+        ));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn backref_filesystem_targets_stay_below_docroot_or_need_unsafe_flag() {
+        let base = std::env::temp_dir().join(format!("vp-rewrite-fs-{}", std::process::id()));
+        let docroot = base.join("www");
+        let conf = base.join("conf");
+        fs::create_dir_all(&docroot).unwrap();
+        fs::create_dir_all(&conf).unwrap();
+        fs::write(docroot.join("inside.txt"), "inside").unwrap();
+        fs::write(conf.join("secret.txt"), "secret").unwrap();
+
+        let outside_rel = conf.join("secret.txt");
+        let outside_rel = outside_rel
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        let path = format!("/q/{outside_rel}");
+        let r = req();
+        let c = Context {
+            url_path: &path,
+            fs_path: &docroot,
+            docroot: &docroot,
+            server_root: &base,
+            query: b"",
+            peer: "127.0.0.1".parse().unwrap(),
+            port: 80,
+            https: false,
+            server_name: "localhost",
+        };
+        let run = |flags: &str| {
+            let mut scope = Scope::default();
+            scope.rewrite_policy.rewrite_engine = Some(true);
+            scope.rewrite_policy.rewrite_rules.push(
+                parse_rewrite_rule(
+                    &["^/q/(.*)$".into(), "/$1".into(), flags.into()],
+                    "/",
+                    false,
+                )
+                .unwrap(),
+            );
+            process(&scope, &r, &c)
+        };
+        assert!(matches!(
+            run("[L]"),
+            Outcome::Internal {
+                filesystem: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            run("[L,UnsafePrefixStat]"),
+            Outcome::Internal {
+                filesystem: Some(path),
+                ..
+            } if path == conf.join("secret.txt")
+        ));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn more_than_nine_captures_are_memory_safe() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &[
+                    "^(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)$".into(),
+                    "/$1".into(),
+                    "[L]".into(),
+                ],
+                "/",
+                true,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        match process(&scope, &r, &ctx("/abcdefghijkl", &root.join("x"), root)) {
+            Outcome::Internal { path, .. } => assert_eq!(path, "/a"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expr_false_is_not_treated_as_true() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        let mut rule =
+            parse_rewrite_rule(&["^/old$".into(), "-".into(), "[G]".into()], "/", false).unwrap();
+        rule.conditions
+            .push(parse_rewrite_cond(&["expr".into(), "false".into()]).unwrap());
+        scope.rewrite_policy.rewrite_rules.push(rule);
+        let r = req();
+        let root = Path::new("/tmp");
+        assert_eq!(
+            process(&scope, &r, &ctx("/old", &root.join("old"), root)),
+            Outcome::None
+        );
+    }
+
+    #[test]
+    fn backreference_question_mark_is_encoded_unless_unsafe_flag_is_set() {
+        let run = |flags: &str, query: &[u8]| {
+            let mut scope = Scope::default();
+            scope.rewrite_policy.rewrite_engine = Some(true);
+            scope.rewrite_policy.rewrite_rules.push(
+                parse_rewrite_rule(
+                    &["^/x$".into(), "/out?%{QUERY_STRING}".into(), flags.into()],
+                    "/",
+                    false,
+                )
+                .unwrap(),
+            );
+            let r = req();
+            let root = Path::new("/tmp");
+            let fs = root.join("x");
+            let mut c = ctx("/x", &fs, root);
+            c.query = query;
+            process(&scope, &r, &c)
+        };
+        match run("[L]", b"a?b") {
+            Outcome::Internal { path, query, .. } => {
+                assert_eq!(path, "/out");
+                assert_eq!(query, b"a%3fb");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match run("[L,UnsafeAllow3F]", b"a?b") {
+            Outcome::Internal { path, query, .. } => {
+                assert_eq!(path, "/out");
+                assert_eq!(query, b"a?b");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(run("[L]", b"a\r\nb"), Outcome::Error(_)));
+    }
+
+    #[test]
+    fn lookahead_rewrite_variables_fail_closed() {
+        assert!(parse_rewrite_cond(&["%{LA-U:HTTP:Host}".into(), "^x$".into()]).is_err());
+        assert!(parse_rewrite_rule(
+            &["^/x$".into(), "/%{LA-U:HTTP:Host}".into(), "[L]".into()],
+            "/",
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn chain_failure_skips_the_next_rule() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/none$".into(), "/bad".into(), "[C,L]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/old$".into(), "/skipped".into(), "[L]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(&["^/old$".into(), "/good".into(), "[L]".into()], "/", false)
+                .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        match process(&scope, &r, &ctx("/old", &root.join("old"), root)) {
+            Outcome::Internal { path, .. } => assert_eq!(path, "/good"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn next_flag_restarts_rule_processing() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(&["^/old$".into(), "/new".into(), "[N]".into()], "/", false)
+                .unwrap(),
+        );
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/new$".into(), "/final".into(), "[L]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        match process(&scope, &r, &ctx("/old", &root.join("old"), root)) {
+            Outcome::Internal { path, .. } => assert_eq!(path, "/final"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_conditions_add_vary() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        let mut rule =
+            parse_rewrite_rule(&["^/old$".into(), "/new".into(), "[L]".into()], "/", false)
+                .unwrap();
+        rule.conditions.push(
+            parse_rewrite_cond(&["%{HTTP:Accept}".into(), "directory-accept".into()]).unwrap(),
+        );
+        scope.rewrite_policy.rewrite_rules.push(rule);
+        let mut r = req();
+        r.headers.insert("accept", "directory-accept");
+        let root = Path::new("/tmp");
+        match process(&scope, &r, &ctx("/old", &root.join("old"), root)) {
+            Outcome::Internal { effects, .. } => assert_eq!(effects.vary, vec!["Accept"]),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effects_are_collected_for_dash_rules() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &[
+                    "^/old$".into(),
+                    "-".into(),
+                    "[E=FOO:bar,E=!OLD,CO=NAME:VAL:localhost:86400:/:secure:httponly:none,H=server-status,T=text/plain]"
+                        .into(),
+                ],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        match process(&scope, &r, &ctx("/old", &root.join("old"), root)) {
+            Outcome::Internal { effects, .. } => {
+                assert_eq!(
+                    effects.env,
+                    vec![("FOO".into(), Some("bar".into())), ("OLD".into(), None)]
+                );
+                assert_eq!(
+                    effects.cookies,
+                    vec!["NAME=VAL; Domain=localhost; Max-Age=5184000; Path=/; Secure; HttpOnly; SameSite=none"]
+                );
+                assert_eq!(effects.handler.as_deref(), Some("server-status"));
+                assert_eq!(effects.content_type.as_deref(), Some("text/plain"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn b_flags_escape_backreferences() {
+        let run = |flags: &str, path: &str| {
+            let mut scope = Scope::default();
+            scope.rewrite_policy.rewrite_engine = Some(true);
+            scope.rewrite_policy.rewrite_rules.push(
+                parse_rewrite_rule(
+                    &["^/x/(.*)$".into(), "/x/$1".into(), flags.into()],
+                    "/",
+                    false,
+                )
+                .unwrap(),
+            );
+            let r = req();
+            let root = Path::new("/tmp");
+            match process(&scope, &r, &ctx(path, &root.join("x"), root)) {
+                Outcome::Internal { path, .. } => path,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert_eq!(run("[B]", "/x/a/b c\r"), "/x/a%2fb+c%0d");
+        assert_eq!(run("[B,BNE=/]", "/x/a/b c\r"), "/x/a/b+c%0d");
+        assert_eq!(run("[BCTLS]", "/x/a/b c\r"), "/x/a/b+c%0d");
+        assert_eq!(run("[B=/]", "/x/a/b c"), "/x/a%2fb c");
+        assert_eq!(run("[B,BNP]", "/x/a b"), "/x/a%20b");
+    }
+
+    #[test]
+    fn internal_rule_rewrites_path() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^old\\.html$".into(), "new.html".into(), "[L]".into()],
+                "/",
+                true,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        let out = process(&scope, &r, &ctx("/old.html", &root.join("old.html"), root));
+        assert!(matches!(out, Outcome::Internal { path, .. } if path == "/new.html"));
+    }
+
+    #[test]
+    fn redirect_and_forbidden_flags() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^old$".into(), "/new".into(), "[R=301,L]".into()],
+                "/",
+                true,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        let out = process(&scope, &r, &ctx("/old", &root.join("old"), root));
+        assert!(
+            matches!(out, Outcome::Redirect { status: 301, location, .. } if location == "/new?x=1")
+        );
+
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(&["^old$".into(), "-".into(), "[F]".into()], "/", true).unwrap(),
+        );
+        assert_eq!(
+            process(&scope, &r, &ctx("/old", &root.join("old"), root)),
+            Outcome::Forbidden
+        );
+    }
+
+    #[test]
+    fn condition_and_query_preservation() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        let cond = parse_rewrite_cond(&["%{QUERY_STRING}".into(), "^x=1$".into()]).unwrap();
+        let mut rule =
+            parse_rewrite_rule(&["^old$".into(), "new".into(), "[L,QSA]".into()], "/", true)
+                .unwrap();
+        rule.conditions.push(cond);
+        scope.rewrite_policy.rewrite_rules.push(rule);
+        let r = req();
+        let root = Path::new("/tmp");
+        let out = process(&scope, &r, &ctx("/old", &root.join("old"), root));
+        assert!(
+            matches!(out, Outcome::Internal { path, query, .. } if path == "/new" && query == b"x=1")
+        );
+    }
+
+    #[test]
+    fn condition_or_groups_are_anded() {
+        let r = req();
+        let root = Path::new("/tmp");
+        let old = root.join("old");
+
+        // A false, B true [OR], C true must be false: A && (B || C).
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        let mut rule =
+            parse_rewrite_rule(&["^old$".into(), "new".into(), "[L]".into()], "/", true).unwrap();
+        rule.conditions = vec![
+            parse_rewrite_cond(&["%{QUERY_STRING}".into(), "^nope$".into()]).unwrap(),
+            parse_rewrite_cond(&["%{QUERY_STRING}".into(), "^x=1$".into(), "[OR]".into()]).unwrap(),
+            parse_rewrite_cond(&["%{QUERY_STRING}".into(), "^x=1$".into()]).unwrap(),
+        ];
+        scope.rewrite_policy.rewrite_rules.push(rule);
+        assert_eq!(process(&scope, &r, &ctx("/old", &old, root)), Outcome::None);
+
+        // A true, B false [OR], C true is true: A && (B || C).
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        let mut rule =
+            parse_rewrite_rule(&["^old$".into(), "new".into(), "[L]".into()], "/", true).unwrap();
+        rule.conditions = vec![
+            parse_rewrite_cond(&["%{QUERY_STRING}".into(), "^x=1$".into()]).unwrap(),
+            parse_rewrite_cond(&["%{QUERY_STRING}".into(), "^nope$".into(), "[OR]".into()])
+                .unwrap(),
+            parse_rewrite_cond(&["%{QUERY_STRING}".into(), "^x=1$".into()]).unwrap(),
+        ];
+        scope.rewrite_policy.rewrite_rules.push(rule);
+        assert!(matches!(
+            process(&scope, &r, &ctx("/old", &old, root)),
+            Outcome::Internal { path, .. } if path == "/new"
+        ));
+    }
+
+    #[test]
+    fn engine_off_backrefs_and_external_redirects() {
+        let r = req();
+        let root = Path::new("/tmp");
+        let item = root.join("item/a");
+        let c = ctx("/item/a", &item, root);
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(false);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^item/(.*)$".into(), "show/$1".into(), "[L]".into()],
+                "/",
+                true,
+            )
+            .unwrap(),
+        );
+        assert_eq!(process(&scope, &r, &c), Outcome::None);
+
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        assert!(matches!(
+            process(&scope, &r, &c),
+            Outcome::Internal { path, .. } if path == "/show/a"
+        ));
+
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &[
+                    "^item/(.*)$".into(),
+                    "https://example.test/$1".into(),
+                    "[R=301,L]".into(),
+                ],
+                "/",
+                true,
+            )
+            .unwrap(),
+        );
+        let out = process(&scope, &r, &c);
+        assert!(
+            matches!(
+                &out,
+                Outcome::Redirect { status: 301, location, .. }
+                    if location == "https://example.test/a?x=1"
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn file_conditions_are_confined_to_the_document_root() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        let mut rule =
+            parse_rewrite_rule(&["^.*$".into(), "new".into(), "[L]".into()], "/", true).unwrap();
+        rule.conditions
+            .push(parse_rewrite_cond(&["%{REQUEST_URI}".into(), "-f".into()]).unwrap());
+        scope.rewrite_policy.rewrite_rules.push(rule);
+        let r = req();
+        let root = Path::new("/tmp/not-the-document-root");
+        let out = process(
+            &scope,
+            &r,
+            &ctx("/etc/passwd", Path::new("/etc/passwd"), root),
+        );
+        assert_eq!(out, Outcome::None);
+    }
+
+    #[test]
+    fn rewrite_map_uses_capture_keys() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_maps.push((
+            "txt".into(),
+            RewriteMap::Txt([("old".into(), "mapped".into())].into_iter().collect()),
+        ));
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/(old)$".into(), "/${txt:$1}".into(), "[L]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        match process(&scope, &r, &ctx("/old", &root.join("old"), root)) {
+            Outcome::Internal { path, .. } => assert_eq!(path, "/mapped"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skip_and_qsd_flags_work() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/old$".into(), "/first".into(), "[S=1]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/first$".into(), "/skip".into(), "[L]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/first$".into(), "/last".into(), "[QSD,L]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        let out = process(&scope, &r, &ctx("/old", &root.join("old"), root));
+        match out {
+            Outcome::Internal { path, query, .. } => {
+                assert_eq!(path, "/last");
+                assert!(query.is_empty(), "QSD should discard the original query");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expr_conditions_are_evaluated() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        let mut rule =
+            parse_rewrite_rule(&["^/old$".into(), "-".into(), "[G]".into()], "/", false).unwrap();
+        rule.conditions
+            .push(parse_rewrite_cond(&["expr".into(), "true".into()]).unwrap());
+        scope.rewrite_policy.rewrite_rules.push(rule);
+        let r = req();
+        let root = Path::new("/tmp");
+        assert_eq!(
+            process(&scope, &r, &ctx("/old", &root.join("old"), root)),
+            Outcome::Gone
+        );
+    }
+
+    #[test]
+    fn malformed_conditions_and_flags_are_rejected() {
+        assert!(parse_rewrite_cond(&["%{REQUEST_URI}".into(), "[".into()]).is_err());
+        assert!(parse_rewrite_cond(&["%{NOT_A_REWRITE_VAR}".into(), "^$".into()]).is_ok());
+        assert!(parse_rewrite_rule(&["^x$".into(), "y".into(), "[C]".into()], "/", true).is_ok());
+        assert!(
+            parse_rewrite_rule(&["^x$".into(), "y".into(), "[UNKNOWN]".into()], "/", true).is_err()
+        );
+
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        let mut rule =
+            parse_rewrite_rule(&["^old$".into(), "new".into(), "[L]".into()], "/", true).unwrap();
+        rule.conditions
+            .push(parse_rewrite_cond(&["%{NOT_A_REWRITE_VAR}".into(), "^$".into()]).unwrap());
+        scope.rewrite_policy.rewrite_rules.push(rule);
+        let r = req();
+        let root = Path::new("/tmp");
+        assert!(matches!(
+            process(&scope, &r, &ctx("/old", &root.join("old"), root)),
+            Outcome::Error(_)
+        ));
+    }
+
+    #[test]
+    fn substitution_variables_are_expanded() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &[
+                    "^old$".into(),
+                    "https://%{HTTP_HOST}/new".into(),
+                    "[R=301,L]".into(),
+                ],
+                "/",
+                true,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        assert!(matches!(
+            process(&scope, &r, &ctx("/old", &root.join("old"), root)),
+            Outcome::Redirect { status: 301, location, .. } if location == "https://localhost/new?x=1"
+        ));
+    }
+
+    #[test]
+    fn base_normalization_and_negation() {
+        assert_eq!(normalize_rewrite_base("sub"), "/sub/");
+        let rule = parse_rewrite_rule(&["!^keep$".into(), "x".into()], "/", true).unwrap();
+        assert!(rule.negated);
+    }
+}
