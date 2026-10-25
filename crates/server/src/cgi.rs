@@ -13,7 +13,7 @@ use crate::util::trim_ascii;
 use crate::verified::valid_token;
 use std::ffi::OsString;
 use std::fs::{File, Metadata};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -28,6 +28,35 @@ use std::time::{Duration, Instant};
 const MAX_OUTPUT: usize = 64 * 1024 * 1024;
 const MAX_HEADER: usize = 64 * 1024;
 const MAX_STDERR: usize = 64 * 1024;
+const CGI_BODY_IN_MEMORY: u64 = 1024 * 1024;
+
+/// Request body for CGI execution.  The HTTP reader already spools bodies
+/// above 1 MiB to an unlinked file; keep them there through the worker
+/// protocol instead of materializing the whole body in each process.
+enum BodySource {
+    Bytes(Vec<u8>),
+    File(File),
+}
+
+impl BodySource {
+    fn len(&self) -> u64 {
+        match self {
+            BodySource::Bytes(bytes) => bytes.len() as u64,
+            BodySource::File(file) => file.metadata().map(|m| m.len()).unwrap_or(0),
+        }
+    }
+
+    fn reader(&self) -> std::io::Result<Box<dyn Read + Send>> {
+        match self {
+            BodySource::Bytes(bytes) => Ok(Box::new(std::io::Cursor::new(bytes.clone()))),
+            BodySource::File(file) => {
+                let mut clone = file.try_clone()?;
+                clone.seek(SeekFrom::Start(0))?;
+                Ok(Box::new(clone))
+            }
+        }
+    }
+}
 
 pub struct ScriptTarget {
     pub rel_script: PathBuf,
@@ -39,6 +68,15 @@ pub struct ScriptTarget {
 /// Find the executable prefix of a mapped path, splitting `PATH_INFO` the way
 /// Apache's mod_cgi does when the trailing path does not exist.
 pub fn find_script(root: &Path, rel: &Path, follow: bool) -> Option<ScriptTarget> {
+    find_script_checked(root, rel, follow, false)
+}
+
+pub fn find_script_checked(
+    root: &Path,
+    rel: &Path,
+    follow: bool,
+    owner_match_only: bool,
+) -> Option<ScriptTarget> {
     let comps: Vec<&std::ffi::OsStr> = rel.iter().collect();
     for n in (1..=comps.len()).rev() {
         let mut prefix = PathBuf::new();
@@ -46,7 +84,7 @@ pub fn find_script(root: &Path, rel: &Path, follow: bool) -> Option<ScriptTarget
             prefix.push(c);
         }
         if let crate::files::Target::File { file, meta, .. } =
-            crate::files::resolve_target(root, &prefix, follow)
+            crate::files::resolve_target_checked(root, &prefix, follow, owner_match_only)
         {
             let info = comps[n..]
                 .iter()
@@ -81,10 +119,16 @@ pub struct CgiContext<'a> {
     pub remote_port: u16,
     pub local_ip: &'a str,
     pub local_port: u16,
+    /// True when the request arrived over a TLS listener.
+    pub https: bool,
     pub server_name: &'a str,
     pub host: &'a str,
     pub follow_symlinks: bool,
     pub env: &'a [(String, String)],
+    /// Authenticated user from the access grant, exported as `REMOTE_USER`.
+    pub remote_user: Option<&'a str>,
+    /// Authentication scheme (for example `Basic`) exported as `AUTH_TYPE`.
+    pub auth_type: Option<&'a str>,
     /// Opened script descriptor, when the caller already authorized a
     /// specific inode.  Execution uses `/proc/self/fd` so the path cannot be
     /// swapped between authorization and exec.
@@ -169,7 +213,19 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
     put("REMOTE_ADDR", ctx.remote_ip.to_string());
     put("REMOTE_PORT", ctx.remote_port.to_string());
     put("REMOTE_HOST", ctx.remote_ip.to_string());
-    put("REQUEST_SCHEME", "http".into());
+    if let Some(user) = ctx.remote_user.filter(|user| !user.is_empty()) {
+        put("REMOTE_USER", user.to_string());
+        if let Some(auth_type) = ctx.auth_type.filter(|kind| !kind.is_empty()) {
+            put("AUTH_TYPE", auth_type.to_string());
+        }
+    }
+    put(
+        "REQUEST_SCHEME",
+        if ctx.https { "https" } else { "http" }.into(),
+    );
+    if ctx.https {
+        put("HTTPS", "on".into());
+    }
     put("REDIRECT_STATUS", "200".into());
     put("PATH", "/usr/local/bin:/usr/bin:/bin".into());
     put("LANG", "C".into());
@@ -236,16 +292,13 @@ pub fn execute(ctx: &CgiContext) -> Response {
         original_path.clone()
     };
     let env = build_env(ctx);
-    // Local CGI still expects a contiguous stdin buffer; proxy and FastCGI
-    // stream spooled bodies directly.  Reads above the request threshold are
-    // already on disk, so this is the remaining memory copy for CGI only.
-    let spooled_body = ctx.req.body_reader().and_then(|r| {
-        let mut file = r.ok()?;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data).ok()?;
-        Some(data)
-    });
-    let body = spooled_body.as_deref().unwrap_or(&ctx.req.body);
+    // Keep large bodies on their existing spool file.  Only the small
+    // in-memory case is copied, so concurrent CGI POSTs no longer multiply
+    // LimitRequestBody-sized allocations.
+    let body = match ctx.req.body_reader() {
+        Some(Ok(file)) => BodySource::File(file),
+        _ => BodySource::Bytes(ctx.req.body.clone()),
+    };
 
     // The worker pool is created on the first CGI request.  Static-only
     // deployments therefore pay nothing, and CGI no longer forks from the
@@ -270,7 +323,7 @@ pub fn execute(ctx: &CgiContext) -> Response {
                 worker_path,
                 &cwd,
                 &env,
-                body,
+                &body,
                 ctx.cfg.timeout,
                 worker_identity,
             ) {
@@ -293,7 +346,7 @@ pub fn execute(ctx: &CgiContext) -> Response {
         }
     }
 
-    match run_local(&path, &cwd, &env, body, ctx.cfg.timeout, false, None) {
+    match run_local(&path, &cwd, &env, &body, ctx.cfg.timeout, false, None) {
         Ok((out, stderr)) => {
             if !stderr.trim().is_empty() {
                 eprintln!("CGI stderr: {}", stderr.trim());
@@ -304,10 +357,6 @@ pub fn execute(ctx: &CgiContext) -> Response {
             }
         }
         Err(e) => {
-            let _ = std::fs::write(
-                "/tmp/vapache-cgi-debug",
-                format!("run_local {path:?}: {e}\n"),
-            );
             eprintln!("vapached: CGI failed: {e}");
             cgi_error(ctx)
         }
@@ -483,6 +532,11 @@ fn start_pool(uid: u32, gid: u32, user: &str) -> Result<CgiPool, String> {
                 if libc::dup2(child_fd, WORKER_FD) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // Keep the descriptor across this exec (the worker needs it).
+                // The worker sets FD_CLOEXEC itself before spawning scripts.
+                if libc::fcntl(WORKER_FD, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -557,6 +611,14 @@ pub fn worker_main(fd: i32, uid: u32, gid: u32, user: &str) {
         libc::setrlimit(libc::RLIMIT_FSIZE, &fsize);
     }
     let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
+    // The worker owns the control socket, but CGI scripts spawned by the
+    // worker must not inherit it.  Marking it close-on-exec here (after the
+    // worker's own exec) keeps the socket alive for the worker loop while
+    // excluding it from every script descriptor set.
+    let fd = stream.as_raw_fd();
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return;
+    }
     if stream.write_all(&[1]).is_err() {
         return;
     }
@@ -597,10 +659,30 @@ fn worker_request(stream: &mut UnixStream) -> Result<bool, String> {
     if body_len > MAX_WORKER_BODY {
         return Err("CGI request body too large".into());
     }
-    let mut body = vec![0u8; body_len as usize];
-    stream
-        .read_exact(&mut body)
-        .map_err(|e| format!("short CGI body: {e}"))?;
+    let body = if body_len == 0 {
+        BodySource::Bytes(Vec::new())
+    } else if body_len <= CGI_BODY_IN_MEMORY {
+        let mut body = vec![0u8; body_len as usize];
+        stream
+            .read_exact(&mut body)
+            .map_err(|e| format!("short CGI body: {e}"))?;
+        BodySource::Bytes(body)
+    } else {
+        let mut file =
+            crate::http::spool_file().map_err(|e| format!("cannot spool CGI body: {e}"))?;
+        let mut remaining = body_len;
+        let mut chunk = vec![0u8; 64 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(chunk.len() as u64) as usize;
+            stream
+                .read_exact(&mut chunk[..want])
+                .map_err(|e| format!("short CGI body: {e}"))?;
+            file.write_all(&chunk[..want])
+                .map_err(|e| format!("cannot spool CGI body: {e}"))?;
+            remaining -= want as u64;
+        }
+        BodySource::File(file)
+    };
     let timeout = Duration::from_secs(read_u64(stream)?.clamp(1, 3600));
 
     let result = run_local(&script, &cwd, &env, &body, timeout, true, expected);
@@ -625,7 +707,7 @@ fn exchange(
     path: &Path,
     cwd: &Path,
     env: &[(OsString, OsString)],
-    body: &[u8],
+    body: &BodySource,
     timeout: Duration,
     expected: Option<(u64, u64)>,
 ) -> Result<(Vec<u8>, String), String> {
@@ -644,10 +726,23 @@ fn exchange(
         write_bytes(stream, k.as_os_str().as_bytes())?;
         write_bytes(stream, v.as_os_str().as_bytes())?;
     }
-    write_u64(stream, body.len() as u64)?;
-    stream.write_all(body).map_err(|e| e.to_string())?;
-    write_u64(stream, timeout.as_secs().max(1))?;
-    stream.flush().map_err(|e| e.to_string())?;
+    let body_len = body.len();
+    write_u64(stream, body_len)?;
+    let mut reader = body.reader().map_err(|e| e.to_string())?;
+    let copied = std::io::copy(&mut reader, stream).map_err(|e| e.to_string())?;
+    if copied != body_len {
+        return Err("short CGI body".into());
+    }
+    // A worker that already produced its full response may close as soon as
+    // the body is consumed; a broken pipe on the final metadata write does not
+    // invalidate the response we can still read.
+    match write_u64(stream, timeout.as_secs().max(1)) {
+        Ok(()) => {
+            let _ = stream.flush();
+        }
+        Err(e) if e.contains("Broken pipe") => {}
+        Err(e) => return Err(e),
+    }
 
     let ok = read_u8(stream)?;
     let out = read_bytes(stream, MAX_OUTPUT as u32, false)?.unwrap_or_default();
@@ -718,7 +813,7 @@ fn run_local(
     path: &Path,
     cwd: &Path,
     env: &[(OsString, OsString)],
-    body: &[u8],
+    body: &BodySource,
     timeout: Duration,
     worker_prepared: bool,
     expected: Option<(u64, u64)>,
@@ -799,17 +894,23 @@ fn run_local(
     // Feed stdin.  Empty GET bodies just close the pipe.  Only larger bodies
     // need a writer thread; it is joined before this worker forks again.
     let stdin_thread = child.stdin.take().and_then(|mut stdin| {
-        if body.is_empty() {
+        let body_len = body.len();
+        if body_len == 0 {
             drop(stdin);
             None
-        } else if body.len() <= 16 * 1024 {
-            let _ = stdin.write_all(body);
+        } else if body_len <= 16 * 1024 {
+            if let Ok(mut reader) = body.reader() {
+                let _ = std::io::copy(&mut reader, &mut stdin);
+            }
             drop(stdin);
             None
         } else {
-            let body = body.to_vec();
+            let Ok(mut reader) = body.reader() else {
+                drop(stdin);
+                return None;
+            };
             Some(std::thread::spawn(move || {
-                let _ = stdin.write_all(&body);
+                let _ = std::io::copy(&mut reader, &mut stdin);
             }))
         }
     });
@@ -1106,10 +1207,13 @@ mod tests {
             remote_port: 12345,
             local_ip: "127.0.0.1",
             local_port: 8080,
+            https: false,
             server_name: "localhost",
             host: "localhost",
             follow_symlinks: false,
             env: &[],
+            remote_user: None,
+            auth_type: None,
             script_file: None,
         };
         let resp = execute(&ctx);
@@ -1145,10 +1249,13 @@ mod tests {
             remote_port: 12345,
             local_ip: "127.0.0.1",
             local_port: 8080,
+            https: false,
             server_name: "localhost",
             host: "localhost",
             follow_symlinks: false,
             env: &[],
+            remote_user: None,
+            auth_type: None,
             script_file: Some(&file),
         };
         let resp = execute(&ctx);
@@ -1185,10 +1292,13 @@ mod tests {
             remote_port: 12345,
             local_ip: "127.0.0.1",
             local_port: 8080,
+            https: false,
             server_name: "localhost",
             host: "localhost",
             follow_symlinks: false,
             env: &extra,
+            remote_user: None,
+            auth_type: None,
             script_file: None,
         };
         let env = build_env(&ctx);
@@ -1205,6 +1315,48 @@ mod tests {
         );
         assert_eq!(get("CUSTOM_VALUE"), "ok");
         assert_eq!(get("QUERY_STRING"), "x=1");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authenticated_identity_is_exported_as_remote_user_and_auth_type() {
+        let dir = tempdir("remote-user");
+        let cfg = config(&dir);
+        let req = request("/cgi-bin/who.sh", Vec::new());
+        let extra = vec![
+            ("REMOTE_USER".into(), "attacker".into()),
+            ("AUTH_TYPE".into(), "None".into()),
+        ];
+        let ctx = CgiContext {
+            cfg: &cfg,
+            vhost: None,
+            req: &req,
+            root: &dir,
+            script_rel: Path::new("cgi-bin/who.sh"),
+            script_name: "/cgi-bin/who.sh",
+            path_info: "",
+            docroot: &dir,
+            remote_ip: "127.0.0.1",
+            remote_port: 12345,
+            local_ip: "127.0.0.1",
+            local_port: 8080,
+            https: false,
+            server_name: "localhost",
+            host: "localhost",
+            follow_symlinks: false,
+            env: &extra,
+            remote_user: Some("alice"),
+            auth_type: Some("Basic"),
+            script_file: None,
+        };
+        let env = build_env(&ctx);
+        let get = |name: &str| {
+            env.iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        assert_eq!(get("REMOTE_USER").as_deref(), Some("alice"));
+        assert_eq!(get("AUTH_TYPE").as_deref(), Some("Basic"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1239,10 +1391,13 @@ mod tests {
             remote_port: 12345,
             local_ip: "127.0.0.1",
             local_port: 8080,
+            https: false,
             server_name: "localhost",
             host: "localhost",
             follow_symlinks: false,
             env: &[],
+            remote_user: None,
+            auth_type: None,
             script_file: None,
         };
         assert_eq!(execute(&ctx).status, 500);
@@ -1254,7 +1409,15 @@ mod tests {
         let dir = tempdir("timeout");
         let p = script(&dir, "slow.sh", "#!/bin/sh\nsleep 5\n");
         let start = Instant::now();
-        let result = run_local(&p, &dir, &[], b"", Duration::from_millis(50), false, None);
+        let result = run_local(
+            &p,
+            &dir,
+            &[],
+            &BodySource::Bytes(Vec::new()),
+            Duration::from_millis(50),
+            false,
+            None,
+        );
         assert!(result.is_err());
         assert!(start.elapsed() < Duration::from_secs(2));
         let _ = fs::remove_dir_all(&dir);
@@ -1275,6 +1438,9 @@ mod tests {
         let (mut parent, child) = UnixStream::pair().unwrap();
         let fake = std::thread::spawn(move || {
             let mut child = child;
+            // Let the client finish writing the request before this minimal
+            // fake worker replies and closes.
+            std::thread::sleep(Duration::from_millis(50));
             write_u8(&mut child, 1).unwrap();
             write_bytes(&mut child, b"out").unwrap();
             write_bytes(&mut child, b"").unwrap();
@@ -1285,7 +1451,7 @@ mod tests {
             Path::new("/bin/true"),
             Path::new("/"),
             &[],
-            b"",
+            &BodySource::Bytes(Vec::new()),
             Duration::from_secs(1),
             None,
         )
@@ -1297,6 +1463,7 @@ mod tests {
         let (mut parent, child) = UnixStream::pair().unwrap();
         let fake = std::thread::spawn(move || {
             let mut child = child;
+            std::thread::sleep(Duration::from_millis(50));
             write_u8(&mut child, 0).unwrap();
             write_bytes(&mut child, b"").unwrap();
             write_bytes(&mut child, b"boom").unwrap();
@@ -1307,7 +1474,7 @@ mod tests {
             Path::new("/bin/true"),
             Path::new("/"),
             &[],
-            b"",
+            &BodySource::Bytes(Vec::new()),
             Duration::from_secs(1),
             None,
         )

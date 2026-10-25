@@ -487,17 +487,18 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         let filesystem = if !external && Path::new(&joined).is_absolute() {
             let candidate = fs::canonicalize(&joined).ok();
             let docroot = fs::canonicalize(ctx.docroot).ok();
-            let server_root = fs::canonicalize(ctx.server_root).ok();
-            match (candidate, docroot, server_root) {
-                (Some(candidate), Some(docroot), Some(server_root)) => {
-                    let is_file = candidate.is_file();
-                    let under_docroot = candidate.starts_with(&docroot);
-                    let under_server_root = candidate.starts_with(&server_root);
+            match (candidate, docroot) {
+                (Some(candidate), Some(docroot)) => {
+                    // `UnsafePrefixStat` may relax what the rule is allowed to
+                    // stat, but it must never relax the base used to authorize
+                    // and serve the result.  A rewrite names one file inside
+                    // the current root, not a new root.
                     if vapache_verified::rewrite_filesystem_admit(
-                        is_file,
-                        under_docroot,
-                        under_server_root,
-                        rule.flags.unsafe_prefix_stat,
+                        candidate.is_file(),
+                        vapache_verified::path_under_base(
+                            candidate.as_os_str().as_encoded_bytes(),
+                            docroot.as_os_str().as_encoded_bytes(),
+                        ),
                     ) {
                         Some(candidate)
                     } else {
@@ -1451,7 +1452,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_stat_filesystem_override_respects_safety_flag() {
+    fn prefix_stat_filesystem_override_never_changes_the_authorization_base() {
         let base = std::env::temp_dir().join(format!("vp-prefix-{}", std::process::id()));
         let docroot = base.join("www");
         let conf = base.join("conf");
@@ -1500,15 +1501,21 @@ mod tests {
                 ..
             }
         ));
+        // The compatibility flag must not re-root the request at the target's
+        // parent directory.  Authorization always remains below the current
+        // document/alias root.
         assert!(matches!(
             run(&outside_query, "[L,UnsafePrefixStat]"),
-            Outcome::Internal { filesystem: Some(path), .. } if path == outside
+            Outcome::Internal {
+                filesystem: None,
+                ..
+            }
         ));
         let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn backref_filesystem_targets_stay_below_docroot_or_need_unsafe_flag() {
+    fn backref_filesystem_targets_stay_below_the_current_root() {
         let base = std::env::temp_dir().join(format!("vp-rewrite-fs-{}", std::process::id()));
         let docroot = base.join("www");
         let conf = base.join("conf");
@@ -1558,9 +1565,9 @@ mod tests {
         assert!(matches!(
             run("[L,UnsafePrefixStat]"),
             Outcome::Internal {
-                filesystem: Some(path),
+                filesystem: None,
                 ..
-            } if path == conf.join("secret.txt")
+            }
         ));
         let _ = fs::remove_dir_all(&base);
     }

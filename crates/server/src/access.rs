@@ -483,13 +483,10 @@ fn eval_require(
                 .unwrap_or(false);
             decide(hit, *negate)
         }
-        Require::Expr(e) => {
+        Require::Expr { negate, expr } => {
             let mut ctx = crate::expr::Context::new(req, env, peer, docroot);
-            if e.eval(&mut ctx).map(|v| v.truthy()).unwrap_or(false) {
-                PolicyResult::Granted
-            } else {
-                PolicyResult::Denied
-            }
+            let hit = expr.eval(&mut ctx).map(|v| v.truthy()).unwrap_or(false);
+            decide(hit, *negate)
         }
         Require::Unsupported(_) => PolicyResult::Denied,
     }

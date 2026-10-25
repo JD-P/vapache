@@ -751,20 +751,61 @@ pub fn rewrite_internal_path(joined: &[u8]) -> (out: Vec<u8>)
 }
 
 /// Admit an absolute filesystem target produced by a rewrite.  A file may
-/// be served only below the request's document root, or below the server
-/// root when the rule explicitly opted into `UnsafePrefixStat`.  This is the
-/// CVE-2024-38475 boundary: a backreference or query value cannot turn an
-/// absolute substitute into an arbitrary file read.
-pub fn rewrite_filesystem_admit(
-    is_file: bool,
-    under_docroot: bool,
-    under_server_root: bool,
-    unsafe_prefix_stat: bool,
-) -> (ok: bool)
-    ensures
-        ok == (is_file && (under_docroot || (unsafe_prefix_stat && under_server_root))),
+/// be served only below the request's current document/alias root.  The
+/// `UnsafePrefixStat` flag is parsed for compatibility but never changes the
+/// authorization base: admitting a file for stat must not turn its parent
+/// directory into a new virtual root.  This is the CVE-2024-38475 boundary.
+pub fn rewrite_filesystem_admit(is_file: bool, under_base: bool) -> (ok: bool)
+    ensures ok == (is_file && under_base),
 {
-    is_file && (under_docroot || (unsafe_prefix_stat && under_server_root))
+    is_file && under_base
+}
+
+/// Component-aware lexical containment for an absolute filesystem target.
+///
+/// `base` must be a real directory prefix of `target`; a bare string prefix is
+/// not enough (`/srv/www2` must not be admitted below `/srv/www`).  The check
+/// is deliberately on encoded path bytes so it can run immediately before a
+/// filesystem operation without allocating or consulting the filesystem.  The
+/// runtime still resolves symlinks and uses `openat2(RESOLVE_BENEATH)` as the
+/// kernel-level half of the containment argument.
+pub open spec fn path_under_base_spec(target: Seq<u8>, base: Seq<u8>) -> bool {
+    &&& base.len() > 0
+    &&& target.len() >= base.len()
+    &&& target.subrange(0, base.len() as int) == base
+    &&& (target.len() == base.len()
+        || base[base.len() - 1] == b'/'
+        || target[base.len() as int] == b'/')
+}
+
+pub fn path_under_base(target: &[u8], base: &[u8]) -> (ok: bool)
+    ensures ok == path_under_base_spec(target@, base@),
+{
+    if base.len() == 0 || target.len() < base.len() {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < base.len()
+        invariant
+            i <= base.len(),
+            target.len() >= base.len(),
+            forall|j: int| 0 <= j < i ==> #[trigger] target@[j] == base@[j],
+        decreases base.len() - i,
+    {
+        if target[i] != base[i] {
+            assert(target@.subrange(0, base.len() as int) != base@);
+            return false;
+        }
+        i = i + 1;
+    }
+    assert(target@.subrange(0, base.len() as int) == base@);
+    if target.len() == base.len() {
+        return true;
+    }
+    if base[base.len() - 1] == b'/' {
+        return true;
+    }
+    target[base.len()] == b'/'
 }
 
 /// Escape access-log text so a hostile request field cannot inject a
@@ -1191,6 +1232,75 @@ pub open spec fn header_ok(h: (Vec<u8>, Vec<u8>)) -> bool {
 
 pub open spec fn headers_ok(hs: Seq<(Vec<u8>, Vec<u8>)>) -> bool {
     forall|i: int| 0 <= i < hs.len() ==> #[trigger] header_ok(hs[i])
+}
+
+/// Admission for the outbound request line of an HTTP/1.1 proxy hop.  The
+/// method is a bounded RFC 9110 token, the target is a non-empty run of
+/// visible bytes (no spaces or CTLs that could start a second request line),
+/// and the version is exactly `HTTP/1.1`.
+pub fn proxy_request_line_admit(
+    method: &[u8],
+    target: &[u8],
+    version: &[u8],
+) -> (ok: bool)
+    ensures
+        ok == (valid_method(method@)
+            && valid_target(target@)
+            && version@ == b"HTTP/1.1"@),
+{
+    if method.len() == 0 || method.len() > 64 || !valid_token(method) {
+        return false;
+    }
+    if target.len() == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < target.len()
+        invariant
+            i <= target.len(),
+            forall|j: int| 0 <= j < i ==> #[trigger] target@[j] >= 0x21
+                && target@[j] != 0x7f,
+        decreases target.len() - i,
+    {
+        if target[i] < 0x21 || target[i] == 0x7f {
+            assert(!all_target_bytes(target@));
+            return false;
+        }
+        i = i + 1;
+    }
+    assert(all_target_bytes(target@));
+    assert(valid_method(method@));
+    assert(valid_target(target@));
+    bytes_eq(version, b"HTTP/1.1")
+}
+
+/// Admission for one outbound proxy header field.  Names must be tokens and
+/// values may contain only HTAB, SP and visible bytes; CR, LF, NUL and other
+/// CTLs cannot be serialized into the upstream head.
+pub fn proxy_header_admit(name: &[u8], value: &[u8]) -> (ok: bool)
+    ensures ok == (valid_header_name(name@) && valid_header_value(value@)),
+{
+    if !valid_token(name) {
+        return false;
+    }
+    assert(valid_header_name(name@));
+    let mut i: usize = 0;
+    while i < value.len()
+        invariant
+            i <= value.len(),
+            forall|j: int| 0 <= j < i ==> #[trigger] is_ows(value@[j])
+                || (value@[j] >= 0x20 && value@[j] != 0x7f),
+        decreases value.len() - i,
+    {
+        let b = value[i];
+        if !(is_ows_exec(b) || (b >= 0x20 && b != 0x7f)) {
+            assert(!valid_header_value(value@));
+            return false;
+        }
+        i = i + 1;
+    }
+    assert(valid_header_value(value@));
+    true
 }
 
 pub open spec fn no_byte(s: Seq<u8>, b: u8) -> bool {
@@ -2417,18 +2527,21 @@ pub fn cgi_env_entry_admit(
 // ---------------------------------------------------------------------------
 
 /// One cache lookup is admissible only when the key and policy match, the
-/// stored `Vary` values match the current request, and the entry is fresh.
-/// This is the security decision consumed by the runtime cache lookup.
+/// entry belongs to the current configuration generation, the stored `Vary`
+/// values match the current request, and the entry is fresh.  This is the
+/// security decision consumed by the runtime cache lookup.
 pub fn cache_lookup_admit(
     key_match: bool,
     policy_match: bool,
     vary_match: bool,
+    generation_match: bool,
     expires: i64,
     now: i64,
 ) -> (hit: bool)
-    ensures hit == (key_match && policy_match && vary_match && now < expires),
+    ensures
+        hit == (key_match && policy_match && vary_match && generation_match && now < expires),
 {
-    key_match && policy_match && vary_match && now < expires
+    key_match && policy_match && vary_match && generation_match && now < expires
 }
 
 // ---------------------------------------------------------------------------
@@ -2887,10 +3000,10 @@ pub open spec fn directive_disposition_spec(
 ) -> DirectiveDisposition {
     if security {
         DirectiveDisposition::FailClosedSecurity
-    } else if known {
-        DirectiveDisposition::WarnKnown
     } else if strict {
         DirectiveDisposition::FailClosedStrict
+    } else if known {
+        DirectiveDisposition::WarnKnown
     } else {
         DirectiveDisposition::WarnUnknown
     }
@@ -2905,10 +3018,10 @@ pub fn directive_disposition(
 {
     if security {
         DirectiveDisposition::FailClosedSecurity
-    } else if known {
-        DirectiveDisposition::WarnKnown
     } else if strict {
         DirectiveDisposition::FailClosedStrict
+    } else if known {
+        DirectiveDisposition::WarnKnown
     } else {
         DirectiveDisposition::WarnUnknown
     }
@@ -3041,6 +3154,179 @@ pub fn expr_value_truthy(
         ExprValueKind::Str => length > 0,
         ExprValueKind::List => length > 0,
     }
+}
+
+/// Comparison operators admitted by the `ap_expr` subset.  Numeric `-eq`
+/// through `-ge` and string `=`, `!=`, `<`, `<=`, `>`, `>=` share one enum so
+/// the evaluator cannot silently fall back to a different ordering.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExprCompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+pub open spec fn expr_compare_ints_spec(op: ExprCompareOp, a: i64, b: i64) -> bool {
+    match op {
+        ExprCompareOp::Eq => a == b,
+        ExprCompareOp::Ne => a != b,
+        ExprCompareOp::Lt => a < b,
+        ExprCompareOp::Le => a <= b,
+        ExprCompareOp::Gt => a > b,
+        ExprCompareOp::Ge => a >= b,
+    }
+}
+
+pub fn expr_compare_ints(op: ExprCompareOp, a: i64, b: i64) -> (out: bool)
+    ensures out == expr_compare_ints_spec(op, a, b),
+{
+    match op {
+        ExprCompareOp::Eq => a == b,
+        ExprCompareOp::Ne => a != b,
+        ExprCompareOp::Lt => a < b,
+        ExprCompareOp::Le => a <= b,
+        ExprCompareOp::Gt => a > b,
+        ExprCompareOp::Ge => a >= b,
+    }
+}
+
+/// Byte-lexicographic order, matching Rust's `str` ordering (UTF-8 byte
+/// comparison).  Stated recursively so the executable comparison and its
+/// specification use the same definition.
+pub open spec fn bytes_lt_spec(a: Seq<u8>, b: Seq<u8>) -> bool
+    decreases a.len() + b.len(),
+{
+    if a.len() == 0 {
+        b.len() > 0
+    } else if b.len() == 0 {
+        false
+    } else if a[0] < b[0] {
+        true
+    } else if a[0] > b[0] {
+        false
+    } else {
+        bytes_lt_spec(a.skip(1), b.skip(1))
+    }
+}
+
+fn bytes_lt(a: &[u8], b: &[u8]) -> (out: bool)
+    ensures out == bytes_lt_spec(a@, b@),
+    decreases a.len() + b.len(),
+{
+    if a.len() == 0 {
+        return b.len() > 0;
+    }
+    if b.len() == 0 {
+        return false;
+    }
+    if a[0] < b[0] {
+        return true;
+    }
+    if a[0] > b[0] {
+        return false;
+    }
+    bytes_lt(&a[1..], &b[1..])
+}
+
+pub open spec fn expr_compare_strs_spec(
+    op: ExprCompareOp,
+    a: Seq<u8>,
+    b: Seq<u8>,
+) -> bool {
+    match op {
+        ExprCompareOp::Eq => a == b,
+        ExprCompareOp::Ne => a != b,
+        ExprCompareOp::Lt => bytes_lt_spec(a, b),
+        ExprCompareOp::Le => a == b || bytes_lt_spec(a, b),
+        ExprCompareOp::Gt => bytes_lt_spec(b, a),
+        ExprCompareOp::Ge => a == b || bytes_lt_spec(b, a),
+    }
+}
+
+pub fn expr_compare_strs(op: ExprCompareOp, a: &[u8], b: &[u8]) -> (out: bool)
+    ensures out == expr_compare_strs_spec(op, a@, b@),
+{
+    match op {
+        ExprCompareOp::Eq => bytes_eq(a, b),
+        ExprCompareOp::Ne => !bytes_eq(a, b),
+        ExprCompareOp::Lt => bytes_lt(a, b),
+        ExprCompareOp::Le => bytes_eq(a, b) || bytes_lt(a, b),
+        ExprCompareOp::Gt => bytes_lt(b, a),
+        ExprCompareOp::Ge => bytes_eq(a, b) || bytes_lt(b, a),
+    }
+}
+
+/// Shell-style expression matching used by `-strmatch` and `-fnmatch`.
+/// `path_mode` makes `*` and `?` stop at `/`, matching Apache's filename
+/// matcher.  The verified form is the exact evaluator kernel: callers still
+/// supply the operands and decide case folding.
+pub open spec fn expr_glob_spec(
+    pattern: Seq<u8>,
+    value: Seq<u8>,
+    path_mode: bool,
+) -> bool
+    decreases pattern.len() + value.len(),
+{
+    if pattern.len() == 0 {
+        value.len() == 0
+    } else if pattern[0] == b'*' {
+        if path_mode && pattern.len() > 1 && pattern[1] == b'/' {
+            expr_glob_spec(pattern.skip(2), value, path_mode)
+        } else if expr_glob_spec(pattern.skip(1), value, path_mode) {
+            true
+        } else if value.len() == 0 || value[0] == b'/' {
+            false
+        } else {
+            expr_glob_spec(pattern, value.skip(1), path_mode)
+        }
+    } else if pattern[0] == b'?' {
+        if value.len() == 0 {
+            false
+        } else {
+            (path_mode || value[0] != b'/')
+                && expr_glob_spec(pattern.skip(1), value.skip(1), path_mode)
+        }
+    } else if value.len() == 0 {
+        false
+    } else {
+        pattern[0] == value[0]
+            && expr_glob_spec(pattern.skip(1), value.skip(1), path_mode)
+    }
+}
+
+pub fn expr_glob_match(pattern: &[u8], value: &[u8], path_mode: bool) -> (out: bool)
+    ensures out == expr_glob_spec(pattern@, value@, path_mode),
+    decreases pattern.len() + value.len(),
+{
+    if pattern.len() == 0 {
+        return value.len() == 0;
+    }
+    if pattern[0] == b'*' {
+        if path_mode && pattern.len() > 1 && pattern[1] == b'/' {
+            return expr_glob_match(&pattern[2..], value, path_mode);
+        }
+        if expr_glob_match(&pattern[1..], value, path_mode) {
+            return true;
+        }
+        if value.len() == 0 || value[0] == b'/' {
+            return false;
+        }
+        return expr_glob_match(pattern, &value[1..], path_mode);
+    }
+    if pattern[0] == b'?' {
+        if value.len() == 0 {
+            return false;
+        }
+        return (path_mode || value[0] != b'/')
+            && expr_glob_match(&pattern[1..], &value[1..], path_mode);
+    }
+    if value.len() == 0 {
+        return false;
+    }
+    pattern[0] == value[0] && expr_glob_match(&pattern[1..], &value[1..], path_mode)
 }
 
 /// Fold an Apache rewrite-condition chain.  `matches[i]` is the predicate
@@ -4378,6 +4664,287 @@ pub proof fn h2_budget_replay_preserves_inv(
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I3 — fast-path prefilter soundness
+// ---------------------------------------------------------------------------
+
+/// The runtime `.htaccess` gate is the conjunction of "overrides are enabled"
+/// and "the override policy can apply to this path".  The access-file walk
+/// reads a directory only when that gate holds (plus the directory being under
+/// the walk root and an access file existing there).
+pub open spec fn htaccess_may_apply_spec(enabled: bool, applicable: bool) -> bool {
+    enabled && applicable
+}
+
+pub open spec fn access_file_layer_read(
+    enabled: bool,
+    applicable: bool,
+    under_root: bool,
+    file_present: bool,
+) -> bool {
+    enabled && applicable && under_root && file_present
+}
+
+/// If the prefilter says the walk cannot matter, no directory in the walk can
+/// contribute an access-file layer.  This is the `htaccess_may_apply` half of
+/// I3; the path-pattern predicate itself is supplied by the unproved matcher.
+pub proof fn htaccess_prefilter_sound(
+    enabled: bool,
+    applicable: bool,
+    under_root: bool,
+    file_present: bool,
+)
+    ensures
+        !htaccess_may_apply_spec(enabled, applicable)
+            ==> !access_file_layer_read(enabled, applicable, under_root, file_present),
+{
+}
+
+/// The matcher used by `CacheEnable`/`CacheDisable`.  Only its identity is
+/// needed for the prefilter proof, so it is intentionally uninterpreted.
+pub uninterp spec fn cache_prefix_matches(prefix: u64, path: u64) -> bool;
+
+/// True when any enable prefix in the list matches the request path.
+pub open spec fn any_cache_prefix_matches(prefixes: Seq<u64>, path: u64) -> bool
+    decreases prefixes.len(),
+{
+    if prefixes.len() == 0 {
+        false
+    } else {
+        cache_prefix_matches(prefixes[0], path)
+            || any_cache_prefix_matches(prefixes.drop_first(), path)
+    }
+}
+
+/// Appending a prefix list cannot change whether any prefix matches.
+pub proof fn any_cache_prefix_matches_append(a: Seq<u64>, b: Seq<u64>, path: u64)
+    ensures
+        any_cache_prefix_matches(a + b, path) == (any_cache_prefix_matches(a, path)
+            || any_cache_prefix_matches(b, path)),
+    decreases a.len(),
+{
+    if a.len() == 0 {
+        assert(a + b == b);
+    } else {
+        assert(a == seq![a[0]] + a.drop_first());
+        assert(a + b == seq![a[0]] + (a.drop_first() + b));
+        assert((seq![a[0]] + (a.drop_first() + b))[0] == a[0]);
+        assert((seq![a[0]] + (a.drop_first() + b)).drop_first() == a.drop_first() + b);
+        assert(any_cache_prefix_matches(a + b, path)
+            == (cache_prefix_matches(a[0], path)
+                || any_cache_prefix_matches(a.drop_first() + b, path)));
+        assert(any_cache_prefix_matches(a, path)
+            == (cache_prefix_matches(a[0], path)
+                || any_cache_prefix_matches(a.drop_first(), path)));
+        any_cache_prefix_matches_append(a.drop_first(), b, path);
+    }
+}
+
+/// Abstract view of `cache::rules_may_enable_cache`: one entry per rule in
+/// preorder, holding the rule's own `CacheEnable` prefixes.  A rule is
+/// "prefilter-positive" when its own list is non-empty; nested rules are
+/// flattened into the same sequence by the runtime prefilter.
+pub open spec fn rules_may_enable_cache_spec(rule_enables: Seq<Seq<u64>>) -> bool
+    decreases rule_enables.len(),
+{
+    if rule_enables.len() == 0 {
+        false
+    } else {
+        rule_enables[0].len() > 0 || rules_may_enable_cache_spec(rule_enables.drop_first())
+    }
+}
+
+/// Concatenation of every rule's `CacheEnable` prefixes in application order.
+pub open spec fn applied_cache_enables(rule_enables: Seq<Seq<u64>>) -> Seq<u64>
+    decreases rule_enables.len(),
+{
+    if rule_enables.len() == 0 {
+        Seq::empty()
+    } else {
+        rule_enables[0] + applied_cache_enables(rule_enables.drop_first())
+    }
+}
+
+pub proof fn cache_prefilter_false_means_no_enables(rule_enables: Seq<Seq<u64>>)
+    requires !rules_may_enable_cache_spec(rule_enables),
+    ensures forall|i: int| 0 <= i < rule_enables.len() ==> rule_enables[i].len() == 0,
+    decreases rule_enables.len(),
+{
+    if rule_enables.len() == 0 {
+    } else {
+        assert(rules_may_enable_cache_spec(rule_enables)
+            == (rule_enables[0].len() > 0
+                || rules_may_enable_cache_spec(rule_enables.drop_first())));
+        assert(!(rule_enables[0].len() > 0));
+        assert(!rules_may_enable_cache_spec(rule_enables.drop_first()));
+        assert(rule_enables[0].len() == 0);
+        cache_prefilter_false_means_no_enables(rule_enables.drop_first());
+        assert forall|i: int| 0 <= i < rule_enables.len() implies rule_enables[i].len() == 0 by {
+            if i == 0 {
+            } else {
+                assert(rule_enables.drop_first()[i - 1].len() == 0);
+                assert(rule_enables[i] == rule_enables.drop_first()[i - 1]);
+            }
+        }
+    }
+}
+
+pub proof fn applied_cache_enables_empty(rule_enables: Seq<Seq<u64>>)
+    requires forall|i: int| 0 <= i < rule_enables.len() ==> rule_enables[i].len() == 0,
+    ensures applied_cache_enables(rule_enables).len() == 0,
+    decreases rule_enables.len(),
+{
+    if rule_enables.len() == 0 {
+    } else {
+        assert(rule_enables[0].len() == 0);
+        applied_cache_enables_empty(rule_enables.drop_first());
+        assert((rule_enables[0] + applied_cache_enables(rule_enables.drop_first())).len() == 0);
+    }
+}
+
+/// `cache_enabled` is disable-first and then requires an enabled prefix to
+/// match.  A prefilter-negative rule set cannot introduce such a prefix, so a
+/// request outside the inherited enable prefixes stays outside the cache.
+pub open spec fn cache_enabled_spec(
+    cache_enable: Seq<u64>,
+    cache_disable: Seq<u64>,
+    path: u64,
+) -> bool {
+    !any_cache_prefix_matches(cache_disable, path) && any_cache_prefix_matches(cache_enable, path)
+}
+
+/// The cache half of I3: if the inherited scope does not enable the raw
+/// request path and no matching directory/conditional rule can add a
+/// `CacheEnable` prefix, the effective scope cannot enable the cache.
+pub proof fn cache_prefilter_sound(
+    base_enable: Seq<u64>,
+    base_disable: Seq<u64>,
+    rule_enables: Seq<Seq<u64>>,
+    path: u64,
+)
+    requires
+        !any_cache_prefix_matches(base_enable, path),
+        !rules_may_enable_cache_spec(rule_enables),
+    ensures
+        !cache_enabled_spec(base_enable + applied_cache_enables(rule_enables), base_disable, path),
+{
+    cache_prefilter_false_means_no_enables(rule_enables);
+    applied_cache_enables_empty(rule_enables);
+    assert(applied_cache_enables(rule_enables) == Seq::<u64>::empty());
+    any_cache_prefix_matches_append(base_enable, applied_cache_enables(rule_enables), path);
+    assert(!any_cache_prefix_matches(base_enable + applied_cache_enables(rule_enables), path));
+}
+
+/// I14's first-match rule, stated independently of any particular table.
+/// Encoding an ordered mapping table as its match-bit vector is the
+/// refinement step; this theorem proves that the selected bit is the first
+/// true one, so a later overlapping mapping can never win.
+pub proof fn first_match_is_first(flags: Seq<bool>, selected: int)
+    requires first_true_spec(flags) == Some(selected),
+    ensures
+        0 <= selected < flags.len(),
+        flags[selected],
+        forall|j: int| 0 <= j < selected ==> !flags[j],
+    decreases flags.len(),
+{
+    if flags.len() == 0 {
+        assert(first_true_spec(flags) == None);
+    } else if flags[0] {
+        assert(first_true_spec(flags) == Some(0));
+        assert(selected == 0);
+    } else {
+        let rest = flags.drop_first();
+        assert(first_true_spec(flags) == match first_true_spec(rest) {
+            None => None,
+            Some(i) => Some(i + 1),
+        });
+        match first_true_spec(rest) {
+            None => {
+                assert(first_true_spec(flags) == None);
+            }
+            Some(i) => {
+                assert(selected == i + 1);
+                first_match_is_first(rest, i);
+                assert(flags[selected] == rest[i]);
+                assert forall|j: int| 0 <= j < selected implies !flags[j] by {
+                    if j == 0 {
+                        assert(!flags[0]);
+                    } else {
+                        assert(flags[j] == rest[j - 1]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// No match bit set means the table has no applicable entry.
+pub proof fn first_match_none_means_no_match(flags: Seq<bool>)
+    requires first_true_spec(flags) == None,
+    ensures forall|j: int| 0 <= j < flags.len() ==> !flags[j],
+    decreases flags.len(),
+{
+    if flags.len() == 0 {
+    } else if flags[0] {
+        assert(first_true_spec(flags) == Some(0));
+    } else {
+        assert(first_true_spec(flags) == match first_true_spec(flags.drop_first()) {
+            None => None,
+            Some(i) => Some(i + 1),
+        });
+        first_match_none_means_no_match(flags.drop_first());
+        assert forall|j: int| 0 <= j < flags.len() implies !flags[j] by {
+            if j == 0 {
+                assert(!flags[0]);
+            } else {
+                assert(flags[j] == flags.drop_first()[j - 1]);
+            }
+        }
+    }
+}
+
+/// Named entry point for the proof obligation in section 10 of
+/// `docs/config-semantics.md`: both fast-path prefilters imply their
+/// authoritative checks.
+pub proof fn prefilter_sound(
+    override_enabled: bool,
+    override_applicable: bool,
+    under_root: bool,
+    file_present: bool,
+    base_enable: Seq<u64>,
+    base_disable: Seq<u64>,
+    rule_enables: Seq<Seq<u64>>,
+    path: u64,
+)
+    ensures
+        (!htaccess_may_apply_spec(override_enabled, override_applicable)
+            ==> !access_file_layer_read(
+                override_enabled,
+                override_applicable,
+                under_root,
+                file_present,
+            ))
+            && ((!any_cache_prefix_matches(base_enable, path)
+                && !rules_may_enable_cache_spec(rule_enables))
+                ==> !cache_enabled_spec(
+                    base_enable + applied_cache_enables(rule_enables),
+                    base_disable,
+                    path,
+                )),
+{
+    htaccess_prefilter_sound(
+        override_enabled,
+        override_applicable,
+        under_root,
+        file_present,
+    );
+    if !any_cache_prefix_matches(base_enable, path)
+        && !rules_may_enable_cache_spec(rule_enables)
+    {
+        cache_prefilter_sound(base_enable, base_disable, rule_enables, path);
     }
 }
 

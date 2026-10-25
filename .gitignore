@@ -1,0 +1,17 @@
+# Cargo build output
+/target/
+
+# LLVM raw coverage profiles from tests/coverage.sh
+*.profraw
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Profiling data
+/perf.data*
+
+# Generated per-run test and benchmark output
+/bench/results/
+/bench/FEATURE_RESULTS-*.md
+/tests/differential_report.md

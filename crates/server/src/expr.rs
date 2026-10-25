@@ -85,6 +85,62 @@ impl Value {
     }
 }
 
+thread_local! {
+    /// The listener scheme/port for the request currently being dispatched.
+    /// These are set by the connection layer, never derived from a client
+    /// header such as `X-Forwarded-Proto`.
+    static REQUEST_HTTPS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static REQUEST_PORT: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+    static REQUEST_SERVER_NAME: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct ServerNameGuard(Option<String>);
+
+impl Drop for ServerNameGuard {
+    fn drop(&mut self) {
+        REQUEST_SERVER_NAME.with(|v| *v.borrow_mut() = self.0.take());
+    }
+}
+
+/// Install the dispatcher-selected canonical name for expression evaluation.
+/// The guard restores the previous value when the request finishes.
+pub(crate) fn set_server_name(name: &str) -> ServerNameGuard {
+    let previous = REQUEST_SERVER_NAME.with(|v| v.borrow_mut().replace(name.to_string()));
+    ServerNameGuard(previous)
+}
+
+fn request_server_name() -> Option<String> {
+    REQUEST_SERVER_NAME.with(|v| v.borrow().clone())
+}
+
+/// Run `f` with the real listener TLS state and port visible to expression
+/// evaluation.
+pub(crate) fn with_connection<T>(https: bool, port: u16, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>, Option<u16>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REQUEST_HTTPS.with(|v| v.set(self.0));
+            REQUEST_PORT.with(|v| v.set(self.1));
+        }
+    }
+    let previous = (
+        REQUEST_HTTPS.with(|v| v.get()),
+        REQUEST_PORT.with(|v| v.get()),
+    );
+    REQUEST_HTTPS.with(|v| v.set(Some(https)));
+    REQUEST_PORT.with(|v| v.set(Some(port)));
+    let _restore = Restore(previous.0, previous.1);
+    f()
+}
+
+pub(crate) fn request_is_https() -> bool {
+    REQUEST_HTTPS.with(|v| v.get()).unwrap_or(false)
+}
+
+fn request_port() -> u16 {
+    REQUEST_PORT.with(|v| v.get()).unwrap_or(80)
+}
+
 pub struct Context<'a> {
     pub req: &'a Request,
     pub env: &'a [(String, String)],
@@ -127,6 +183,7 @@ fn function_arg(ctx: &Context<'_>, arg: &str) -> Result<String, String> {
                 | "TIME_MIN"
                 | "TIME_SEC"
                 | "REQUEST_METHOD"
+                | "QUERY_STRING"
                 | "REQUEST_URI"
                 | "REQUEST_SCHEME"
                 | "HTTPS"
@@ -204,24 +261,24 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
         "time_min" => format!("{mm:02}"),
         "time_sec" => format!("{ss:02}"),
         "request_method" => ctx.req.method.clone(),
+        "query_string" => String::from_utf8_lossy(&ctx.req.query).into_owned(),
         "request_uri" => String::from_utf8_lossy(&ctx.req.target).into_owned(),
-        "request_scheme" => "http".into(),
-        "https" => if ctx.req.header_str("x-forwarded-proto") == Some("https") {
-            "on"
-        } else {
-            "off"
-        }
-        .into(),
+        "request_scheme" => if request_is_https() { "https" } else { "http" }.into(),
+        // Never trust X-Forwarded-Proto here.  Forwarded headers are only a
+        // separate, explicitly trusted-proxy input (mod_remoteip); they are
+        // not evidence that the client connection itself used TLS.
+        "https" => if request_is_https() { "on" } else { "off" }.into(),
         "remote_addr" => ctx.peer.to_string(),
-        "server_name" => ctx
-            .req
-            .header_str("host")
-            .unwrap_or("")
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .to_string(),
-        "server_port" => "80".into(),
+        "server_name" => request_server_name().unwrap_or_else(|| {
+            ctx.req
+                .header_str("host")
+                .unwrap_or("")
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        }),
+        "server_port" => request_port().to_string(),
         "document_root" => ctx.docroot.to_string_lossy().into_owned(),
         "api_version" => "20120211".into(),
         other => {
@@ -317,54 +374,38 @@ fn hex(b: u8) -> Option<u8> {
 }
 
 fn glob(pattern: &str, value: &str, path_mode: bool) -> bool {
-    fn rec(p: &[u8], v: &[u8], path_mode: bool) -> bool {
-        if p.is_empty() {
-            return v.is_empty();
-        }
-        match p[0] {
-            b'*' => {
-                if path_mode && p.len() > 1 && p[1] == b'/' {
-                    return rec(&p[2..], v, path_mode);
-                }
-                rec(&p[1..], v, path_mode)
-                    || (!v.is_empty() && v[0] != b'/' && rec(p, &v[1..], path_mode))
-            }
-            b'?' => {
-                !v.is_empty() && (path_mode || v[0] != b'/') && rec(&p[1..], &v[1..], path_mode)
-            }
-            c => !v.is_empty() && c == v[0] && rec(&p[1..], &v[1..], path_mode),
-        }
-    }
-    rec(pattern.as_bytes(), value.as_bytes(), path_mode)
+    vapache_verified::expr_glob_match(pattern.as_bytes(), value.as_bytes(), path_mode)
+}
+
+fn compare_op(op: &str) -> Option<vapache_verified::ExprCompareOp> {
+    Some(match op {
+        "=" | "==" | "-eq" => vapache_verified::ExprCompareOp::Eq,
+        "!=" | "-ne" => vapache_verified::ExprCompareOp::Ne,
+        "<" | "-lt" => vapache_verified::ExprCompareOp::Lt,
+        "<=" | "-le" => vapache_verified::ExprCompareOp::Le,
+        ">" | "-gt" => vapache_verified::ExprCompareOp::Gt,
+        ">=" | "-ge" => vapache_verified::ExprCompareOp::Ge,
+        _ => return None,
+    })
 }
 
 fn cmp(left: &Value, op: &str, right: &Value) -> bool {
+    let Some(kind) = compare_op(op) else {
+        return false;
+    };
     let numeric = matches!(op, "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge")
         && left.int().is_some()
         && right.int().is_some();
     if numeric {
-        let a = left.int().unwrap();
-        let b = right.int().unwrap();
-        return match op {
-            "-eq" => a == b,
-            "-ne" => a != b,
-            "-lt" => a < b,
-            "-le" => a <= b,
-            "-gt" => a > b,
-            _ => a >= b,
-        };
+        return vapache_verified::expr_compare_ints(
+            kind,
+            left.int().unwrap_or_default(),
+            right.int().unwrap_or_default(),
+        );
     }
     let a = left.string();
     let b = right.string();
-    match op {
-        "=" | "==" | "-eq" => a == b,
-        "!=" | "-ne" => a != b,
-        "<" | "-lt" => a < b,
-        "<=" | "-le" => a <= b,
-        ">" | "-gt" => a > b,
-        ">=" | "-ge" => a >= b,
-        _ => false,
-    }
+    vapache_verified::expr_compare_strs(kind, a.as_bytes(), b.as_bytes())
 }
 
 /// Resolve an expression file argument beneath the document root.  `.htaccess`
@@ -1040,6 +1081,16 @@ mod tests {
     }
 
     #[test]
+    fn query_string_variable_uses_the_current_request_query() {
+        let mut r = req();
+        r.query = b"a=1".to_vec();
+        let e = parse("%{QUERY_STRING} == 'a=1'").unwrap();
+        let docroot = Path::new("/tmp");
+        let mut c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), docroot);
+        assert!(e.eval(&mut c).unwrap().truthy());
+    }
+
+    #[test]
     fn expression_file_access_is_confined_to_docroot() {
         let dir = std::env::temp_dir().join(format!("vp-expr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1054,6 +1105,35 @@ mod tests {
         let traversal = parse("-f '../etc/passwd'").unwrap();
         assert!(!traversal.eval(&mut c).unwrap().truthy());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verified_expression_kernels_keep_comparison_and_glob_semantics() {
+        use vapache_verified::ExprCompareOp::{Eq, Ge, Gt, Le, Ne};
+        use vapache_verified::{expr_compare_ints, expr_compare_strs, expr_glob_match};
+        assert!(expr_compare_ints(Eq, 1, 1));
+        assert!(expr_compare_ints(Le, -1, 1));
+        assert!(expr_compare_ints(Ge, 1, 1));
+        assert!(expr_compare_ints(Ne, 1, 2));
+        assert!(expr_compare_strs(Le, b"aa", b"b"));
+        assert!(expr_compare_strs(Gt, b"b", b"aa"));
+        assert!(expr_compare_strs(Eq, b"", b""));
+        assert!(!expr_compare_strs(Gt, b"aa", b"aa"));
+        assert!(expr_glob_match(b"a/*", b"a/b", true));
+        assert!(!expr_glob_match(b"a/*", b"a/b/c", true));
+        assert!(!expr_glob_match(b"a?b", b"a/b", false));
+        assert!(expr_glob_match(b"a?b", b"a/b", true));
+        assert!(expr_glob_match(b"*.php", b"index.php", true));
+        assert!(!expr_glob_match(b"?.php", b"index.php", true));
+        assert!(expr_glob_match(b"", b"", true));
+        assert!(!expr_glob_match(b"", b"x", true));
+        // The runtime evaluator consumes the verified kernels directly.
+        assert!(!eval("'a/b/c' -fnmatch 'a/*'"));
+        assert!(eval("'a/b' -fnmatch 'a/*'"));
+        assert!(!eval("'a/b' -strmatch 'a?b'"));
+        assert!(eval("'a/b' -fnmatch 'a?b'"));
+        assert!(eval("'aa' < 'b'"));
+        assert!(eval("'2' -lt '10'"));
     }
 
     #[test]

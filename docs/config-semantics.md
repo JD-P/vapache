@@ -137,7 +137,11 @@ one pass because there is no access file to interleave.
 - `Require` is replaced by a child `Require` unless the child sets
   `AuthMerging And|Or`, in which case the child policy is combined with the
   inherited policy;
-- every container/list field appends parent then child;
+- every append-only container/list field appends parent then child;
+- a child `Header set` replaces an inherited field of the same name instead of
+  emitting a duplicate; `Header unset` removes inherited set/add fields;
+  `Header always` lists are merged separately and also apply to error
+  responses;
 - `ErrorDocument` and `RewriteMap` are list-backed; a reverse lookup makes
   child entries win for duplicate keys;
 - `RewriteRule`/`RewriteCond` lists append;
@@ -208,8 +212,10 @@ the same check would have allowed the request.
 The implementation refines I1 with a concrete `ResourceKey`:
 
 ```text
-grant.resource = (vhost, method, URL, filesystem path,
-                  proxy URL, cache host/path/query, identity)
+grant.resource = (vhost, method, URL, resolved filesystem/script path,
+                  proxy/backend target, cache host/path/query,
+                  opened dev/ino, policy fingerprint, identity)
+cache key     = (listener address/port, scheme, grant.resource, Vary variant)
 ```
 
 Every body/tunnel sink checks the grant against the resource it is about to
@@ -291,8 +297,558 @@ access.
 ### I8 — Rewrite/proxy authorization
 
 A proxy target reached through a rewrite `[P]` is still subject to the
-matching `<Proxy>` authorization section (the implementation already does
-this deliberately).
+matching `<Proxy>` authorization section.  `<Proxy>` matching considers both
+the configured logical identity (`balancer://cluster`, or the rule URL) and
+the concrete selected member, and a balancer failover re-runs that decision
+before sending the request to a different member.  Prefix and regex proxy
+routes form one configuration-ordered table; the first matching route chooses
+HTTP proxy versus FastCGI, so a later `ProxyPassMatch` cannot reorder an
+earlier `ProxyPass`.  The complete route/balancer identity rules are in I32.
+
+### I9 — Closed-world configuration acceptance
+
+```text
+Accepted(cfg) ==> forall d in directives(cfg): handled(d) or proved_inert(d)
+Strict(cfg)   ==> forall d in directives(cfg): handled(d)
+```
+
+A warning may only mean “proved semantically inert,” never “effectful but
+unsupported.”  In particular, `AliasMatch`, `ScriptAliasMatch`,
+`RedirectMatch`, `RedirectPermanent`, `RedirectTemp` and `RemoveHandler` are
+handled; the remaining mapping/handler directives (`Action`, etc.) fail
+closed in compatibility mode and strict mode rejects every unhandled name.
+
+### I10 — One resolved target
+
+```text
+resolve(req) -> Resolved(vhost, listener, url, root, rel, fs_path,
+                          script?, path_info?, backend?, cache_target?)
+policy and every sink use the same Resolved
+sink_grant.target == sink_target == resolve(req).target
+```
+
+The dispatcher, cache prefilter and authorization walk share `map_path()`.
+`AliasMatch`/`ScriptAliasMatch` are part of that mapping, not a separate
+lookup.  `map_path()` returns an explicit mapping failure when a regex alias
+expands outside its configured base; there is no parent-root fallback.
+`ResourceKey` carries the vhost, URL, filesystem target, proxy target, backend
+identity, inode, authenticated identity and policy fingerprint; `bind_file`
+and `bind_backend` produce the bound grant required by every sink.
+
+### I11 — Reauthorize every target-changing transform
+
+```text
+Resolve -> Authorize -> [Transform -> Reauthorize]* -> Sink
+Invariant: sink_grant.target == current_target
+```
+
+PATH_INFO splitting, Alias/ScriptAlias mapping, symlink resolution, internal
+rewrites, DirectoryIndex, ErrorDocument and FastCGI script resolution are
+transforms.  In particular:
+
+- a CGI handler is selected from the **actual script** basename, not from a
+  trailing `PATH_INFO` component;
+- after `find_script`, policy is re-evaluated for the script path and the
+  grant is bound to its opened inode;
+- a FastCGI `ProxyPassMatch` target splits `PATH_INFO` to an existing script
+  file and re-authorizes that script; the script filename and the ancestor
+  walk are bounded by the configured FastCGI prefix (or the request's
+  document/alias root), and symlinks that leave that base are rejected;
+- an internal rewrite requires both the original request URL scope
+  (`<Location>`/`<LocationMatch>`) and the final target scope to allow; an
+  absolute rewrite target is only admitted when its canonical file remains
+  below the current document/alias root, so a rewrite cannot name a new root;
+- an `.htaccess` walk for an alias target starts at that alias root, so parent
+  access files outside `DocumentRoot` cannot be skipped;
+- `SymLinksIfOwnerMatch` compares each symlink owner with the resolved target
+  owner unless unconditional `FollowSymLinks` is also enabled.
+
+The complete transform inventory and the original/current target gate are
+specified in I30.  The CGI/FastCGI execution boundary is closed in I31 and the
+proxy route/balancer identity boundary in I32.
+
+### I12 — Cache non-interference
+
+```text
+hit(entry, req) ==>
+    entry.resource == resolve(req).resource
+    && entry.policy == policy(resolve(req))
+    && identity compatible
+    && entry.vary matches req
+```
+
+The cache key binds scheme, listener local address/port, vhost, `Host`, raw
+canonical URL (including trailing slash), query, resolved filesystem/alias
+target and policy fingerprint.  The fingerprint includes the complete request
+header set, because `Require expr`, `SetEnvIf` and rewrite conditions can read
+any header, and the complete material of every `Scope` policy slice (I26);
+hashing only a selected policy subset would let two tenants share an entry when
+their policy branches differ.  For CGI `PATH_INFO` the resolved
+target is the script prefix, not the URL-mapped nonexistent path.  Entries
+also carry the configuration generation (I20); a reload makes every older
+entry inadmissible.  A hit re-runs authorization against the mapped target.
+Multiple `Vary` field lines are concatenated before variant selection; disk
+entries must satisfy the same `vary_match` predicate as memory entries.
+Unsafe methods invalidate persisted entries as well as memory entries.
+Credentialed and cookie-bearing requests are not stored in the shared cache.
+
+The per-finding closure matrix is in `docs/adversarial-closure.md`.
+
+### I13 — Descriptor capability isolation
+
+```text
+fds(cgi_child) subseteq {0,1,2,script_fd}
+control_socket.cloexec == true
+```
+
+The worker control socket is marked close-on-exec by the worker after its own
+exec and before any script is spawned; the script descriptor is the only
+additional inheritable descriptor.  A CGI test inspects `/proc/self/fd` and
+fails if any socket other than stdio/script is visible.
+
+### I14 — Ordered competing mappings
+
+Every request-to-resource table has one explicit order and one deterministic
+winner:
+
+```text
+Alias | ScriptAlias | AliasMatch | ScriptAliasMatch   : first match wins
+Redirect | RedirectMatch | RedirectPermanent/Temp     : first match wins
+ProxyPass | ProxyPassMatch                            : first match wins
+AddHandler | SetHandler | RemoveHandler               : last matching op wins
+```
+
+A later, more-specific mapping does not override an earlier overlapping one;
+Apache also treats such overlapping aliases as unreachable.  For handler
+operations, `RemoveHandler` must be able to cancel an inherited `AddHandler`
+regardless of section depth.  `ProxyPass`/`ProxyPassMatch` exclusion syntax
+(`!`) is not implemented and is rejected at startup rather than silently
+ignored.  This closes the “multiple competing request-to-resource mappings”
+class from the findings.
+
+### I15 — Internal subrequests
+
+```text
+DirectoryIndex and local ErrorDocument dispatch go through the normal dispatcher
+subrequest(req, url) retains method, headers, peer and authenticated identity
+subrequest target policy is evaluated exactly like a client request
+ErrorDocument recursion is depth-limited and cannot replace a failed target
+```
+
+The original directory access check happens before a `DirectoryIndex`
+subrequest, and the subrequest re-checks its target.  An `ErrorDocument` may
+intentionally run after a denied or missing original resource, but it still
+runs through target authorization, handler selection and `.htaccess` review;
+it cannot recursively invoke itself.
+
+### I16 — Trusted input boundary
+
+Security-relevant request context has exactly one source:
+
+```text
+scheme / HTTPS       <- listener TLS state, never a forwarding header
+peer address         <- socket peer, rewritten only by configured trusted RemoteIP
+canonical name       <- ServerName when UseCanonicalName On/DNS
+%{SERVER_NAME}       <- dispatcher-selected name, not a raw Host lookup
+vhost                <- listener port + Host/SNI selection
+authorization identity <- verified Basic/client-certificate authenticator
+```
+
+`X-Forwarded-Proto`, `Forwarded`, and similar headers never satisfy `HTTPS`,
+never change `REQUEST_SCHEME`, and are not authentication evidence.
+Forwarded addresses are honored only for peers inside `RemoteIPInternalProxy`.
+`UseCanonicalName DNS` currently maps to the configured `ServerName` rather
+than performing reverse DNS; this is a conservative approximation that cannot
+be steered by the client Host header.
+
+### I17 — Bounded resource consumption
+
+Every untrusted stream has an explicit limit and a deadline:
+
+```text
+request body + chunked trailers : byte/count/deadline bounds
+CGI/FastCGI body                : spool above threshold; do not materialize LimitRequestBody
+CGI output/stderr               : capped
+proxy response head/body/trailer: capped
+proxy chunk arithmetic          : checked_add and MAX_PROXY_BODY
+handlers/descriptors            : only stdio + script fd cross exec
+```
+
+Exceeding a bound is an error response or connection close, never an
+unbounded allocation or an indefinitely pinned worker.
+
+### I18 — Response-header policy
+
+`Header set`, `Header add`, `Header unset`, `Header always ...` and
+`Header onsuccess ...` are evaluated for every response category (static,
+directory, redirect, CGI/FastCGI, proxy and error).  `unset` runs after
+set/add; a child `set` replaces an inherited field with the same name; `always`
+fields also apply to error responses while plain/`onsuccess` fields do not.
+Header names and values still pass the verified token/sanitization checks.
+Unsupported `Header` actions (for example `Header edit`) are rejected at
+startup rather than warned-and-ignored.
+
+### I19 — Terminal sink gate and monotone authorization
+
+```text
+State = (original_request, current_url, current_target,
+         original_grant, target_grant, cache_epoch)
+
+forall executions:
+    Terminal(state, outcome) && positive(outcome)
+    ==> Allowed(original_url)
+        && Allowed(current_target)
+        && target_grant.target == current_target
+```
+
+A transform adds an obligation; it never replaces one.  Static, directory,
+CGI, FastCGI, proxy and positive redirect outcomes all consume the gate.
+In particular a rewrite chain such as `/admin -> /front -> [P] backend`
+still authorizes `/admin` before the proxy sink, and a positive `[R]` after a
+rewrite does the same.  The gate uses the original request context and applies
+the accumulated rewrite effects, so a query-only rewrite or `[E=...]` change
+cannot evade the original URL policy.  The implementation shares one
+`authorize_original_request()` helper between the post-loop static path and
+the early-return proxy/redirect arms; adding a new terminal outcome must route
+through the same gate.  The closed transform inventory is I30.
+
+### I20 — Cache generation and resolved-target identity
+
+```text
+CacheEntry = { epoch, resolved_target, policy_fingerprint, vary, identity }
+hit(entry, req, cfg) ==>
+    entry.epoch == cfg.epoch
+    && entry.resolved_target == resolve(req).target
+    && entry.policy_fingerprint == policy(resolve(req))
+    && VaryMatches(entry, req)
+
+Reload(cfg, cache) -> cfg', cache'
+ensures cfg'.epoch = cfg.epoch + 1
+        forall e in cache: e.epoch < cfg'.epoch
+```
+
+`cache_lookup_admit` takes a `generation_match` conjunct, disk metadata stores
+the epoch, and reload clears both memory and persisted representations before
+bumping the generation.  A CGI `PATH_INFO` request is resolved to the actual
+script target (and that script's policy) for both the fingerprint and the key,
+so a later `<Files "script.cgi">` deny cannot leave a usable path-info entry.
+Authorization still runs on every hit; the cache is a derived view, never an
+authorization shortcut.
+
+### I21 — Alias root identity
+
+```text
+alias_target(template, captures, server_root) -> (root, rel)
+root is non-empty and absolute
+access_walk_root = target.alias_root
+```
+
+Prefix aliases and regex aliases (absolute, relative, fixed or capture-only)
+must produce the same root for `map_path()`, `ResourceKey`, the access-file
+walk and the cache.  A relative substitute such as `private/$1` is anchored
+at `ServerRoot` when the alias is compiled; it is never represented as an
+empty root that the walk silently skips.
+
+### I22 — Contextual output encoding
+
+```text
+SafeRelativeHref = "./" + percent_encode(name)
+forall name: href(autoindex, name).starts_with("./")
+forall name: !is_absolute_url(href(autoindex, name))
+```
+
+HTML text escaping is not URL-context encoding.  Autoindex links, `Location`
+headers, cookie values and log fields each use the encoder for their sink.
+The `./` prefix removes `javascript:`, `data:`, `vbscript:` and
+protocol-relative targets by construction while HTML escaping remains a
+separate text-context operation.
+
+### I23 — Provider operands and directive effects
+
+```text
+parse("Require not env NAME")   -> Env { negate: true, name: NAME }
+parse("Require not env NAME=V") -> Env { negate: true, name: NAME, value: V }
+parse("Require not expr E")     -> Expr { negate: true, expr: E }
+
+Accepted(.htaccess) ==> every directive is modeled or fails closed
+```
+
+Negation shifts the operand with the provider; it does not read the literal
+`env`/`expr` token.  Environment and autoindex directives are not
+"accepted but inert": `SetEnv`, `SetEnvIf`, `UnsetEnv`, `PassEnv` and
+`IndexIgnore` populate the same `EnvironmentPolicy`/`ContentPolicy` fields in
+the main configuration and `.htaccess` parsers.  A directive that feeds
+`Require env`, `Require expr`, autoindex or response policy counts as
+effectful.  The exhaustive disposition registry and effect matrix for every
+recognized `.htaccess` directive are specified in I29.
+
+### I24 — Canonical directory URL and autoindex policy
+
+```text
+authorize(/dir, DirectorySlash Off) uses policy(/dir/)
+IndexIgnore patterns are part of the autoindex scope
+```
+
+`/dir` and `/dir/` must share one authorization context for directory
+actions.  With `DirectorySlash Off`, the dispatcher reauthorizes the
+canonical trailing-slash URL before considering a directory index or
+autoindex, so a trailing-slash `<Location>` cannot be bypassed.  `IndexIgnore`
+patterns are inherited and filter emitted entries in both main-config and
+`.htaccess` form.
+
+### I25 — Configured-base containment
+
+```text
+configured_base(alias|rewrite|fastcgi) = the stable root named by the mapping
+resolved_target(m) ∈ configured_base(m)
+failure_to_prove_containment -> mapping failure (404/403), never a new root
+```
+
+An alias capture, rewrite substitution or FastCGI suffix may choose a path
+inside the configured base; it may not choose the base.  `map_path()` returns
+`None` for a regex alias whose expansion leaves its alias root, an internal
+rewrite admits a filesystem target only below the current document/alias root,
+and a FastCGI script (including its `PATH_INFO` ancestor walk) is canonicalized
+inside the configured prefix or document root.  All three mapping paths consume
+the verified component-aware `path_under_base` kernel, so a sibling such as
+`/srv/www2` is not treated as a child of `/srv/www`.  In particular,
+`UnsafePrefixStat` and compatibility flags never widen the authorization base.
+
+### I26 — Cache authorization input closure
+
+```text
+cache_policy_material(scope) =
+    canonical(scope.options, scope.override_policy, scope.authorization,
+              scope.header_policy, scope.content_policy, scope.mapping_policy,
+              scope.error_policy, scope.environment_policy,
+              scope.rewrite_policy, scope.compression_policy,
+              scope.proxy_policy)
+
+cache_fingerprint(req) = hash(cache_policy_material(scope), peer, method,
+                              resolve(req).target, all request headers)
+cache_key(req)          = (listener, vhost, scheme, host, URL, query,
+                           resolve(req).target, cache_fingerprint(req))
+```
+
+Any request input that can select an authorization branch or representation is
+part of the key.  Header-driven providers are covered by hashing every request
+header, not only the headers named in `Vary`; credentialed and cookie-bearing
+requests are additionally excluded from storage.  A cached representation may
+never cross a policy branch merely because the branch was selected by a header.
+
+The policy side is closed over **every** `Scope` policy slice, not a hand-picked
+subset.  `cache_policy_material` destructures `Scope`, so adding a new policy
+slice is a compile-time prompt to include it.  Each policy object is hashed
+through its complete `Debug` representation; rewrite maps are canonicalized by
+sorting keys because their backing `HashMap` iteration order is unstable.  The
+unit matrix mutates every field of every policy object and every request/key
+dimension and asserts that the fingerprint or key changes.  A future policy
+field is therefore either automatically bound through its policy object or
+fails the matrix when someone replaces that object with a manual list.
+
+The current authenticators are request-header based (`Authorization`), and
+credentialed requests are excluded from cache lookup and storage.  If a future
+authenticator derives identity from the connection rather than a header (for
+example a TLS client certificate), that identity must be added to the
+fingerprint before it can authorize a cacheable request.
+
+### I27 — Authenticated identity reaches every script sink
+
+```text
+grant.identity = Some(user) -> CGI/FastCGI env contains REMOTE_USER=user
+authentication scheme          -> AUTH_TYPE=Basic (for Basic authentication)
+```
+
+The identity recorded when `helper_access_response()` authenticates is carried
+through the target reauthorization and grant binding into `CgiContext`.  Both
+local CGI and FastCGI use the same `build_env()`, so an application cannot see
+an empty user for an authenticated request.  Configured/rewrite environment
+entries still cannot override `REMOTE_USER`/`AUTH_TYPE`.
+
+### I28 — Proxy serialization boundary
+
+```text
+serialized_upstream_head = request_line + headers
+forall inserted field value v: no_ctl(v) && header_value_safe(v)
+backend authority ∈ DNS/IPv4/IPv6 literal alphabet
+```
+
+Backend hosts are validated when the route is parsed, `X-Forwarded-Host` is
+validated before insertion, and the complete upstream request head is checked
+immediately before `write_all` by the verified `proxy_request_line_admit`
+(method token, visible target, exact `HTTP/1.1`) and `proxy_header_admit`
+(token name, CTL-free value) kernels.
+Configuration- or rewrite-derived text therefore cannot split the request line
+or inject an upstream header.
+
+### I29 — `.htaccess` directive disposition closure
+
+```text
+recognized(d) <-> exists spec(d) in DIRECTIVE_SPECS
+disposition(d) in {Effectful, Inert, Reject}
+
+Effectful(d) ==> parse(d) changes Scope or adds a rule
+Inert(d)     ==> parse(d) leaves Scope unchanged
+              && d cannot mutate the request, authorization, mapping,
+                 handler, Options or environment state
+Reject(d)    ==> parse(d) returns an error
+forall recognized d: category(d) is defined
+```
+
+`DIRECTIVE_SPECS` is the authoritative registry: `directive_category()` derives
+the `AllowOverride` category from it, and `apply_directive()` refuses any name
+that is absent.  The exhaustive unit matrix asserts that every registry entry
+has exactly one effect case, that the case matches observed behavior under
+`AllowOverride All`, and that the directive is denied under `AllowOverride
+None`.  Adding a directive therefore requires an explicit disposition and a
+category; an accidental “recognized but silently ignored” directive fails the
+test.
+
+The reviewed inert set is `AddCharset`, `AddLanguage`, `AddEncoding`,
+`RemoveCharset`, `RemoveEncoding`, `AddDescription`, `IndexOptions`,
+`ReadmeName` and `HeaderName`, plus the validated no-op
+`AuthBasicProvider file`.  These do not select an access or mapping branch.
+`RequestHeader` and `AllowMethods` are `Reject`; they are never inert.
+
+### I30 — Transform inventory and reauthorization gate
+
+```text
+Transform = (original_request, before_url, before_target,
+             after_url, after_target, effects)
+
+forall terminal positive outcomes after a transform:
+    Allowed(original_request, original_url, original_target)
+    && Allowed(current_request, current_url, current_target)
+    && grant.target == current_target
+    && grant is bound to the current inode/backend/cache key
+```
+
+A transform adds an authorization obligation; it never replaces one.  The
+inventory is closed over every request-to-resource conversion:
+
+| Transform | Target identity | Reauthorization / binding |
+|---|---|---|
+| prefix alias, `ScriptAlias` | `map_path` root + rel | target scope, alias-root access walk, file grant |
+| `AliasMatch`, `ScriptAliasMatch` | capture-expanded target inside stable alias base | mapping failure outside base; target scope, file grant |
+| internal URL rewrite | canonical rewritten URL | target scope + original-URL gate with rewrite effects |
+| internal filesystem rewrite | canonical file below current root | target scope, original-URL gate, file inode grant |
+| CGI `PATH_INFO` | `find_script_checked` actual script | script scope, inode-bound CGI grant |
+| FastCGI `ProxyPassMatch`/`PATH_INFO` | contained script filename + `PATH_INFO` | script scope, backend-bound FastCGI grant |
+| `SetHandler proxy:fcgi` | contained handler script | script scope, backend-bound FastCGI grant |
+| symlink resolution | opened descriptor path | target scope, file inode grant |
+| `DirectoryIndex` | index subrequest URL | normal dispatcher authorization for the index target |
+| local `ErrorDocument` | error-document subrequest URL | normal dispatcher authorization; recursion bound |
+| `DirectorySlash Off` | canonical trailing-slash URL | reauthorize before index/autoindex |
+| proxy route / balancer failover | concrete member URL + binding | `<Proxy>` reauthorization, backend-bound proxy grant |
+| cache `PATH_INFO` | actual CGI script target | cache policy grant bound to script target |
+| WebSocket rewrite/proxy | rewritten proxy target | rewrite gate, proxy authorization, backend binding |
+
+The original-URL gate deliberately uses the **original request context** and
+applies the accumulated rewrite effects before evaluating the original scope.
+A rewrite that changes only the query string or only `[E=...]` environment
+state therefore still rechecks the original URL policy; it cannot use the
+rewritten query or environment to escape it.  The final target scope uses the
+current rewritten request context.
+
+### I31 — CGI/FastCGI execution boundary
+
+```text
+script = resolve_script(req)
+contained(script, configured_base)
+authorized(script, target_scope) && identity(grant) == identity(req)
+CGI:     grant bound to opened script inode
+FastCGI: grant bound to (transport, script, SCRIPT_NAME, PATH_INFO)
+env = calculated_env(req, script) ∪ admitted(config/rewrite env)
+calculated_env ∩ admitted_env = ∅
+fds(child) subseteq {0,1,2,script_fd}
+FastCGI params contain exactly one SCRIPT_FILENAME, SCRIPT_NAME,
+PATH_INFO and PATH_TRANSLATED for the selected target
+```
+
+The handler is selected from the **actual script basename**, never from a
+trailing `PATH_INFO` component.  Script construction, `PATH_INFO` splitting
+and the ancestor walk are bounded by the configured FastCGI prefix or the
+document/alias root; symlink escapes are rejected.  The target script is
+reauthorized before execution and the grant is bound to its inode (CGI) or
+transport/script identity (FastCGI).  `REMOTE_USER`/`AUTH_TYPE` come from the
+authenticated grant, while configured or rewrite-set environment entries
+cannot override calculated names.  Request bodies stay on their spool file
+above the threshold; stdout/stderr, descriptors and deadlines are bounded.
+
+### I32 — Proxy route and balancer identity
+
+```text
+Route = (order, matcher, logical_identity, concrete_member)
+selected = matching route with minimum order
+prefix and regex routes share one order space
+
+balancer request has:
+    logical_identity  = balancer://name/suffix or rule URL
+    concrete_identity = selected member URL + binding_key
+
+authorize(logical_identity) && authorize(concrete_identity)
+failover(member') -> (scope', grant', resource') atomically
+sink_grant.target == selected_member.binding_key()
+```
+
+Prefix and regex `ProxyPass`/`ProxyPassMatch` routes form one
+configuration-ordered table; a later overlapping route cannot beat an earlier
+one.  `<Proxy>`/`<ProxyMatch>` policy is applied to both the logical balancer
+identity and the concrete selected member.  Sticky sessions, health checks and
+round-robin only choose a member; they never bypass authorization.  On
+failover the dispatcher re-runs proxy authorization, rebuilds the resource key
+for the new member and binds a new grant to that member before sending.  The
+selected grant/resource pair is replaced together, so a grant for member A
+cannot authorize a request sent to member B.
+
+### I33 — Framing and resource-bounds closure
+
+```text
+forall untrusted stream s:
+    bytes(s) <= bound(s)
+    && deadline(s) is finite
+    && overflow is checked before resize/allocation
+```
+
+The bound is part of the protocol adapter, not an incidental `Vec` limit:
+
+| Stream | Explicit bound |
+|---|---|
+| HTTP/1 request line/head | `LimitRequestLine`, `LimitRequestFields`, `LimitRequestFieldSize`, total head cap |
+| HTTP/1 request body | `LimitRequestBody`, in-memory threshold then an `O_EXCL`, mode-0600 spool file that is unlinked immediately |
+| HTTP/1 chunked trailers | trailer count and byte budget, request deadline |
+| Proxy response head | line, header-count and total-head caps |
+| Proxy response body | fixed-length/chunked/EOF body capped at `MAX_PROXY_BODY`; chunk `checked_add` before resize |
+| Proxy trailers | trailer count and byte budget |
+| CGI worker protocol | path/env/body field caps, env-count cap, body spool above threshold |
+| CGI stdout/stderr | output and stderr caps, watchdog deadline, process-group kill |
+| FastCGI records | fixed record/header sizes; stdout spool cap; stderr cap |
+| FastCGI response head | bounded prefix/header scan before body streaming |
+| HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error |
+| HTTP/2 | verified settings, header-state, flow-control, body and reset budgets |
+| Compression | fixed maximum compressible body; range/HEAD bypass |
+
+A malformed or over-limit stream produces an error response or connection
+close; it never causes an unbounded allocation or an indefinitely pinned
+worker.
+
+### I34 — Main-configuration directive disposition closure
+
+```text
+recognized(d) -> handled(d) | fail_closed(d) | warned_inert(d)
+security(d) || filter(d) || audit(d) || resource_bound(d) -> fail_closed(d)
+warned_inert(d) -> d is presentation/module-absence only
+Strict(cfg) -> forall unhandled d: reject(cfg)
+```
+
+`fail_closed_directives` and the security-family classifier are the explicit
+main-config counterpart of the `.htaccess` registry.  Security, filter, audit
+and resource-limit directives that are not implemented fail startup even in
+compatibility mode.  The remaining compatibility warnings are limited to a
+reviewed presentation/module-absence surface (for example `AddDescription`,
+`UserDir`, `Session*`, `Substitute`, `Charset*`); strict mode rejects every
+unhandled directive.  The disposition matrix test asserts the fail-closed set,
+the explicit warning set and strict-mode rejection.
 
 ## 9. Formalization boundary
 
@@ -304,6 +860,19 @@ The first Verus model should cover:
 4. `eval_require` over `AuthPolicy`, `MethodSet`, `AuthMerging`
 5. `override_allowed` and the category table
 6. `cache_maybe_enabled` and `htaccess_may_apply` prefilter predicates
+7. ordered mapping-table resolution (alias/redirect/proxy/handler operations)
+8. transform-state reauthorization and sink-grant identity
+9. subrequest identity and error-document recursion bounds
+10. trusted request-context construction (scheme, peer, canonical name)
+11. response-header policy application and merge
+12. configured-base containment for alias, rewrite and FastCGI mappings
+13. cache-key input closure over policy-relevant request headers
+14. `.htaccess` directive disposition closure and override-category coverage
+15. transform inventory closure and original/current target reauthorization
+16. CGI/FastCGI script, environment, descriptor and identity closure
+17. proxy route ordering plus logical/concrete balancer identity binding
+18. framing and resource-bound closure over every untrusted stream
+19. main-config directive disposition closure and strict-mode rejection
 
 The following remain assumptions or separate proofs:
 
@@ -334,6 +903,15 @@ Suggested order:
 7. `prefilter_sound`: fast-path predicates imply the authoritative checks.
 8. `acl_reachability`: every dispatch branch that returns a file/proxy body
    has a predecessor `check(scope, req) == Allowed`.
+9. `configured_base_containment`: alias, rewrite and FastCGI resolution never
+   returns a target outside the mapping's stable base, and a failed
+   containment check produces no target.
+10. `cache_input_closure`: the cache key contains every request input read by
+    authorization, environment and rewrite evaluation.
+11. `identity_propagation`: an authenticated grant's identity is present in
+    the CGI/FastCGI environment at the script sink.
+12. `proxy_head_safe`: every serialized upstream request line and header value
+    satisfies the token/header predicates before I/O.
 
 ## 10a. Mechanized pieces already connected
 
@@ -344,7 +922,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **194 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **218 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `require_none_result`.
   `crates/server/src/access.rs` calls these for
@@ -366,18 +944,26 @@ construction: there is no second production interleaver.
   standard-library primitive.
 - `append_vec`, `merge_containers`, `container_append_preserves_parent`,
   `container_lookup_pair` and `container_append_child_lookup_wins`.  Every
-  container/list field in `Scope::merge` now appends through the verified
-  `append_vec` helper, including list-backed `ErrorDocument` and `RewriteMap`
-  fields.  Child values win by reverse lookup.  Debug builds still audit the
+  append-only container/list field in `Scope::merge` appends through the
+  verified `append_vec` helper, including list-backed `ErrorDocument` and
+  `RewriteMap` fields.  `Header set` uses ordered child replacement (the
+  runtime debug snapshot audit models that replacement separately).  Child values win by reverse lookup.  Debug builds still audit the
   concrete `Scope` containers after every merge against a projected snapshot
   and fail if a field is omitted or reordered.
 - `options_apply`.  `Scope::effective_options` uses the verified
   Set/Add/Remove operation instead of an open-coded match.
-- `expr_value_truthy` and `cond_chain_eval`.  Expression values map to
-  booleans through the verified truthiness table, and rewrite `[OR]` condition
-  groups fold through the verified condition-chain evaluator.  Leaf evaluators
-  that consult regex, filesystem, IP or request state remain explicit
-  assumptions.
+- `expr_value_truthy`, `expr_compare_ints`, `expr_compare_strs`,
+  `expr_glob_match` and `cond_chain_eval`.  Expression values map to booleans
+  through the verified truthiness table; integer and UTF-8 byte-string
+  comparisons, `-strmatch`/`-fnmatch` globbing and rewrite `[OR]` condition
+  groups all consume verified kernels.  Leaf evaluators that consult regex,
+  filesystem, IP or request state remain explicit assumptions.
+- `path_under_base`, `rewrite_filesystem_admit`, `proxy_request_line_admit`
+  and `proxy_header_admit`.  Alias, rewrite and FastCGI targets use the
+  component-aware containment predicate (`/srv/www2` is not below `/srv/www`);
+  the proxy serializer admits the outbound method, target, version and every
+  header through the same token/header predicates immediately before
+  `write_all`.
 - `regex_dialect_admit` / `guard_regex` / `compile_regex`.  Every
   configuration- and expression-supplied regex is admitted only after the
   verified dialect guard: backreferences, look-around, other PCRE-only
@@ -385,9 +971,11 @@ construction: there is no second production interleaver.
   regex engine still supplies the matching semantics for the accepted
   regular subset.
 - `directive_disposition`.  The configuration fallback uses a verified
-  four-way disposition: security-sensitive unhandled directives fail closed,
-  known module directives warn, strict unknown directives fail, and ordinary
-  unknown directives warn in compatibility mode.
+  four-way disposition: security-sensitive unhandled directives fail closed;
+  in strict mode every unhandled directive (known or unknown) fails; in
+  compatibility mode known module directives warn and unknown directives
+  warn.  This is the executable form of I9 and prevents `--strict-config`
+  from accepting an effectful but unimplemented directive.
 - `access_layer_slot`.  Parsed `.htaccess` rules are translated into
   conditional, Files or top-level layer slots by a verified decision used by
   `collect_layers`.
@@ -402,6 +990,18 @@ construction: there is no second production interleaver.
   partition: condition/non-normal rules go to the deferred conditional bucket,
   `<Files>` rules to the Files bucket, and everything else to the top-level
   scope.
+- `prefilter_sound`.  The I3 fast-path implication is a Verus theorem for both
+  prefilters: `htaccess_may_apply_spec` false admits no access-file layer in
+  the walk, and a false cache rule prefilter over an unchanged inherited
+  `CacheEnable` list keeps `cache_enabled_spec` false.  `cache_prefilter_sound`
+  proves the list/append obligation through an explicit preorder flattening of
+  rule deltas; the path matcher and parser-to-rule-tree refinement remain the
+  stated assumptions.
+- `first_match_is_first` / `first_match_none_means_no_match`.  For an ordered
+  mapping table encoded as its match-bit vector, the selected entry is the
+  first true bit and no true bit means no mapping applies.  This is the I14
+  first-match theorem; flattening the runtime alias/redirect/proxy tables into
+  the vector remains outside Verus.
 - `h2_method_ok`, `h2_head_admit`, `H2BodyState`/`h2_body_append`, and
   `H2Budget`.  The HTTP/2 adapter calls the verified method/head decision and
   advances a verified body budget as it consumes DATA frames.  `H2Settings`
@@ -432,22 +1032,34 @@ construction: there is no second production interleaver.
   relative targets are classified exactly, internal targets are given a
   single leading slash, and same-host internalization compares authority and
   optional decimal port with ASCII case folding.  Absolute rewritten
-  filesystem targets are admitted only below the document root or, with
-  explicit `UnsafePrefixStat`, the server root.
+  filesystem targets are admitted only below the current document/alias root;
+  `UnsafePrefixStat` is parsed for compatibility but never changes that base.
 - `proxy_target_key`.  Proxy grant binding uses an exact, verified
   length-delimited identity of `(tls, host, port, path)`; host/path NUL
   characters are excluded by the validated inputs.  The runtime converts the
   key to hex for string comparison.
 - `cache_lookup_admit`.  Cache hits require matching key, policy fingerprint,
-  `Vary` values and freshness (`now < expires`); the runtime uses this
-  verified decision for memory and disk entries.
+  configuration-generation epoch, `Vary` values and freshness
+  (`now < expires`); the runtime uses this verified decision for memory and
+  disk entries.
 - Cache credential exclusion.  Disk metadata stores response headers, not
   request headers, and explicitly drops Authorization/Proxy-Authorization;
-  cache keys include the policy fingerprint and query.
+  cache keys include the policy fingerprint, query and a hash of every request
+  header, so header-selected authorization branches cannot share an entry.
 - Proxy target authority binding.  `ProxyPassMatch` and rewrite `[P]`
   authority templates are rejected when derived from captures or variables;
-  targets are canonical and paths are encoded exactly once.  Backend response
+  targets are canonical and paths are encoded exactly once.  Backend hosts,
+  `X-Forwarded-Host`, and the fully serialized upstream request head pass the
+  verified token/header predicates before `write_all`.  Backend response
   `Location` values also pass the verified header sanitizer.
+- FastCGI script containment.  `script_from_prefix()` and
+  `split_path_info()` clean and canonicalize the target inside the configured
+  FastCGI prefix or document/alias root; the `PATH_INFO` ancestor walk cannot
+  select a file above that base.
+- CGI/FastCGI authentication context.  The grant identity is passed into
+  `CgiContext`; `build_env()` emits `REMOTE_USER` and `AUTH_TYPE` for both
+  local CGI and FastCGI while keeping configured environment entries unable to
+  override them.
 - Expression filesystem confinement.  `file()` and `filesize()` data paths
   are confined beneath `DOCUMENT_ROOT`; absolute, parent-relative and
   symlink-escaping reads fail closed.  `FileTest` remains metadata-only (and
@@ -571,8 +1183,9 @@ layer-slot translation use verified helpers.  The parser is covered by the
 explicit `configuration parsing refines the model` assumption.
 
 The authorization decision, access-phase interleaving, Options algebra,
-scalar overrides, `.htaccess` rule classification, expression truthiness and
-rewrite condition-chain folding are verified kernels.  The parser-to-model
+scalar overrides, `.htaccess` rule classification, expression truthiness,
+comparison and glob semantics, and rewrite condition-chain folding are
+verified kernels.  The parser-to-model
 translation, Directory sort, regex semantics and the
 filesystem view are explicit assumptions, not hidden axioms.
 
@@ -587,18 +1200,18 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus
 ```
 
-The current ledger (2026-10-24) is:
+The current ledger (2026-10-25) is:
 
-- weighted obligations: **3.5 / 8.0 (43.8%)** if partial obligations receive
+- weighted obligations: **13.0 / 26.0 (50.0%)** if partial obligations receive
   half credit;
 - proof debt: **6 / 6** — 0 named unverified security components, 0 partially
   bound sinks, 6 assumptions and 0 accepted unmodeled security-directive
   classes;
-- sinks: **8/8** grant-required, **8/8** path/target-bound, **3/8**
-  inode-bound, **3/8** backend-target-bound, **2/8** policy-key-bound;
+- sinks: **8/8** grant-required, **8/8** path/target-bound, **4/8**
+  inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
-  not yet systematic);
-- Verus: **194 functions, 0 errors**, with no `assume` or `external_body`
+  not yet systematic; the separate finding-replay suite covers F23–F38);
+- Verus: **218 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops
@@ -631,11 +1244,41 @@ The pre-proof suite is:
 - `tests/config_validity.py` — `apache2 -t` vs `vapached -t` context matrix.
 - `tests/config_grammar.py` — finite supported directive/context grammar,
   including valid and invalid argument/section forms.
-- Rust unit invariants in `config.rs`, `htaccess.rs`, `access.rs`.
+- `tests/adversarial_regressions.py` — end-to-end F23–F38 finding replays
+  (authorization transforms, cache identity, alias/rewrite/FastCGI
+  containment, request-header effects and CGI identity).
+- Rust unit invariants in `config.rs`, `htaccess.rs`, `access.rs`, `cache.rs`,
+  `fastcgi.rs`, `proxy.rs`, `rewrite.rs` and `server.rs`.
 
 Until the model is mechanized, any change to merge order or override gating
 must be accompanied by a differential case.  The generated suite is the
 current definition of “matches Apache” for the covered surface.
+
+### 11c — Unproven security-critical production coverage
+
+Modules that are too complex or protocol-dependent for the current Verus model
+are tracked separately from the proof ledger:
+
+```sh
+tests/coverage.sh
+python3 tests/security_coverage.py --check
+```
+
+The tracker measures **production lines before each file's test module** and
+currently enforces 100% for:
+
+- `fastcgi.rs` — record parsing, spooling, script/PATH_INFO containment,
+  environment derivation, error paths and process boundary;
+- `http.rs` — request-head/body framing, chunk/trailer bounds, spool-file
+  creation, response framing headers and short-body failure paths;
+- `tls.rs` — certificate/key parsing, SNI selection, OCSP refresh, client-auth
+  policy and listener construction.
+
+The remaining high-risk surfaces (`cgi`, `h2`, `proxy`, `server`,
+`htaccess`, `config`, `expr`, `rewrite`) are reported with their current
+production coverage and promoted to enforced 100% one at a time.  A module is
+not considered closed merely because its test module is covered; the tracker
+excludes test-only code from the denominator.
 
 ## 12. Known gaps before formal proof
 
@@ -657,9 +1300,11 @@ current definition of “matches Apache” for the covered surface.
 - I1 is capability-enforced for cache/file/directory/CGI/FastCGI/proxy and the
   WebSocket tunnel path.  A few explicit pre-auth error paths still construct
   responses before an access check; those are documented separately.
-- I3 prefilters are covered by unit/property tests and the cache lookup now
-  requires an `AccessGrant`; the prefilter implication itself is not yet a
-  Verus theorem.
+- I3 prefilters are now Verus theorems (`prefilter_sound`,
+  `htaccess_prefilter_sound`, `cache_prefilter_sound`) over the boolean/list
+  model.  The path-pattern matcher and the parser-to-flattened-rule-list
+  refinement are still explicit assumptions; the cache lookup also requires an
+  `AccessGrant` at runtime.
 - The durable `.htaccess` cache/metadata invalidation is outside the model.
 
 ## 13. Apache CVE triage

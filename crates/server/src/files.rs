@@ -8,7 +8,7 @@
 
 use crate::config::{Config, ErrorDoc, Scope, ServerSignature, VHost, ETAG_ALL};
 use crate::http::{reason_phrase, Body, Request, Response};
-use crate::util::{html_escape, http_date, parse_http_date, url_encode_path};
+use crate::util::{html_escape, http_date, parse_http_date};
 use crate::verified::{parse_byte_range, RangeDecision};
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -49,6 +49,39 @@ pub fn fd_path(file: &File) -> Option<PathBuf> {
 
 /// Open `root/rel` without ever escaping `root`.
 pub fn resolve_target(root: &Path, rel: &Path, follow_symlinks: bool) -> Target {
+    resolve_target_checked(root, rel, follow_symlinks, false)
+}
+
+/// `Options +SymLinksIfOwnerMatch` (without `FollowSymLinks`) follows a
+/// symlink only when its target is owned by the same account.  `openat2`
+/// contains the target but cannot enforce that ownership relation.
+fn symlink_owner_matches(root: &Path, rel: &Path) -> bool {
+    let mut prefix = PathBuf::new();
+    for component in rel.components() {
+        prefix.push(component.as_os_str());
+        let candidate = root.join(&prefix);
+        let Ok(link_meta) = std::fs::symlink_metadata(&candidate) else {
+            return false;
+        };
+        if !link_meta.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(resolved) = std::fs::metadata(&candidate) else {
+            return false;
+        };
+        if resolved.uid() != link_meta.uid() {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn resolve_target_checked(
+    root: &Path,
+    rel: &Path,
+    follow_symlinks: bool,
+    owner_match_only: bool,
+) -> Target {
     let mut flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64;
     if rel.as_os_str().is_empty() {
         flags |= libc::O_DIRECTORY as u64;
@@ -74,6 +107,9 @@ pub fn resolve_target(root: &Path, rel: &Path, follow_symlinks: bool) -> Target 
         Ok(m) => m,
         Err(_) => return Target::Forbidden,
     };
+    if owner_match_only && !symlink_owner_matches(root, rel) {
+        return Target::Forbidden;
+    }
     if meta.is_dir() {
         Target::Directory { file, meta }
     } else if meta.is_file() {
@@ -420,14 +456,7 @@ fn serve_file_inner(
     if let Some(cr) = content_range {
         r.headers.push(("Content-Range".into(), cr.into_bytes()));
     }
-    for (n, v) in &scope.header_policy.set_headers {
-        r.headers
-            .push((Cow::Owned(n.clone()), v.as_bytes().to_vec()));
-    }
-    for (n, v) in &scope.header_policy.add_headers {
-        r.headers
-            .push((Cow::Owned(n.clone()), v.as_bytes().to_vec()));
-    }
+    scope.header_policy.apply(&mut r.headers, true);
     if req.is_head() {
         r.headers
             .push(("Content-Length".into(), len.to_string().into_bytes()));
@@ -514,6 +543,14 @@ fn directory_action(
                 if name.starts_with(b".") {
                     continue;
                 }
+                if scope
+                    .content_policy
+                    .index_ignore
+                    .iter()
+                    .any(|pattern| crate::config::glob_match(pattern.as_bytes(), &name))
+                {
+                    continue;
+                }
                 if name.ends_with(b"~") || name.starts_with(b"#") {
                     continue;
                 }
@@ -577,20 +614,35 @@ fn serve_directory_inner(
             .contains(crate::config::Options::SYMLINKS_IF_OWNER_MATCH);
     match directory_action(cfg, scope, req, &dir, url_path, raw_path, follow) {
         DirAction::Redirect(loc) => {
-            let authority = req
-                .header_str("host")
-                .map(str::trim)
-                .filter(|h| !h.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    if port == 80 {
-                        host.to_string()
-                    } else {
-                        format!("{host}:{port}")
-                    }
-                });
+            let canonical_authority = if (!crate::expr::request_is_https() && port == 80)
+                || (crate::expr::request_is_https() && port == 443)
+            {
+                host.to_string()
+            } else {
+                format!("{host}:{port}")
+            };
+            let authority = if cfg.use_canonical_name {
+                vhost
+                    .and_then(|v| v.server_name.as_deref())
+                    .or(cfg.server_name.as_deref())
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or(canonical_authority)
+            } else {
+                req.header_str("host")
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or(canonical_authority)
+            };
+            let scheme = if crate::expr::request_is_https() {
+                "https"
+            } else {
+                "http"
+            };
             let loc = if loc.starts_with('/') {
-                format!("http://{authority}{loc}")
+                format!("{scheme}://{authority}{loc}")
             } else {
                 loc
             };
@@ -655,6 +707,7 @@ pub fn serve_directory(
     let mut r = serve_directory_inner(
         cfg, vhost, scope, req, dir, url_path, raw_path, host, port, peer, local_ip,
     );
+    scope.header_policy.apply(&mut r.headers, r.status < 400);
     crate::compression::finalize(scope, req, &mut r, url_path.as_bytes());
     r
 }
@@ -680,7 +733,7 @@ fn autoindex(
         body.push_str("   <tr><td><a href=\"../\">Parent Directory</a></td></tr>\n");
     }
     for (name, is_dir, size) in entries {
-        let mut href = url_encode_path(name);
+        let mut href = crate::util::safe_relative_href(name);
         if *is_dir {
             href.push('/');
         }
@@ -702,12 +755,7 @@ fn autoindex(
     body.push_str("  </table>\n");
     add_signature(&mut body, cfg, host, port);
     body.push_str(" </body>\n</html>\n");
-    let mut r = Response::bytes(200, "text/html; charset=UTF-8", body.into_bytes());
-    for (n, v) in &scope.header_policy.set_headers {
-        r.headers
-            .push((Cow::Owned(n.clone()), v.as_bytes().to_vec()));
-    }
-    r
+    Response::bytes(200, "text/html; charset=UTF-8", body.into_bytes())
 }
 
 fn add_signature(body: &mut String, cfg: &Config, host: &str, port: u16) {
@@ -811,6 +859,8 @@ pub fn error_response(
     let mut r = error_response_inner(
         cfg, vhost, scope, status, req, url_path, port, host, peer, local_ip,
     );
+    // Only `Header always` applies to error responses.
+    scope.header_policy.apply(&mut r.headers, false);
     crate::compression::finalize(scope, req, &mut r, url_path.as_bytes());
     r
 }

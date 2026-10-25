@@ -46,6 +46,12 @@ pub struct Target {
     fail_on_status: Vec<u16>,
     /// Backend URL used for `<Proxy>` / `<ProxyMatch>` matching.
     pub proxy_url: String,
+    /// Configured front-end URL (`balancer://...` or the rule's backend).
+    /// `<Proxy>` sections are matched against this identity as well as the
+    /// concrete member selected for the request.
+    pub logical_url: Option<String>,
+    /// Position in the merged proxy route table.
+    pub route_order: usize,
 }
 
 impl Target {
@@ -117,7 +123,7 @@ fn parse_http_url(value: &str) -> Option<HttpBackend> {
             None => (authority.to_string(), default_port),
         }
     };
-    if host.is_empty() {
+    if host.is_empty() || !valid_backend_host(&host) {
         return None;
     }
     Some(HttpBackend {
@@ -126,6 +132,22 @@ fn parse_http_url(value: &str) -> Option<HttpBackend> {
         base,
         tls,
     })
+}
+
+/// A backend authority is configuration- or rewrite-derived.  Reject control
+/// bytes and request-line delimiters before the host can be interpolated into
+/// an upstream request line or `Host`/`X-Forwarded-*` field.
+fn valid_backend_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')
+        })
+}
+
+fn valid_forwarded_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host.bytes().any(|b| b <= b' ' || b == 0x7f)
+        && crate::verified::sanitize_header_value(host.as_bytes()).is_some()
 }
 
 fn dead_map() -> &'static Mutex<HashMap<String, std::time::Instant>> {
@@ -317,7 +339,10 @@ fn check_health(spec: &HealthSpec) -> bool {
         "{method} {path} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
         backend.host, backend.port
     );
-    if stream.write_all(request.as_bytes()).is_err() {
+    let Ok(head) = ValidatedProxyHead::new(request, &backend, None) else {
+        return false;
+    };
+    if stream.write_all(head.as_bytes()).is_err() {
         return false;
     }
     let mut reader = BufReader::new(stream);
@@ -488,6 +513,8 @@ pub fn target_from_url(cfg: &Config, scope: &Scope, url: &str, req: &Request) ->
         balancer,
         fail_on_status,
         proxy_url,
+        logical_url: Some(path_part.to_string()),
+        route_order: usize::MAX,
     })
 }
 
@@ -543,6 +570,7 @@ pub fn match_target_req(
     url_path: &str,
     req: Option<&Request>,
 ) -> Option<Target> {
+    let mut best: Option<Target> = None;
     for rule in &scope.proxy_policy.proxy_passes {
         let Some(suffix) = prefix_suffix(&rule.prefix, url_path) else {
             continue;
@@ -564,7 +592,12 @@ pub fn match_target_req(
                 .map(|b| b.fail_on_status.clone())
                 .unwrap_or_default();
             let proxy_url = canonical_proxy_url(&backend, &path);
-            return Some(Target {
+            let logical_url = format!(
+                "{}/{}",
+                rule.backend.trim_end_matches('/'),
+                suffix.trim_start_matches('/')
+            );
+            let candidate = Target {
                 path,
                 suffix: suffix.to_string(),
                 backend,
@@ -572,7 +605,16 @@ pub fn match_target_req(
                 balancer,
                 fail_on_status,
                 proxy_url,
-            });
+                logical_url: Some(logical_url),
+                route_order: rule.route_order,
+            };
+            if best
+                .as_ref()
+                .map(|b| candidate.route_order < b.route_order)
+                .unwrap_or(true)
+            {
+                best = Some(candidate);
+            }
         }
     }
     for rule in &scope.proxy_policy.proxy_rules {
@@ -609,7 +651,7 @@ pub fn match_target_req(
                 .map(|b| b.fail_on_status.clone())
                 .unwrap_or_default();
             let proxy_url = canonical_proxy_url(&backend, &path);
-            return Some(Target {
+            let candidate = Target {
                 path,
                 suffix: if replaces {
                     String::new()
@@ -621,10 +663,19 @@ pub fn match_target_req(
                 balancer,
                 fail_on_status,
                 proxy_url,
-            });
+                logical_url: Some(raw.clone()),
+                route_order: rule.route_order,
+            };
+            if best
+                .as_ref()
+                .map(|b| candidate.route_order < b.route_order)
+                .unwrap_or(true)
+            {
+                best = Some(candidate);
+            }
         }
     }
-    None
+    best
 }
 
 fn encode_proxy_path(path: &str) -> String {
@@ -644,6 +695,78 @@ fn encode_proxy_path(path: &str) -> String {
         }
     }
     out
+}
+
+/// Final serialization gate for an upstream request head.  Every value that
+/// can come from configuration, a rewrite or a request is checked with the
+/// same token/header predicates used for native responses before `write_all`.
+fn validate_proxy_head(head: &str) -> std::io::Result<()> {
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "unsafe proxy head");
+    let mut lines = head.split("\r\n");
+    let request = lines.next().ok_or_else(invalid)?;
+    let mut parts = request.split(' ');
+    let method = parts.next().ok_or_else(invalid)?;
+    let target = parts.next().ok_or_else(invalid)?;
+    let version = parts.next().ok_or_else(invalid)?;
+    if parts.next().is_some()
+        || !crate::verified::proxy_request_line_admit(
+            method.as_bytes(),
+            target.as_bytes(),
+            version.as_bytes(),
+        )
+    {
+        return Err(invalid());
+    }
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line.split_once(':').ok_or_else(invalid)?;
+        if !crate::verified::proxy_header_admit(name.as_bytes(), value.as_bytes()) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+/// A proxy head that passed the verified serialization gate.  Upstream write
+/// sites take this type rather than a raw `String`, so the "validate before
+/// every write" rule is visible at the call site and cannot be skipped by
+/// accident when a new path is added.
+struct ValidatedProxyHead(Vec<u8>);
+
+impl ValidatedProxyHead {
+    /// Validate the *sources* of the authority text as well as the finished
+    /// head.  Checking only the final string is not enough: a host value
+    /// containing CRLF followed by a syntactically valid `Name: value` line
+    /// looks like an ordinary additional header.  The component checks make
+    /// that shape unrepresentable even if a future parser/rewrite supplies it.
+    fn new(
+        head: String,
+        backend: &HttpBackend,
+        forwarded_host: Option<&str>,
+    ) -> std::io::Result<Self> {
+        if !valid_backend_host(&backend.host) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsafe proxy backend host",
+            ));
+        }
+        if let Some(host) = forwarded_host {
+            if !valid_forwarded_host(host) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "unsafe X-Forwarded-Host",
+                ));
+            }
+        }
+        validate_proxy_head(&head)?;
+        Ok(Self(head.into_bytes()))
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 fn hop_by_hop(name: &str) -> bool {
@@ -733,14 +856,15 @@ fn read_chunked(reader: &mut impl BufRead, out: &mut Vec<u8>) -> std::io::Result
                 }
             }
         }
-        if out.len() + size > MAX_PROXY_BODY {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "proxy body too large",
-            ));
-        }
+        let end = out
+            .len()
+            .checked_add(size)
+            .filter(|end| *end <= MAX_PROXY_BODY)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "proxy body too large")
+            })?;
         let start = out.len();
-        out.resize(start + size, 0);
+        out.resize(end, 0);
         reader.read_exact(&mut out[start..])?;
         let mut crlf = [0u8; 2];
         reader.read_exact(&mut crlf)?;
@@ -977,9 +1101,20 @@ where
         if https { "https" } else { "http" }
     ));
     if !host.is_empty() {
+        if !valid_forwarded_host(host) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsafe X-Forwarded-Host",
+            ));
+        }
         head.push_str(&format!("X-Forwarded-Host: {host}\r\n"));
     }
     head.push_str("\r\n");
+    let head = ValidatedProxyHead::new(
+        head,
+        &target.backend,
+        if host.is_empty() { None } else { Some(host) },
+    )?;
     upstream.write_all(head.as_bytes()).await?;
     let response = read_async_head(&mut upstream).await?;
     let status_line = String::from_utf8_lossy(&response);
@@ -1237,9 +1372,20 @@ fn proxy_once(
         if https { "https" } else { "http" }
     ));
     if !host.is_empty() {
+        if !valid_forwarded_host(host) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsafe X-Forwarded-Host",
+            ));
+        }
         head.push_str(&format!("X-Forwarded-Host: {host}\r\n"));
     }
     head.push_str("\r\n");
+    let head = ValidatedProxyHead::new(
+        head,
+        &target.backend,
+        if host.is_empty() { None } else { Some(host) },
+    )?;
     stream.write_all(head.as_bytes())?;
     if let Some(reader) = req.body_reader() {
         let mut reader = reader?;
@@ -1480,6 +1626,9 @@ fn proxy_once(
     } else {
         Body::Bytes(body)
     };
+    scope
+        .header_policy
+        .apply(&mut response.headers, response.status < 400);
     crate::compression::finalize(scope, req, &mut response, url_path.as_bytes());
     let returned = if reusable {
         Some(reader.into_inner())
@@ -1499,6 +1648,7 @@ fn alternate_target(
     let balancer = cfg.balancers.iter().find(|b| b.name == *name)?;
     let backend = next_balancer_member(balancer, Some(req), Some(tried), None)?;
     let path = join_path(&backend.base, &target.suffix);
+    let proxy_url = canonical_proxy_url(&backend, &path);
     Some(Target {
         path,
         suffix: target.suffix.clone(),
@@ -1506,8 +1656,63 @@ fn alternate_target(
         reverse: target.reverse.clone(),
         balancer: Some(name.clone()),
         fail_on_status: balancer.fail_on_status.clone(),
-        proxy_url: target.proxy_url.clone(),
+        proxy_url,
+        logical_url: target.logical_url.clone(),
+        route_order: target.route_order,
     })
+}
+
+/// Re-authorize a balancer failover member.  A grant for member A must not be
+/// reused for member B when the members have different `<Proxy>` policy.
+#[allow(clippy::too_many_arguments)]
+fn authorize_failover(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    scope: &Scope,
+    req: &Request,
+    url_path: &str,
+    target: &Target,
+    peer: SocketAddr,
+    resource: &crate::access::ResourceKey,
+) -> Option<(
+    Scope,
+    crate::access::AccessGrant,
+    crate::access::ResourceKey,
+)> {
+    let mut next_scope = scope.clone();
+    let mut proxy_urls = vec![target.proxy_url.as_str()];
+    if let Some(logical) = target.logical_url.as_deref() {
+        proxy_urls.push(logical);
+    }
+    cfg.apply_proxy_access_urls(vhost, &mut next_scope, &proxy_urls, req, peer.ip());
+    let mut identity = None;
+    let mut access = crate::access::check(&next_scope, req, peer.ip(), None);
+    if access == crate::access::Access::AuthRequired {
+        if let Some(id) = crate::auth::authenticate(&next_scope, req) {
+            identity = Some(id);
+            access = crate::access::check(&next_scope, req, peer.ip(), identity.as_ref());
+        }
+    }
+    if access != crate::access::Access::Allowed {
+        return None;
+    }
+    let mut next_resource = crate::access::ResourceKey::request(
+        vhost,
+        req,
+        url_path,
+        resource.fs_path.as_deref(),
+        Some(target.proxy_url.as_str()),
+    );
+    next_resource.identity = identity.map(|i| i.user);
+    let grant = crate::access::grant_if_allowed(access, next_resource.clone())?;
+    let binding = target.binding_key();
+    let bound = grant.bind_backend(&next_resource, binding.clone())?;
+    let mut expected = next_resource;
+    expected.backend_target = Some(binding);
+    if !bound.require(&expected) {
+        return None;
+    }
+    Some((next_scope, bound, expected))
 }
 
 pub fn execute(
@@ -1539,9 +1744,10 @@ pub fn execute(
             local_ip,
         );
     };
-    let mut expected = resource.clone();
-    expected.backend_target = Some(binding);
-    if !bound.require(&expected) || resource.proxy_url.as_deref() != Some(target.proxy_url.as_str())
+    let mut active_resource = resource.clone();
+    active_resource.backend_target = Some(binding);
+    if !bound.require(&active_resource)
+        || resource.proxy_url.as_deref() != Some(target.proxy_url.as_str())
     {
         return error(
             cfg,
@@ -1557,17 +1763,50 @@ pub fn execute(
     }
     let timeout = cfg.timeout.max(Duration::from_secs(5));
     let mut current = target.clone();
+    let mut active_scope = scope.clone();
+    let mut active_grant = bound;
     let mut tried: HashSet<String> = HashSet::new();
     loop {
+        // The grant used by the sink must name the exact member currently
+        // selected.  A balancer failover replaces both together.
+        let binding = current.binding_key();
+        let mut expected = active_resource.clone();
+        expected.backend_target = Some(binding.clone());
+        if !active_grant.require(&expected)
+            || active_resource.proxy_url.as_deref() != Some(current.proxy_url.as_str())
+            || active_resource.backend_target.as_deref() != Some(binding.as_str())
+        {
+            return error(
+                cfg,
+                vhost,
+                &active_scope,
+                req,
+                url_path,
+                local_port,
+                host,
+                peer.ip(),
+                local_ip,
+            );
+        }
         let key = backend_key(&current.backend);
         tried.insert(key.clone());
         let mut retried = false;
         let result = loop {
-            let (stream, was_pooled) = match connect_pooled(&current.backend, scope, timeout) {
-                Ok(v) => v,
-                Err(e) => break Err(e),
-            };
-            match proxy_once(stream, &current, req, scope, url_path, peer, https, host) {
+            let (stream, was_pooled) =
+                match connect_pooled(&current.backend, &active_scope, timeout) {
+                    Ok(v) => v,
+                    Err(e) => break Err(e),
+                };
+            match proxy_once(
+                stream,
+                &current,
+                req,
+                &active_scope,
+                url_path,
+                peer,
+                https,
+                host,
+            ) {
                 Ok((response, reusable)) => {
                     if let Some(stream) = reusable {
                         release_pooled(&key, stream);
@@ -1593,8 +1832,38 @@ pub fn execute(
                         );
                     }
                     if let Some(next) = alternate_target(cfg, &current, &tried, req) {
-                        current = next;
-                        continue;
+                        match authorize_failover(
+                            cfg,
+                            vhost,
+                            &active_scope,
+                            req,
+                            url_path,
+                            &next,
+                            peer,
+                            resource,
+                        ) {
+                            Some((next_scope, next_grant, next_resource)) => {
+                                active_scope = next_scope;
+                                active_grant = next_grant;
+                                active_resource = next_resource;
+                                current = next;
+                                continue;
+                            }
+                            None => {
+                                return crate::files::error_response(
+                                    cfg,
+                                    vhost,
+                                    &active_scope,
+                                    403,
+                                    req,
+                                    url_path,
+                                    local_port,
+                                    host,
+                                    peer.ip(),
+                                    local_ip,
+                                )
+                            }
+                        }
                     }
                 }
                 return response;
@@ -1608,8 +1877,38 @@ pub fn execute(
                     );
                 }
                 if let Some(next) = alternate_target(cfg, &current, &tried, req) {
-                    current = next;
-                    continue;
+                    match authorize_failover(
+                        cfg,
+                        vhost,
+                        &active_scope,
+                        req,
+                        url_path,
+                        &next,
+                        peer,
+                        resource,
+                    ) {
+                        Some((next_scope, next_grant, next_resource)) => {
+                            active_scope = next_scope;
+                            active_grant = next_grant;
+                            active_resource = next_resource;
+                            current = next;
+                            continue;
+                        }
+                        None => {
+                            return crate::files::error_response(
+                                cfg,
+                                vhost,
+                                &active_scope,
+                                403,
+                                req,
+                                url_path,
+                                local_port,
+                                host,
+                                peer.ip(),
+                                local_ip,
+                            )
+                        }
+                    }
                 }
                 return error(
                     cfg,
@@ -1732,6 +2031,7 @@ mod tests {
                 backend: format!("http://127.0.0.1:{port}/"),
                 sticky_cookie: None,
                 fail_on_status: Vec::new(),
+                route_order: 0,
             });
         scope
             .proxy_policy
@@ -1851,6 +2151,7 @@ mod more_tests {
                 backend: format!("http://127.0.0.1:{port}/"),
                 sticky_cookie: None,
                 fail_on_status: Vec::new(),
+                route_order: 0,
             });
         match_target(cfg, &scope, "/app/chunked").unwrap()
     }
@@ -1881,6 +2182,7 @@ mod more_tests {
                     backend: format!("http://127.0.0.1:{port}/"),
                     sticky_cookie: None,
                     fail_on_status: Vec::new(),
+                    route_order: 0,
                 });
             s
         };
@@ -1921,6 +2223,7 @@ mod more_tests {
                 backend: "http://127.0.0.1:1/".into(),
                 sticky_cookie: None,
                 fail_on_status: Vec::new(),
+                route_order: 0,
             });
         let t = match_target(&cfg, &scope, "/app/x").unwrap();
         let r = execute(
@@ -1972,6 +2275,7 @@ mod more_tests {
                 backend: "balancer://cluster/".into(),
                 sticky_cookie: None,
                 fail_on_status: Vec::new(),
+                route_order: 0,
             });
         let first = match_target(&cfg, &scope, "/bal/x").unwrap();
         let second = match_target(&cfg, &scope, "/bal/x").unwrap();
@@ -2034,6 +2338,7 @@ mod more_tests {
                 backend: format!("http://127.0.0.1:{port}/"),
                 sticky_cookie: None,
                 fail_on_status: Vec::new(),
+                route_order: 0,
             });
         let request = req("/pool/x");
         let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -2106,6 +2411,7 @@ mod more_tests {
                 backend: "balancer://failover/".into(),
                 sticky_cookie: None,
                 fail_on_status: Vec::new(),
+                route_order: 0,
             });
         let req = req("/fo/x");
         let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -2174,6 +2480,7 @@ mod more_tests {
                 backend: format!("http://127.0.0.1:{port}/"),
                 sticky_cookie: None,
                 fail_on_status: Vec::new(),
+                route_order: 0,
             });
         let request = req("/stream/x");
         let target = match_target(&cfg, &scope, "/stream/x").unwrap();
@@ -2255,6 +2562,7 @@ mod more_tests {
                 backend: "balancer://failstatus/".into(),
                 sticky_cookie: None,
                 fail_on_status: Vec::new(),
+                route_order: 0,
             });
         let request = req("/fs/x");
         let target = match_target(&cfg, &scope, "/fs/x").unwrap();
@@ -2274,6 +2582,86 @@ mod more_tests {
         assert_eq!(response.status, 200);
         h1.join().unwrap();
         h2.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failover_member_must_pass_its_own_proxy_authorization() {
+        let a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let live = a.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = a.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf).unwrap();
+            let _ = s
+                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        let dir =
+            std::env::temp_dir().join(format!("vapache-proxy-failauth-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("httpd.conf");
+        fs::write(
+            &conf,
+            "Listen 127.0.0.1:0\n\
+             <Proxy \"http://127.0.0.1:1/*\">\n\
+                 Require all denied\n\
+             </Proxy>\n",
+        )
+        .unwrap();
+        let mut cfg = crate::config::Config::load(
+            &conf,
+            &dir,
+            &Default::default(),
+            &Default::default(),
+            false,
+        )
+        .unwrap();
+        cfg.balancers = vec![crate::config::Balancer {
+            name: "failauth".into(),
+            health: crate::config::HealthTemplate::default(),
+            sticky_cookie: None,
+            sticky_sep: None,
+            fail_on_status: vec![500],
+            members: vec![
+                BalancerMember {
+                    url: format!("http://127.0.0.1:{live}/"),
+                    ..BalancerMember::default()
+                },
+                BalancerMember {
+                    url: "http://127.0.0.1:1/".into(),
+                    ..BalancerMember::default()
+                },
+            ],
+        }];
+        let mut scope = Scope::default();
+        scope
+            .proxy_policy
+            .proxy_passes
+            .push(crate::config::ProxyPassRule {
+                prefix: "/fa".into(),
+                backend: "balancer://failauth/".into(),
+                sticky_cookie: None,
+                fail_on_status: Vec::new(),
+                route_order: 0,
+            });
+        let request = req("/fa/x");
+        let target = match_target(&cfg, &scope, "/fa/x").unwrap();
+        let response = execute(
+            &cfg,
+            None,
+            &scope,
+            &request,
+            "/fa/x",
+            &target,
+            "127.0.0.1:1".parse().unwrap(),
+            80,
+            false,
+            "localhost",
+            "127.0.0.1",
+        );
+        assert_eq!(response.status, 403);
+        h.join().unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2311,6 +2699,7 @@ mod more_tests {
                 backend: "balancer://sticky/".into(),
                 sticky_cookie: None,
                 fail_on_status: Vec::new(),
+                route_order: 0,
             });
         let mut request = req("/sticky/x");
         request.headers.insert("cookie", "JSESSIONID=abc.node2");
@@ -2350,6 +2739,8 @@ mod more_tests {
             balancer: None,
             fail_on_status: Vec::new(),
             proxy_url: "http://127.0.0.1/".into(),
+            logical_url: None,
+            route_order: 0,
         };
         let request = req("/");
         let result = proxy_once(
@@ -2404,6 +2795,7 @@ mod more_tests {
                 backend: "http://127.0.0.1:9000/".into(),
                 sticky_cookie: None,
                 fail_on_status: Vec::new(),
+                route_order: 0,
             });
         let target = match_target(&cfg, &scope, "/app/x").unwrap();
         assert_eq!(target.proxy_url, "http://127.0.0.1:9000/x");
@@ -2430,9 +2822,248 @@ mod more_tests {
             .push(crate::config::ProxyRule {
                 pattern: std::sync::Arc::new(regex::Regex::new("^/(.*\\.php)$").unwrap()),
                 backend: "http://127.0.0.1:9000/$1".into(),
+                route_order: 0,
             });
         let t = match_target(&cfg, &scope, "/index.php").unwrap();
         assert_eq!(t.path, "/index.php");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_and_regex_routes_share_one_configuration_order() {
+        let dir = std::env::temp_dir().join(format!("vapache-proxy-order-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = config(&dir);
+        let mut scope = Scope::default();
+        scope
+            .proxy_policy
+            .proxy_passes
+            .push(crate::config::ProxyPassRule {
+                prefix: "/app".into(),
+                backend: "http://127.0.0.1:9001/".into(),
+                sticky_cookie: None,
+                fail_on_status: Vec::new(),
+                route_order: 1,
+            });
+        scope
+            .proxy_policy
+            .proxy_rules
+            .push(crate::config::ProxyRule {
+                pattern: std::sync::Arc::new(regex::Regex::new("^/app/(.*)$").unwrap()),
+                backend: "http://127.0.0.1:9002/$1".into(),
+                route_order: 0,
+            });
+        let regex_first = match_target(&cfg, &scope, "/app/x").unwrap();
+        assert_eq!(regex_first.backend.port, 9002);
+        assert_eq!(regex_first.path, "/x");
+
+        // Reversing the configuration order reverses the winner even though
+        // prefix and regex routes live in separate vectors.
+        scope.proxy_policy.proxy_passes[0].route_order = 0;
+        scope.proxy_policy.proxy_rules[0].route_order = 1;
+        let prefix_first = match_target(&cfg, &scope, "/app/x").unwrap();
+        assert_eq!(prefix_first.backend.port, 9001);
+        assert_eq!(prefix_first.path, "/x");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn balancer_target_keeps_logical_and_concrete_proxy_identities() {
+        let dir =
+            std::env::temp_dir().join(format!("vapache-proxy-balance-id-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("httpd.conf");
+        fs::write(
+            &conf,
+            "Listen 127.0.0.1:0\n\
+             <Proxy \"http://127.0.0.1:9001/*\">\n\
+                 Require all denied\n\
+             </Proxy>\n",
+        )
+        .unwrap();
+        let mut cfg = crate::config::Config::load(
+            &conf,
+            &dir,
+            &Default::default(),
+            &Default::default(),
+            false,
+        )
+        .unwrap();
+        cfg.balancers = vec![crate::config::Balancer {
+            name: "cluster".into(),
+            health: crate::config::HealthTemplate::default(),
+            sticky_cookie: None,
+            sticky_sep: None,
+            fail_on_status: Vec::new(),
+            members: vec![BalancerMember {
+                url: "http://127.0.0.1:9001/".into(),
+                ..BalancerMember::default()
+            }],
+        }];
+        let mut scope = Scope::default();
+        scope
+            .proxy_policy
+            .proxy_passes
+            .push(crate::config::ProxyPassRule {
+                prefix: "/bal".into(),
+                backend: "balancer://cluster/".into(),
+                sticky_cookie: None,
+                fail_on_status: Vec::new(),
+                route_order: 0,
+            });
+        let target = match_target(&cfg, &scope, "/bal/x").unwrap();
+        assert_eq!(target.logical_url.as_deref(), Some("balancer://cluster/x"));
+        assert_eq!(target.proxy_url, "http://127.0.0.1:9001/x");
+        let logical = target.logical_url.clone().unwrap();
+        let req = req("/bal/x");
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut matched = scope.clone();
+        cfg.apply_proxy_access_urls(
+            None,
+            &mut matched,
+            &[target.proxy_url.as_str(), logical.as_str()],
+            &req,
+            peer.ip(),
+        );
+        assert_eq!(
+            crate::access::check(&matched, &req, peer.ip(), None),
+            crate::access::Access::Denied,
+            "concrete balancer member identity must participate in <Proxy> matching"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxy_framing_and_trailer_limits_fail_before_allocation() {
+        // A chunk size larger than MAX_PROXY_BODY is rejected by checked_add
+        // before resizing the output buffer.
+        let mut out = Vec::new();
+        let mut oversized = Cursor::new(b"FFFFFFFF\r\n".to_vec());
+        assert!(read_chunked(&mut oversized, &mut out).is_err());
+
+        // Too many trailer fields are bounded independently of their bytes.
+        let mut trailers = b"0\r\n".to_vec();
+        for i in 0..(MAX_PROXY_TRAILERS + 1) {
+            trailers.extend_from_slice(format!("X-Trailer-{i}: x\r\n").as_bytes());
+        }
+        trailers.extend_from_slice(b"\r\n");
+        let mut trailer_reader = Cursor::new(trailers);
+        assert!(read_chunked(&mut trailer_reader, &mut out).is_err());
+
+        // A backend cannot make the line reader allocate an unbounded line.
+        let mut long_line = Cursor::new(vec![b'a'; MAX_PROXY_LINE + 1]);
+        assert!(read_line(&mut long_line).is_err());
+
+        // Chunk data must be followed by exactly CRLF.
+        let mut bad_crlf = Cursor::new(b"1\r\naXX".to_vec());
+        assert!(read_chunked(&mut bad_crlf, &mut out).is_err());
+    }
+
+    #[test]
+    fn proxy_rejects_control_bytes_in_backend_host_and_serialized_head() {
+        assert!(parse_http_url("http://evil.example\r\nX-Injected: yes/").is_none());
+        assert!(parse_http_url("http://evil.example\n/").is_none());
+        assert!(parse_http_url("http://127.0.0.1:9000/").is_some());
+
+        let safe =
+            "GET /path HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Forwarded-Host: example.test\r\n\r\n";
+        assert!(validate_proxy_head(safe).is_ok());
+        assert!(valid_forwarded_host("example.test:8443"));
+        assert!(!valid_forwarded_host("evil\r\nX-Injected: yes"));
+        assert!(!valid_forwarded_host("evil\nX-Injected: yes"));
+        let bad_value = "GET /path HTTP/1.1\r\nHost: x\r\nX-Test: evil\rInjected\r\n\r\n";
+        assert!(validate_proxy_head(bad_value).is_err());
+        let bad_target = "GET /path\r\nInjected HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert!(validate_proxy_head(bad_target).is_err());
+        assert!(validate_proxy_head("GET /path HTTP/1.0\r\nHost: x\r\n\r\n").is_err());
+        assert!(validate_proxy_head("GE T /path HTTP/1.1\r\nHost: x\r\n\r\n").is_err());
+        assert!(validate_proxy_head("GET /path HTTP/1.1\r\nBad Name: x\r\n\r\n").is_err());
+        assert!(validate_proxy_head("GET /path HTTP/1.1\r\nX-Test: a\0b\r\n\r\n").is_err());
+        // HTAB is legal inside all header values; the verified predicate must
+        // preserve it while still rejecting CTLs.
+        assert!(validate_proxy_head("GET /path HTTP/1.1\r\nX-Test: a\tb\r\n\r\n").is_ok());
+        assert!(vapache_verified::proxy_request_line_admit(
+            b"GET",
+            b"/path",
+            b"HTTP/1.1"
+        ));
+        assert!(!vapache_verified::proxy_request_line_admit(
+            b"GET",
+            b"/pa th",
+            b"HTTP/1.1"
+        ));
+        assert!(vapache_verified::proxy_header_admit(b"X-Test", b"a\tb"));
+        assert!(!vapache_verified::proxy_header_admit(b"X-Test", b"a\rb"));
+    }
+
+    #[test]
+    fn validated_proxy_head_is_the_only_path_to_an_upstream_write() {
+        fn backend(host: &str) -> HttpBackend {
+            HttpBackend {
+                host: host.to_string(),
+                port: 9000,
+                base: "/".to_string(),
+                tls: false,
+            }
+        }
+
+        let safe = "GET /path HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\n".to_string();
+        let validated =
+            ValidatedProxyHead::new(safe.clone(), &backend("127.0.0.1"), Some("example.test"))
+                .unwrap();
+        assert_eq!(validated.as_bytes(), safe.as_bytes());
+        assert!(ValidatedProxyHead::new(
+            "GET /path HTTP/1.1\r\nHost: [::1]:9000\r\n\r\n".to_string(),
+            &backend("[::1]"),
+            None,
+        )
+        .is_ok());
+
+        // A host value containing CRLF followed by a syntactically valid
+        // header is the dangerous shape: the finished head is well-formed, so
+        // only the component check can reject it.
+        let injected_host = "evil\r\nX-Injected: yes";
+        let head = format!("GET /path HTTP/1.1\r\nHost: {injected_host}:9000\r\n\r\n");
+        assert!(validate_proxy_head(&head).is_ok());
+        assert!(ValidatedProxyHead::new(head, &backend(injected_host), None).is_err());
+        for bad_backend in ["evil host", "evil/path", "evil\r\nX: y", ""] {
+            assert!(
+                ValidatedProxyHead::new(
+                    "GET /path HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+                    &backend(bad_backend),
+                    None,
+                )
+                .is_err(),
+                "{bad_backend:?}"
+            );
+        }
+        for bad_forwarded in ["evil\r\nX-Injected: yes", "evil\nX: y", "evil host", ""] {
+            assert!(
+                ValidatedProxyHead::new(
+                    "GET /path HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\n".to_string(),
+                    &backend("127.0.0.1"),
+                    Some(bad_forwarded),
+                )
+                .is_err(),
+                "{bad_forwarded:?}"
+            );
+        }
+
+        for injected in [
+            "GET /path HTTP/1.1\r\nHost: evil\rInjected: yes\r\n\r\n",
+            "GET /path HTTP/1.1\r\nHost: evil\nInjected: yes\r\n\r\n",
+            "GET /path HTTP/1.1\r\nX-Test: a\0b\r\n\r\n",
+            // A second request line smuggled into the target.
+            "GET /path\r\nInjected HTTP/1.1\r\nHost: x\r\n\r\n",
+            // Obs-fold / whitespace before a header name.
+            "GET /path HTTP/1.1\r\nHost: x\r\n X-Folded: yes\r\n\r\n",
+        ] {
+            assert!(
+                ValidatedProxyHead::new(injected.to_string(), &backend("127.0.0.1"), None).is_err(),
+                "{injected:?}"
+            );
+        }
     }
 }

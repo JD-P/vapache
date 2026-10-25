@@ -324,6 +324,10 @@ pub struct HeaderPolicy {
     pub add_headers: Vec<(String, String)>,
     pub set_headers: Vec<(String, String)>,
     pub unset_headers: Vec<String>,
+    /// `Header always ...`: these also apply to error responses.
+    pub always_add_headers: Vec<(String, String)>,
+    pub always_set_headers: Vec<(String, String)>,
+    pub always_unset_headers: Vec<String>,
     pub expires_active: Option<bool>,
     pub expires_default: Option<String>,
     pub expires_by_type: Vec<(String, String)>,
@@ -331,11 +335,23 @@ pub struct HeaderPolicy {
     pub vary: Vec<String>,
 }
 
+fn merge_set_headers(parent: &mut Vec<(String, String)>, child: &[(String, String)]) {
+    for (name, value) in child {
+        // A child `Header set` replaces an inherited value with the same name
+        // instead of emitting a duplicate field line.
+        parent.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        parent.push((name.clone(), value.clone()));
+    }
+}
+
 impl HeaderPolicy {
     pub fn merge_child(&mut self, child: &HeaderPolicy) {
         crate::verified::append_vec(&mut self.add_headers, &child.add_headers);
-        crate::verified::append_vec(&mut self.set_headers, &child.set_headers);
+        merge_set_headers(&mut self.set_headers, &child.set_headers);
         crate::verified::append_vec(&mut self.unset_headers, &child.unset_headers);
+        crate::verified::append_vec(&mut self.always_add_headers, &child.always_add_headers);
+        merge_set_headers(&mut self.always_set_headers, &child.always_set_headers);
+        crate::verified::append_vec(&mut self.always_unset_headers, &child.always_unset_headers);
         if child.expires_active.is_some() {
             self.expires_active = child.expires_active;
         }
@@ -346,11 +362,74 @@ impl HeaderPolicy {
         crate::verified::append_vec(&mut self.cookies, &child.cookies);
         crate::verified::append_vec(&mut self.vary, &child.vary);
     }
+
+    /// Apply configured response headers in Apache order: set/add first, then
+    /// unset removes any field with that name.  `include_onsuccess` is false
+    /// for error responses, where only `Header always` applies.
+    pub fn apply(
+        &self,
+        headers: &mut Vec<(std::borrow::Cow<'static, str>, Vec<u8>)>,
+        include_onsuccess: bool,
+    ) {
+        let mut unset: Vec<&str> = self
+            .always_unset_headers
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut set: Vec<&(String, String)> = self.always_set_headers.iter().collect();
+        let mut add: Vec<&(String, String)> = self.always_add_headers.iter().collect();
+        if include_onsuccess {
+            unset.extend(self.unset_headers.iter().map(String::as_str));
+            set.extend(self.set_headers.iter());
+            add.extend(self.add_headers.iter());
+        }
+        for (name, value) in set {
+            headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+            headers.push((
+                std::borrow::Cow::Owned(name.clone()),
+                value.as_bytes().to_vec(),
+            ));
+        }
+        for (name, value) in add {
+            headers.push((
+                std::borrow::Cow::Owned(name.clone()),
+                value.as_bytes().to_vec(),
+            ));
+        }
+        for name in unset {
+            headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        }
+    }
 }
 
 #[cfg(test)]
 mod header_tests {
     use super::*;
+
+    #[test]
+    fn child_set_replaces_and_unset_removes_inherited_headers() {
+        let mut parent = HeaderPolicy::default();
+        parent.set_headers.push(("X-Set".into(), "one".into()));
+        parent.unset_headers.push("X-Old".into());
+        let mut child = HeaderPolicy::default();
+        child.set_headers.push(("X-Set".into(), "two".into()));
+        parent.merge_child(&child);
+        assert_eq!(parent.set_headers, vec![("X-Set".into(), "two".into())]);
+        let mut headers = vec![
+            (std::borrow::Cow::Borrowed("X-Old"), b"leak".to_vec()),
+            (std::borrow::Cow::Borrowed("X-Set"), b"one".to_vec()),
+        ];
+        parent.apply(&mut headers, true);
+        assert!(!headers.iter().any(|(n, _)| n == "X-Old"));
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|(n, _)| n == "X-Set")
+                .map(|(_, v)| v.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"two".as_slice()]
+        );
+    }
 
     #[test]
     fn header_lists_append_and_scalars_child_win() {
@@ -418,6 +497,7 @@ mod environment_tests {
 pub struct ContentPolicy {
     pub document_root: Option<std::path::PathBuf>,
     pub directory_index: Option<Vec<String>>,
+    pub index_ignore: Vec<String>,
     pub default_charset: Option<String>,
     pub file_etag: Option<u32>,
     pub enable_sendfile: Option<bool>,
@@ -436,6 +516,7 @@ impl ContentPolicy {
         if child.directory_index.is_some() {
             self.directory_index = child.directory_index.clone();
         }
+        crate::verified::append_vec(&mut self.index_ignore, &child.index_ignore);
         if child.default_charset.is_some() {
             self.default_charset = child.default_charset.clone();
         }
@@ -502,15 +583,15 @@ mod content_mapping_tests {
     #[test]
     fn mapping_lists_append_in_order() {
         let mut parent = MappingPolicy::default();
-        parent.handlers.push(crate::config::Handler {
-            ext: ".php".into(),
-            handler: "php-script".into(),
-        });
+        parent.handlers.push(crate::config::Handler::add(
+            ".php".into(),
+            "php-script".into(),
+        ));
         let mut child = MappingPolicy::default();
-        child.handlers.push(crate::config::Handler {
-            ext: ".cgi".into(),
-            handler: "cgi-script".into(),
-        });
+        child.handlers.push(crate::config::Handler::add(
+            ".cgi".into(),
+            "cgi-script".into(),
+        ));
         child.unsupported_filters.push("INCLUDES".into());
         parent.merge_child(&child);
         assert_eq!(parent.handlers.len(), 2);

@@ -5,8 +5,8 @@ use crate::cgi::{self, CgiContext};
 use crate::config::{Config, EncodedSlashes, Options, Scope, VHost};
 use crate::fastcgi;
 use crate::files::{
-    directory_index_name, error_response, mime_type, resolve_target, serve_directory, serve_file,
-    simple_html, Target,
+    directory_index_name, error_response, mime_type, resolve_target_checked, serve_directory,
+    serve_file, simple_html, Target,
 };
 use crate::http::{
     read_request, write_response, Body, Limits, ParseError, ReadError, Request, Response,
@@ -20,6 +20,7 @@ use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -289,6 +290,7 @@ impl Server {
                                             peer,
                                             &local_ip,
                                             port,
+                                            false,
                                         );
                                     }
                                 })
@@ -385,6 +387,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
     peer: SocketAddr,
     local_ip: &str,
     local_port: u16,
+    tls: bool,
 ) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let limits = Limits {
@@ -443,6 +446,8 @@ fn handle_connection<C: Conn + ResponseWrite>(
             let host = host_header(&req).unwrap_or("");
             let vhost =
                 cfg.select_vhost(local_port, if host.is_empty() { None } else { Some(host) });
+            let ws_server_name = server_name_for_public(&cfg, &req, local_port);
+            let _ws_server_name_guard = crate::expr::set_server_name(&ws_server_name);
             // The upgrade path must use the same canonical path as ordinary
             // dispatch.  Raw paths containing dot segments or encoded
             // separators would otherwise let the proxy/ACL see a different
@@ -467,7 +472,10 @@ fn handle_connection<C: Conn + ResponseWrite>(
             if trailing_slash && url_path != "/" {
                 url_path.push('/');
             }
-            let (root, rel, _script_alias) = map_path(&cfg, vhost, &norm);
+            let Some((root, rel, _script_alias)) = map_path(&cfg, vhost, &norm) else {
+                let _ = write_ws_error(stream, &cfg, 404, b"no mapping");
+                return Ok(());
+            };
             let fs_path = root.join(&rel);
             let (mut scope, config_conditionals, htaccess_conditionals) =
                 match evaluate_scope_for_path(&cfg, vhost, &fs_path, &url_path, &req, peer.ip()) {
@@ -502,7 +510,9 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 query: &req.query,
                 peer: peer.ip(),
                 port: local_port,
-                https: local_port == 443 || vhost.map(|v| v.ssl.engine).unwrap_or(cfg.ssl.engine),
+                https: crate::expr::request_is_https()
+                    || local_port == 443
+                    || vhost.map(|v| v.ssl.engine).unwrap_or(cfg.ssl.engine),
                 server_name: &server_name_for_public(&cfg, &req, local_port),
             };
             let mut rewritten_target = None;
@@ -544,7 +554,11 @@ fn handle_connection<C: Conn + ResponseWrite>(
             let ws_target = rewritten_target
                 .or_else(|| proxy::match_target_req(&cfg, &scope, &url_path, Some(&req)));
             if let Some(target) = ws_target {
-                cfg.apply_proxy_access(vhost, &mut scope, &target.proxy_url, &req, peer.ip());
+                let mut proxy_urls = vec![target.proxy_url.as_str()];
+                if let Some(logical) = target.logical_url.as_deref() {
+                    proxy_urls.push(logical);
+                }
+                cfg.apply_proxy_access_urls(vhost, &mut scope, &proxy_urls, &req, peer.ip());
                 if let Some(mut resp) = helper_method_not_allowed(
                     &cfg,
                     vhost,
@@ -625,7 +639,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
             }
         }
 
-        let mut resp = dispatch(&cfg, &req, peer, &local_ip, local_port);
+        let mut resp = dispatch_with_scheme(&cfg, &req, peer, &local_ip, local_port, tls);
         let keep_alive = cfg.keep_alive
             && req.keep_alive
             && (cfg.max_keep_alive_requests == 0 || served + 1 < cfg.max_keep_alive_requests);
@@ -639,7 +653,13 @@ fn handle_connection<C: Conn + ResponseWrite>(
         if !keep_alive {
             opts.keep_alive = false;
         }
-        let body_sent = write_response(stream, &mut resp, &opts).unwrap_or(0);
+        let body_sent = match write_response(stream, &mut resp, &opts) {
+            Ok(sent) => sent,
+            // The head or body was partially written, or the response failed
+            // its own framing checks.  Reusing this connection would let the
+            // next response be read as a continuation of this body.
+            Err(_) => return Ok(()),
+        };
         crate::status::hit(body_sent);
         if logger.wants_access_log() {
             let host = host_header(&req).unwrap_or("");
@@ -794,7 +814,15 @@ fn handle_tls_connection(
         let bridge = TlsH1::new(tls, tokio::runtime::Handle::current());
         tokio::task::spawn_blocking(move || {
             let mut bridge = bridge;
-            handle_connection(&cfg, &logger, &mut bridge, peer, &local_ip, local_port)
+            handle_connection(
+                &cfg,
+                &logger,
+                &mut bridge,
+                peer,
+                &local_ip,
+                local_port,
+                true,
+            )
         })
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
@@ -946,24 +974,45 @@ fn helper_access_response(
 }
 
 fn absolute_url_scheme(
+    cfg: &Config,
+    vhost: Option<&VHost>,
     req: &Request,
     path: &str,
     server_name: &str,
     port: u16,
     https: bool,
 ) -> String {
-    let authority = req
-        .header_str("host")
-        .map(str::trim)
-        .filter(|h| !h.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if (!https && port == 80) || (https && port == 443) {
-                server_name.to_string()
-            } else {
-                format!("{server_name}:{port}")
-            }
-        });
+    let authority = if cfg.use_canonical_name {
+        // `UseCanonicalName On` pins redirects to the configured ServerName;
+        // the client Host header must not turn them into open redirects.
+        // Apache uses the directive verbatim, including any explicit port, and
+        // does not append the listening port to a bare ServerName.
+        vhost
+            .and_then(|v| v.server_name.as_deref())
+            .or(cfg.server_name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if (!https && port == 80) || (https && port == 443) {
+                    server_name.to_string()
+                } else {
+                    format!("{server_name}:{port}")
+                }
+            })
+    } else {
+        req.header_str("host")
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if (!https && port == 80) || (https && port == 443) {
+                    server_name.to_string()
+                } else {
+                    format!("{server_name}:{port}")
+                }
+            })
+    };
     format!(
         "{}://{authority}{path}",
         if https { "https" } else { "http" }
@@ -1000,6 +1049,11 @@ fn server_name_for(cfg: &Config, req: &Request, port: u16) -> String {
             return strip_port(n).to_string();
         }
     }
+    if cfg.use_canonical_name {
+        if let Some(name) = &cfg.server_name {
+            return strip_port(name).to_string();
+        }
+    }
     if let Some(h) = host_header(req) {
         return strip_port(h).to_string();
     }
@@ -1019,12 +1073,37 @@ pub fn dispatch(
     local_ip: &str,
     local_port: u16,
 ) -> Response {
+    dispatch_with_scheme(cfg, req, peer, local_ip, local_port, false)
+}
+
+pub(crate) fn dispatch_with_scheme(
+    cfg: &Config,
+    req: &Request,
+    peer: SocketAddr,
+    local_ip: &str,
+    local_port: u16,
+    tls: bool,
+) -> Response {
+    crate::expr::with_connection(tls, local_port, || {
+        dispatch_inner_request(cfg, req, peer, local_ip, local_port)
+    })
+}
+
+fn dispatch_inner_request(
+    cfg: &Config,
+    req: &Request,
+    peer: SocketAddr,
+    local_ip: &str,
+    local_port: u16,
+) -> Response {
     let host = host_header(req).unwrap_or("");
     let path = String::from_utf8_lossy(&req.raw_path).into_owned();
     let vhost = cfg.select_vhost(local_port, if host.is_empty() { None } else { Some(host) });
-    let https_for_cache =
-        local_port == 443 || vhost.map(|v| v.ssl.engine).unwrap_or(cfg.ssl.engine);
+    let https_for_cache = crate::expr::request_is_https()
+        || local_port == 443
+        || vhost.map(|v| v.ssl.engine).unwrap_or(cfg.ssl.engine);
     let server_name_for_cache = server_name_for(cfg, req, local_port);
+    let _server_name_guard = crate::expr::set_server_name(&server_name_for_cache);
     let cache_scope = crate::cache::request_scope(
         cfg,
         vhost,
@@ -1035,11 +1114,21 @@ pub fn dispatch(
         https_for_cache,
         &server_name_for_cache,
         host,
+        local_ip,
     );
-    if let Some((scope, grant)) = &cache_scope {
-        if let Some(resp) =
-            crate::cache::lookup(cfg, vhost, req, host, &path, scope, peer.ip(), grant)
-        {
+    if let Some(cache_ctx) = &cache_scope {
+        if let Some(resp) = crate::cache::lookup(
+            cfg,
+            vhost,
+            req,
+            host,
+            &path,
+            &cache_ctx.scope,
+            peer.ip(),
+            &cache_ctx.grant,
+            &cache_ctx.key,
+            &cache_ctx.target,
+        ) {
             return resp;
         }
     }
@@ -1052,17 +1141,19 @@ pub fn dispatch(
         vhost,
         &server_name_for_cache,
     );
-    if let Some((scope, grant)) = cache_scope {
+    if let Some(cache_ctx) = cache_scope {
         crate::cache::store(
             cfg,
             vhost,
             req,
             host,
             &path,
-            &scope,
+            &cache_ctx.scope,
             peer.ip(),
             &mut resp,
-            &grant,
+            &cache_ctx.grant,
+            &cache_ctx.key,
+            &cache_ctx.target,
         );
     }
     if !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE") {
@@ -1251,6 +1342,68 @@ fn bind_target_grant(
     }
 }
 
+/// Re-evaluate policy for a target selected by a transform (PATH_INFO split,
+/// FastCGI script resolution, alias target).  The returned grant is bound to
+/// the target path and, for CGIs, to the opened inode by the caller.
+#[allow(clippy::too_many_arguments)]
+fn authorize_resolved_target(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
+    peer: IpAddr,
+    target_fs: &Path,
+    target_url: &str,
+    proxy_url: Option<&str>,
+    local_port: u16,
+    server_name: &str,
+    local_ip: &str,
+) -> Result<(access::AccessGrant, access::ResourceKey, Scope), Response> {
+    let (mut target_scope, config_conditionals, htaccess_conditionals) =
+        match evaluate_scope_for_path(cfg, vhost, target_fs, target_url, req, peer) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("vapached: target scope error: {e}");
+                return Err(error_response(
+                    cfg,
+                    vhost,
+                    &cfg.global,
+                    500,
+                    req,
+                    target_url,
+                    local_port,
+                    server_name,
+                    peer,
+                    local_ip,
+                ));
+            }
+        };
+    apply_scope_conditionals(
+        cfg,
+        vhost,
+        &mut target_scope,
+        &config_conditionals,
+        &htaccess_conditionals,
+        target_fs,
+        target_url,
+        req,
+        peer,
+    );
+    let mut key = access::ResourceKey::request(vhost, req, target_url, Some(target_fs), proxy_url);
+    let grant = helper_access_response(
+        cfg,
+        vhost,
+        &target_scope,
+        req,
+        target_url,
+        local_port,
+        server_name,
+        peer,
+        local_ip,
+        &mut key,
+    )?;
+    Ok((grant, key, target_scope))
+}
+
 fn apply_scope_conditionals(
     cfg: &Config,
     vhost: Option<&VHost>,
@@ -1291,6 +1444,75 @@ fn apply_scope_conditionals(
         &fname,
         &mut state,
     );
+}
+
+/// Re-authorize the URL the client actually requested after an internal
+/// rewrite changed the target.  Apache keeps `<Location>`/`<LocationMatch>`
+/// policy for the original URL across internal rewrites, including when the
+/// rewrite chain ends in a proxy or redirect rather than a static file.
+#[allow(clippy::too_many_arguments)]
+fn authorize_original_request(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
+    url_path: &str,
+    fs_path: &Path,
+    local_port: u16,
+    server_name: &str,
+    peer: SocketAddr,
+    local_ip: &str,
+    rewrite_effects: &crate::rewrite::Effects,
+) -> Result<(), Response> {
+    let (mut original_scope, config_conditionals, htaccess_conditionals) =
+        match evaluate_scope_for_path(cfg, vhost, fs_path, url_path, req, peer.ip()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("vapached: original URL scope error after rewrite: {e}");
+                return Err(error_response(
+                    cfg,
+                    vhost,
+                    &cfg.global,
+                    500,
+                    req,
+                    url_path,
+                    local_port,
+                    server_name,
+                    peer.ip(),
+                    local_ip,
+                ));
+            }
+        };
+    // Rewrite `[E=...]` effects apply before authorization.  The original URL
+    // gate must see the same environment as the final target scope; otherwise
+    // an original-URL `Require expr`/`SetEnvIf` rule can be bypassed by a
+    // rewrite that changes the environment.
+    apply_rewrite_effects(&mut original_scope, rewrite_effects);
+    apply_scope_conditionals(
+        cfg,
+        vhost,
+        &mut original_scope,
+        &config_conditionals,
+        &htaccess_conditionals,
+        fs_path,
+        url_path,
+        req,
+        peer.ip(),
+    );
+    let mut original_resource =
+        access::ResourceKey::request(vhost, req, url_path, Some(fs_path), None);
+    helper_access_response(
+        cfg,
+        vhost,
+        &original_scope,
+        req,
+        url_path,
+        local_port,
+        server_name,
+        peer.ip(),
+        local_ip,
+        &mut original_resource,
+    )
+    .map(|_| ())
 }
 
 fn dispatch_inner(
@@ -1408,6 +1630,26 @@ fn dispatch_inner(
     if trailing_slash && url_path != "/" {
         url_path.push('/');
     }
+    let original_req = req;
+    let original_url_path = url_path.clone();
+    let original_norm = norm.clone();
+    let Some((original_root, original_rel, _)) = map_path(cfg, vhost, &original_norm) else {
+        // A regex alias expanded outside its configured base.  The mapping is
+        // invalid; do not fall back to a different root.
+        return error_response(
+            cfg,
+            vhost,
+            base_scope,
+            404,
+            req,
+            &original_url_path,
+            local_port,
+            &server_name,
+            peer.ip(),
+            local_ip,
+        );
+    };
+    let original_fs_path = original_root.join(original_rel);
 
     // Rewrites may change the URL, so resolve the target and its override
     // scope first, then restart resolution with the rewritten path.  A hard
@@ -1423,8 +1665,26 @@ fn dispatch_inner(
     let mut fs_path;
     let mut scope;
     loop {
-        (root, rel, script_alias) = map_path(cfg, vhost, &norm);
+        let Some(mapped) = map_path(cfg, vhost, &norm) else {
+            return error_response(
+                cfg,
+                vhost,
+                base_scope,
+                404,
+                owned_req.as_ref().unwrap_or(req),
+                &url_path,
+                local_port,
+                &server_name,
+                peer.ip(),
+                local_ip,
+            );
+        };
+        (root, rel, script_alias) = mapped;
         fs_path = root.join(&rel);
+        // After a rewrite has changed the query, the target scope must be
+        // evaluated with the rewritten request context.  The original URL is
+        // still reauthorized separately with `original_req`.
+        let current_req = owned_req.as_ref().unwrap_or(req);
         let mut config_files = Vec::new();
         let mut config_locations = Vec::new();
         let mut config_conditionals = Vec::new();
@@ -1456,7 +1716,7 @@ fn dispatch_inner(
                     vhost,
                     &fs_path,
                     &url_path,
-                    req,
+                    current_req,
                     peer.ip(),
                     &layers,
                 );
@@ -1465,7 +1725,7 @@ fn dispatch_inner(
             htaccess_conditionals = access_conditionals;
         } else {
             let (cached_scope, conditionals) =
-                cfg.effective_scope_req_cached(vhost, &fs_path, &url_path, req, peer.ip());
+                cfg.effective_scope_req_cached(vhost, &fs_path, &url_path, current_req, peer.ip());
             scope = cached_scope;
             cached_conditionals = Some(conditionals);
         }
@@ -1478,7 +1738,7 @@ fn dispatch_inner(
         crate::config::apply_normal_rule_list(
             &config_files,
             &mut scope,
-            req,
+            current_req,
             peer.ip(),
             &cond_docroot,
             &fs_path,
@@ -1489,7 +1749,7 @@ fn dispatch_inner(
         crate::config::apply_normal_rule_list(
             &htaccess_files,
             &mut scope,
-            req,
+            current_req,
             peer.ip(),
             &cond_docroot,
             &fs_path,
@@ -1500,7 +1760,7 @@ fn dispatch_inner(
         crate::config::apply_normal_rule_list(
             &config_locations,
             &mut scope,
-            req,
+            current_req,
             peer.ip(),
             &cond_docroot,
             &fs_path,
@@ -1517,7 +1777,7 @@ fn dispatch_inner(
         crate::config::apply_deferred_req(
             &mut scope,
             config_conditionals,
-            req,
+            current_req,
             peer.ip(),
             &cond_docroot,
             &fs_path,
@@ -1529,7 +1789,7 @@ fn dispatch_inner(
         crate::config::apply_deferred_req(
             &mut scope,
             &htaccess_conditionals,
-            req,
+            current_req,
             peer.ip(),
             &cond_docroot,
             &fs_path,
@@ -1618,13 +1878,11 @@ fn dispatch_inner(
                         local_ip,
                     );
                 };
-                cfg.apply_proxy_access(
-                    vhost,
-                    &mut scope,
-                    &target.proxy_url,
-                    current_req,
-                    peer.ip(),
-                );
+                let mut proxy_urls = vec![target.proxy_url.as_str()];
+                if let Some(logical) = target.logical_url.as_deref() {
+                    proxy_urls.push(logical);
+                }
+                cfg.apply_proxy_access_urls(vhost, &mut scope, &proxy_urls, current_req, peer.ip());
                 if let Some(r) = helper_method_not_allowed(
                     cfg,
                     vhost,
@@ -1660,6 +1918,30 @@ fn dispatch_inner(
                     Ok(grant) => grant,
                     Err(r) => return r,
                 };
+                // A terminal proxy outcome returns before the post-loop
+                // original-URL check.  Enforce the original URL policy here
+                // as well; otherwise `/admin -> /front -> [P]` bypasses
+                // `<Location "/admin">`.
+                if original_url_path != url_path
+                    || original_fs_path != fs_path
+                    || original_req.query != current_req.query
+                    || !rewrite_effects.is_empty()
+                {
+                    if let Err(r) = authorize_original_request(
+                        cfg,
+                        vhost,
+                        original_req,
+                        &original_url_path,
+                        &original_fs_path,
+                        local_port,
+                        &server_name,
+                        peer,
+                        local_ip,
+                        &rewrite_effects,
+                    ) {
+                        return r;
+                    }
+                }
                 let mut proxy_req = current_req.clone();
                 proxy_req.query = query.as_bytes().to_vec();
                 return proxy::execute(
@@ -1685,10 +1967,41 @@ fn dispatch_inner(
             } => {
                 rewrite_effects.merge(effects);
                 apply_rewrite_effects(&mut scope, &rewrite_effects);
+                // A positive redirect is also a terminal outcome.  Do not let
+                // it escape the original URL's authorization after a rewrite.
+                if status < 400
+                    && (original_url_path != url_path
+                        || original_fs_path != fs_path
+                        || original_req.query != current_req.query
+                        || !rewrite_effects.is_empty())
+                {
+                    if let Err(r) = authorize_original_request(
+                        cfg,
+                        vhost,
+                        original_req,
+                        &original_url_path,
+                        &original_fs_path,
+                        local_port,
+                        &server_name,
+                        peer,
+                        local_ip,
+                        &rewrite_effects,
+                    ) {
+                        return r;
+                    }
+                }
                 let location = if location.starts_with("//") {
                     format!("{}:{}", if https { "https" } else { "http" }, location)
                 } else if location.starts_with('/') {
-                    absolute_url_scheme(current_req, &location, &server_name, local_port, https)
+                    absolute_url_scheme(
+                        cfg,
+                        vhost,
+                        current_req,
+                        &location,
+                        &server_name,
+                        local_port,
+                        https,
+                    )
                 } else {
                     location
                 };
@@ -1700,6 +2013,7 @@ fn dispatch_inner(
                 if current_req.method == "HEAD" {
                     r.body = Body::Empty;
                 }
+                scope.header_policy.apply(&mut r.headers, r.status < 400);
                 crate::compression::finalize(&scope, current_req, &mut r, url_path.as_bytes());
                 return r;
             }
@@ -1808,37 +2122,91 @@ fn dispatch_inner(
         }
     }
 
+    // An internal rewrite must not erase authorization attached to the URL the
+    // client actually requested.  Apache keeps `<Location>`/`<LocationMatch>`
+    // policy for the original URL across internal rewrites; require both the
+    // original URL scope and the final target scope to allow the request.
+    if original_url_path != url_path
+        || original_fs_path != fs_path
+        || original_req.query != req.query
+        || !rewrite_effects.is_empty()
+    {
+        if let Err(r) = authorize_original_request(
+            cfg,
+            vhost,
+            original_req,
+            &original_url_path,
+            &original_fs_path,
+            local_port,
+            &server_name,
+            peer,
+            local_ip,
+            &rewrite_effects,
+        ) {
+            return r;
+        }
+    }
+
     // Redirects are evaluated after rewrites but before access control and
     // filesystem mapping, matching Apache's URL translation order.
-    if let Some(red) = match_redirect(&scope, &url_path) {
-        let suffix = if red.from.ends_with('/') {
-            &url_path[red.from.len()..]
-        } else if url_path.len() > red.from.len() {
-            &url_path[red.from.len()..]
-        } else {
-            ""
-        };
-        let loc = format!("{}{}", red.to, suffix);
-        let loc = if loc.starts_with('/') {
-            absolute_url_scheme(req, &loc, &server_name, local_port, https)
+    if let Some((red, loc)) = match_redirect(&scope, &url_path) {
+        let loc = if loc.is_empty() {
+            String::new()
+        } else if loc.starts_with('/') {
+            absolute_url_scheme(cfg, vhost, req, &loc, &server_name, local_port, https)
         } else {
             loc
         };
-        let mut r = simple_html(
-            red.status,
-            &format!("The document has moved to {loc}"),
-            Some(&loc),
-        );
+        let mut r = if loc.is_empty() {
+            simple_html(red.status, "", None)
+        } else {
+            simple_html(
+                red.status,
+                &format!("The document has moved to {loc}"),
+                Some(&loc),
+            )
+        };
         if req.method == "HEAD" {
             r.body = Body::Empty;
         }
+        scope.header_policy.apply(&mut r.headers, r.status < 400);
         crate::compression::finalize(&scope, req, &mut r, url_path.as_bytes());
         return r;
     }
 
     let proxy_target = proxy::match_target_req(cfg, &scope, &url_path, Some(req));
-    if let Some(target) = &proxy_target {
-        cfg.apply_proxy_access(vhost, &mut scope, &target.proxy_url, req, peer.ip());
+    let fastcgi_target = fastcgi::match_proxy(&scope, &url_path, &root);
+    // Apache resolves prefix and regex proxy routes in configuration order.
+    // Selecting FastCGI first regardless of order lets a regex PHP route
+    // capture a URL that an earlier `ProxyPass` sends to an upstream gateway.
+    let fastcgi_wins = match (&fastcgi_target, &proxy_target) {
+        (Some(f), Some(p)) => f.route_order < p.route_order,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    // Only the selected route's proxy identity participates in `<Proxy>`
+    // authorization; a losing later route must not deny it.
+    let mut selected_proxy_url: Option<String> = None;
+    if fastcgi_wins {
+        if let Some(target) = &fastcgi_target {
+            let logical = target.logical_url.as_deref().unwrap_or("");
+            let proxy_urls = if logical.is_empty() {
+                Vec::new()
+            } else {
+                vec![logical]
+            };
+            if !proxy_urls.is_empty() {
+                cfg.apply_proxy_access_urls(vhost, &mut scope, &proxy_urls, req, peer.ip());
+            }
+            selected_proxy_url = target.logical_url.clone();
+        }
+    } else if let Some(target) = &proxy_target {
+        let mut proxy_urls = vec![target.proxy_url.as_str()];
+        if let Some(logical) = target.logical_url.as_deref() {
+            proxy_urls.push(logical);
+        }
+        cfg.apply_proxy_access_urls(vhost, &mut scope, &proxy_urls, req, peer.ip());
+        selected_proxy_url = Some(target.proxy_url.clone());
     }
 
     if let Some(r) = helper_method_not_allowed(
@@ -1859,9 +2227,9 @@ fn dispatch_inner(
         req,
         &url_path,
         Some(&fs_path),
-        proxy_target.as_ref().map(|t| t.proxy_url.as_str()),
+        selected_proxy_url.as_deref(),
     );
-    let grant = match helper_access_response(
+    let mut grant = match helper_access_response(
         cfg,
         vhost,
         &scope,
@@ -1887,21 +2255,23 @@ fn dispatch_inner(
         return crate::status::response(auto);
     }
 
-    if let Some(target) = fastcgi::match_proxy(&scope, &url_path, &root) {
-        return run_fastcgi(
-            cfg,
-            vhost,
-            req,
-            &url_path,
-            &server_name,
-            peer,
-            local_ip,
-            local_port,
-            &scope,
-            &target,
-            &grant,
-            &resource,
-        );
+    if fastcgi_wins {
+        if let Some(target) = fastcgi_target {
+            return run_fastcgi(
+                cfg,
+                vhost,
+                req,
+                &url_path,
+                &server_name,
+                peer,
+                local_ip,
+                local_port,
+                &scope,
+                &target,
+                &grant,
+                &resource,
+            );
+        }
     }
 
     if let Some(target) = proxy_target {
@@ -1921,7 +2291,10 @@ fn dispatch_inner(
             &resource,
         );
     }
-    if proxy::balancer_unavailable(cfg, &scope, &url_path) {
+    if !fastcgi_wins
+        && proxy_target.is_none()
+        && proxy::balancer_unavailable(cfg, &scope, &url_path)
+    {
         return error_response(
             cfg,
             vhost,
@@ -1936,12 +2309,14 @@ fn dispatch_inner(
         );
     }
 
-    let follow = scope.effective_options().contains(Options::FOLLOW_SYMLINKS)
-        || scope
+    let follow_symlinks = scope.effective_options().contains(Options::FOLLOW_SYMLINKS);
+    let owner_match_only = !follow_symlinks
+        && scope
             .effective_options()
             .contains(Options::SYMLINKS_IF_OWNER_MATCH);
+    let follow = follow_symlinks || owner_match_only;
 
-    match resolve_target(&root, &rel, follow) {
+    match resolve_target_checked(&root, &rel, follow, owner_match_only) {
         Target::File { file, meta } => {
             let name = rel.file_name().map(|n| n.as_encoded_bytes()).unwrap_or(b"");
             if req.method == "OPTIONS" {
@@ -2098,12 +2473,39 @@ fn dispatch_inner(
                     .push(("Allow".into(), b"GET, HEAD, OPTIONS".to_vec()));
                 return r;
             }
+            // With `DirectorySlash Off`, Apache does not redirect `/dir` to
+            // `/dir/`.  Authorization must still use the canonical directory
+            // URL, otherwise `<Location "/dir/">` is skipped and an autoindex
+            // listing for the protected directory leaks its entries.
+            let mut auth_url = url_path.clone();
+            if !url_path.ends_with('/') && !scope.content_policy.directory_slash.unwrap_or(true) {
+                let canonical = format!("{}/", url_path.trim_end_matches('/'));
+                match authorize_resolved_target(
+                    cfg,
+                    vhost,
+                    req,
+                    peer.ip(),
+                    &fs_path,
+                    &canonical,
+                    None,
+                    local_port,
+                    &server_name,
+                    local_ip,
+                ) {
+                    Ok((target_grant, _target_resource, target_scope)) => {
+                        scope = target_scope;
+                        grant = target_grant;
+                        auth_url = canonical;
+                    }
+                    Err(r) => return r,
+                }
+            }
             if let Some(name) =
-                directory_index_name(cfg, &scope, req, &file, &url_path, &req.raw_path)
+                directory_index_name(cfg, &scope, req, &file, &auth_url, &req.raw_path)
             {
                 let index_url = format!(
                     "{}/{}",
-                    url_path.trim_end_matches('/'),
+                    auth_url.trim_end_matches('/'),
                     String::from_utf8_lossy(&name)
                 );
                 return internal_dispatch(cfg, req, &index_url, peer, local_ip, local_port);
@@ -2117,7 +2519,7 @@ fn dispatch_inner(
                 &fs_path,
                 &actual_path,
                 &meta,
-                &url_path,
+                &auth_url,
                 req,
                 peer.ip(),
                 local_port,
@@ -2162,18 +2564,45 @@ fn dispatch_inner(
             if req.method == "OPTIONS" {
                 return options_response(cfg, None);
             }
-            // CGI PATH_INFO: try progressively shorter script names.
-            let maybe_cgi = script_alias || cgi::is_cgi(cfg, &scope, norm.as_slice(), false);
-            if maybe_cgi {
-                if let Some(st) = cgi::find_script(&root, &rel, follow) {
-                    let script_name = if st.path_info.is_empty() {
-                        url_path.clone()
-                    } else {
-                        url_path
-                            .strip_suffix(&st.path_info)
-                            .unwrap_or(&url_path)
-                            .to_string()
-                    };
+            // CGI PATH_INFO: try progressively shorter script names.  The
+            // requested suffix must not select the handler: `/protected.sh/x.cgi`
+            // is only executable when `protected.sh` itself is configured as a
+            // CGI script.  Policy is then re-evaluated for the actual script
+            // path before the script inode is executed.
+            if let Some(st) = cgi::find_script_checked(&root, &rel, follow, owner_match_only) {
+                let script_name = if st.path_info.is_empty() {
+                    url_path.clone()
+                } else {
+                    url_path
+                        .strip_suffix(&st.path_info)
+                        .unwrap_or(&url_path)
+                        .to_string()
+                };
+                let script_base = st
+                    .rel_script
+                    .file_name()
+                    .map(|n| n.as_encoded_bytes())
+                    .unwrap_or(b"");
+                let requested_base = norm.rsplit(|b| *b == b'/').next().unwrap_or(&norm);
+                let path_info_selected_cgi = cgi::is_cgi(cfg, &scope, requested_base, false);
+                if script_alias || cgi::is_cgi(cfg, &scope, script_base, false) {
+                    let script_fs = root.join(&st.rel_script);
+                    let (target_grant, target_resource, target_scope) =
+                        match authorize_resolved_target(
+                            cfg,
+                            vhost,
+                            req,
+                            peer.ip(),
+                            &script_fs,
+                            &script_name,
+                            None,
+                            local_port,
+                            &server_name,
+                            local_ip,
+                        ) {
+                            Ok(v) => v,
+                            Err(r) => return r,
+                        };
                     return run_cgi(
                         cfg,
                         vhost,
@@ -2187,11 +2616,28 @@ fn dispatch_inner(
                         peer,
                         local_ip,
                         local_port,
-                        &scope,
-                        &grant,
-                        &resource,
+                        &target_scope,
+                        &target_grant,
+                        &target_resource,
                         Some(&st.file),
                         Some(&st.meta),
+                    );
+                }
+                if path_info_selected_cgi {
+                    // A suffix such as `/.cgi` must not turn an arbitrary
+                    // executable into a script.  Fail closed rather than
+                    // falling through to a different handler.
+                    return error_response(
+                        cfg,
+                        vhost,
+                        &scope,
+                        403,
+                        req,
+                        &url_path,
+                        local_port,
+                        &server_name,
+                        peer.ip(),
+                        local_ip,
                     );
                 }
             }
@@ -2211,26 +2657,83 @@ fn dispatch_inner(
     }
 }
 
-fn map_path(cfg: &Config, vhost: Option<&VHost>, norm: &[u8]) -> (PathBuf, PathBuf, bool) {
+pub(crate) fn map_path(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    norm: &[u8],
+) -> Option<(PathBuf, PathBuf, bool)> {
     let url = String::from_utf8_lossy(norm);
     let base_scope = vhost.map(|v| &v.scope).unwrap_or(&cfg.global);
-    let mut best: Option<(&crate::config::Alias, usize)> = None;
+    // Apache's alias table is ordered: the first matching `Alias`,
+    // `ScriptAlias`, `AliasMatch` or `ScriptAliasMatch` wins.  A later, more
+    // specific alias that overlaps an earlier one never matches.
     for a in &base_scope.mapping_policy.aliases {
-        if let Some(rest) = alias_remainder(&a.virtual_path, &url) {
-            if best.map(|(_, l)| a.virtual_path.len() > l).unwrap_or(true) {
-                best = Some((a, a.virtual_path.len()));
+        if a.regex.is_none() {
+            if let Some(rest) = alias_remainder(&a.virtual_path, &url) {
+                let rel = PathBuf::from(rest.trim_start_matches('/'));
+                return Some((a.fs_path.clone(), rel, a.script));
             }
-            let _ = rest;
+            continue;
         }
-    }
-    if let Some((a, _)) = best {
-        let rest = alias_remainder(&a.virtual_path, &url).unwrap_or_default();
-        let rel = PathBuf::from(rest.trim_start_matches('/'));
-        return (a.fs_path.clone(), rel, a.script);
+        let Some(regex) = &a.regex else {
+            continue;
+        };
+        let Some(caps) = regex.captures(&url) else {
+            continue;
+        };
+        let Some(template) = &a.target_template else {
+            continue;
+        };
+        let mut expanded = template.clone();
+        for i in (0..caps.len()).rev() {
+            let value = caps.get(i).map(|m| m.as_str()).unwrap_or("");
+            expanded = expanded.replace(&format!("${i}"), value);
+        }
+        let target = PathBuf::from(&expanded);
+        let target = if target.is_absolute() {
+            target
+        } else {
+            cfg.server_root.join(target)
+        };
+        let target = clean_alias_path(&target);
+        // A regex alias may only resolve inside the stable alias base derived
+        // from its replacement prefix.  Falling back to `target.parent()` as a
+        // new root would silently change both the served object and the
+        // `<Directory>`/`.htaccess` authorization base.  The component-aware
+        // byte check is the verified kernel; `strip_prefix` remains the
+        // allocation-free way to obtain the relative target after admission.
+        if a.fs_path.as_os_str().is_empty()
+            || !crate::verified::path_under_base(
+                target.as_os_str().as_encoded_bytes(),
+                a.fs_path.as_os_str().as_encoded_bytes(),
+            )
+        {
+            return None;
+        }
+        let Ok(rel) = target.strip_prefix(&a.fs_path) else {
+            return None;
+        };
+        return Some((a.fs_path.clone(), rel.to_path_buf(), a.script));
     }
     let root = cfg.documentation_root_for(vhost);
     let rel = PathBuf::from(OsStr::from_bytes(&norm[1..]));
-    (root, rel, false)
+    Some((root, rel, false))
+}
+
+fn clean_alias_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        use std::path::Component::*;
+        match c {
+            Prefix(_) | RootDir => out.push(c.as_os_str()),
+            CurDir => {}
+            ParentDir => {
+                out.pop();
+            }
+            Normal(x) => out.push(x),
+        }
+    }
+    out
 }
 
 fn alias_remainder(alias: &str, url: &str) -> Option<String> {
@@ -2259,19 +2762,41 @@ fn alias_remainder(alias: &str, url: &str) -> Option<String> {
     }
 }
 
-fn match_redirect<'a>(scope: &'a Scope, url: &str) -> Option<&'a crate::config::Redirect> {
-    let mut best: Option<&crate::config::Redirect> = None;
+fn match_redirect<'a>(
+    scope: &'a Scope,
+    url: &str,
+) -> Option<(&'a crate::config::Redirect, String)> {
+    // Redirect and RedirectMatch share one ordered table, matching Apache's
+    // first-match behavior (a later overlapping redirect is unreachable).
     for r in &scope.mapping_policy.redirects {
+        if let Some(regex) = &r.regex {
+            let Some(caps) = regex.captures(url) else {
+                continue;
+            };
+            let mut location = r.to.clone();
+            for i in (0..caps.len()).rev() {
+                let value = caps.get(i).map(|m| m.as_str()).unwrap_or("");
+                location = location.replace(&format!("${i}"), value);
+            }
+            return Some((r, location));
+        }
         let m = if r.from.ends_with('/') {
             url.starts_with(&r.from)
         } else {
             url == r.from || url.starts_with(&format!("{}/", r.from))
         };
-        if m && best.map(|b| r.from.len() > b.from.len()).unwrap_or(true) {
-            best = Some(r);
+        if m {
+            let suffix = if r.from.ends_with('/') {
+                &url[r.from.len()..]
+            } else if url.len() > r.from.len() {
+                &url[r.from.len()..]
+            } else {
+                ""
+            };
+            return Some((r, format!("{}{}", r.to, suffix)));
         }
     }
-    best
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2289,6 +2814,36 @@ fn run_fastcgi(
     grant: &crate::access::AccessGrant,
     resource: &crate::access::ResourceKey,
 ) -> Response {
+    // `ProxyPassMatch`/`SetHandler` can resolve PATH_INFO to a real script
+    // whose own `<Files>`/`<Directory>` policy differs from the requested URL.
+    // Re-evaluate policy for the script target before binding the backend.
+    let script_url = if target.path_info.is_empty() {
+        url_path.to_string()
+    } else {
+        url_path
+            .strip_suffix(&target.path_info)
+            .unwrap_or(url_path)
+            .to_string()
+    };
+    let proxy_identity = target.script_filename.to_string_lossy().into_owned();
+    let (target_grant, target_resource, target_scope) = match authorize_resolved_target(
+        cfg,
+        vhost,
+        req,
+        peer.ip(),
+        &target.script_filename,
+        &script_url,
+        Some(&proxy_identity),
+        local_port,
+        server_name,
+        local_ip,
+    ) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let scope = &target_scope;
+    let grant = &target_grant;
+    let resource = &target_resource;
     let binding = target.binding_key();
     let Some(bound) = grant.bind_backend(resource, binding.clone()) else {
         return error_response(
@@ -2323,6 +2878,11 @@ fn run_fastcgi(
         );
     }
     let docroot = cfg.documentation_root_for(vhost);
+    let remote_user = grant.key().identity.as_deref();
+    let auth_type = remote_user.and_then(|_| match scope.authorization.auth_type.as_deref() {
+        Some(kind) if kind.eq_ignore_ascii_case("basic") => Some("Basic"),
+        _ => None,
+    });
     let ctx = CgiContext {
         cfg,
         vhost,
@@ -2336,13 +2896,20 @@ fn run_fastcgi(
         remote_port: peer.port(),
         local_ip,
         local_port,
+        https: crate::expr::request_is_https()
+            || local_port == 443
+            || vhost.map(|v| v.ssl.engine).unwrap_or(cfg.ssl.engine),
         server_name,
         host: server_name,
         follow_symlinks: true,
         env: &scope.request_env(req),
+        remote_user,
+        auth_type,
         script_file: None,
     };
-    fastcgi::execute(&ctx, scope, target)
+    let mut r = fastcgi::execute(&ctx, scope, target);
+    scope.header_policy.apply(&mut r.headers, r.status < 400);
+    r
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2380,11 +2947,24 @@ fn run_cgi(
         );
     }
     if let (Some(_), Some(meta)) = (script_file, script_meta) {
-        if grant.bind_file(resource, meta).is_none() {
-            let _ = std::fs::write(
-                "/tmp/vapache-cgi-debug",
-                format!("bind fail resource={resource:?} grant={:?}\n", grant.key()),
+        let Some(bound) = grant.bind_file(resource, meta) else {
+            return error_response(
+                cfg,
+                vhost,
+                scope,
+                500,
+                req,
+                script_name,
+                local_port,
+                server_name,
+                peer.ip(),
+                local_ip,
             );
+        };
+        let mut expected = resource.clone();
+        expected.file_dev = Some(meta.dev());
+        expected.file_ino = Some(meta.ino());
+        if !bound.require(&expected) {
             return error_response(
                 cfg,
                 vhost,
@@ -2404,6 +2984,11 @@ fn run_cgi(
             .effective_options()
             .contains(Options::SYMLINKS_IF_OWNER_MATCH);
     let docroot = cfg.documentation_root_for(vhost);
+    let remote_user = grant.key().identity.as_deref();
+    let auth_type = remote_user.and_then(|_| match scope.authorization.auth_type.as_deref() {
+        Some(kind) if kind.eq_ignore_ascii_case("basic") => Some("Basic"),
+        _ => None,
+    });
     let ctx = CgiContext {
         cfg,
         vhost,
@@ -2417,13 +3002,19 @@ fn run_cgi(
         remote_port: peer.port(),
         local_ip,
         local_port,
+        https: crate::expr::request_is_https()
+            || local_port == 443
+            || vhost.map(|v| v.ssl.engine).unwrap_or(cfg.ssl.engine),
         server_name,
         host: server_name,
         follow_symlinks: follow,
         env: &scope.request_env(req),
+        remote_user,
+        auth_type,
         script_file,
     };
     let mut r = cgi::execute(&ctx);
+    scope.header_policy.apply(&mut r.headers, r.status < 400);
     crate::compression::finalize(scope, req, &mut r, script_name.as_bytes());
     r
 }
@@ -2462,10 +3053,10 @@ fn apply_rewrite_effects(scope: &mut crate::config::Scope, effects: &crate::rewr
             .iter()
             .any(|h| h.ext == "*" && h.handler == *handler)
         {
-            scope.mapping_policy.handlers.push(crate::config::Handler {
-                ext: "*".into(),
-                handler: handler.clone(),
-            });
+            scope
+                .mapping_policy
+                .handlers
+                .push(crate::config::Handler::add("*".into(), handler.clone()));
         }
     }
     if let Some(content_type) = &effects.content_type {
@@ -2487,5 +3078,89 @@ mod tests {
         assert_eq!(alias_remainder("/icons/", "/iconsx"), None);
         assert_eq!(alias_remainder("/foo", "/foo/bar"), Some("/bar".into()));
         assert_eq!(alias_remainder("/foo", "/foobar"), None);
+    }
+
+    #[test]
+    fn verified_path_containment_uses_component_boundaries() {
+        assert!(vapache_verified::path_under_base(
+            b"/srv/www/a.txt",
+            b"/srv/www"
+        ));
+        assert!(vapache_verified::path_under_base(b"/srv/www", b"/srv/www"));
+        assert!(vapache_verified::path_under_base(
+            b"/srv/www/a.txt",
+            b"/srv/www/"
+        ));
+        assert!(vapache_verified::path_under_base(b"/etc/passwd", b"/"));
+        assert!(!vapache_verified::path_under_base(
+            b"/srv/www2/a.txt",
+            b"/srv/www"
+        ));
+        assert!(!vapache_verified::path_under_base(b"/srv/w", b"/srv/www"));
+        assert!(!vapache_verified::path_under_base(b"/srv/www", b""));
+    }
+
+    #[test]
+    fn regex_alias_and_redirect_expand_captures() {
+        let dir = std::env::temp_dir().join(format!("vapache-server-map-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("httpd.conf");
+        std::fs::write(
+            &conf,
+            "Listen 127.0.0.1:0\n\
+             Alias /foo/ \"/srv/a/\"\n\
+             Alias /foo/bar/ \"/srv/b/\"\n\
+             AliasMatch \"^/pub/(.*)$\" \"/srv/private/$1\"\n\
+             RedirectMatch 404 \"^/secret/(.*)$\"\n",
+        )
+        .unwrap();
+        let cfg =
+            Config::load(&conf, &dir, &Default::default(), &Default::default(), false).unwrap();
+        let (root, rel, script) = map_path(&cfg, None, b"/pub/a/b.txt").unwrap();
+        assert_eq!(root, PathBuf::from("/srv/private"));
+        assert_eq!(rel, PathBuf::from("a/b.txt"));
+        assert!(!script);
+        // The first overlapping prefix alias wins, even though the second is
+        // more specific.
+        let (root, rel, _) = map_path(&cfg, None, b"/foo/bar/x").unwrap();
+        assert_eq!(root, PathBuf::from("/srv/a"));
+        assert_eq!(rel, PathBuf::from("bar/x"));
+        let (red, location) = match_redirect(&cfg.global, "/secret/file").unwrap();
+        assert_eq!(red.status, 404);
+        assert!(location.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regex_alias_cannot_re_root_outside_its_configured_base() {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-server-alias-escape-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("httpd.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "ServerRoot \"{}\"\n\
+                 Listen 127.0.0.1:0\n\
+                 AliasMatch \"^/capture(.*)$\" \"$1\"\n\
+                 AliasMatch \"^/fixed$\" \"/srv/fixed/index.html\"\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let cfg =
+            Config::load(&conf, &dir, &Default::default(), &Default::default(), false).unwrap();
+        // Capture-only absolute replacements outside ServerRoot are a failed
+        // mapping, not a new parent-rooted target.
+        assert!(map_path(&cfg, None, b"/capture/tmp/elsewhere/secret.txt").is_none());
+        // A fixed absolute target still maps relative to its stable parent.
+        let (root, rel, _) = map_path(&cfg, None, b"/fixed").unwrap();
+        assert_eq!(root, PathBuf::from("/srv/fixed"));
+        assert_eq!(rel, PathBuf::from("index.html"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

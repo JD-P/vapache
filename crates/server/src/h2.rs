@@ -624,7 +624,7 @@ async fn handle_stream(
     let peer = cfg.client_addr(peer, &req);
     let resp = match early {
         Some(resp) => resp,
-        None => crate::server::dispatch(&cfg, &req, peer, &local_ip, local_port),
+        None => crate::server::dispatch_with_scheme(&cfg, &req, peer, &local_ip, local_port, true),
     };
     let head_only = req.is_head();
     let status = resp.status;

@@ -112,8 +112,9 @@ The 12 rewrite rows were used as prompts for a narrower spec boundary:
   default backreference/variable expansion cannot introduce `?`; unsafe
   behavior requires the explicit `UnsafeAllow3F` flag.
 - **CVE-2024-38475** — `rewrite_filesystem_admit` proves an absolute rewrite
-  file target is below the document root, or below the server root only with
-  explicit `UnsafePrefixStat`; target authorization is re-evaluated.
+  file target is below the current document/alias root; `UnsafePrefixStat` is
+  parsed for compatibility but never changes the authorization base, and
+  target authorization is re-evaluated.
 - **CVE-2024-39573** — proxying requires explicit `[P]`; external
   substitutions otherwise redirect, and proxy targets are canonical and
   access-checked.

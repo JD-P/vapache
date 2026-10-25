@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "updated": "2026-10-24",
+  "updated": "2026-10-25",
   "verus": {
-    "verified_functions": 194,
+    "verified_functions": 218,
     "errors": 0
   },
   "obligations": [
@@ -11,7 +11,7 @@
       "title": "field-wise Scope merge",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "auth_merge_kind, option_child_wins/option_child_presence, options_apply and append_vec are mechanized/used; every container/list field merges through the verified append helper; ErrorDocument and RewriteMap are list-backed with reverse child-wins lookup; parser and Options-list construction remain outside this obligation"
+      "evidence": "auth_merge_kind, option_child_wins/option_child_presence, options_apply and append_vec are mechanized/used; append-only container/list fields merge through the verified helper; Header set uses ordered child replacement audited by the debug container snapshot; ErrorDocument and RewriteMap are list-backed with reverse child-wins lookup; parser and Options-list construction remain outside this obligation"
     },
     {
       "id": "phase_order",
@@ -25,14 +25,14 @@
       "title": "per-directory Directory; access-file interleaving",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "verified plan and collect_layers classifier; parser-to-AccessLayer refinement is assumed"
+      "evidence": "verified plan and collect_layers classifier; alias targets walk to the alias root instead of stopping at DocumentRoot; parser-to-AccessLayer refinement is assumed"
     },
     {
       "id": "require_eval_sound",
       "title": "Require/PolicyResult semantics",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "PolicyResult combinators and require_none are verified; provider/auth/expression semantics are not"
+      "evidence": "PolicyResult combinators and require_none are verified; expression integer/string comparison and glob matching now run through verified kernels (expr_compare_ints, expr_compare_strs, expr_glob_match); provider/auth backends and regex/file/IP leaf semantics remain outside the model"
     },
     {
       "id": "require_none_never_grants",
@@ -51,16 +51,142 @@
     {
       "id": "prefilter_sound",
       "title": "htaccess/cache prefilter over-approximation",
-      "status": "open",
+      "status": "partial",
       "weight": 1.0,
-      "evidence": "unit/differential tests only"
+      "evidence": "prefilter_sound proves both boolean implications in Verus: htaccess_may_apply false admits no access-file layer, and a false cache prefilter over an unchanged base enable list keeps cache_enabled false; the path-pattern matcher, recursive rule flattening and parser-to-ActiveLayer refinement remain explicit assumptions"
     },
     {
       "id": "acl_reachability",
       "title": "ACL reachability and resource binding",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "I1a path/URL/proxy/cache grants and I1b inode binding for file/directory; proxy/cache/CGI/FastCGI full binding is open"
+      "evidence": "I1a path/URL/proxy/cache grants and I1b inode binding for file/directory; I31 binds CGI scripts by inode and FastCGI by transport/script/PATH_INFO, exports grant identity and makes the FastCGI target authoritative for derived environment; I32 binds both logical and concrete balancer identities and atomically replaces grant/resource on failover; the mechanized universal sink theorem remains open"
+    },
+    {
+      "id": "mapping_order",
+      "title": "Ordered competing request-to-resource mappings",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "first_match_is_first and first_match_none_means_no_match prove that the selected match bit is the first true one and that no bit means no match, so a later overlapping route cannot win; Alias/AliasMatch/ScriptAliasMatch and Redirect/RedirectMatch use this order, ProxyPass/ProxyPassMatch share one route_order space, handler operations use last-match wins, and unit/differential tests cover order reversal; flattening the runtime tables to the match-bit vector remains outside Verus"
+    },
+    {
+      "id": "transform_reauthorization",
+      "title": "Every target-changing transform reauthorizes the sink",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "the I30 transform inventory covers alias mapping, CGI/FastCGI PATH_INFO and handlers, symlink targets, internal URL/filesystem rewrites, DirectoryIndex, ErrorDocument, DirectorySlash, proxy/balancer failover, cache PATH_INFO and WebSocket targets; each re-evaluates the target scope and binds the sink grant, and original-URL rechecks use the original request context plus accumulated rewrite effects; the universal Resolve/Authorize/Transform/Sink theorem remains a proof obligation"
+    },
+    {
+      "id": "trusted_request_context",
+      "title": "Scheme, peer, canonical name and identity have trusted sources",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "HTTPS/REQUEST_SCHEME come from listener TLS state, RemoteIP only trusts configured internal proxies, UseCanonicalName uses ServerName, and identity comes from verified authenticators; context-construction refinement is not mechanized"
+    },
+    {
+      "id": "resource_bounds",
+      "title": "Untrusted streams have bounded size and deadlines",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "I33 covers request/proxy trailer count and byte budgets, proxy chunk checked_add before resize, CGI worker path/env/body/output caps, FastCGI record/header/stdout/stderr caps, HTTP/2 budgets and compression; framing-limit unit cases cover oversized chunks, long lines, trailer floods and FastCGI stderr; the aggregate resource-exhaustion model is not mechanized"
+    },
+    {
+      "id": "response_header_policy",
+      "title": "Header set/add/unset/always semantics across all response paths",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Static, directory, redirect, CGI/FastCGI, proxy and error responses apply the ordered header policy; child set replaces, unset runs last, always applies to errors; merge/application proofs are unit-tested but not mechanized"
+    },
+    {
+      "id": "terminal_sink_gate",
+      "title": "Every positive terminal outcome enforces original-URL and current-target grants",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Static/directory, CGI/FastCGI, proxy and positive redirect outcomes require both the original request URL scope and the transformed target scope; F23 regression covers rewrite-then-proxy and rewrite-then-redirect, but the state-machine gate is not mechanized"
+    },
+    {
+      "id": "cache_generation_epoch",
+      "title": "Reload advances a cache generation and stale entries are never served",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "cache_lookup_admit binds generation_match, disk metadata records the epoch, reload clears memory/disk and bumps the epoch, and PATH_INFO keys resolve to the actual CGI script; admission is verified, reload orchestration is not"
+    },
+    {
+      "id": "resolve_root_identity",
+      "title": "map_path, access-file walk and cache consume one alias-root identity",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Relative AliasMatch/ScriptAliasMatch roots are resolved against ServerRoot at compile time and access_root_for uses the same alias table; absolute/prefix and relative/capture-only forms are unit-tested"
+    },
+    {
+      "id": "output_context_encoding",
+      "title": "Autoindex and generated headers use sink-context encoders",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "safe_relative_href prefixes './' before URL encoding so hostile names cannot become javascript:/data:/scheme-relative links; header values still pass the verified CR/LF/NUL sanitizer"
+    },
+    {
+      "id": "provider_operand_binding",
+      "title": "Require providers consume exactly the post-not operand",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "parse_require uses rest.first() for env and rest.join(' ') for expr, and Require::Expr carries negation; unit and HTTP-level tests cover not env, not env NAME=VALUE and not expr"
+    },
+    {
+      "id": "directive_effect_completeness",
+      "title": "Every accepted .htaccess directive is modeled, explicitly inert, or rejected",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "htaccess SetEnv/SetEnvIf/UnsetEnv/PassEnv and IndexIgnore populate EnvironmentPolicy/ContentPolicy through the same parser as main config; RequestHeader is rejected instead of accepted as inert; DIRECTIVE_SPECS is the authoritative disposition/category registry and an exhaustive test matrix asserts every entry is effectful, inert or rejected and is gated by AllowOverride None; I34 adds the main-config fail-closed matrix for security, filter, audit and resource-limit directives plus explicit compatibility-inert warnings"
+    },
+    {
+      "id": "autoindex_canonical_directory",
+      "title": "Autoindex policy and /dir versus /dir/ authorization",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "IndexIgnore filters listing entries in main config and .htaccess; DirectorySlash Off reauthorizes a no-slash directory target as the canonical trailing-slash URL before index/listing dispatch"
+    },
+    {
+      "id": "alias_base_containment",
+      "title": "Regex alias targets remain inside their configured alias base",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "map_path returns an explicit mapping failure when a capture-only or absolute AliasMatch/ScriptAliasMatch expansion leaves fs_path; the parent-root fallback is removed; alias admission now consumes the verified component-aware path_under_base kernel (including the /srv/www versus /srv/www2 boundary), and unit plus end-to-end F31 cases cover the escape shape"
+    },
+    {
+      "id": "rewrite_filesystem_containment",
+      "title": "Internal rewrite filesystem targets never change the authorization base",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "verified rewrite_filesystem_admit admits only files below the current document/alias root; its under_base input is produced by the verified component-aware path_under_base kernel; UnsafePrefixStat cannot re-root at the target parent; rewrite unit tests and the F32 replay cover the former server-root escape"
+    },
+    {
+      "id": "fastcgi_script_containment",
+      "title": "FastCGI script and PATH_INFO targets are bounded by the configured base",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "script_from_prefix and split_path_info clean/canonicalize the script inside the FastCGI prefix or document/alias root and consume the verified component-aware path_under_base kernel; the ancestor walk cannot select an ancestor file such as /bin/sh or a sibling with a shared byte prefix such as www2; unit cases cover dot segments, $1 templates, sibling-prefix targets and outside targets"
+    },
+    {
+      "id": "cache_authorization_inputs",
+      "title": "Cache keys bind request inputs that select authorization branches",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "cache_policy_material destructures Scope and hashes every policy slice (rewrite maps canonicalized); cache_policy_fingerprint also binds all request headers, peer, method and target; the unit matrix mutates every policy field plus listener/vhost/URL/query/target/header dimensions, and F34 replay verifies tenant beta cannot receive tenant alpha's entry"
+    },
+    {
+      "id": "proxy_serialization_safety",
+      "title": "Upstream request lines and forwarded headers reject control injection",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "backend authorities are validated at parse time, X-Forwarded-Host is checked before insertion, and validate_proxy_head applies the verified proxy_request_line_admit and proxy_header_admit kernels (method/target/version plus token/header-value admission) immediately before every upstream write"
+    },
+    {
+      "id": "cgi_authentication_env",
+      "title": "Authenticated identity reaches CGI and FastCGI environment",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "the access-grant identity is carried into CgiContext and build_env emits REMOTE_USER/AUTH_TYPE for local CGI and FastCGI; configured environment entries remain unable to override reserved names; unit and F38 replay cases cover Basic auth"
     }
   ],
   "minimum_weighted_score": 3.5,
@@ -86,18 +212,18 @@
     "total": 8,
     "grant_required": 8,
     "path_target_bound": 8,
-    "inode_bound": 3,
-    "policy_key_bound": 2,
-    "minimum_inode_bound": 3,
+    "inode_bound": 4,
+    "policy_key_bound": 3,
+    "minimum_inode_bound": 4,
     "backend_target_bound": 3,
     "minimum_backend_target_bound": 3,
-    "minimum_policy_key_bound": 2
+    "minimum_policy_key_bound": 3
   },
   "adversarial": {
     "conformance": 165,
     "semantics": 194,
     "random": 300,
-    "cve_replay_cases": 0,
+    "cve_replay_cases": 29,
     "unexplained_replay_failures": 0,
     "max_unexplained_replay_failures": 0,
     "cve_triage_cases": 371,
@@ -126,13 +252,30 @@
     "CGI configured-environment admission",
     "HTTP/2 adapter stream-ID admission and local lifecycle state",
     "TLS listener client-certificate policy identity",
-    "Scope container/list append and reverse child-wins map lookup",
+    "Scope append-only container/list merge and reverse child-wins map lookup",
     "Rewrite target external/internal classification, internal joining and same-host authority identity",
-    "Expression value truthiness and rewrite condition-chain folding",
+    "Component-aware filesystem containment for alias, rewrite and FastCGI targets (path_under_base)",
+    "Expression value truthiness, integer/string comparison and glob matching, plus rewrite condition-chain folding",
     "Regex dialect admission guard for configuration and expression patterns",
     "Directive disposition and fail-closed security fallback",
+    "Shared request-to-target mapping for dispatch and cache authorization",
+    "Ordered alias/redirect/proxy route tables and handler operation ordering",
+    "Closed transform inventory with original-context and current-target reauthorization",
+    "Canonical ServerName context for redirects and expression variables",
+    "Cache key identity for listener, vhost, URL, resolved target and policy",
+    "Balancer logical/concrete proxy identity and failover reauthorization",
+    "CGI control-socket CLOEXEC and spool-backed request-body transfer",
     "Access-file rule slot translation into conditional/Files/top-level layers",
     "Configuration front-end line-kind IR classification",
-    "Configuration section-context nesting transition"
+    "Configuration section-context nesting transition",
+    "Configured-base containment for regex aliases and internal rewrites",
+    "FastCGI script and PATH_INFO containment",
+    "Cache policy fingerprint closure over every Scope policy slice and header-selected authorization input",
+    "CGI/FastCGI authenticated identity environment and exact target-derived environment",
+    "Upstream proxy request-head serialization validation",
+    "Proxy route order and logical/concrete balancer identity binding",
+    "Main-config directive disposition and explicit compatibility-inert warnings",
+    "Framing and resource-bound closure across HTTP, proxy, CGI and FastCGI streams",
+    "Exhaustive .htaccess directive disposition and override-category matrix"
   ]
 }

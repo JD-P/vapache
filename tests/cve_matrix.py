@@ -106,7 +106,7 @@ OVERRIDES: dict[str, tuple[str, str, str, str]] = {
     "CVE-2020-1927": ("prevented", "rewrite-redirect", "verified percent_decode_path rejects encoded controls before rewrite; redirect locations are escaped", "medium"),
     "CVE-2023-25690": ("prevented", "rewrite-proxy-target", "verified rewrite_backref_no_qmark prevents capture/variable '?' injection by default; proxy framing is strict and UnsafeAllow3F is explicit", "high"),
     "CVE-2024-38474": ("prevented", "rewrite-substitution", "default backreference/variable encoding proves no '?' is introduced; UnsafeAllow3F is an explicit opt-in", "high"),
-    "CVE-2024-38475": ("prevented", "rewrite-filesystem", "verified rewrite_filesystem_admit limits absolute rewritten files to docroot, or serverroot only with explicit UnsafePrefixStat; target scope is re-evaluated", "high"),
+    "CVE-2024-38475": ("prevented", "rewrite-filesystem", "verified rewrite_filesystem_admit limits absolute rewritten files to the current document/alias root; UnsafePrefixStat is parsed for compatibility but never changes the authorization base, and target scope is re-evaluated", "high"),
     "CVE-2024-39573": ("prevented", "rewrite-proxy", "only an explicit [P] flag selects proxying; external substitutions otherwise redirect, and proxy targets are canonical and access-checked", "high"),
     "CVE-2025-54090": ("not_applicable", "rewrite-expr", "Apache 2.4.64-specific regression; Vapache has an independent expression evaluator with a false-expression regression", "medium"),
     "CVE-2026-56154": ("fail_closed", "rewrite-lookahead", "LA-U/LA-F lookahead variables are rejected at configuration load instead of evaluated", "high"),

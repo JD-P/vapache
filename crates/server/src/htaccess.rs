@@ -113,7 +113,7 @@ pub fn apply_req_deferred(
     apply_config_dirs: bool,
     config_files: &mut Vec<crate::config::ScopeRule>,
 ) -> Result<(), String> {
-    let root = cfg.documentation_root_for(vhost);
+    let root = access_root_for(cfg, vhost, fs_path);
     let start = if fs_path.is_dir() {
         fs_path
     } else {
@@ -136,6 +136,12 @@ pub fn apply_req_deferred(
     let can_read_access = cfg.override_enabled && cfg.override_applicable(fs_path);
     let mut ignored_locations = Vec::new();
     for dir in dirs {
+        // A PATH_INFO request maps to `script.cgi/info`; the immediate
+        // "parent" is the script file, not a directory.  Only real
+        // directories can contain access files.
+        if !dir.is_dir() {
+            continue;
+        }
         if apply_config_dirs {
             if let Some(req) = req {
                 cfg.apply_directory_rules_for_dir(
@@ -152,7 +158,7 @@ pub fn apply_req_deferred(
                 );
             }
         }
-        if !can_read_access || !(dir.starts_with(&root) || dir == start) {
+        if !can_read_access || !dir.starts_with(&root) {
             continue;
         }
         // Resolving a per-directory scope walks the vhost and rule lists.  The
@@ -227,6 +233,31 @@ pub fn apply_req_deferred(
     Ok(())
 }
 
+/// The filesystem root that bounds an access-file walk.  For a document-root
+/// target this is `DocumentRoot`; for an `Alias`/`ScriptAlias` target outside
+/// the document root it is the alias target directory.  The walk must stop at
+/// that root, not at the document root, or parent access files between the
+/// filesystem root and the alias target are skipped.
+fn access_root_for(cfg: &Config, vhost: Option<&VHost>, fs_path: &Path) -> PathBuf {
+    let docroot = cfg.documentation_root_for(vhost);
+    if fs_path == docroot || fs_path.starts_with(&docroot) {
+        return docroot;
+    }
+    let base = vhost.map(|v| &v.scope).unwrap_or(&cfg.global);
+    // Aliases are an ordered table.  The first alias whose target contains
+    // this path is the one that mapped the request; a later overlapping alias
+    // cannot be reached, so it must not change the access-file walk root.
+    for alias in &base.mapping_policy.aliases {
+        if alias.fs_path.as_os_str().is_empty() {
+            continue;
+        }
+        if fs_path == alias.fs_path || fs_path.starts_with(&alias.fs_path) {
+            return alias.fs_path.clone();
+        }
+    }
+    docroot
+}
+
 /// Parse the access files that affect a request into pure layers.  Filesystem
 /// I/O and parsing stay here; the merge is performed by
 /// `policy_ref::effective_scope_with_layers`, so the interleaving has a single
@@ -240,7 +271,7 @@ pub fn collect_layers(
     if !cfg.htaccess_may_apply(fs_path) {
         return Ok(Vec::new());
     }
-    let root = cfg.documentation_root_for(vhost);
+    let root = access_root_for(cfg, vhost, fs_path);
     let start = if fs_path.is_dir() {
         fs_path
     } else {
@@ -262,7 +293,7 @@ pub fn collect_layers(
     dirs.dedup();
     let mut layers = Vec::new();
     for dir in dirs {
-        if !(dir.starts_with(&root) || dir == start) {
+        if !dir.is_dir() || !dir.starts_with(&root) {
             continue;
         }
         let dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
@@ -337,7 +368,7 @@ pub fn trace_access_files(
         out.push("skipped (no override-enabled directory in path)".into());
         return out;
     }
-    let root = cfg.documentation_root_for(vhost);
+    let root = access_root_for(cfg, vhost, fs_path);
     let start = if fs_path.is_dir() {
         fs_path
     } else {
@@ -359,7 +390,7 @@ pub fn trace_access_files(
     dirs.dedup();
     let mut found = false;
     for dir in dirs {
-        if !(dir.starts_with(&root) || dir == start) {
+        if !dir.is_dir() || !dir.starts_with(&root) {
             continue;
         }
         let dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
@@ -955,6 +986,13 @@ fn skip_section(lines: &[String], i: &mut usize, name: &str) -> Result<(), Strin
     Err(format!("missing closing </{name}>"))
 }
 
+/// `.htaccess` cannot see `LoadModule` state, so a positive `<IfModule>`
+/// must not silently hide directives that the server actually implements.
+/// Parse the block for every module name; unknown modules inside such a block
+/// still fail closed if their directives are unsupported.  For a negated
+/// module, only skip the block when the module is one of the built-ins below
+/// (treating an unknown, possibly-loaded module as present is the
+/// conservative choice for access rules).
 fn ifmodule_active(args: &[String]) -> bool {
     let Some(name) = args.first() else {
         return false;
@@ -963,13 +1001,19 @@ fn ifmodule_active(args: &[String]) -> bool {
         Some(n) => (true, n),
         None => (false, name.as_str()),
     };
-    let supported = [
+    let builtin = [
         "mod_authz_core.c",
         "authz_core_module",
         "mod_authz_user.c",
         "authz_user_module",
         "mod_authz_groupfile.c",
         "authz_groupfile_module",
+        "mod_authn_core.c",
+        "authn_core_module",
+        "mod_authz_host.c",
+        "authz_host_module",
+        "mod_access_compat.c",
+        "access_compat_module",
         "mod_auth_basic.c",
         "auth_basic_module",
         "mod_authn_file.c",
@@ -984,72 +1028,422 @@ fn ifmodule_active(args: &[String]) -> bool {
         "headers_module",
         "mod_setenvif.c",
         "setenvif_module",
+        "mod_rewrite.c",
+        "rewrite_module",
+        "mod_cgi.c",
+        "cgi_module",
+        "mod_autoindex.c",
+        "autoindex_module",
         "mod_deflate.c",
         "deflate_module",
         "mod_brotli.c",
         "brotli_module",
         "mod_filter.c",
         "filter_module",
+        "mod_expires.c",
+        "expires_module",
+        "mod_env.c",
+        "env_module",
+        "mod_remoteip.c",
+        "remoteip_module",
+        "mod_proxy.c",
+        "proxy_module",
+        "mod_proxy_http.c",
+        "proxy_http_module",
+        "mod_proxy_fcgi.c",
+        "proxy_fcgi_module",
+        "mod_cache.c",
+        "cache_module",
+        "mod_cache_disk.c",
+        "cache_disk_module",
+        "mod_ssl.c",
+        "ssl_module",
     ]
     .iter()
     .any(|m| m.eq_ignore_ascii_case(name));
     if negated {
-        !supported
+        !builtin
     } else {
-        supported
+        true
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectiveDisposition {
+    /// The directive must change the parsed scope or add a rule.
+    Effectful,
+    /// The directive is accepted only because its effect is genuinely local
+    /// to presentation/metadata and cannot select an access or mapping branch.
+    Inert,
+    /// The directive is recognized but refused in `.htaccess`.
+    Reject,
+}
+
+/// Authoritative disposition table for every directive the `.htaccess` parser
+/// recognizes.  `apply_directive` refuses names absent from this table, and
+/// `directive_category` derives the AllowOverride category from it.  The test
+/// matrix in this module must cover every entry with an observable effect.
+const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
+    (
+        "addcharset",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "adddefaultcharset",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "adddescription",
+        OverrideCategory::Indexes,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "addencoding",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "addhandler",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "addinputfilter",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "addlanguage",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "addoutputfilter",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "addoutputfilterbytype",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "addtype",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "allow",
+        OverrideCategory::Limit,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "allowmethods",
+        OverrideCategory::AuthConfig,
+        DirectiveDisposition::Reject,
+    ),
+    (
+        "authbasicprovider",
+        OverrideCategory::AuthConfig,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "authgroupfile",
+        OverrideCategory::AuthConfig,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "authmerging",
+        OverrideCategory::AuthConfig,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "authname",
+        OverrideCategory::AuthConfig,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "authtype",
+        OverrideCategory::AuthConfig,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "authuserfile",
+        OverrideCategory::AuthConfig,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "browsermatch",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "browsermatchnocase",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "brotlialteretag",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "brotlicompressionalteretag",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "brotlicompressionquality",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "deflatealteretag",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "deflatebuffersize",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "deflatecompressionlevel",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "deflatefilternote",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "deflatememlevel",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "deflatewindowssize",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "deny",
+        OverrideCategory::Limit,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "directoryindex",
+        OverrideCategory::Indexes,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "directoryslash",
+        OverrideCategory::Indexes,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "enablesendfile",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "errordocument",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "expiresactive",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "expiresbytype",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "expiresdefault",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "fileetag",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "forcetype",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "header",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "headername",
+        OverrideCategory::Indexes,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "indexignore",
+        OverrideCategory::Indexes,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "indexoptions",
+        OverrideCategory::Indexes,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "options",
+        OverrideCategory::Options,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "order",
+        OverrideCategory::Limit,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "passenv",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "readmefile",
+        OverrideCategory::Indexes,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "redirect",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "redirectmatch",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "redirectpermanent",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "redirecttemp",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "removecharset",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "removeencoding",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Inert,
+    ),
+    (
+        "removehandler",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "removetype",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "requestheader",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Reject,
+    ),
+    (
+        "require",
+        OverrideCategory::AuthConfig,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "rewritebase",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "rewritecond",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "rewriteengine",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "rewriteoptions",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "rewriterule",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "satisfy",
+        OverrideCategory::AuthConfig,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "sethandler",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "setenv",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "setenvif",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "setenvifnocase",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "setinputfilter",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "setoutputfilter",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+    (
+        "unsetenv",
+        OverrideCategory::FileInfo,
+        DirectiveDisposition::Effectful,
+    ),
+];
+
+fn directive_spec(
+    name: &str,
+) -> Option<&'static (&'static str, OverrideCategory, DirectiveDisposition)> {
+    DIRECTIVE_SPECS.iter().find(|spec| spec.0 == name)
+}
+
 fn directive_category(name: &str) -> Option<OverrideCategory> {
-    Some(match name {
-        "require" | "authtype" | "authname" | "authuserfile" | "authgroupfile"
-        | "authbasicprovider" | "authmerging" => OverrideCategory::AuthConfig,
-        "options" => OverrideCategory::Options,
-        "directoryindex" | "indexoptions" | "indexignore" | "adddescription" | "readmefile"
-        | "headername" | "directoryslash" => OverrideCategory::Indexes,
-        "order" | "allow" | "deny" => OverrideCategory::Limit,
-        "addtype"
-        | "removetype"
-        | "addhandler"
-        | "sethandler"
-        | "forcetype"
-        | "adddefaultcharset"
-        | "header"
-        | "redirect"
-        | "errordocument"
-        | "fileetag"
-        | "enablesendfile"
-        | "rewriteengine"
-        | "rewritebase"
-        | "rewritecond"
-        | "rewriterule"
-        | "rewriteoptions"
-        | "expiresactive"
-        | "expiresbytype"
-        | "expiresdefault"
-        | "setenv"
-        | "setenvif"
-        | "requestheader"
-        | "addcharset"
-        | "addlanguage"
-        | "addencoding"
-        | "removecharset"
-        | "removeencoding"
-        | "addoutputfilterbytype"
-        | "addoutputfilter"
-        | "setoutputfilter"
-        | "deflatecompressionlevel"
-        | "brotlicompressionquality"
-        | "deflatealteretag"
-        | "brotlialteretag"
-        | "brotlicompressionalteretag"
-        | "deflatefilternote"
-        | "deflatebuffersize"
-        | "deflatememlevel"
-        | "deflatewindowssize" => OverrideCategory::FileInfo,
-        "satisfy" => OverrideCategory::AuthConfig,
-        _ => return None,
-    })
+    directive_spec(name).map(|spec| spec.1)
 }
 
 #[cfg(test)]
@@ -1117,6 +1511,21 @@ fn apply_directive(
     args: &[String],
     limit: Option<&MethodSet>,
 ) -> Result<(), String> {
+    let Some(spec) = directive_spec(name) else {
+        return Err(format!("unsupported .htaccess directive '{name}'"));
+    };
+    if spec.2 == DirectiveDisposition::Reject {
+        return Err(match name {
+            "allowmethods" => {
+                "AllowMethods is only allowed in directory configuration, not .htaccess".into()
+            }
+            "requestheader" => {
+                "RequestHeader is not implemented in .htaccess; refusing to ignore a request-mutating directive"
+                    .into()
+            }
+            _ => format!("unsupported .htaccess directive '{name}'"),
+        });
+    }
     let first = args.first().map(String::as_str).unwrap_or("");
     match name {
         "require" => {
@@ -1170,17 +1579,30 @@ fn apply_directive(
         "addhandler" => {
             if args.len() >= 2 {
                 for ext in &args[1..] {
-                    scope.mapping_policy.handlers.push(crate::config::Handler {
-                        ext: ext.trim_start_matches('.').to_ascii_lowercase(),
-                        handler: args[0].clone(),
-                    });
+                    scope
+                        .mapping_policy
+                        .handlers
+                        .push(crate::config::Handler::add(
+                            ext.trim_start_matches('.').to_ascii_lowercase(),
+                            args[0].clone(),
+                        ));
                 }
             }
         }
-        "sethandler" => scope.mapping_policy.handlers.push(crate::config::Handler {
-            ext: "*".into(),
-            handler: first.to_string(),
-        }),
+        "removehandler" => {
+            for ext in args {
+                scope
+                    .mapping_policy
+                    .handlers
+                    .push(crate::config::Handler::remove(
+                        ext.trim_start_matches('.').to_ascii_lowercase(),
+                    ));
+            }
+        }
+        "sethandler" => scope
+            .mapping_policy
+            .handlers
+            .push(crate::config::Handler::add("*".into(), first.to_string())),
         "forcetype" => scope.content_policy.force_type = Some(first.to_string()),
         "adddefaultcharset" => {
             if !first.eq_ignore_ascii_case("off") {
@@ -1304,11 +1726,6 @@ fn apply_directive(
             };
             scope.add_satisfy(satisfy, limit);
         }
-        "allowmethods" => {
-            return Err(
-                "AllowMethods is only allowed in directory configuration, not .htaccess".into(),
-            )
-        }
         "authmerging" => {
             scope.authorization.auth_merging = Some(match first.to_ascii_lowercase().as_str() {
                 "off" => AuthMerging::Off,
@@ -1351,7 +1768,16 @@ fn apply_directive(
             scope.rewrite_policy.rewrite_inherit =
                 Some(args.iter().any(|a| a.eq_ignore_ascii_case("Inherit")));
         }
-        "redirect" => apply_redirect(scope, args)?,
+        "redirect" | "redirectpermanent" | "redirecttemp" => {
+            let mut args = args.to_vec();
+            if name == "redirectpermanent" {
+                args.insert(0, "301".into());
+            } else if name == "redirecttemp" {
+                args.insert(0, "302".into());
+            }
+            apply_redirect(scope, &args)?
+        }
+        "redirectmatch" => apply_redirect_match(scope, args)?,
         "fileetag" => {
             let mut v = 0u32;
             for a in args {
@@ -1384,12 +1810,41 @@ fn apply_directive(
                     .push((args[0].to_ascii_lowercase(), args[1..].join(" ")));
             }
         }
-        // These do not affect access decisions or response framing; accepting
-        // them keeps common .htaccess files usable until environment filters
-        // are implemented.
-        "setenv" | "setenvif" | "requestheader" | "addcharset" | "addlanguage" | "addencoding"
-        | "removecharset" | "removeencoding" | "adddescription" | "indexoptions"
-        | "indexignore" | "readmefile" | "headername" => {}
+        "setenv" => {
+            let Some(name) = args.first() else {
+                return Err("SetEnv requires a variable".into());
+            };
+            scope
+                .environment_policy
+                .set_env
+                .push((name.clone(), args[1..].join(" ")));
+        }
+        "unsetenv" => scope
+            .environment_policy
+            .unset_env
+            .extend(args.iter().cloned()),
+        "passenv" => scope
+            .environment_policy
+            .pass_env
+            .extend(args.iter().cloned()),
+        "setenvif" | "setenvifnocase" | "browsermatch" | "browsermatchnocase" => {
+            scope
+                .environment_policy
+                .set_env_if
+                .push(crate::config::parse_env_rule(name, args)?);
+        }
+        "indexignore" => {
+            scope
+                .content_policy
+                .index_ignore
+                .extend(args.iter().cloned());
+        }
+        // These are explicitly reviewed as inert in `DIRECTIVE_SPECS`.  They
+        // do not affect access decisions, request mutation, handler selection
+        // or response framing; accepting them keeps common .htaccess files
+        // usable until the corresponding presentation filters are implemented.
+        "addcharset" | "addlanguage" | "addencoding" | "removecharset" | "removeencoding"
+        | "adddescription" | "indexoptions" | "readmefile" | "headername" => {}
         _ => return Err(format!("unsupported .htaccess directive '{name}'")),
     }
     Ok(())
@@ -1438,7 +1893,8 @@ fn apply_header(scope: &mut Scope, args: &[String]) -> Result<(), String> {
         return Err("Header requires an action and name".into());
     }
     let mut idx = 0;
-    if args[0].eq_ignore_ascii_case("always") || args[0].eq_ignore_ascii_case("onsuccess") {
+    let always = args[0].eq_ignore_ascii_case("always");
+    if always || args[0].eq_ignore_ascii_case("onsuccess") {
         idx = 1;
     }
     if args.len() < idx + 2 {
@@ -1446,16 +1902,25 @@ fn apply_header(scope: &mut Scope, args: &[String]) -> Result<(), String> {
     }
     let action = args[idx].to_ascii_lowercase();
     let name = args[idx + 1].trim_end_matches(':').to_string();
-    match action.as_str() {
-        "set" => {
+    match (action.as_str(), always) {
+        ("set", true) => {
+            let value = args[idx + 2..].join(" ");
+            scope.header_policy.always_set_headers.push((name, value));
+        }
+        ("set", false) => {
             let value = args[idx + 2..].join(" ");
             scope.header_policy.set_headers.push((name, value));
         }
-        "add" => {
+        ("add", true) => {
+            let value = args[idx + 2..].join(" ");
+            scope.header_policy.always_add_headers.push((name, value));
+        }
+        ("add", false) => {
             let value = args[idx + 2..].join(" ");
             scope.header_policy.add_headers.push((name, value));
         }
-        "unset" => scope.header_policy.unset_headers.push(name),
+        ("unset", true) => scope.header_policy.always_unset_headers.push(name),
+        ("unset", false) => scope.header_policy.unset_headers.push(name),
         _ => return Err(format!("unsupported Header action '{action}'")),
     }
     Ok(())
@@ -1465,19 +1930,47 @@ fn apply_redirect(scope: &mut Scope, args: &[String]) -> Result<(), String> {
     if args.len() < 2 {
         return Err("Redirect requires a source and target".into());
     }
-    let (status, from, to) = if args[0].parse::<u16>().is_ok() && args.len() >= 3 {
-        (
-            args[0].parse().unwrap_or(302),
-            args[1].clone(),
-            args[2..].join(" "),
-        )
-    } else {
-        (302, args[0].clone(), args[1..].join(" "))
+    let (status, rest) = match args[0].parse::<u16>() {
+        Ok(s) => (s, &args[1..]),
+        _ => (302, args),
     };
+    if rest.is_empty() {
+        return Err("Redirect requires a source path".into());
+    }
     scope
         .mapping_policy
         .redirects
-        .push(crate::config::Redirect { from, to, status });
+        .push(crate::config::Redirect {
+            from: rest[0].clone(),
+            to: rest[1..].join(" "),
+            status,
+            regex: None,
+        });
+    Ok(())
+}
+
+fn apply_redirect_match(scope: &mut Scope, args: &[String]) -> Result<(), String> {
+    if args.len() < 2 {
+        return Err("RedirectMatch requires a pattern".into());
+    }
+    let (status, rest) = match args[0].parse::<u16>() {
+        Ok(s) => (s, &args[1..]),
+        _ => (302, args),
+    };
+    if rest.is_empty() {
+        return Err("RedirectMatch requires a pattern".into());
+    }
+    let regex = crate::config::compile_regex(&rest[0])
+        .map_err(|e| format!("bad RedirectMatch regex: {e}"))?;
+    scope
+        .mapping_policy
+        .redirects
+        .push(crate::config::Redirect {
+            from: String::new(),
+            to: rest[1..].join(" "),
+            status,
+            regex: Some(std::sync::Arc::new(regex)),
+        });
     Ok(())
 }
 
@@ -1630,12 +2123,72 @@ mod tests {
         assert!(p
             .scope
             .header_policy
-            .add_headers
+            .always_add_headers
             .iter()
             .any(|(n, v)| n == "X-Added" && v == "value with spaces"));
         let opts = p.scope.effective_options();
         assert!(!opts.contains(Options::INDEXES));
         assert!(opts.contains(Options::FOLLOW_SYMLINKS));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setenv_directives_affect_require_and_are_not_discarded() {
+        let dir = tempdir("setenv");
+        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let file = dir.join(".htaccess");
+        fs::write(
+            &file,
+            concat!(
+                "SetEnv STATIC yes\n",
+                "SetEnvIf X-Block yes BLOCK=1\n",
+                "<Files \"secret.txt\">\n",
+                "Require expr \"%{ENV:BLOCK} == ''\"\n",
+                "</Files>\n",
+            ),
+        )
+        .unwrap();
+        let p = parse_file(&cfg, &file, OverrideMode::All, "/").unwrap();
+        assert_eq!(
+            p.scope.environment_policy.set_env,
+            vec![("STATIC".to_string(), "yes".to_string())]
+        );
+        assert_eq!(p.scope.environment_policy.set_env_if.len(), 1);
+        let mut req = crate::http::Request {
+            method: "GET".into(),
+            target: b"/secret.txt".to_vec(),
+            raw_path: b"/secret.txt".to_vec(),
+            query: Vec::new(),
+            version: crate::http::Version::Http11,
+            headers: crate::http::Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        };
+        req.headers.push("X-Block", "yes");
+        let env = p.scope.request_env(&req);
+        assert!(env.iter().any(|(n, v)| n == "STATIC" && v == "yes"));
+        assert!(env.iter().any(|(n, v)| n == "BLOCK" && v == "1"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn indexignore_patterns_are_modeled() {
+        let dir = tempdir("indexignore");
+        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let file = dir.join(".htaccess");
+        fs::write(&file, "IndexIgnore *.secret backup-?\n").unwrap();
+        let p = parse_file(&cfg, &file, OverrideMode::All, "/").unwrap();
+        assert_eq!(
+            p.scope.content_policy.index_ignore,
+            vec!["*.secret".to_string(), "backup-?".to_string()]
+        );
+        assert!(crate::config::glob_match(
+            p.scope.content_policy.index_ignore[0].as_bytes(),
+            b"wallet.secret"
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1788,6 +2341,505 @@ mod tests {
             .unsupported_filters
             .iter()
             .any(|f| f.eq_ignore_ascii_case("INCLUDES")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requestheader_is_rejected_instead_of_silently_ignored() {
+        let dir = tempdir("requestheader");
+        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let file = dir.join(".htaccess");
+        for line in [
+            "RequestHeader set X-Block yes\n",
+            "RequestHeader append X-Block yes\n",
+            "RequestHeader unset X-Block\n",
+            "RequestHeader echo X-Block\n",
+        ] {
+            fs::write(&file, line).unwrap();
+            match parse_file(&cfg, &file, OverrideMode::All, "/") {
+                Ok(_) => panic!("RequestHeader must be rejected: {line}"),
+                Err(err) => assert!(err.contains("RequestHeader"), "{line}: {err}"),
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ExpectedEffect {
+        Changed,
+        Inert,
+        Error,
+    }
+
+    struct DirectiveCase {
+        name: &'static str,
+        args: &'static [&'static str],
+        effect: ExpectedEffect,
+    }
+
+    const DIRECTIVE_CASES: &[DirectiveCase] = &[
+        DirectiveCase {
+            name: "addcharset",
+            args: &["utf-8", ".txt"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "adddefaultcharset",
+            args: &["utf-8"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "adddescription",
+            args: &["x", ".txt"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "addencoding",
+            args: &["gzip", ".gz"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "addhandler",
+            args: &["cgi-script", ".cgi"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "addinputfilter",
+            args: &["INCLUDES"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "addlanguage",
+            args: &["en", ".txt"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "addoutputfilter",
+            args: &["DEFLATE", ".txt"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "addoutputfilterbytype",
+            args: &["DEFLATE", "text/plain"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "addtype",
+            args: &["text/plain", ".foo"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "allow",
+            args: &["from", "all"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "allowmethods",
+            args: &["POST"],
+            effect: ExpectedEffect::Error,
+        },
+        DirectiveCase {
+            name: "authbasicprovider",
+            args: &["file"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "authgroupfile",
+            args: &["/tmp/htgroup"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "authmerging",
+            args: &["And"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "authname",
+            args: &["TestRealm"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "authtype",
+            args: &["Basic"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "authuserfile",
+            args: &["/tmp/htpasswd"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "browsermatch",
+            args: &["yes", "FOO=bar"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "browsermatchnocase",
+            args: &["yes", "FOO=bar"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "brotlialteretag",
+            args: &["AddSuffix"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "brotlicompressionalteretag",
+            args: &["AddSuffix"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "brotlicompressionquality",
+            args: &["5"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "deflatealteretag",
+            args: &["AddSuffix"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "deflatebuffersize",
+            args: &["4096"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "deflatecompressionlevel",
+            args: &["6"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "deflatefilternote",
+            args: &["foo"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "deflatememlevel",
+            args: &["8"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "deflatewindowssize",
+            args: &["15"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "deny",
+            args: &["from", "all"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "directoryindex",
+            args: &["index.html"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "directoryslash",
+            args: &["Off"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "enablesendfile",
+            args: &["On"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "errordocument",
+            args: &["404", "/notfound.html"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "expiresactive",
+            args: &["On"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "expiresbytype",
+            args: &["text/html", "access plus 1 hour"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "expiresdefault",
+            args: &["access plus 1 hour"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "fileetag",
+            args: &["None"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "forcetype",
+            args: &["text/plain"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "header",
+            args: &["set", "X-Test", "yes"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "headername",
+            args: &["HEADER"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "indexignore",
+            args: &["*.secret"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "indexoptions",
+            args: &["FancyIndexing"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "options",
+            args: &["+Indexes"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "order",
+            args: &["deny,allow"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "passenv",
+            args: &["PATH"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "readmefile",
+            args: &["README"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "redirect",
+            args: &["/old", "/new"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "redirectmatch",
+            args: &["^/old(.*)$", "/new$1"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "redirectpermanent",
+            args: &["/old", "/new"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "redirecttemp",
+            args: &["/old", "/new"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "removecharset",
+            args: &[".txt"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "removeencoding",
+            args: &[".gz"],
+            effect: ExpectedEffect::Inert,
+        },
+        DirectiveCase {
+            name: "removehandler",
+            args: &[".cgi"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "removetype",
+            args: &[".foo"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "requestheader",
+            args: &["set", "X-Test", "yes"],
+            effect: ExpectedEffect::Error,
+        },
+        DirectiveCase {
+            name: "require",
+            args: &["all", "granted"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "rewritebase",
+            args: &["/other/"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "rewritecond",
+            args: &["%{REQUEST_URI}", "^/x$"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "rewriteengine",
+            args: &["On"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "rewriteoptions",
+            args: &["Inherit"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "rewriterule",
+            args: &["^/old$", "/new", "[L]"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "satisfy",
+            args: &["all"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "sethandler",
+            args: &["cgi-script"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "setenv",
+            args: &["FOO", "bar"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "setenvif",
+            args: &["X-Test", "yes", "FOO=bar"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "setenvifnocase",
+            args: &["X-Test", "yes", "FOO=bar"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "setinputfilter",
+            args: &["INCLUDES"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "setoutputfilter",
+            args: &["DEFLATE"],
+            effect: ExpectedEffect::Changed,
+        },
+        DirectiveCase {
+            name: "unsetenv",
+            args: &["FOO"],
+            effect: ExpectedEffect::Changed,
+        },
+    ];
+
+    fn scope_signature(scope: &Scope) -> String {
+        format!("{scope:?}")
+    }
+
+    #[test]
+    fn htaccess_directive_matrix_is_exhaustive_and_matches_behavior() {
+        let dir = tempdir("directive-matrix");
+        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let file = dir.join(".htaccess");
+        fs::write(&file, "").unwrap();
+        let baseline = match parse_file(&cfg, &file, OverrideMode::All, "/dir/") {
+            Ok(parsed) => scope_signature(&parsed.scope),
+            Err(e) => panic!("empty .htaccess failed: {e}"),
+        };
+
+        let registry: std::collections::BTreeSet<&str> =
+            DIRECTIVE_SPECS.iter().map(|spec| spec.0).collect();
+        assert_eq!(
+            registry.len(),
+            DIRECTIVE_SPECS.len(),
+            "duplicate directive in DIRECTIVE_SPECS"
+        );
+        let cases: std::collections::BTreeSet<&str> =
+            DIRECTIVE_CASES.iter().map(|case| case.name).collect();
+        assert_eq!(
+            cases.len(),
+            DIRECTIVE_CASES.len(),
+            "duplicate directive in DIRECTIVE_CASES"
+        );
+        assert_eq!(
+            cases, registry,
+            "every recognized .htaccess directive needs exactly one effect case"
+        );
+
+        for case in DIRECTIVE_CASES {
+            let line = if case.args.is_empty() {
+                format!("{}\n", case.name)
+            } else {
+                format!("{} {}\n", case.name, case.args.join(" "))
+            };
+            fs::write(&file, &line).unwrap();
+            let parsed = parse_file(&cfg, &file, OverrideMode::All, "/dir/");
+            match case.effect {
+                ExpectedEffect::Error => assert!(
+                    parsed.is_err(),
+                    "{} must fail closed, parsed successfully",
+                    case.name
+                ),
+                ExpectedEffect::Inert => {
+                    let parsed = match parsed {
+                        Ok(parsed) => parsed,
+                        Err(e) => panic!("{} must parse as inert: {e}", case.name),
+                    };
+                    assert_eq!(
+                        scope_signature(&parsed.scope),
+                        baseline,
+                        "{} is marked inert but changed the scope",
+                        case.name
+                    );
+                }
+                ExpectedEffect::Changed => {
+                    let parsed = match parsed {
+                        Ok(parsed) => parsed,
+                        Err(e) => panic!("{} must apply an effect: {e}", case.name),
+                    };
+                    assert_ne!(
+                        scope_signature(&parsed.scope),
+                        baseline,
+                        "{} is marked effectful but did not change the scope",
+                        case.name
+                    );
+                }
+            }
+            // A directive with no AllowOverride category would bypass the
+            // override gate.  Every recognized directive must be denied when
+            // overrides are disabled.
+            assert!(
+                parse_file(&cfg, &file, OverrideMode::None, "/dir/").is_err(),
+                "{} is not gated by AllowOverride None",
+                case.name
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn htaccess_rejects_unknown_main_config_only_directives_and_sections() {
+        let dir = tempdir("rejected-surface");
+        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let file = dir.join(".htaccess");
+        for line in [
+            "DefinitelyNotADirective on\n",
+            "ProxyBlock 169.254.169.254\n",
+            "AcceptPathInfo Off\n",
+            "SetEnvIfExpr \"true\" X=1\n",
+            "AuthzProviderAlias ldap-group foo\n",
+            "<Directory /srv>\nRequire all denied\n</Directory>\n",
+            "<Location />\nRequire all denied\n</Location>\n",
+            "<Proxy http://example.test/>\nRequire all denied\n</Proxy>\n",
+            "<IfDefine PROD>\nRequire all denied\n</IfDefine>\n",
+        ] {
+            fs::write(&file, line).unwrap();
+            match parse_file(&cfg, &file, OverrideMode::All, "/dir/") {
+                Ok(_) => panic!("must fail closed: {line}"),
+                Err(e) => assert!(
+                    e.contains("unsupported") || e.contains("not supported"),
+                    "{line}: {e}"
+                ),
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

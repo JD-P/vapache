@@ -284,7 +284,10 @@ pub enum Require {
         name: String,
         value: Option<String>,
     },
-    Expr(crate::expr::Expr),
+    Expr {
+        negate: bool,
+        expr: crate::expr::Expr,
+    },
     User {
         negate: bool,
         names: Vec<String>,
@@ -547,6 +550,55 @@ pub struct Alias {
     pub virtual_path: String,
     pub fs_path: PathBuf,
     pub script: bool,
+    /// `AliasMatch`/`ScriptAliasMatch`: match the URL with this regex and
+    /// build the target from `target_template` instead of `fs_path`.
+    pub regex: Option<Arc<Regex>>,
+    pub target_template: Option<String>,
+}
+
+impl Alias {
+    pub fn prefix(virtual_path: String, fs_path: PathBuf, script: bool) -> Self {
+        Self {
+            virtual_path,
+            fs_path,
+            script,
+            regex: None,
+            target_template: None,
+        }
+    }
+
+    pub fn regex(
+        regex: Arc<Regex>,
+        target_template: String,
+        script: bool,
+        server_root: &Path,
+    ) -> Self {
+        // Keep the stable directory prefix of the replacement so the target
+        // mapping and the `.htaccess` walk share the same alias root.  A
+        // template such as `/srv/private/$1` has root `/srv/private`; a fixed
+        // target such as `/srv/index.html` uses its parent directory.
+        // Relative replacements are resolved exactly like `map_path()` does,
+        // against ServerRoot.  Representing them as an empty root made the
+        // access-file walk fall back to DocumentRoot and skip the target tree.
+        let cut = target_template.find('$').unwrap_or(target_template.len());
+        let prefix = &target_template[..cut];
+        let mut root = PathBuf::from(prefix);
+        if !prefix.ends_with('/') {
+            root = root.parent().map(Path::to_path_buf).unwrap_or(root);
+        }
+        let root = if root.is_absolute() {
+            root
+        } else {
+            server_root.join(root)
+        };
+        Self {
+            virtual_path: String::new(),
+            fs_path: clean_path(&root),
+            script,
+            regex: Some(regex),
+            target_template: Some(target_template),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -554,6 +606,9 @@ pub struct Redirect {
     pub from: String,
     pub to: String,
     pub status: u16,
+    /// `RedirectMatch`: match the full URL path with this regex and expand
+    /// `$1`..`$9` captures in `to`.
+    pub regex: Option<Arc<Regex>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -625,20 +680,33 @@ pub struct RewriteRule {
 pub struct Handler {
     pub ext: String,
     pub handler: String,
+    /// `RemoveHandler`: the matching extension no longer has a handler.
+    pub remove: bool,
 }
 
-/// Resolve the effective handler for a filename.  Apache's `SetHandler`
-/// overrides `AddHandler`; a later `AddHandler` entry wins over an earlier one.
-pub(crate) fn effective_handler<'a>(scope: &'a Scope, name: &[u8]) -> Option<&'a str> {
-    if let Some(handler) = scope
-        .mapping_policy
-        .handlers
-        .iter()
-        .rev()
-        .find(|h| h.ext == "*")
-    {
-        return Some(handler.handler.as_str());
+impl Handler {
+    pub fn add(ext: String, handler: String) -> Self {
+        Self {
+            ext,
+            handler,
+            remove: false,
+        }
     }
+
+    pub fn remove(ext: String) -> Self {
+        Self {
+            ext,
+            handler: String::new(),
+            remove: true,
+        }
+    }
+}
+
+/// Resolve the effective handler for a filename.  Apache applies handler
+/// operations in configuration order: `SetHandler`/`AddHandler` install a
+/// handler and a later `RemoveHandler` removes it again.  Scanning the merged
+/// list in reverse gives the last operation for each matching name.
+pub(crate) fn effective_handler<'a>(scope: &'a Scope, name: &[u8]) -> Option<&'a str> {
     let base = name.rsplit(|b| *b == b'/').next().unwrap_or(name);
     let ext = base
         .rsplit(|b| *b == b'.')
@@ -646,13 +714,18 @@ pub(crate) fn effective_handler<'a>(scope: &'a Scope, name: &[u8]) -> Option<&'a
         .and_then(|e| std::str::from_utf8(e).ok())
         .unwrap_or("")
         .to_ascii_lowercase();
-    scope
-        .mapping_policy
-        .handlers
-        .iter()
-        .rev()
-        .find(|h| h.ext.eq_ignore_ascii_case(&ext))
-        .map(|h| h.handler.as_str())
+    for handler in scope.mapping_policy.handlers.iter().rev() {
+        let matches = handler.ext == "*" || handler.ext.eq_ignore_ascii_case(&ext);
+        if !matches {
+            continue;
+        }
+        return if handler.remove {
+            None
+        } else {
+            Some(handler.handler.as_str())
+        };
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -794,6 +867,8 @@ impl Balancer {
 pub struct ProxyRule {
     pub pattern: Arc<Regex>,
     pub backend: String,
+    /// Position in the merged `ProxyPass`/`ProxyPassMatch` route table.
+    pub route_order: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -802,6 +877,8 @@ pub struct ProxyPassRule {
     pub backend: String,
     pub sticky_cookie: Option<String>,
     pub fail_on_status: Vec<u16>,
+    /// Position in the merged `ProxyPass`/`ProxyPassMatch` route table.
+    pub route_order: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -827,6 +904,48 @@ pub struct EnvRule {
     pub nocase: bool,
     /// `(name, Some(value))` sets the variable; `(name, None)` unsets it.
     pub actions: Vec<(String, Option<String>)>,
+}
+
+/// Parse `SetEnvIf`, `SetEnvIfNoCase`, `BrowserMatch` and
+/// `BrowserMatchNoCase` uniformly.  `.htaccess` and the main configuration
+/// must share this parser: silently dropping or mis-indexing an environment
+/// action changes the result of `Require env`/`Require expr`.
+pub(crate) fn parse_env_rule(name: &str, args: &[String]) -> Result<EnvRule, String> {
+    let nocase = name.ends_with("nocase");
+    let (attribute, pattern_idx, actions_idx) = if name.starts_with("browsermatch") {
+        ("User-Agent".to_string(), 0, 1)
+    } else {
+        (args.first().cloned().unwrap_or_default(), 1, 2)
+    };
+    let Some(pattern) = args.get(pattern_idx) else {
+        return Err(format!("{name} requires an attribute, pattern and action"));
+    };
+    let pattern = if nocase {
+        format!("(?i:{pattern})")
+    } else {
+        pattern.clone()
+    };
+    let pattern = compile_regex(&pattern).map_err(|e| format!("bad SetEnvIf regex: {e}"))?;
+    let mut actions = Vec::new();
+    for action in &args[actions_idx..] {
+        if let Some(name) = action.strip_prefix('!') {
+            actions.push((name.to_string(), None));
+        } else if let Some((k, v)) = action.split_once('=') {
+            actions.push((k.to_string(), Some(v.to_string())));
+        } else {
+            actions.push((action.to_string(), Some(String::new())));
+        }
+    }
+    if actions.is_empty() {
+        return Err(format!("{name} requires an environment action"));
+    }
+    Ok(EnvRule {
+        attribute,
+        pattern: Arc::new(pattern),
+        negate: false,
+        nocase,
+        actions,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -878,8 +997,11 @@ struct ContainerSnapshot {
     add_types: Vec<u64>,
     remove_types: Vec<u64>,
     add_headers: Vec<u64>,
-    set_headers: Vec<u64>,
+    set_headers: Vec<(String, u64)>,
     unset_headers: Vec<u64>,
+    always_add_headers: Vec<u64>,
+    always_set_headers: Vec<(String, u64)>,
+    always_unset_headers: Vec<u64>,
     expires_by_type: Vec<u64>,
     set_env: Vec<u64>,
     unset_env: Vec<u64>,
@@ -926,8 +1048,21 @@ impl Scope {
             add_types: hash_vec(&self.content_policy.add_types),
             remove_types: hash_vec(&self.content_policy.remove_types),
             add_headers: hash_vec(&self.header_policy.add_headers),
-            set_headers: hash_vec(&self.header_policy.set_headers),
+            set_headers: self
+                .header_policy
+                .set_headers
+                .iter()
+                .map(|(k, v)| (k.clone(), hash_item(v)))
+                .collect(),
             unset_headers: hash_vec(&self.header_policy.unset_headers),
+            always_add_headers: hash_vec(&self.header_policy.always_add_headers),
+            always_set_headers: self
+                .header_policy
+                .always_set_headers
+                .iter()
+                .map(|(k, v)| (k.clone(), hash_item(v)))
+                .collect(),
+            always_unset_headers: hash_vec(&self.header_policy.always_unset_headers),
             expires_by_type: hash_vec(&self.header_policy.expires_by_type),
             set_env: hash_vec(&self.environment_policy.set_env),
             unset_env: hash_vec(&self.environment_policy.unset_env),
@@ -976,6 +1111,14 @@ impl Scope {
             out.extend(b.iter().copied());
             out
         };
+        let merge_set = |a: &Vec<(String, u64)>, b: &Vec<(String, u64)>| {
+            let mut out = a.clone();
+            for (name, value) in b {
+                out.retain(|(existing, _)| existing != name);
+                out.push((name.clone(), *value));
+            }
+            out
+        };
         ContainerSnapshot {
             error_documents,
             aliases: append(&parent.aliases, &child.aliases),
@@ -985,8 +1128,11 @@ impl Scope {
             add_types: append(&parent.add_types, &child.add_types),
             remove_types: append(&parent.remove_types, &child.remove_types),
             add_headers: append(&parent.add_headers, &child.add_headers),
-            set_headers: append(&parent.set_headers, &child.set_headers),
+            set_headers: merge_set(&parent.set_headers, &child.set_headers),
             unset_headers: append(&parent.unset_headers, &child.unset_headers),
+            always_add_headers: append(&parent.always_add_headers, &child.always_add_headers),
+            always_set_headers: merge_set(&parent.always_set_headers, &child.always_set_headers),
+            always_unset_headers: append(&parent.always_unset_headers, &child.always_unset_headers),
             expires_by_type: append(&parent.expires_by_type, &child.expires_by_type),
             set_env: append(&parent.set_env, &child.set_env),
             unset_env: append(&parent.unset_env, &child.unset_env),
@@ -1981,7 +2127,7 @@ impl ParserState {
     }
 }
 
-fn glob_match(pat: &[u8], name: &[u8]) -> bool {
+pub(crate) fn glob_match(pat: &[u8], name: &[u8]) -> bool {
     fn rec(p: &[u8], n: &[u8]) -> bool {
         if p.is_empty() {
             return n.is_empty();
@@ -2117,6 +2263,7 @@ struct Compile {
     current_balancer: Option<usize>,
     known: HashSet<&'static str>,
     next_condition_chain: usize,
+    next_route: usize,
 }
 
 impl Compile {
@@ -2199,6 +2346,7 @@ impl Compile {
             current_balancer: None,
             known,
             next_condition_chain: 0,
+            next_route: 0,
         }
     }
 
@@ -3026,6 +3174,12 @@ impl Compile {
             "directoryindex" => {
                 scope.content_policy.directory_index = Some(args.to_vec());
             }
+            "indexignore" => {
+                scope
+                    .content_policy
+                    .index_ignore
+                    .extend(args.iter().cloned());
+            }
             "options" => {
                 if args.is_empty() {
                     scope.options.push_set(Options::empty().0);
@@ -3340,30 +3494,101 @@ impl Compile {
                     if !fpath.is_absolute() {
                         fpath = self.cfg.server_root.join(fpath);
                     }
-                    scope.mapping_policy.aliases.push(Alias {
-                        virtual_path: vpath,
-                        fs_path: clean_path(&fpath),
-                        script: name == "scriptalias",
+                    scope.mapping_policy.aliases.push(Alias::prefix(
+                        vpath,
+                        clean_path(&fpath),
+                        name == "scriptalias",
+                    ));
+                }
+            }
+            "aliasmatch" | "scriptaliasmatch" => {
+                if args.len() >= 2 {
+                    match compile_regex(&args[0]) {
+                        Ok(regex) => scope.mapping_policy.aliases.push(Alias::regex(
+                            Arc::new(regex),
+                            args[1].clone(),
+                            name == "scriptaliasmatch",
+                            &self.cfg.server_root,
+                        )),
+                        Err(e) => self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!("bad {name} regex: {e}"),
+                        }),
+                    }
+                } else {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("{name} requires a pattern and a target"),
                     });
                 }
             }
-            "aliasmatch" | "scriptaliasmatch" | "redirectmatch" => {
-                self.warn(format!(
-                    "{}:{}: {name} is not implemented; directive ignored",
-                    loc.file, loc.line
-                ));
-            }
-            "redirect" => {
+            "redirectmatch" => {
                 if args.len() >= 2 {
                     let (status, rest) = match args[0].parse::<u16>() {
-                        Ok(s) if args.len() >= 3 => (s, &args[1..]),
+                        Ok(s) => (s, &args[1..]),
                         _ => (302, &args[..]),
                     };
-                    scope.mapping_policy.redirects.push(Redirect {
-                        from: rest[0].clone(),
-                        to: rest[1..].join(" "),
-                        status,
+                    if rest.is_empty() {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: "RedirectMatch requires a pattern".into(),
+                        });
+                    } else {
+                        match compile_regex(&rest[0]) {
+                            Ok(regex) => scope.mapping_policy.redirects.push(Redirect {
+                                from: String::new(),
+                                to: rest[1..].join(" "),
+                                status,
+                                regex: Some(Arc::new(regex)),
+                            }),
+                            Err(e) => self.errors.push(ConfigError {
+                                file: loc.file.clone(),
+                                line: loc.line,
+                                msg: format!("bad RedirectMatch regex: {e}"),
+                            }),
+                        }
+                    }
+                } else {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "RedirectMatch requires a pattern".into(),
                     });
+                }
+            }
+            "redirect" | "redirectpermanent" | "redirecttemp" => {
+                if args.len() >= 2 {
+                    let force = if name == "redirectpermanent" {
+                        Some(301)
+                    } else if name == "redirecttemp" {
+                        Some(302)
+                    } else {
+                        None
+                    };
+                    let (status, rest) = match force {
+                        Some(s) => (s, &args[..]),
+                        None => match args[0].parse::<u16>() {
+                            Ok(s) => (s, &args[1..]),
+                            _ => (302, &args[..]),
+                        },
+                    };
+                    if rest.is_empty() {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!("{name} requires a source path"),
+                        });
+                    } else {
+                        scope.mapping_policy.redirects.push(Redirect {
+                            from: rest[0].clone(),
+                            to: rest[1..].join(" "),
+                            status,
+                            regex: None,
+                        });
+                    }
                 }
             }
             "rewritemap" => {
@@ -3501,18 +3726,25 @@ impl Compile {
             "addhandler" => {
                 if args.len() >= 2 {
                     for ext in &args[1..] {
-                        scope.mapping_policy.handlers.push(Handler {
-                            ext: ext.trim_start_matches('.').to_ascii_lowercase(),
-                            handler: args[0].clone(),
-                        });
+                        scope.mapping_policy.handlers.push(Handler::add(
+                            ext.trim_start_matches('.').to_ascii_lowercase(),
+                            args[0].clone(),
+                        ));
                     }
                 }
             }
+            "removehandler" => {
+                for ext in args {
+                    scope.mapping_policy.handlers.push(Handler::remove(
+                        ext.trim_start_matches('.').to_ascii_lowercase(),
+                    ));
+                }
+            }
             "sethandler" => {
-                scope.mapping_policy.handlers.push(Handler {
-                    ext: "*".into(),
-                    handler: first(),
-                });
+                scope
+                    .mapping_policy
+                    .handlers
+                    .push(Handler::add("*".into(), first()));
             }
             "forcetype" => scope.content_policy.force_type = Some(first()),
             "adddefaultcharset" => {
@@ -3546,18 +3778,38 @@ impl Compile {
                 scope.content_policy.access_file_names = Some(args.to_vec());
             }
             "header" => {
-                if args.len() >= 2 {
-                    let action = args[0].to_ascii_lowercase();
-                    if action == "set" || action == "add" {
-                        let name = args[1].trim_end_matches(':').to_string();
-                        let value = args[2..].join(" ");
-                        if action == "set" {
-                            scope.header_policy.set_headers.push((name, value));
-                        } else {
-                            scope.header_policy.add_headers.push((name, value));
-                        }
-                    } else if action == "unset" {
-                        scope.header_policy.unset_headers.push(args[1].clone());
+                let mut idx = 0;
+                let always = args
+                    .first()
+                    .map(|a| a.eq_ignore_ascii_case("always"))
+                    .unwrap_or(false);
+                if always
+                    || args
+                        .first()
+                        .map(|a| a.eq_ignore_ascii_case("onsuccess"))
+                        .unwrap_or(false)
+                {
+                    idx = 1;
+                }
+                if args.len() >= idx + 2 {
+                    let action = args[idx].to_ascii_lowercase();
+                    let name = args[idx + 1].trim_end_matches(':').to_string();
+                    let value = args[idx + 2..].join(" ");
+                    match (action.as_str(), always) {
+                        ("set", true) => scope.header_policy.always_set_headers.push((name, value)),
+                        ("set", false) => scope.header_policy.set_headers.push((name, value)),
+                        ("add", true) => scope.header_policy.always_add_headers.push((name, value)),
+                        ("add", false) => scope.header_policy.add_headers.push((name, value)),
+                        ("unset", true) => scope.header_policy.always_unset_headers.push(name),
+                        ("unset", false) => scope.header_policy.unset_headers.push(name),
+                        _ => self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!(
+                                "Header action '{}' is not implemented; refusing to ignore a response-header policy",
+                                action
+                            ),
+                        }),
                     }
                 }
             }
@@ -3663,10 +3915,17 @@ impl Compile {
                 }
             }
             "proxypass" => {
-                if args.len() >= 2
-                    && !args[0].starts_with('!')
-                    && !supported_proxy_backend(&args[1], false)
+                if args
+                    .get(1)
+                    .map(|a| a == "!" || a.starts_with('!'))
+                    .unwrap_or(false)
                 {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "ProxyPass exclusions (!) are not implemented; refusing to ignore a route exclusion".into(),
+                    });
+                } else if args.len() >= 2 && !supported_proxy_backend(&args[1], false) {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
@@ -3678,7 +3937,9 @@ impl Compile {
                         backend: args[1].clone(),
                         sticky_cookie: None,
                         fail_on_status: Vec::new(),
+                        route_order: self.next_route,
                     };
+                    self.next_route += 1;
                     for item in &args[2..] {
                         if let Some((key, value)) = item.split_once('=') {
                             match key.to_ascii_lowercase().as_str() {
@@ -3708,7 +3969,17 @@ impl Compile {
                 }
             }
             "proxypassmatch" => {
-                if args.len() >= 2 && !supported_proxy_backend(&args[1], true) {
+                if args
+                    .get(1)
+                    .map(|a| a == "!" || a.starts_with('!'))
+                    .unwrap_or(false)
+                {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "ProxyPassMatch exclusions (!) are not implemented; refusing to ignore a route exclusion".into(),
+                    });
+                } else if args.len() >= 2 && !supported_proxy_backend(&args[1], true) {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
@@ -3725,10 +3996,14 @@ impl Compile {
                     });
                 } else if args.len() >= 2 {
                     match compile_regex(&args[0]) {
-                        Ok(pattern) => scope.proxy_policy.proxy_rules.push(ProxyRule {
-                            pattern: Arc::new(pattern),
-                            backend: args[1].clone(),
-                        }),
+                        Ok(pattern) => {
+                            scope.proxy_policy.proxy_rules.push(ProxyRule {
+                                pattern: Arc::new(pattern),
+                                backend: args[1].clone(),
+                                route_order: self.next_route,
+                            });
+                            self.next_route += 1;
+                        }
                         Err(e) => self.errors.push(ConfigError {
                             file: loc.file.clone(),
                             line: loc.line,
@@ -3877,11 +4152,11 @@ impl Compile {
                 }
             }
             "setenv" => {
-                if args.len() >= 2 {
+                if let Some(name) = args.first() {
                     scope
                         .environment_policy
                         .set_env
-                        .push((args[0].clone(), args[1..].join(" ")));
+                        .push((name.clone(), args[1..].join(" ")));
                 }
             }
             "unsetenv" => scope
@@ -3893,44 +4168,13 @@ impl Compile {
                 .pass_env
                 .extend(args.iter().cloned()),
             "setenvif" | "setenvifnocase" | "browsermatch" | "browsermatchnocase" => {
-                let nocase = name.ends_with("nocase");
-                let (attribute, pattern_idx, actions_idx) = if name.starts_with("browsermatch") {
-                    ("User-Agent".to_string(), 0, 1)
-                } else {
-                    (args.first().cloned().unwrap_or_default(), 1, 2)
-                };
-                if let Some(pattern) = args.get(pattern_idx) {
-                    let pattern = if nocase {
-                        format!("(?i:{pattern})")
-                    } else {
-                        pattern.clone()
-                    };
-                    match compile_regex(&pattern) {
-                        Ok(pattern) => {
-                            let mut actions = Vec::new();
-                            for action in &args[actions_idx..] {
-                                if let Some(name) = action.strip_prefix('!') {
-                                    actions.push((name.to_string(), None));
-                                } else if let Some((k, v)) = action.split_once('=') {
-                                    actions.push((k.to_string(), Some(v.to_string())));
-                                } else {
-                                    actions.push((action.to_string(), Some(String::new())));
-                                }
-                            }
-                            scope.environment_policy.set_env_if.push(EnvRule {
-                                attribute,
-                                pattern: Arc::new(pattern),
-                                negate: false,
-                                nocase,
-                                actions,
-                            });
-                        }
-                        Err(e) => self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: format!("bad SetEnvIf regex: {e}"),
-                        }),
-                    }
+                match parse_env_rule(name, args) {
+                    Ok(rule) => scope.environment_policy.set_env_if.push(rule),
+                    Err(e) => self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: e,
+                    }),
                 }
             }
             "remoteipheader" => {
@@ -3976,7 +4220,20 @@ impl Compile {
                 }
             }
             "hostnamelookups" => self.cfg.hostname_lookups = first().eq_ignore_ascii_case("on"),
-            "usecanonicalname" => self.cfg.use_canonical_name = first().eq_ignore_ascii_case("on"),
+            "usecanonicalname" => match first().to_ascii_lowercase().as_str() {
+                "on" => self.cfg.use_canonical_name = true,
+                "off" => self.cfg.use_canonical_name = false,
+                // Apache resolves the local address for `DNS`.  Until that
+                // reverse-DNS path is modeled, use ServerName, which is the
+                // conservative choice for redirects and expression variables:
+                // the client Host header never becomes the canonical name.
+                "dns" => self.cfg.use_canonical_name = true,
+                other => self.errors.push(ConfigError {
+                    file: loc.file.clone(),
+                    line: loc.line,
+                    msg: format!("UseCanonicalName must be On, Off or DNS, not '{other}'"),
+                }),
+            },
             "servertokens" => {
                 self.cfg.server_tokens = match first().to_ascii_lowercase().as_str() {
                     "full" => ServerTokens::Full,
@@ -5219,7 +5476,10 @@ pub(crate) fn parse_require(args: &[String]) -> Require {
             Require::Method { negate, methods }
         }
         "env" => {
-            let Some(item) = args.get(1) else {
+            // Use the operand after the provider token (and after `not`).
+            // Reading `args[1]` made `Require not env BLOCK` test a variable
+            // literally named `env`.
+            let Some(item) = rest.first() else {
                 return Require::Unsupported("Require env requires a variable".into());
             };
             let (name, value) = match item.split_once('=') {
@@ -5236,9 +5496,9 @@ pub(crate) fn parse_require(args: &[String]) -> Require {
             }
         }
         "expr" => {
-            let text = args[1..].join(" ");
+            let text = rest.join(" ");
             match crate::expr::parse(&text) {
-                Ok(e) => Require::Expr(e),
+                Ok(expr) => Require::Expr { negate, expr },
                 Err(e) => Require::Unsupported(format!("bad Require expr: {e}")),
             }
         }
@@ -5590,17 +5850,35 @@ fn is_security_directive(name: &str) -> bool {
 fn fail_closed_directives() -> HashSet<&'static str> {
     [
         "acceptpathinfo",
+        "action",
         "authnprovideralias",
         "authzprovideralias",
+        "browseripmatch",
+        "cgidscripttimeout",
         "extfilterdefine",
         "extfilteroptions",
         "filterchain",
         "filterdeclare",
         "filterprovider",
+        "forceauthoritative",
+        "inputfilter",
+        "limitinternalrecursion",
+        "limitxmlrequestbody",
         "outputfilterbytype",
+        "protocolshonororder",
         "proxyblock",
+        "removeinputfilter",
+        "removeoutputfilter",
         "requestheader",
+        "rlimitcpu",
+        "rlimitmem",
+        "rlimitnofile",
+        "rlimitnproc",
+        "scriptlog",
+        "scriptlogbuffer",
+        "scriptloglength",
         "setenvifexpr",
+        "transferlog",
     ]
     .into_iter()
     .collect()
@@ -6201,9 +6479,45 @@ mod tests {
             _ => panic!(),
         }
         let r = parse_require(&["expr".into(), "true".into()]);
-        assert!(matches!(r, Require::Expr(_)));
+        assert!(matches!(r, Require::Expr { .. }));
         let r = parse_require(&["env".into(), "ALLOW_ME".into()]);
         assert!(matches!(r, Require::Env { .. }));
+        // Negation must shift with the provider operand, not read `args[1]`
+        // (which is the literal word `env`).
+        let r = parse_require(&["not".into(), "env".into(), "BLOCK".into()]);
+        match r {
+            Require::Env {
+                negate,
+                name,
+                value,
+            } => {
+                assert!(negate);
+                assert_eq!(name, "BLOCK");
+                assert_eq!(value, None);
+            }
+            _ => panic!(),
+        }
+        let r = parse_require(&["not".into(), "env".into(), "BLOCK=1".into()]);
+        match r {
+            Require::Env {
+                negate,
+                name,
+                value,
+            } => {
+                assert!(negate);
+                assert_eq!(name, "BLOCK");
+                assert_eq!(value.as_deref(), Some("1"));
+            }
+            _ => panic!(),
+        }
+        let r = parse_require(&[
+            "not".into(),
+            "expr".into(),
+            "%{ENV:BLOCK}".into(),
+            "==".into(),
+            "''".into(),
+        ]);
+        assert!(matches!(r, Require::Expr { .. }));
     }
 
     #[test]
@@ -6889,7 +7203,115 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
             .warnings
             .iter()
             .any(|w| w.contains("recognised but not implemented")));
-        assert!(load_text(known, true).is_ok());
+        // Strict mode rejects every unhandled directive, not only unknown
+        // names; otherwise a known-but-unimplemented security control would
+        // be accepted and silently ignored.
+        assert!(load_text(known, true).is_err());
+    }
+
+    #[test]
+    fn security_and_resource_directive_disposition_matrix() {
+        // Every security-, filter-, audit- or resource-relevant directive in
+        // the compatibility warning set must fail closed instead of being
+        // silently ignored.
+        for name in fail_closed_directives() {
+            let text = format!("Listen 127.0.0.1:0\n{name} on\n");
+            assert!(
+                load_text(&text, false).is_err(),
+                "security/resource directive '{name}' must fail closed in compat mode"
+            );
+            assert!(
+                load_text(&text, true).is_err(),
+                "security/resource directive '{name}' must fail closed in strict mode"
+            );
+        }
+
+        // A deliberately small presentation/module surface remains a warning
+        // in compatibility mode, but strict mode still rejects it.
+        for directive in [
+            "AddDescription \"x\" .txt",
+            "UserDir public_html",
+            "SessionCookieName session path=/",
+            "Substitute \"s/a/b/\"",
+            "CharsetDefault utf-8",
+            "Protocols h2 http/1.1",
+        ] {
+            let text = format!("Listen 127.0.0.1:0\n{directive}\n");
+            let cfg = load_text(&text, false)
+                .unwrap_or_else(|e| panic!("compat directive '{directive}' failed: {e:?}"));
+            assert!(
+                cfg.warnings
+                    .iter()
+                    .any(|w| w.contains("recognised but not implemented")),
+                "compat directive '{directive}' must be explicitly warned"
+            );
+            assert!(
+                load_text(&text, true).is_err(),
+                "strict mode must reject '{directive}'"
+            );
+        }
+    }
+
+    #[test]
+    fn effectful_unimplemented_mapping_and_header_forms_fail_closed() {
+        assert!(load_text("Listen 127.0.0.1:0\nProxyPass /app !\n", false).is_err());
+        assert!(load_text("Listen 127.0.0.1:0\nHeader edit X-Test a b\n", false).is_err());
+    }
+
+    #[test]
+    fn regex_alias_redirect_and_remove_handler_are_handled() {
+        let cfg = load_text(
+            concat!(
+                "Listen 127.0.0.1:0\n",
+                "RedirectMatch 404 /\\.env$\n",
+                "AliasMatch \"^/pub/(.*)$\" \"/srv/private/$1\"\n",
+                "ScriptAliasMatch \"^/cgi/(.*)$\" \"/srv/cgi/$1\"\n",
+                "AddHandler cgi-script .cgi\n",
+                "RemoveHandler .cgi\n",
+            ),
+            false,
+        )
+        .unwrap();
+        let redirect = cfg.global.mapping_policy.redirects.first().unwrap();
+        assert_eq!(redirect.status, 404);
+        assert!(redirect.regex.as_ref().unwrap().is_match("/.env"));
+        assert!(cfg
+            .global
+            .mapping_policy
+            .aliases
+            .iter()
+            .any(|a| a.regex.is_some() && !a.script));
+        assert!(cfg
+            .global
+            .mapping_policy
+            .aliases
+            .iter()
+            .any(|a| a.regex.is_some() && a.script));
+        assert!(effective_handler(&cfg.global, b"evil.cgi").is_none());
+    }
+
+    #[test]
+    fn relative_regex_alias_root_is_resolved_against_server_root() {
+        let cfg = load_text(
+            concat!(
+                "Listen 127.0.0.1:0\n",
+                "AliasMatch \"^/x/(.*)$\" \"private/$1\"\n",
+                "ScriptAliasMatch \"^/cgi/(.*)$\" \"cgi-bin/$1\"\n",
+            ),
+            false,
+        )
+        .unwrap();
+        let server_root = std::env::temp_dir();
+        for alias in &cfg.global.mapping_policy.aliases {
+            assert!(
+                alias.fs_path.starts_with(&server_root),
+                "relative alias root must be anchored at ServerRoot: {:?}",
+                alias.fs_path
+            );
+            assert!(!alias.fs_path.as_os_str().is_empty());
+        }
+        let alias = &cfg.global.mapping_policy.aliases[0];
+        assert_eq!(alias.fs_path, server_root.join("private"));
     }
 
     #[test]
@@ -6969,6 +7391,45 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
         );
         assert_eq!(parent.header_policy.set_headers.len(), 2);
         assert_eq!(parent.environment_policy.set_env.len(), 2);
+    }
+
+    #[test]
+    fn scope_merge_replaces_child_set_headers_and_audits_always_lists() {
+        let mut parent = Scope::default();
+        parent
+            .header_policy
+            .set_headers
+            .push(("X-Set".into(), "one".into()));
+        parent
+            .header_policy
+            .always_set_headers
+            .push(("X-Always".into(), "one".into()));
+        let mut child = Scope::default();
+        child
+            .header_policy
+            .set_headers
+            .push(("X-Set".into(), "two".into()));
+        child
+            .header_policy
+            .always_set_headers
+            .push(("X-Always".into(), "two".into()));
+        child
+            .header_policy
+            .always_unset_headers
+            .push("X-Old".into());
+        parent.merge(&child);
+        assert_eq!(
+            parent.header_policy.set_headers,
+            vec![("X-Set".into(), "two".into())]
+        );
+        assert_eq!(
+            parent.header_policy.always_set_headers,
+            vec![("X-Always".into(), "two".into())]
+        );
+        assert_eq!(
+            parent.header_policy.always_unset_headers,
+            vec!["X-Old".to_string()]
+        );
     }
 
     #[test]
@@ -7615,12 +8076,27 @@ impl Config {
         req: &crate::http::Request,
         peer: IpAddr,
     ) {
+        self.apply_proxy_access_urls(vhost, scope, &[proxy_url], req, peer);
+    }
+
+    /// Match `<Proxy>`/`<ProxyMatch>` sections against every identity the
+    /// request has.  A balancer request has both the logical
+    /// `balancer://cluster` identity and the concrete member URL; Apache
+    /// applies sections matching either one.
+    pub fn apply_proxy_access_urls(
+        &self,
+        vhost: Option<&VHost>,
+        scope: &mut Scope,
+        proxy_urls: &[&str],
+        req: &crate::http::Request,
+        peer: IpAddr,
+    ) {
         let containers: &[ProxyContainer] = vhost
             .map(|v| v.proxy_containers.as_slice())
             .unwrap_or(self.proxy_containers.as_slice());
         let docroot = self.documentation_root_for(vhost);
         for container in containers {
-            let matched = match &container.kind {
+            let matched = proxy_urls.iter().any(|proxy_url| match &container.kind {
                 ProxyMatchKind::Wildcard(pattern) => {
                     if pattern
                         .as_bytes()
@@ -7633,7 +8109,7 @@ impl Config {
                     }
                 }
                 ProxyMatchKind::Regex(re) => re.is_match(proxy_url),
-            };
+            });
             if !matched {
                 continue;
             }

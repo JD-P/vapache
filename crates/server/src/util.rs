@@ -305,6 +305,15 @@ pub fn url_encode_path(path: &[u8]) -> String {
     out
 }
 
+/// Encode an autoindex entry as a relative hyperlink.  The leading `./`
+/// is mandatory: it prevents a hostile filename such as `javascript:...`,
+/// `data:...` or `//attacker.example/...` from becoming an absolute/scheme
+/// URL in the generated HTML.  The encoder still handles quotes, controls
+/// and other attribute-breaking bytes.
+pub fn safe_relative_href(name: &[u8]) -> String {
+    format!("./{}", url_encode_path(name))
+}
+
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 /// HTML-escape file names for autoindex output.
@@ -441,5 +450,22 @@ mod tests {
         assert_eq!(url_encode_path(b"/a b"), "/a%20b");
         assert_eq!(url_encode_path(b"/caf\xc3\xa9"), "/caf%C3%A9");
         assert_eq!(url_encode_path(b"/a?b"), "/a%3Fb");
+    }
+
+    #[test]
+    fn autoindex_hrefs_are_always_relative() {
+        for name in [
+            b"javascript:alert(1)".as_slice(),
+            b"data:text/html,boom",
+            b"vbscript:msgbox(1)",
+            b"//attacker.example/x",
+            b"\"/onmouseover=alert(1)",
+        ] {
+            let href = safe_relative_href(name);
+            assert!(href.starts_with("./"), "{href}");
+            assert!(!href.starts_with("//"), "{href}");
+            assert!(!href.contains("://"), "{href}");
+            assert!(!href.contains('"'), "{href}");
+        }
     }
 }

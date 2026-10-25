@@ -53,23 +53,29 @@ fn normalize_name(name: &str) -> String {
     name.trim_end_matches('.').to_ascii_lowercase()
 }
 
-impl ResolvesServerCert for SniResolver {
-    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let Some(name) = hello.server_name() else {
-            return Some(current_key(&self.default));
+impl SniResolver {
+    fn select_key(&self, name: Option<&str>) -> Arc<CertifiedKey> {
+        let Some(name) = name else {
+            return current_key(&self.default);
         };
         let name = normalize_name(name);
         if let Some(key) = self.names.get(&name) {
-            return Some(current_key(key));
+            return current_key(key);
         }
         for (suffix, key) in &self.wildcards {
             if let Some(prefix) = name.strip_suffix(&format!(".{suffix}")) {
                 if !prefix.is_empty() && !prefix.contains('.') {
-                    return Some(current_key(key));
+                    return current_key(key);
                 }
             }
         }
-        Some(current_key(&self.default))
+        current_key(&self.default)
+    }
+}
+
+impl ResolvesServerCert for SniResolver {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.select_key(hello.server_name()))
     }
 }
 
@@ -163,20 +169,40 @@ fn load_key(
     Ok((certified, refresh))
 }
 
-fn spawn_ocsp_refresh(refresh: OcspRefresh) {
-    std::thread::spawn(move || loop {
+fn apply_ocsp_response(refresh: &OcspRefresh, response: Vec<u8>) {
+    crate::ocsp::save_cached(&refresh.cache_path, &response);
+    let mut guard = refresh.key.write().unwrap_or_else(|e| e.into_inner());
+    let mut key = (**guard).clone();
+    key.ocsp = Some(response);
+    *guard = Arc::new(key);
+}
+
+fn ocsp_refresh_loop<F, G>(refresh: OcspRefresh, mut fetch: F, mut keep_going: G)
+where
+    F: FnMut(&OcspRefresh) -> Option<Vec<u8>>,
+    G: FnMut() -> bool,
+{
+    while keep_going() {
         std::thread::sleep(refresh.interval);
-        if let Some(response) = crate::ocsp::fetch_fresh(
-            &refresh.chain,
-            refresh.force_url.as_deref(),
-            refresh.timeout,
-        ) {
-            crate::ocsp::save_cached(&refresh.cache_path, &response);
-            let mut guard = refresh.key.write().unwrap_or_else(|e| e.into_inner());
-            let mut key = (**guard).clone();
-            key.ocsp = Some(response);
-            *guard = Arc::new(key);
+        if let Some(response) = fetch(&refresh) {
+            apply_ocsp_response(&refresh, response);
         }
+    }
+}
+
+fn spawn_ocsp_refresh(refresh: OcspRefresh) {
+    std::thread::spawn(move || {
+        ocsp_refresh_loop(
+            refresh,
+            |refresh| {
+                crate::ocsp::fetch_fresh(
+                    &refresh.chain,
+                    refresh.force_url.as_deref(),
+                    refresh.timeout,
+                )
+            },
+            || true,
+        )
     });
 }
 
@@ -454,5 +480,292 @@ mod tests {
         assert_eq!(normalize_name("Example.COM:443"), "example.com");
         assert_eq!(normalize_name("[::1]:443"), "::1");
         assert_eq!(normalize_name("host.example."), "host.example");
+    }
+
+    fn tempdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vapache-tls-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_cert(dir: &Path) -> (PathBuf, PathBuf) {
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let status = std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost,DNS:*.example.test,IP:127.0.0.1",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+                "-keyout",
+                key.to_str().unwrap(),
+                "-out",
+                cert.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("openssl");
+        assert!(status.success());
+        (cert, key)
+    }
+
+    fn test_config(dir: &Path, text: &str) -> Config {
+        let path = dir.join("httpd.conf");
+        std::fs::write(&path, text).unwrap();
+        Config::load(&path, dir, &Default::default(), &Default::default(), false).unwrap()
+    }
+
+    #[test]
+    fn certificate_and_key_parsing_errors_are_closed() {
+        let dir = tempdir("parse");
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, "").unwrap();
+        assert!(read_certs(&empty)
+            .unwrap_err()
+            .contains("no PEM certificates"));
+        assert!(read_key(&empty).unwrap_err().contains("no PEM private key"));
+
+        let garbage = dir.join("garbage.pem");
+        std::fs::write(&garbage, "not a pem file\n").unwrap();
+        assert!(read_certs(&garbage).is_err());
+        assert!(read_key(&garbage).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_key_uses_cached_ocsp_and_zero_timeout_defaults() {
+        let dir = tempdir("ocsp");
+        let (cert, key) = make_cert(&dir);
+        let chain = read_certs(&cert).unwrap();
+        let force_url = Some("http://127.0.0.1:1/");
+        let cache_dir = dir.join("cache");
+        let cache_path = crate::ocsp::cache_path(&cache_dir, &chain, force_url);
+        crate::ocsp::save_cached(&cache_path, &[0x30, 0x03, 0x0a, 0x01, 0x00]);
+        let ssl = SslConfig {
+            engine: true,
+            cert_file: Some(cert.clone()),
+            key_file: Some(key),
+            chain_file: Some(cert),
+            stapling: true,
+            stapling_force_url: force_url.map(str::to_string),
+            stapling_responder_timeout: Duration::ZERO,
+            stapling_standard_cache_timeout: Duration::ZERO,
+            ..SslConfig::default()
+        };
+        let provider = ring::default_provider();
+        let (certified, refresh) = load_key(&ssl, &provider, Some(&cache_dir)).unwrap();
+        assert!(certified.ocsp.is_some());
+        assert!(refresh.is_some());
+
+        // Non-zero responder timeout with no cached response exercises the
+        // warning path and returns a refresh handle with no initial staple.
+        let no_cache = dir.join("no-cache");
+        let ssl = SslConfig {
+            engine: true,
+            cert_file: Some(dir.join("cert.pem")),
+            key_file: Some(dir.join("key.pem")),
+            stapling: true,
+            stapling_force_url: force_url.map(str::to_string),
+            stapling_responder_timeout: Duration::from_millis(1),
+            stapling_standard_cache_timeout: Duration::from_millis(1),
+            ..SslConfig::default()
+        };
+        let (certified, refresh) = load_key(&ssl, &provider, Some(&no_cache)).unwrap();
+        assert!(certified.ocsp.is_none());
+        assert!(refresh.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ocsp_refresh_loop_applies_a_response_and_spawn_is_bounded() {
+        let dir = tempdir("ocsp-loop");
+        let (cert, key) = make_cert(&dir);
+        let ssl = SslConfig {
+            engine: true,
+            cert_file: Some(cert),
+            key_file: Some(key),
+            stapling: true,
+            stapling_responder_timeout: Duration::from_millis(1),
+            stapling_standard_cache_timeout: Duration::from_millis(1),
+            ..SslConfig::default()
+        };
+        let provider = ring::default_provider();
+        let (_certified, refresh) = load_key(&ssl, &provider, Some(&dir)).unwrap();
+        let mut refresh = refresh.expect("refresh handle");
+        refresh.interval = Duration::ZERO;
+        let mut iterations = 0;
+        ocsp_refresh_loop(
+            refresh,
+            |_| Some(vec![0x30, 0x03, 0x0a, 0x01, 0x00]),
+            || {
+                iterations += 1;
+                iterations == 1
+            },
+        );
+        assert_eq!(iterations, 2);
+
+        // The production spawn wrapper is covered; the thread sleeps on the
+        // default interval and is reclaimed when the test process exits.
+        let (cert, key) = make_cert(&dir);
+        let ssl = SslConfig {
+            engine: true,
+            cert_file: Some(cert),
+            key_file: Some(key),
+            stapling: true,
+            stapling_standard_cache_timeout: Duration::from_secs(3600),
+            ..SslConfig::default()
+        };
+        let (_certified, refresh) = load_key(&ssl, &provider, Some(&dir)).unwrap();
+        if let Some(refresh) = refresh {
+            spawn_ocsp_refresh(refresh);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sni_selection_and_client_policy_modes_are_explicit() {
+        let dir = tempdir("sni");
+        let (cert, key) = make_cert(&dir);
+        let provider = ring::default_provider();
+        let ssl = SslConfig {
+            engine: true,
+            cert_file: Some(cert),
+            key_file: Some(key),
+            ..SslConfig::default()
+        };
+        let (first, _) = load_key(&ssl, &provider, None).unwrap();
+        let (second, _) = load_key(&ssl, &provider, None).unwrap();
+        let first = Arc::new(RwLock::new(first));
+        let second = Arc::new(RwLock::new(second));
+        let resolver = SniResolver {
+            default: first.clone(),
+            names: HashMap::from([("exact.test".to_string(), second.clone())]),
+            wildcards: vec![("example.test".to_string(), second.clone())],
+        };
+        let default_key = current_key(&first);
+        let second_key = current_key(&second);
+        assert!(Arc::ptr_eq(&resolver.select_key(None), &default_key));
+        assert!(Arc::ptr_eq(
+            &resolver.select_key(Some("exact.test")),
+            &second_key
+        ));
+        assert!(Arc::ptr_eq(
+            &resolver.select_key(Some("single.example.test")),
+            &second_key
+        ));
+        assert!(Arc::ptr_eq(
+            &resolver.select_key(Some("multi.label.example.test")),
+            &default_key
+        ));
+        assert!(Arc::ptr_eq(
+            &resolver.select_key(Some("unknown.test")),
+            &default_key
+        ));
+
+        assert_eq!(client_policy_mode(&SslConfig::default()), 0);
+        assert_eq!(
+            client_policy_mode(&SslConfig {
+                verify_client: Some(crate::config::ClientVerify::None),
+                ..SslConfig::default()
+            }),
+            1
+        );
+        assert_eq!(
+            client_policy_mode(&SslConfig {
+                verify_client: Some(crate::config::ClientVerify::Optional),
+                ..SslConfig::default()
+            }),
+            2
+        );
+        assert_eq!(
+            client_policy_mode(&SslConfig {
+                verify_client: Some(crate::config::ClientVerify::Require),
+                ..SslConfig::default()
+            }),
+            3
+        );
+        assert!(ensure_uniform_client_policy(&[], 443).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_config_covers_global_vhost_sni_and_optional_client_auth() {
+        let dir = tempdir("server-config");
+        let (cert, key) = make_cert(&dir);
+        let cert_s = cert.display();
+        let key_s = key.display();
+
+        let none = test_config(&dir, "Listen 127.0.0.1:444\n");
+        assert!(server_config(&none, 444).unwrap().is_none());
+
+        let global = test_config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:443\nSSLEngine on\nSSLCertificateFile \"{cert_s}\"\nSSLCertificateKeyFile \"{key_s}\"\n"
+            ),
+        );
+        assert!(server_config(&global, 443).unwrap().is_some());
+
+        let vhosts = test_config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:443\n\
+                 <VirtualHost *:443>\n\
+                     ServerName a.test\n\
+                     ServerAlias *.example.test .example.test _default_ *\n\
+                     SSLEngine on\n\
+                     SSLCertificateFile \"{cert_s}\"\n\
+                     SSLCertificateKeyFile \"{key_s}\"\n\
+                 </VirtualHost>\n\
+                 <VirtualHost *:443>\n\
+                     ServerName b.test\n\
+                     SSLEngine on\n\
+                     SSLUseStapling on\n\
+                     SSLStaplingStandardCacheTimeout 3600\n\
+                     SSLCertificateFile \"{cert_s}\"\n\
+                     SSLCertificateKeyFile \"{key_s}\"\n\
+                 </VirtualHost>\n"
+            ),
+        );
+        assert!(server_config(&vhosts, 443).unwrap().is_some());
+
+        for mode in ["optional", "require"] {
+            let cfg = test_config(
+                &dir,
+                &format!(
+                    "Listen 127.0.0.1:443\n\
+                     SSLEngine on\n\
+                     SSLCertificateFile \"{cert_s}\"\n\
+                     SSLCertificateKeyFile \"{key_s}\"\n\
+                     SSLVerifyClient {mode}\n\
+                     SSLCACertificateFile \"{cert_s}\"\n"
+                ),
+            );
+            assert!(server_config(&cfg, 443).unwrap().is_some(), "{mode}");
+        }
+
+        let missing_ca = test_config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:443\n\
+                 SSLEngine on\n\
+                 SSLCertificateFile \"{cert_s}\"\n\
+                 SSLCertificateKeyFile \"{key_s}\"\n\
+                 SSLVerifyClient require\n"
+            ),
+        );
+        assert!(server_config(&missing_ca, 443).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

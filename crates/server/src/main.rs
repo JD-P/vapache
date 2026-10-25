@@ -841,7 +841,7 @@ fn main() {
         cfg = new_cfg;
         bound = new_bound;
         logger = new_logger;
-        vapached::cache::clear();
+        vapached::cache::clear(&cfg);
         logger.info("configuration reloaded; cache generation invalidated");
     }
     vapached::cgi::shutdown_pool();

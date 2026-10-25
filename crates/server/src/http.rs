@@ -11,7 +11,9 @@ use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use vapache_verified::{parse_request_head, HeadError, HttpVersion, ParsedHead};
 
@@ -25,6 +27,9 @@ pub const MAX_BODY_BUFFERED: u64 = 32 * 1024 * 1024;
 /// Request bodies above this size are spooled to an unlinked temporary file
 /// instead of occupying heap memory for the whole request.
 pub const MAX_REQUEST_BODY_IN_MEMORY: u64 = 1024 * 1024;
+/// Bound request trailers the same way the proxy reader does.
+const MAX_REQUEST_TRAILERS: usize = 64;
+const MAX_REQUEST_TRAILER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Version {
@@ -384,20 +389,51 @@ pub fn read_request<R: Read + Write>(
     Ok(Some(req))
 }
 
-fn spool_file() -> io::Result<File> {
-    use std::sync::atomic::{AtomicU64, Ordering};
+const SPOOL_ATTEMPTS: u64 = 16;
+
+fn spool_path(dir: &Path, counter: u64) -> PathBuf {
+    dir.join(format!(
+        "vapache-request-{}-{}.body",
+        std::process::id(),
+        counter
+    ))
+}
+
+/// Create an unlinked, private spool file.  `O_EXCL` matters: a predictable
+/// name in a shared temporary directory must never follow a pre-created
+/// symlink (which could truncate or expose a file the server can reach).  A
+/// colliding name is skipped rather than followed, and a bounded number of
+/// collisions fails closed.
+fn spool_file_named(dir: &Path, counter: &std::sync::atomic::AtomicU64) -> io::Result<File> {
+    use std::sync::atomic::Ordering;
+    for _ in 0..SPOOL_ATTEMPTS {
+        let n = counter.fetch_add(1, Ordering::Relaxed);
+        let path = spool_path(dir, n);
+        match OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => {
+                let _ = std::fs::remove_file(&path);
+                return Ok(file);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "cannot create a private request spool file",
+    ))
+}
+
+pub(crate) fn spool_file() -> io::Result<File> {
+    use std::sync::atomic::AtomicU64;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path =
-        std::env::temp_dir().join(format!("vapache-request-{}-{}.body", std::process::id(), n));
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(&path)?;
-    let _ = std::fs::remove_file(&path);
-    Ok(file)
+    spool_file_named(&std::env::temp_dir(), &COUNTER)
 }
 
 fn read_exact_into<R: Read>(
@@ -457,10 +493,30 @@ fn read_chunked_to_file<R: Read>(
         let size = crate::util::parse_hex_u64(trim_ascii(size_part))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
         if size == 0 {
+            // Trailer fields are part of the request body deadline.  Without
+            // an explicit check a client can send a zero-size chunk and then
+            // keep one worker busy with trailer lines indefinitely.
+            let mut trailer_count = 0usize;
+            let mut trailer_bytes = 0usize;
             loop {
+                if Instant::now() > deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "request body timeout",
+                    ));
+                }
                 let t = read_line(stream, buf, 8190)?;
                 if t.is_empty() {
                     return Ok(total);
+                }
+                trailer_count += 1;
+                trailer_bytes = trailer_bytes.saturating_add(t.len() + 2);
+                if trailer_count > MAX_REQUEST_TRAILERS || trailer_bytes > MAX_REQUEST_TRAILER_BYTES
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "request trailers too large",
+                    ));
                 }
             }
         }
@@ -772,17 +828,23 @@ pub fn write_response<W: ResponseWrite>(
     let status = resp.status;
     let mut have_date = false;
     let mut have_server = false;
-    let mut have_cl = false;
     for (n, _) in &resp.headers {
         if n.eq_ignore_ascii_case("date") {
             have_date = true;
         } else if n.eq_ignore_ascii_case("server") {
             have_server = true;
-        } else if n.eq_ignore_ascii_case("content-length") {
-            have_cl = true;
         }
     }
     let no_body_status = status == 204 || status == 304 || (100..200).contains(&status);
+    // For a HEAD response there is no body to frame, and a 204/304/1xx status
+    // has no body by definition.  Preserve an explicitly supplied
+    // Content-Length there (HEAD mirrors the GET representation); for every
+    // body-bearing response the writer computes it from the bytes it will send.
+    let preserve_content_length = (opts.head_only || no_body_status)
+        && resp
+            .headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("content-length"));
 
     // Coalesce the response head with small bodies into one write.  For static
     // files this avoids a separate header packet/syscall; larger files still
@@ -814,6 +876,17 @@ pub fn write_response<W: ResponseWrite>(
         head.extend_from_slice(b"\r\n");
     }
     for (name, value) in &resp.headers {
+        // The writer owns the message framing.  A caller-supplied
+        // Content-Length/Transfer-Encoding that disagreed with the bytes sent
+        // would desynchronize a keep-alive connection (request/response
+        // smuggling for the next request on the socket).
+        if name.eq_ignore_ascii_case("content-length") {
+            if !preserve_content_length {
+                continue;
+            }
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            continue;
+        }
         // Never let an upstream/CGI/filename-derived header split the response.
         if crate::verified::sanitize_header_value(value).is_none() {
             return Err(io::Error::new(
@@ -832,7 +905,7 @@ pub fn write_response<W: ResponseWrite>(
         head.extend_from_slice(value);
         head.extend_from_slice(b"\r\n");
     }
-    if !have_cl && !no_body_status {
+    if !preserve_content_length && !no_body_status {
         head.extend_from_slice(b"Content-Length: ");
         push_decimal(&mut head, body_len);
         head.extend_from_slice(b"\r\n");
@@ -847,20 +920,16 @@ pub fn write_response<W: ResponseWrite>(
 
     if inline_body {
         let mut sent = 0u64;
-        match &mut resp.body {
-            Body::Empty => {}
-            Body::Bytes(b) => {
-                head.extend_from_slice(b);
-                sent = b.len() as u64;
-            }
-            Body::File { file, offset, len } => {
-                file.seek(SeekFrom::Start(*offset))?;
-                let start = head.len();
-                head.resize(start + *len as usize, 0);
-                file.read_exact(&mut head[start..])?;
-                sent = *len;
-            }
-            Body::Stream { .. } => {}
+        if let Body::Bytes(b) = &mut resp.body {
+            head.extend_from_slice(b);
+            sent = b.len() as u64;
+        }
+        if let Body::File { file, offset, len } = &mut resp.body {
+            file.seek(SeekFrom::Start(*offset))?;
+            let start = head.len();
+            head.resize(start + *len as usize, 0);
+            file.read_exact(&mut head[start..])?;
+            sent = *len;
         }
         stream.write_all(&head)?;
         stream.flush()?;
@@ -911,12 +980,9 @@ pub fn write_response<W: ResponseWrite>(
                         libc::sendfile(fd, file.as_raw_fd(), &mut off as *mut i64, chunk)
                     };
                     if n < 0 {
-                        let e = io::Error::last_os_error();
-                        if e.kind() == io::ErrorKind::Interrupted
-                            || e.kind() == io::ErrorKind::WouldBlock
-                        {
-                            continue;
-                        }
+                        // Fall through to the bounded copy path.  Never spin
+                        // here on a non-blocking destination (EAGAIN): a full
+                        // socket buffer is not a truncated response budget.
                         break;
                     }
                     if n == 0 {
@@ -935,7 +1001,10 @@ pub fn write_response<W: ResponseWrite>(
                     let want = remaining.min(tmp.len() as u64) as usize;
                     let got = f.read(&mut tmp[..want])?;
                     if got == 0 {
-                        break;
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "short file response body",
+                        ));
                     }
                     stream.write_all(&tmp[..got])?;
                     sent += got as u64;
@@ -1096,11 +1165,889 @@ mod tests {
     }
 
     #[test]
+    fn request_trailers_are_bounded() {
+        let mut wire =
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+        for i in 0..(MAX_REQUEST_TRAILERS + 1) {
+            wire.extend_from_slice(format!("X-Trailer-{i}: x\r\n").as_bytes());
+        }
+        wire.extend_from_slice(b"\r\n");
+        let mut cursor = std::io::Cursor::new(wire);
+        let mut buf = Vec::new();
+        assert!(read_request(&mut cursor, &mut buf, &limits(), |_| {}).is_err());
+    }
+
+    #[test]
     fn head_limits() {
         let long = format!("GET /{} HTTP/1.1\r\nHost: x\r\n\r\n", "a".repeat(9000));
         assert!(matches!(
             parse_head(long.as_bytes(), &limits()),
             Err(ParseError::UriTooLong)
         ));
+    }
+
+    #[test]
+    fn parse_error_and_reason_phrase_tables_are_complete() {
+        let errors = [
+            ParseError::BadRequest("x"),
+            ParseError::UriTooLong,
+            ParseError::HeadersTooLarge,
+            ParseError::TooManyHeaders,
+            ParseError::VersionNotSupported,
+            ParseError::PayloadTooLarge,
+            ParseError::LengthRequired,
+            ParseError::NotImplemented("x"),
+        ];
+        for error in errors {
+            assert!(error.status() >= 400);
+            assert!(!error.message().is_empty());
+        }
+        for status in [
+            100u16, 201, 202, 204, 303, 307, 308, 408, 409, 411, 413, 415, 417, 429, 431, 503, 504,
+        ] {
+            assert_ne!(reason_phrase(status), "Unknown", "status {status}");
+        }
+    }
+
+    #[test]
+    fn head_error_maps_every_parser_rejection() {
+        use vapache_verified::HeadError::*;
+        let errors = [
+            NulByte,
+            TooManyEmptyLines,
+            UnterminatedRequestLine,
+            RequestLineTooLong,
+            MissingMethod,
+            MissingTarget,
+            MissingVersion,
+            WhitespaceInRequestLine,
+            InvalidMethod,
+            InvalidTargetByte,
+            InvalidVersion,
+            VersionNotSupported,
+            UnterminatedHeaders,
+            UnterminatedHeader,
+            HeaderLineTooLong,
+            ObsoleteFolding,
+            MissingColon,
+            InvalidHeaderName,
+            InvalidHeaderValue,
+            TooManyHeaders,
+            DuplicateHost,
+            MissingHost,
+            InvalidHost,
+            InvalidAuthority,
+            NotOriginForm,
+            FragmentInTarget,
+            BothTransferEncodingAndContentLength,
+            TransferEncodingInHttp10,
+            UnsupportedTransferCoding,
+            InvalidContentLength,
+            ConflictingContentLength,
+        ];
+        for error in errors {
+            let mapped = head_error(error);
+            assert!(mapped.status() >= 400);
+            assert!(!mapped.message().is_empty());
+        }
+    }
+
+    fn header_and_empty_body_helpers() {
+        let response = Response::new(204).header("X-Test", "yes");
+        assert_eq!(response.status, 204);
+        assert_eq!(response.body_len(), 0);
+        assert_eq!(response.headers[0].0, "X-Test");
+        let stream = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Body::Stream {
+                reader: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                len: 7,
+            },
+        };
+        assert_eq!(stream.body_len(), 7);
+    }
+
+    #[test]
+    fn response_builders_and_body_lengths() {
+        header_and_empty_body_helpers();
+    }
+
+    struct TestWriter {
+        data: Vec<u8>,
+        fd: Option<RawFd>,
+    }
+
+    impl Write for TestWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.data.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ResponseWrite for TestWriter {
+        fn raw_fd(&self) -> Option<RawFd> {
+            self.fd
+        }
+    }
+
+    struct SocketWriter(std::os::unix::net::UnixStream);
+
+    impl Write for SocketWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl ResponseWrite for SocketWriter {
+        fn raw_fd(&self) -> Option<RawFd> {
+            Some(self.0.as_raw_fd())
+        }
+    }
+
+    fn response_options() -> ResponseOptions<'static> {
+        ResponseOptions {
+            server_header: "test",
+            keep_alive: true,
+            head_only: false,
+            protocol: Version::Http11,
+            request_keep_alive: true,
+        }
+    }
+
+    fn temp_file(data: &[u8]) -> File {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "vapache-http-test-{}-{}.body",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, data).unwrap();
+        let file = File::open(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        file
+    }
+
+    #[test]
+    fn response_writer_covers_inline_stream_file_and_error_paths() {
+        // Inline bytes.
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response::bytes(200, "text/plain", b"hello".to_vec());
+        let sent = write_response(&mut writer, &mut response, &response_options()).unwrap();
+        assert_eq!(sent, 5);
+        assert!(writer.data.windows(5).any(|w| w == b"hello"));
+
+        // Inline small file.
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Body::File {
+                file: temp_file(b"file-body"),
+                offset: 0,
+                len: 9,
+            },
+        };
+        assert_eq!(
+            write_response(&mut writer, &mut response, &response_options()).unwrap(),
+            9
+        );
+        assert!(writer.data.windows(9).any(|w| w == b"file-body"));
+
+        // Empty body, HEAD and no-body statuses.
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response::new(200);
+        assert_eq!(
+            write_response(&mut writer, &mut response, &response_options()).unwrap(),
+            0
+        );
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response::bytes(200, "text/plain", b"abc".to_vec());
+        let mut opts = response_options();
+        opts.head_only = true;
+        assert_eq!(
+            write_response(&mut writer, &mut response, &opts).unwrap(),
+            0
+        );
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response::bytes(204, "text/plain", b"abc".to_vec());
+        assert_eq!(
+            write_response(&mut writer, &mut response, &response_options()).unwrap(),
+            0
+        );
+
+        // Large bytes use the non-inline path.
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response::bytes(200, "text/plain", vec![b'b'; 70 * 1024]);
+        assert_eq!(
+            write_response(&mut writer, &mut response, &response_options()).unwrap(),
+            70 * 1024
+        );
+
+        // Stream body success and premature EOF.
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Body::Stream {
+                reader: Box::new(std::io::Cursor::new(vec![b's'; 10])),
+                len: 10,
+            },
+        };
+        assert_eq!(
+            write_response(&mut writer, &mut response, &response_options()).unwrap(),
+            10
+        );
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Body::Stream {
+                reader: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                len: 10,
+            },
+        };
+        assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
+
+        // Non-socket file copy fallback.
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Body::File {
+                file: temp_file(&vec![b'f'; 32 * 1024]),
+                offset: 0,
+                len: 32 * 1024,
+            },
+        };
+        assert_eq!(
+            write_response(&mut writer, &mut response, &response_options()).unwrap(),
+            32 * 1024
+        );
+
+        // sendfile failure falls back to the copy path.
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: Some(-1),
+        };
+        let mut response = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Body::File {
+                file: temp_file(&vec![b'g'; 32 * 1024]),
+                offset: 0,
+                len: 32 * 1024,
+            },
+        };
+        assert_eq!(
+            write_response(&mut writer, &mut response, &response_options()).unwrap(),
+            32 * 1024
+        );
+
+        // Short file: sendfile ends at EOF and the fallback sees no bytes.
+        // The response must fail closed rather than advertise more body bytes
+        // than were sent on a reusable connection.
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: Some(-1),
+        };
+        let mut response = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Body::File {
+                file: temp_file(b"short"),
+                offset: 0,
+                len: 32 * 1024,
+            },
+        };
+        assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
+
+        // Zero-length file body after the head.
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Body::File {
+                file: temp_file(b""),
+                offset: 0,
+                len: 0,
+            },
+        };
+        assert_eq!(
+            write_response(&mut writer, &mut response, &response_options()).unwrap(),
+            0
+        );
+
+        // Header serialization failures.
+        for bad in [
+            ("X-Test", b"bad\r\nvalue".to_vec()),
+            ("bad name", b"value".to_vec()),
+        ] {
+            let mut writer = TestWriter {
+                data: Vec::new(),
+                fd: None,
+            };
+            let mut response = Response::new(200);
+            response
+                .headers
+                .push((Cow::Owned(bad.0.to_string()), bad.1));
+            assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
+        }
+
+        // Connection-header variants.
+        for (opts, expected) in [
+            (
+                ResponseOptions {
+                    keep_alive: false,
+                    ..response_options()
+                },
+                "Connection: close\r\n",
+            ),
+            (
+                ResponseOptions {
+                    protocol: Version::Http10,
+                    ..response_options()
+                },
+                "Connection: keep-alive\r\n",
+            ),
+        ] {
+            let mut writer = TestWriter {
+                data: Vec::new(),
+                fd: None,
+            };
+            let mut response = Response::new(200);
+            write_response(&mut writer, &mut response, &opts).unwrap();
+            assert!(writer
+                .data
+                .windows(expected.len())
+                .any(|w| w == expected.as_bytes()));
+        }
+
+        // sendfile success through a real socket.
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut writer = SocketWriter(a);
+        let mut response = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Body::File {
+                file: temp_file(&vec![b'h'; 32 * 1024]),
+                offset: 0,
+                len: 32 * 1024,
+            },
+        };
+        assert_eq!(
+            write_response(&mut writer, &mut response, &response_options()).unwrap(),
+            32 * 1024
+        );
+        drop(writer);
+        assert!(b.take(32 * 1024).bytes().count() > 0);
+
+        // TcpStream implements raw_fd for the sendfile path.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        assert!(stream.raw_fd().is_some());
+        drop(stream);
+        handle.join().unwrap();
+    }
+
+    struct SlowReader {
+        delay: Duration,
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Read for SlowReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(self.delay);
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn chunked_and_line_readers_cover_limits_timeouts_and_eof() {
+        use std::io::Cursor;
+
+        let mut file = spool_file().unwrap();
+        let mut buf = Vec::new();
+        let mut stream = Cursor::new(b"1\r\na\r\n0\r\n\r\n".to_vec());
+        let now = Instant::now();
+        assert_eq!(
+            read_chunked_to_file(
+                &mut stream,
+                &mut buf,
+                &mut file,
+                10,
+                now + Duration::from_secs(5)
+            )
+            .unwrap(),
+            1
+        );
+
+        let mut file = spool_file().unwrap();
+        let mut buf = b"1\r\na\r\n0\r\n\r\n".to_vec();
+        let mut empty = Cursor::new(Vec::<u8>::new());
+        assert_eq!(
+            read_chunked_to_file(
+                &mut empty,
+                &mut buf,
+                &mut file,
+                10,
+                now + Duration::from_secs(5)
+            )
+            .unwrap(),
+            1
+        );
+
+        let mut file = spool_file().unwrap();
+        let mut buf = Vec::new();
+        let mut too_big = Cursor::new(b"2\r\nxx\r\n0\r\n\r\n".to_vec());
+        assert!(read_chunked_to_file(
+            &mut too_big,
+            &mut buf,
+            &mut file,
+            1,
+            now + Duration::from_secs(5)
+        )
+        .is_err());
+
+        let mut file = spool_file().unwrap();
+        let mut buf = Vec::new();
+        let mut eof = Cursor::new(b"5\r\n".to_vec());
+        assert!(read_chunked_to_file(
+            &mut eof,
+            &mut buf,
+            &mut file,
+            10,
+            now + Duration::from_secs(5)
+        )
+        .is_err());
+
+        let mut file = spool_file().unwrap();
+        let mut buf = Vec::new();
+        let mut bad_crlf = Cursor::new(b"1\r\naXX".to_vec());
+        assert!(read_chunked_to_file(
+            &mut bad_crlf,
+            &mut buf,
+            &mut file,
+            10,
+            now + Duration::from_secs(5)
+        )
+        .is_err());
+
+        let mut file = spool_file().unwrap();
+        let mut buf = b"0\r\n".to_vec();
+        let mut slow = SlowReader {
+            delay: Duration::from_millis(10),
+            data: b"X-Test: x\r\n\r\n".to_vec(),
+            pos: 0,
+        };
+        assert!(read_chunked_to_file(
+            &mut slow,
+            &mut buf,
+            &mut file,
+            10,
+            Instant::now() + Duration::from_millis(1)
+        )
+        .is_err());
+
+        let mut file = spool_file().unwrap();
+        let mut buf = b"5\r\n".to_vec();
+        let mut slow = SlowReader {
+            delay: Duration::from_millis(10),
+            data: b"abc".to_vec(),
+            pos: 0,
+        };
+        assert!(read_chunked_to_file(
+            &mut slow,
+            &mut buf,
+            &mut file,
+            10,
+            Instant::now() + Duration::from_millis(1)
+        )
+        .is_err());
+
+        let mut line = Cursor::new(b"abc\r\n".to_vec());
+        let mut buf = Vec::new();
+        assert!(read_line(&mut line, &mut buf, 1).is_err());
+        let mut long = Cursor::new(vec![b'a'; 8]);
+        let mut buf = Vec::new();
+        assert!(read_line(&mut long, &mut buf, 2).is_err());
+        let mut eof = Cursor::new(Vec::<u8>::new());
+        let mut buf = Vec::new();
+        assert!(read_line(&mut eof, &mut buf, 10).is_err());
+    }
+
+    #[test]
+    fn read_request_covers_header_and_body_error_branches() {
+        use std::io::Cursor;
+
+        // Clean EOF between requests.
+        let mut empty = Cursor::new(Vec::<u8>::new());
+        let mut buf = Vec::new();
+        assert!(read_request(&mut empty, &mut buf, &limits(), |_| {})
+            .unwrap()
+            .is_none());
+
+        // Partial header EOF.
+        let mut partial = Cursor::new(b"GET / HTTP/1.1\r\nHost: x".to_vec());
+        let mut buf = Vec::new();
+        assert!(read_request(&mut partial, &mut buf, &limits(), |_| {}).is_err());
+
+        // Header total limit before and after a read.
+        let mut empty = Cursor::new(Vec::<u8>::new());
+        let mut buf = vec![b'a'; MAX_HEAD_TOTAL + 1];
+        assert!(matches!(
+            read_request(&mut empty, &mut buf, &limits(), |_| {}),
+            Err(ReadError::Parse(ParseError::HeadersTooLarge))
+        ));
+        let mut data = Cursor::new(vec![b'a'; 8192]);
+        let mut buf = vec![b'a'; MAX_HEAD_TOTAL];
+        assert!(matches!(
+            read_request(&mut data, &mut buf, &limits(), |_| {}),
+            Err(ReadError::Parse(ParseError::HeadersTooLarge))
+        ));
+
+        // Header timeout and rate-based allowance.
+        let mut timeout_limits = limits();
+        timeout_limits.header_timeout = Duration::ZERO;
+        timeout_limits.header_min_rate = 1;
+        let mut empty = Cursor::new(Vec::<u8>::new());
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_request(&mut empty, &mut buf, &timeout_limits, |_| {}),
+            Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::TimedOut
+        ));
+
+        // Content-Length over the configured limit.
+        let wire = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\n\r\n".to_vec();
+        let mut cursor = Cursor::new(wire);
+        let mut buf = Vec::new();
+        let mut small = limits();
+        small.body = 5;
+        assert!(matches!(
+            read_request(&mut cursor, &mut buf, &small, |_| {}),
+            Err(ReadError::Parse(ParseError::PayloadTooLarge))
+        ));
+
+        // Spooled body timeout and EOF.
+        let wire = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            MAX_REQUEST_BODY_IN_MEMORY + 1
+        )
+        .into_bytes();
+        let mut cursor = Cursor::new(wire.clone());
+        let mut buf = Vec::new();
+        let mut zero_timeout = limits();
+        zero_timeout.body_timeout = Duration::ZERO;
+        assert!(matches!(
+            read_request(&mut cursor, &mut buf, &zero_timeout, |_| {}),
+            Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::TimedOut
+        ));
+        let mut cursor = Cursor::new(wire);
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_request(&mut cursor, &mut buf, &limits(), |_| {}),
+            Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        // In-memory body timeout and EOF.
+        let wire = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n".to_vec();
+        let mut cursor = Cursor::new(wire.clone());
+        let mut buf = Vec::new();
+        let mut zero_timeout = limits();
+        zero_timeout.body_timeout = Duration::ZERO;
+        assert!(matches!(
+            read_request(&mut cursor, &mut buf, &zero_timeout, |_| {}),
+            Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::TimedOut
+        ));
+        let mut cursor = Cursor::new(wire);
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_request(&mut cursor, &mut buf, &limits(), |_| {}),
+            Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        // Chunked body deadline and success.
+        let wire = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let mut cursor = Cursor::new(wire.clone());
+        let mut buf = Vec::new();
+        let mut zero_timeout = limits();
+        zero_timeout.body_timeout = Duration::ZERO;
+        assert!(matches!(
+            read_request(&mut cursor, &mut buf, &zero_timeout, |_| {}),
+            Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::TimedOut
+        ));
+        let mut wire = wire;
+        wire.extend_from_slice(b"4\r\nbody\r\n0\r\n\r\n");
+        let mut cursor = Cursor::new(wire);
+        let mut buf = Vec::new();
+        let req = read_request(&mut cursor, &mut buf, &limits(), |_| {})
+            .unwrap()
+            .unwrap();
+        assert_eq!(req.body_len(), 4);
+    }
+
+    #[test]
+    fn body_rate_limits_are_applied_to_fixed_and_chunked_bodies() {
+        use std::io::Cursor;
+
+        let mut rate_limited = limits();
+        rate_limited.body_min_rate = 1;
+
+        let wire = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nbody".to_vec();
+        let mut cursor = Cursor::new(wire);
+        let mut buf = Vec::new();
+        let req = read_request(&mut cursor, &mut buf, &rate_limited, |_| {})
+            .unwrap()
+            .unwrap();
+        assert_eq!(req.body, b"body");
+
+        let wire =
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\n"
+                .to_vec();
+        let mut cursor = Cursor::new(wire);
+        let mut buf = Vec::new();
+        let req = read_request(&mut cursor, &mut buf, &rate_limited, |_| {})
+            .unwrap()
+            .unwrap();
+        assert_eq!(req.body_len(), 4);
+        let mut body = req.body_reader().unwrap().unwrap();
+        let mut read = Vec::new();
+        body.read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"body");
+    }
+
+    struct ShortReads {
+        data: Vec<u8>,
+        pos: usize,
+        max: usize,
+    }
+
+    impl Read for ShortReads {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(self.max).min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn chunk_terminator_can_span_two_reads() {
+        let mut file = spool_file().unwrap();
+        let mut buf = Vec::new();
+        let mut stream = ShortReads {
+            data: b"1\r\na\r\n0\r\n\r\n".to_vec(),
+            pos: 0,
+            max: 4,
+        };
+        let total = read_chunked_to_file(
+            &mut stream,
+            &mut buf,
+            &mut file,
+            10,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(total, 1);
+    }
+
+    struct PlainWriter {
+        data: Vec<u8>,
+    }
+
+    impl Write for PlainWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.data.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ResponseWrite for PlainWriter {}
+
+    #[test]
+    fn response_write_default_destination_has_no_sendfile_fd() {
+        let writer = PlainWriter { data: Vec::new() };
+        assert_eq!(writer.raw_fd(), None);
+
+        // The default implementation also selects the encrypted/copy path for
+        // file bodies rather than sendfile.
+        let mut writer = writer;
+        let mut response = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Body::File {
+                file: temp_file(&vec![b'p'; 32 * 1024]),
+                offset: 0,
+                len: 32 * 1024,
+            },
+        };
+        assert_eq!(
+            write_response(&mut writer, &mut response, &response_options()).unwrap(),
+            32 * 1024
+        );
+    }
+
+    #[test]
+    fn short_file_body_fails_closed_on_a_socket_destination() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut writer = SocketWriter(a);
+        let mut response = Response {
+            status: 200,
+            headers: Vec::new(),
+            body: Body::File {
+                file: temp_file(b"short"),
+                offset: 0,
+                len: 32 * 1024,
+            },
+        };
+        assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
+        drop(writer);
+        drop(b);
+    }
+
+    #[test]
+    fn response_writer_owns_framing_headers() {
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response::bytes(200, "text/plain", b"abc".to_vec());
+        response
+            .headers
+            .push((Cow::Borrowed("Content-Length"), b"999".to_vec()));
+        response
+            .headers
+            .push((Cow::Borrowed("Transfer-Encoding"), b"chunked".to_vec()));
+        assert_eq!(
+            write_response(&mut writer, &mut response, &response_options()).unwrap(),
+            3
+        );
+        let head = String::from_utf8_lossy(&writer.data[..writer.data.len() - 3]);
+        assert!(head.contains("Content-Length: 3\r\n"), "{head}");
+        assert!(!head.contains("999"), "{head}");
+        assert!(!head.contains("Transfer-Encoding"), "{head}");
+
+        // HEAD has no body to frame; the selected representation length is
+        // preserved instead of being replaced with zero.
+        let mut writer = TestWriter {
+            data: Vec::new(),
+            fd: None,
+        };
+        let mut response = Response::bytes(200, "text/plain", b"abc".to_vec());
+        response
+            .headers
+            .push((Cow::Borrowed("Content-Length"), b"12".to_vec()));
+        let mut opts = response_options();
+        opts.head_only = true;
+        assert_eq!(
+            write_response(&mut writer, &mut response, &opts).unwrap(),
+            0
+        );
+        let head = String::from_utf8_lossy(&writer.data);
+        assert!(head.contains("Content-Length: 12\r\n"), "{head}");
+        assert!(!head.contains("Content-Length: 3\r\n"), "{head}");
+    }
+
+    #[test]
+    fn spool_files_are_private_and_do_not_follow_existing_names() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::sync::atomic::AtomicU64;
+
+        let dir = std::env::temp_dir().join(format!("vapache-spool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        symlink(&victim, spool_path(&dir, 0)).unwrap();
+
+        let counter = AtomicU64::new(0);
+        let file = spool_file_named(&dir, &counter).unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(spool_path(&dir, 0)
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spool_name_collisions_fail_closed() {
+        use std::sync::atomic::AtomicU64;
+
+        let dir = std::env::temp_dir().join(format!("vapache-spool-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..SPOOL_ATTEMPTS {
+            std::fs::write(spool_path(&dir, n), b"occupied").unwrap();
+        }
+        let counter = AtomicU64::new(0);
+        assert!(spool_file_named(&dir, &counter).is_err());
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            SPOOL_ATTEMPTS
+        );
+
+        // A missing/unusable directory is a hard error, not an unbounded retry.
+        assert!(spool_file_named(&dir.join("missing"), &AtomicU64::new(0)).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -19,9 +19,12 @@ Implemented today:
 - Apache 2.4 config grammar, `<IfModule>`/`<IfDefine>`, `Include`,
   `${VAR}` expansion, scopes, name-based virtual hosts and stock Debian
   `/etc/apache2/apache2.conf` parsing.
-- Static files, `DocumentRoot`, `Alias`, `ScriptAlias`, `Redirect`,
-  `DirectoryIndex`, autoindex, `AddType`/`RemoveType`/`ForceType`,
-  `AddDefaultCharset`, MIME types and custom error documents.
+- Static files, `DocumentRoot`, `Alias`, `ScriptAlias`, `AliasMatch`,
+  `ScriptAliasMatch`, `Redirect`, `RedirectMatch`, `RedirectPermanent`/
+  `RedirectTemp`, `DirectoryIndex`, autoindex, `AddType`/`RemoveType`/
+  `ForceType`, `AddHandler`/`RemoveHandler`, `AddDefaultCharset`, MIME types
+  and custom error documents. Regex aliases and redirects expand `$1`..`$9`
+  captures and are resolved through the same target mapping as prefix aliases.
 - Byte ranges, `If-Range`, `If-Match`, `If-None-Match`,
   `If-Modified-Since`, `If-Unmodified-Since`, ETags and `Last-Modified`.
 - Access control (`Require all`, `ip`, `host`, `method`, `local`, legacy
@@ -36,10 +39,17 @@ Implemented today:
 - Per-directory `.htaccess` overrides with category-specific `AllowOverride`
   (`All`/`None`, `AuthConfig`, `FileInfo`, `Indexes`, `Limit`, `Options`, and
   Apache 2.4 `Options=ExecCGI,Includes,...` forms) for access/auth rules,
-  `Options`, `DirectoryIndex`, `ErrorDocument`, MIME/handlers, `Header`,
-  `Redirect`, and rewrite rules. Unknown directives, disallowed categories and
-  unsupported sections return `500` rather than silently ignoring a possible
-  access rule; unknown-only `AllowOverride` values are rejected at startup.
+  `Options`, `DirectoryIndex`, `ErrorDocument`, MIME/handlers, `Header`
+  (`set`/`add`/`unset` and `always`/`onsuccess`), `Redirect`, and rewrite
+  rules. Unknown directives, disallowed categories and unsupported sections
+  return `500` rather than silently ignoring a possible access rule. Every
+  recognized directive has an explicit effectful, inert or rejected
+  disposition and an `AllowOverride` category in the authoritative registry;
+  an exhaustive test matrix checks all of them.
+  `<IfModule>` covers every module whose directives the server implements, so
+  wrapping auth, rewrite, IP, CGI or autoindex rules in a module block cannot
+  silently disable them. Unknown-only `AllowOverride` values are rejected at
+  startup.
 - A fail-closed `mod_rewrite` implementation in server/vhost/`<Directory>`
   and `.htaccess` contexts: `RewriteEngine`, `RewriteBase`,
   `RewriteOptions Inherit`, `RewriteCond` (regex, `=`, `!=`, `<`, `>`,
@@ -48,9 +58,12 @@ Implemented today:
   (`L`, `END`, `R`, `P`, `F`, `G`, `C`, `S`, `N`, `QSA`, `QSD`, `QSL`,
   `B`, `BCTLS`, `BNE`, `BNP`, `CO`, `E`, `H`, `T`, `NE`, `PT`,
   `UnsafeAllow3F`, `UnsafePrefixStat`), including backreferences, common
-  `%{...}` variables and loop protection. `dbm` maps and exact `DPI`
-  path-info handling remain unsupported; malformed patterns are rejected
-  rather than approximated.
+  `%{...}` variables and loop protection. Internal rewrites reauthorize the
+  original URL with the original request context and accumulated rewrite
+  effects, then authorize the final target. `UnsafePrefixStat` is accepted for
+  compatibility but never weakens the document/alias containment base. `dbm`
+  maps and exact `DPI` path-info handling remain unsupported; malformed
+  patterns are rejected rather than approximated.
 - HTTP Basic authentication (`AuthType Basic`, `AuthName`, `AuthUserFile`,
   `AuthGroupFile`, `Require valid-user`, `Require user` and `Require group`)
   with Apache-compatible `$apr1$`, `$1$`, bcrypt, `{SHA}` and `{SSHA}`
@@ -62,7 +75,14 @@ Implemented today:
   Cleartext h2c is not implemented.
 - CGI/1.1 executed directly (never through a shell) with a minimal
   environment, `PR_SET_NO_NEW_PRIVS`, rlimits, a new session, a watchdog and
-  bounded output.
+  bounded output. `PATH_INFO` is split against the actual script and policy is
+  re-evaluated for that script before execution. The worker control socket is
+  close-on-exec, and request bodies above the spool threshold stay on disk
+  through the CGI worker instead of being buffered in full. TLS requests set
+  `REQUEST_SCHEME=https` and `HTTPS=on`, and authenticated requests export
+  `REMOTE_USER`/`AUTH_TYPE`, for both CGI and FastCGI. The selected FastCGI
+  target is authoritative for `SCRIPT_FILENAME`, `SCRIPT_NAME`, `PATH_INFO`
+  and `PATH_TRANSLATED`; stale base-request values are removed before sending.
 - gzip and Brotli response compression with `AddOutputFilterByType`,
   `SetOutputFilter`, `AddOutputFilter`, compression levels, `Vary`,
   encoding-aware ETags, range bypass and `.htaccess` filter support.
@@ -75,8 +95,11 @@ Implemented today:
   `SSLProxyCACertificateFile` roots, `balancer://` round-robin backends with
   active `hcmethod`/`hcuri` health checks, sticky sessions, `failonstatus`
   retries, same-request member failover and reusable upstream connections,
-  and WebSocket tunneling over
-  TCP/TLS (WSS on either side).
+  and WebSocket tunneling over TCP/TLS (WSS on either side). Prefix and regex
+  routes share one configuration-ordered route table, and `<Proxy>` sections
+  match both the configured `balancer://` identity and the concrete member;
+  failover re-authorizes the next member and atomically replaces the
+  grant/resource binding instead of reusing the first member's grant.
 - TLS client-certificate authentication (`SSLVerifyClient`,
   `SSLCACertificateFile`), and OCSP stapling with AIA or
   `SSLStaplingForceURL` responders, startup warm-start persistence and
@@ -97,7 +120,15 @@ Implemented today:
   `CacheIgnoreCacheControl`, `CacheIgnoreNoLastMod`, `CacheStorePrivate`,
   `CacheStoreNoStore`, `CacheIgnoreQueryString`, `CacheHeader`, `Age`,
   conditional hits, disk warm-start metadata and invalidation on unsafe
-  methods.
+  methods. Keys bind the listener/port, vhost, scheme, canonical URL
+  (including its trailing slash), query and resolved filesystem/alias target,
+  with CGI `PATH_INFO` keys bound to the script actually executed; entries
+  also carry a configuration generation that a reload advances. The policy
+  fingerprint covers every `Scope` policy slice and all request headers, with
+  a matrix test over every policy field and key dimension. Every hit re-runs
+  authorization against that mapped target. Multiple `Vary` field lines are
+  combined, disk entries are rechecked against their variant, and credentialed
+  or cookie-bearing requests are never stored in the shared cache.
 - Apache expression evaluation for `Require expr`, `<If>`, `<ElseIf>`,
   `<Else>` and `<IfFile>`: comparisons, boolean logic, string concatenation,
   regex captures, request headers/environment variables, file tests,
@@ -112,7 +143,9 @@ Implemented today:
 - Bounded-memory proxy and FastCGI traffic: large fixed-length upstream
   bodies stream through `Body::Stream`, large FastCGI stdout is spooled to a
   temporary file, and large request bodies are spooled to an unlinked file
-  before being forwarded to proxy/FastCGI backends.
+  before being forwarded to proxy/FastCGI backends. Request and proxy chunk
+  sizes, trailer counts/bytes, proxy head sizes and CGI/FastCGI output are
+  explicitly bounded.
 - Unsupported security-sensitive directives (`SSLRequire*`,
   `SecRuleEngine On`) fail closed even in
   compatibility mode rather than silently weakening access or TLS policy.
@@ -131,12 +164,15 @@ expression forms such as `LogMessage` interpolation, `RewriteMap dbm`, exact
 `[DPI]` path-info discarding in per-directory contexts, some `[NE]`/`[PT]`
 corner cases, `mod_cache_socache`/`mod_file_cache`, Digest/LDAP
 authentication, h2c, and the long tail of Apache modules.
-Unimplemented non-security directives are reported as warnings in
-compatibility mode and as errors under `--strict-config`.  Security-sensitive
-unimplemented directives (for example `ProxyBlock`, `RequestHeader`,
-`SetEnvIfExpr`, `AcceptPathInfo`, non-file `AuthBasicProvider` values and
-filter-provider directives) fail closed even in compatibility mode, and
-unimplemented `.htaccess` directives fail closed with a `500`.
+Unimplemented directives are reported as warnings in compatibility mode. Under
+`--strict-config` every unhandled directive is an error, including
+directives that are recognized but not implemented; strict mode never means
+“only reject unknown names.”  Security-sensitive unimplemented directives
+(for example `Action`, `ProxyBlock`, `RequestHeader`, `SetEnvIfExpr`,
+`BrowserIPMatch`, `AcceptPathInfo`, `RLimit*`, `TransferLog`, `ScriptLog*`,
+non-file `AuthBasicProvider` values and filter-provider/input-filter
+directives) fail closed even in compatibility mode, and unimplemented
+`.htaccess` directives fail closed with a `500`.
 
 ## Build
 
@@ -155,14 +191,21 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **194 verified functions, 0 errors** (percent-decoding,
+Current result: **218 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
-sanitization, token validation, byte-range arithmetic, the mmap/CGI
-protocol bounds, HTTP/2 method/head/body admission, the stream/reset budget
-model, the stream-ID admission/lifecycle model and the idempotent early-reset purge model, and the TLS listener client-certificate policy identity, the container/list merge append model, the rewrite target classification/internal-join/same-host authority model, the expression truthiness/condition-chain model, the regex dialect admission guard, directive disposition, access-layer slot translation, config front-end line-kind IR and section-context transitions, rewrite backreference
-encoding and filesystem-target admission, and the configuration
-access-plan, authorization-merge, Options-merge and `.htaccess`
-rule-classification kernels used by the dispatcher).
+sanitization, token validation, proxy request-line/header admission, byte-range
+arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
+the stream/reset budget model, the stream-ID admission/lifecycle model and the
+idempotent early-reset purge model, and the TLS listener client-certificate
+policy identity, the append-only container/list merge model, the rewrite target
+classification/internal-join/same-host authority model, component-aware
+filesystem containment for alias/rewrite/FastCGI targets, the expression
+truthiness/comparison/glob/condition-chain model, the regex dialect admission
+guard, directive disposition, access-layer slot translation, config front-end
+line-kind IR and section-context transitions, rewrite backreference encoding
+and filesystem-target admission, and the configuration access-plan,
+authorization-merge, Options-merge and `.htaccess` rule-classification kernels
+used by the dispatcher).
 
 Function count is not the progress metric. The verification ledger tracks
 security obligations and proof debt:
@@ -172,15 +215,16 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus   # include the Verus gate
 ```
 
-Current ledger: **43.8% weighted obligations**, **6/6 proof debt**,
-**8/8 grant-required sinks**, **3/8 inode-bound sinks**, **3/8
-backend-target-bound sinks**, **2/8 policy-key-bound sinks**, **0 partially
-bound sinks**, **0 unexplained replay failures**, and **194 Verus functions
-with 0 errors**.
+Current ledger: **50.0% weighted obligations**, **6/6 proof debt**,
+**8/8 grant-required sinks**, **4/8 inode-bound sinks**, **3/8
+backend-target-bound sinks**, **3/8 policy-key-bound sinks**, **0 partially
+bound sinks**, **0 unexplained replay failures**, and **29 adversarial replay
+cases** covering the findings classes, and **218 Verus functions with 0
+errors** (including the I3 fast-path prefilter and I14 first-match theorems).
 
 The ledger lives in `docs/verification-status.json`. It records:
 
-- weighted progress on the eight proof obligations,
+- weighted progress on the twenty-six proof obligations,
 - named unverified security components,
 - sinks that need stronger resource binding,
 - explicit assumptions and unmodeled directive classes,
@@ -196,6 +240,7 @@ requiring a grant. Raising a budget is a deliberate, reviewable change.
 ```sh
 cargo test --workspace          # Rust unit tests
 python3 tests/conformance.py    # 165 Apache differential/conformance tests
+python3 tests/adversarial_regressions.py  # F23-F38 end-to-end replay suite
 ```
 
 The conformance suite starts a real Apache `httpd` and `vapached` with
@@ -264,17 +309,24 @@ The output shows the selected vhost/docroot, `AllowOverride`, the override
 walk gate, matching top-level rules, effective `Options`, `Require`/legacy
 policy, auth settings, rewrite/cache state, and whether an access file was
 read or skipped.  The reference model and proof obligations for formal
-verification are in `docs/config-semantics.md`.
+verification are in `docs/config-semantics.md`; the per-finding closure matrix
+for the adversarial pass is in `docs/adversarial-closure.md`.
 
 Combined unit and end-to-end line coverage is measured against instrumented binaries:
 
 ```sh
 tests/coverage.sh
+python3 tests/security_coverage.py --check
 ```
+
+`security_coverage.py` reports production-line coverage before each file's
+test module for the unproven security-critical surfaces. FastCGI, HTTP/1.1 and
+TLS are enforced at 100%; the remaining modules are tracked so they can be
+promoted one at a time.
 
 Latest snapshot (`coverage/SUMMARY.md`, taken before the most recent
 semantics tests): **81.9% lines**, **79.6% of functions** across the
-then-current Rust and conformance suites. The current suite is 205 Rust
+then-current Rust and conformance suites. The current suite is 250 Rust
 library tests, 4 CLI tests, 165 conformance tests and the generated
 configuration matrices. Authentication is at 91.7% line coverage, TLS/HTTP/2 at
 86.1%/79.7%, `.htaccess` at 84.9%, access logging at 85.1%, the verified
