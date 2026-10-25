@@ -1,5 +1,7 @@
 # vapache
 
+**WARNING: THIS ISN'T DONE YET AND HAS NOT UNDERGONE AN ADVERSARIAL PASS YET, THERE ARE PROBABLY STILL CRITICAL BUGS IN THIS DON'T USE IT**
+
 A memory-safe, formally verified, drop-in-compatible Apache HTTP Server
 replacement written in Rust.
 
