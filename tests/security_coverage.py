@@ -43,7 +43,7 @@ MODULES = [
 
 # Enforced modules are at 100% production-line coverage.  The rest are reported
 # so the next module can be promoted without changing the measurement method.
-ENFORCED = {"fastcgi", "http", "tls"}
+ENFORCED = {"cgi", "config", "expr", "fastcgi", "htaccess", "http", "proxy", "rewrite", "tls"}
 
 
 def llvm_bin() -> Path:

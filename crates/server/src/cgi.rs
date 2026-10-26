@@ -317,32 +317,16 @@ pub fn execute(ctx: &CgiContext) -> Response {
         path.as_path()
     };
     if let Some(pool) = POOL.get() {
-        if let Some(mut worker) = pool.take() {
-            match exchange(
-                &mut worker.stream,
-                worker_path,
-                &cwd,
-                &env,
-                &body,
-                ctx.cfg.timeout,
-                worker_identity,
-            ) {
-                Ok((out, stderr)) => {
-                    pool.put(worker);
-                    if !stderr.trim().is_empty() {
-                        eprintln!("CGI stderr: {}", stderr.trim());
-                    }
-                    return match parse_cgi_response(&out, ctx.req.version) {
-                        Ok(r) => r,
-                        Err(()) => cgi_error(ctx),
-                    };
-                }
-                Err(e) => {
-                    // Do not retry locally: the script may already have run.
-                    eprintln!("vapached: CGI worker failed: {e}");
-                    return cgi_error(ctx);
-                }
-            }
+        if let Some(resp) = execute_via_pool(
+            pool,
+            ctx,
+            worker_path,
+            &cwd,
+            &env,
+            &body,
+            worker_identity,
+        ) {
+            return resp;
         }
     }
 
@@ -359,6 +343,43 @@ pub fn execute(ctx: &CgiContext) -> Response {
         Err(e) => {
             eprintln!("vapached: CGI failed: {e}");
             cgi_error(ctx)
+        }
+    }
+}
+
+fn execute_via_pool(
+    pool: &CgiPool,
+    ctx: &CgiContext,
+    path: &Path,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    body: &BodySource,
+    expected: Option<(u64, u64)>,
+) -> Option<Response> {
+    let mut worker = pool.take()?;
+    match exchange(
+        &mut worker.stream,
+        path,
+        cwd,
+        env,
+        body,
+        ctx.cfg.timeout,
+        expected,
+    ) {
+        Ok((out, stderr)) => {
+            pool.put(worker);
+            if !stderr.trim().is_empty() {
+                eprintln!("CGI stderr: {}", stderr.trim());
+            }
+            Some(match parse_cgi_response(&out, ctx.req.version) {
+                Ok(r) => r,
+                Err(()) => cgi_error(ctx),
+            })
+        }
+        Err(e) => {
+            // Do not retry locally: the script may already have run.
+            eprintln!("vapached: CGI worker failed: {e}");
+            Some(cgi_error(ctx))
         }
     }
 }
@@ -430,9 +451,12 @@ impl CgiPool {
 /// streams to close cleanly.  Called during server shutdown so a SIGTERM does
 /// not truncate a worker's LLVM profile or leave children behind.
 pub fn shutdown_pool() {
-    let Some(pool) = POOL.get() else {
-        return;
-    };
+    if let Some(pool) = POOL.get() {
+        shutdown_pool_inner(pool);
+    }
+}
+
+fn shutdown_pool_inner(pool: &CgiPool) {
     pool.closed.store(true, Ordering::SeqCst);
     pool.ready.notify_all();
     let workers = {
@@ -442,11 +466,10 @@ pub fn shutdown_pool() {
     for mut worker in workers {
         drop(worker.stream);
         for _ in 0..100 {
-            match worker.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
+            if !matches!(worker.child.try_wait(), Ok(None)) {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(5));
         }
         let _ = worker.child.kill();
         let _ = worker.child.wait();
@@ -467,8 +490,22 @@ pub fn init_pool(cfg: &Config) -> Result<(), String> {
 }
 
 fn worker_ids(user: &str, group: &str) -> Result<(u32, u32), String> {
-    if unsafe { libc::geteuid() } != 0 {
-        return Ok((unsafe { libc::geteuid() }, unsafe { libc::getegid() }));
+    worker_ids_for(
+        unsafe { libc::geteuid() },
+        unsafe { libc::getegid() },
+        user,
+        group,
+    )
+}
+
+fn worker_ids_for(
+    euid: u32,
+    egid: u32,
+    user: &str,
+    group: &str,
+) -> Result<(u32, u32), String> {
+    if euid != 0 {
+        return Ok((euid, egid));
     }
     let uid = if let Ok(n) = user.parse::<u32>() {
         n
@@ -493,6 +530,39 @@ fn worker_ids(user: &str, group: &str) -> Result<(u32, u32), String> {
     Ok((uid, gid))
 }
 
+fn clear_cloexec(fd: i32) -> std::io::Result<()> {
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn prepare_worker_fd(child_fd: i32, target: i32) -> std::io::Result<()> {
+    if unsafe { libc::dup2(child_fd, target) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    clear_cloexec(target)
+}
+
+fn child_process_setup(timeout: Duration) -> std::io::Result<()> {
+    unsafe {
+        libc::setsid();
+        libc::umask(0o022);
+        let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        let lim = libc::rlimit {
+            rlim_cur: timeout.as_secs().max(1) as libc::rlim_t,
+            rlim_max: timeout.as_secs().max(1) as libc::rlim_t,
+        };
+        libc::setrlimit(libc::RLIMIT_CPU, &lim);
+        let fsize = libc::rlimit {
+            rlim_cur: MAX_OUTPUT as libc::rlim_t,
+            rlim_max: MAX_OUTPUT as libc::rlim_t,
+        };
+        libc::setrlimit(libc::RLIMIT_FSIZE, &fsize);
+    }
+    Ok(())
+}
+
 fn start_pool(uid: u32, gid: u32, user: &str) -> Result<CgiPool, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find own executable: {e}"))?;
     // Start enough workers for the common concurrent CGI fan-out.  Each one is
@@ -501,6 +571,16 @@ fn start_pool(uid: u32, gid: u32, user: &str) -> Result<CgiPool, String> {
         .map(|n| n.get() * 4)
         .unwrap_or(8)
         .clamp(8, 64);
+    start_pool_with_exe(&exe, uid, gid, user, count)
+}
+
+fn start_pool_with_exe(
+    exe: &Path,
+    uid: u32,
+    gid: u32,
+    user: &str,
+    count: usize,
+) -> Result<CgiPool, String> {
     let mut workers = Vec::with_capacity(count);
     for _ in 0..count {
         let (mut parent, child) =
@@ -512,7 +592,7 @@ fn start_pool(uid: u32, gid: u32, user: &str) -> Result<CgiPool, String> {
             .set_write_timeout(Some(Duration::from_secs(30)))
             .map_err(|e| e.to_string())?;
         let child_fd = child.as_raw_fd();
-        let mut cmd = Command::new(&exe);
+        let mut cmd = Command::new(exe);
         cmd.arg("--cgi-worker")
             .arg(uid.to_string())
             .arg(gid.to_string())
@@ -527,19 +607,9 @@ fn start_pool(uid: u32, gid: u32, user: &str) -> Result<CgiPool, String> {
         if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
             cmd.env("LLVM_PROFILE_FILE", profile);
         }
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::dup2(child_fd, WORKER_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // Keep the descriptor across this exec (the worker needs it).
-                // The worker sets FD_CLOEXEC itself before spawning scripts.
-                if libc::fcntl(WORKER_FD, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        // Keep the descriptor across this exec (the worker needs it).  The
+        // worker sets FD_CLOEXEC itself before spawning scripts.
+        unsafe { cmd.pre_exec(move || prepare_worker_fd(child_fd, WORKER_FD)); }
         let proc = cmd
             .spawn()
             .map_err(|e| format!("cannot spawn CGI worker: {e}"))?;
@@ -566,23 +636,45 @@ fn start_pool(uid: u32, gid: u32, user: &str) -> Result<CgiPool, String> {
 }
 
 fn drop_worker_privileges(uid: u32, gid: u32, user: &str) -> bool {
-    if unsafe { libc::geteuid() } != 0 {
-        return unsafe { libc::geteuid() } == uid && unsafe { libc::getegid() } == gid;
+    drop_worker_privileges_for(
+        unsafe { libc::geteuid() },
+        unsafe { libc::getegid() },
+        uid,
+        gid,
+        user,
+    )
+}
+
+fn drop_worker_privileges_for(
+    euid: u32,
+    egid: u32,
+    uid: u32,
+    gid: u32,
+    user: &str,
+) -> bool {
+    if euid != 0 {
+        return euid == uid && egid == gid;
     }
-    if let Ok(cuser) = std::ffi::CString::new(user) {
-        let pw = unsafe { libc::getpwnam(cuser.as_ptr()) };
-        if !pw.is_null() {
-            unsafe {
-                libc::initgroups(cuser.as_ptr(), gid as libc::gid_t);
-            }
-        }
-    }
+    init_worker_groups(user, gid);
     unsafe {
         if libc::setgid(gid as libc::gid_t) != 0 || libc::setuid(uid as libc::uid_t) != 0 {
             return false;
         }
     }
     true
+}
+
+fn init_worker_groups(user: &str, gid: u32) {
+    let Ok(cuser) = std::ffi::CString::new(user) else {
+        return;
+    };
+    let pw = unsafe { libc::getpwnam(cuser.as_ptr()) };
+    if pw.is_null() {
+        return;
+    }
+    unsafe {
+        libc::initgroups(cuser.as_ptr(), gid as libc::gid_t);
+    }
 }
 
 /// CGI worker process entry point.  It is spawned once per pool slot and is
@@ -610,25 +702,24 @@ pub fn worker_main(fd: i32, uid: u32, gid: u32, user: &str) {
         };
         libc::setrlimit(libc::RLIMIT_FSIZE, &fsize);
     }
-    let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
     // The worker owns the control socket, but CGI scripts spawned by the
     // worker must not inherit it.  Marking it close-on-exec here (after the
     // worker's own exec) keeps the socket alive for the worker loop while
     // excluding it from every script descriptor set.
-    let fd = stream.as_raw_fd();
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+    let Some(mut stream) = stream_from_fd(fd) else {
         return;
-    }
+    };
     if stream.write_all(&[1]).is_err() {
         return;
     }
-    loop {
-        match worker_request(&mut stream) {
-            Ok(true) => {}
-            Ok(false) => break,
-            Err(_) => break,
-        }
+    while worker_request(&mut stream).unwrap_or(false) {}
+}
+
+fn stream_from_fd(fd: i32) -> Option<UnixStream> {
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return None;
     }
+    Some(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
 fn worker_request(stream: &mut UnixStream) -> Result<bool, String> {
@@ -702,6 +793,17 @@ fn worker_request(stream: &mut UnixStream) -> Result<bool, String> {
     Ok(true)
 }
 
+fn send_timeout(stream: &mut impl Write, timeout: Duration) -> Result<(), String> {
+    match write_u64(stream, timeout.as_secs().max(1)) {
+        Ok(()) => {
+            let _ = stream.flush();
+            Ok(())
+        }
+        Err(e) if e.contains("Broken pipe") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn exchange(
     stream: &mut UnixStream,
     path: &Path,
@@ -736,13 +838,7 @@ fn exchange(
     // A worker that already produced its full response may close as soon as
     // the body is consumed; a broken pipe on the final metadata write does not
     // invalidate the response we can still read.
-    match write_u64(stream, timeout.as_secs().max(1)) {
-        Ok(()) => {
-            let _ = stream.flush();
-        }
-        Err(e) if e.contains("Broken pipe") => {}
-        Err(e) => return Err(e),
-    }
+    send_timeout(stream, timeout)?;
 
     let ok = read_u8(stream)?;
     let out = read_bytes(stream, MAX_OUTPUT as u32, false)?.unwrap_or_default();
@@ -809,6 +905,41 @@ fn read_bytes(r: &mut impl Read, limit: u32, eof_ok: bool) -> Result<Option<Vec<
     Ok(Some(data))
 }
 
+fn inheritable_fd_path(file: &File) -> Result<PathBuf, String> {
+    let fd = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err("cannot make CGI script descriptor inheritable".into());
+    }
+    Ok(PathBuf::from(format!("/proc/self/fd/{fd}")))
+}
+
+fn feed_stdin(
+    stdin: std::process::ChildStdin,
+    body: &BodySource,
+    body_len: u64,
+) -> Option<std::thread::JoinHandle<()>> {
+    let mut stdin = stdin;
+    if body_len == 0 {
+        drop(stdin);
+        None
+    } else if body_len <= 16 * 1024 {
+        if let Ok(mut reader) = body.reader() {
+            let _ = std::io::copy(&mut reader, &mut stdin);
+        }
+        drop(stdin);
+        None
+    } else {
+        let Ok(mut reader) = body.reader() else {
+            drop(stdin);
+            return None;
+        };
+        Some(std::thread::spawn(move || {
+            let _ = std::io::copy(&mut reader, &mut stdin);
+        }))
+    }
+}
+
 fn run_local(
     path: &Path,
     cwd: &Path,
@@ -842,13 +973,9 @@ fn run_local(
         if meta.dev() != dev || meta.ino() != ino {
             return Err("CGI script inode changed after authorization".into());
         }
-        let fd = file.as_raw_fd();
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
-            return Err("cannot make CGI script descriptor inheritable".into());
-        }
+        let fd_path = inheritable_fd_path(&file)?;
         verified_script = Some(file);
-        PathBuf::from(format!("/proc/self/fd/{fd}"))
+        fd_path
     } else {
         path.to_path_buf()
     };
@@ -865,22 +992,7 @@ fn run_local(
     }
     if !worker_prepared {
         unsafe {
-            cmd.pre_exec(move || {
-                libc::setsid();
-                libc::umask(0o022);
-                let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                let lim = libc::rlimit {
-                    rlim_cur: timeout.as_secs().max(1) as libc::rlim_t,
-                    rlim_max: timeout.as_secs().max(1) as libc::rlim_t,
-                };
-                libc::setrlimit(libc::RLIMIT_CPU, &lim);
-                let fsize = libc::rlimit {
-                    rlim_cur: MAX_OUTPUT as libc::rlim_t,
-                    rlim_max: MAX_OUTPUT as libc::rlim_t,
-                };
-                libc::setrlimit(libc::RLIMIT_FSIZE, &fsize);
-                Ok(())
-            });
+            cmd.pre_exec(move || child_process_setup(timeout));
         }
     }
     let spawn_result = cmd.spawn();
@@ -893,27 +1005,11 @@ fn run_local(
 
     // Feed stdin.  Empty GET bodies just close the pipe.  Only larger bodies
     // need a writer thread; it is joined before this worker forks again.
-    let stdin_thread = child.stdin.take().and_then(|mut stdin| {
-        let body_len = body.len();
-        if body_len == 0 {
-            drop(stdin);
-            None
-        } else if body_len <= 16 * 1024 {
-            if let Ok(mut reader) = body.reader() {
-                let _ = std::io::copy(&mut reader, &mut stdin);
-            }
-            drop(stdin);
-            None
-        } else {
-            let Ok(mut reader) = body.reader() else {
-                drop(stdin);
-                return None;
-            };
-            Some(std::thread::spawn(move || {
-                let _ = std::io::copy(&mut reader, &mut stdin);
-            }))
-        }
-    });
+    let body_len = body.len();
+    let stdin_thread = child
+        .stdin
+        .take()
+        .and_then(|stdin| feed_stdin(stdin, body, body_len));
     let stderr_thread = child.stderr.take().map(|e| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -957,12 +1053,7 @@ fn kill_group(pid: i32) {
 }
 
 fn wait_with_deadline(child: &mut Child, pid: i32, deadline: Instant) -> Result<(), String> {
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => {}
-            Err(e) => return Err(e.to_string()),
-        }
+    while matches!(child.try_wait(), Ok(None)) {
         if Instant::now() >= deadline {
             kill_group(pid);
             let _ = child.wait();
@@ -970,6 +1061,17 @@ fn wait_with_deadline(child: &mut Child, pid: i32, deadline: Instant) -> Result<
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+    Ok(())
+}
+
+fn poll_result(rc: i32, error: std::io::Error) -> Result<bool, String> {
+    if rc < 0 {
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error.to_string());
+    }
+    Ok(rc > 0)
 }
 
 fn read_with_deadline(
@@ -992,14 +1094,7 @@ fn read_with_deadline(
             revents: 0,
         };
         let rc = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
-        if rc < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e.to_string());
-        }
-        if rc == 0 {
+        if !poll_result(rc, std::io::Error::last_os_error())? {
             continue;
         }
         match reader.read(&mut chunk) {
@@ -1508,5 +1603,682 @@ mod tests {
         assert!(worker_ids("www-data", "no-such-vapache-group-xyz").is_err());
         assert!(worker_ids("www-data", "www-data").is_ok());
         assert!(worker_ids("33", "33").is_ok());
+    }
+
+    struct ErrorWriter(&'static str);
+
+    impl Write for ErrorWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                self.0,
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BadFd;
+
+    impl Read for BadFd {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl AsRawFd for BadFd {
+        fn as_raw_fd(&self) -> i32 {
+            999_999
+        }
+    }
+
+    struct SeqRead {
+        file: File,
+        stage: usize,
+    }
+
+    impl Read for SeqRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.stage += 1;
+            match self.stage {
+                1 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                2 => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+                _ => {
+                    let _ = buf;
+                    Err(std::io::Error::from(std::io::ErrorKind::Other))
+                }
+            }
+        }
+    }
+
+    impl AsRawFd for SeqRead {
+        fn as_raw_fd(&self) -> i32 {
+            self.file.as_raw_fd()
+        }
+    }
+
+    struct FloodRead {
+        file: File,
+    }
+
+    impl Read for FloodRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let len = buf.len().min(64 * 1024);
+            buf[..len].fill(b'x');
+            Ok(len)
+        }
+    }
+
+    impl AsRawFd for FloodRead {
+        fn as_raw_fd(&self) -> i32 {
+            self.file.as_raw_fd()
+        }
+    }
+
+    fn closed_file(path: &Path) -> File {
+        // Keep the path argument so tests read as "the authorized file is
+        // closed", but return a deterministic invalid descriptor.  Closing a
+        // real high descriptor and handing its number to another thread lets a
+        // parallel test reuse that fd before fcntl() runs, which made the
+        // bad-descriptor assertions flaky.
+        let _ = File::open(path).unwrap();
+        unsafe { File::from_raw_fd(i32::MAX) }
+    }
+
+    fn response_header<'a>(resp: &'a Response, name: &str) -> Option<&'a [u8]> {
+        resp.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_slice())
+    }
+
+    fn test_ctx<'a>(
+        cfg: &'a Config,
+        req: &'a Request,
+        root: &'a Path,
+        script_rel: &'a Path,
+        script_file: Option<&'a File>,
+    ) -> CgiContext<'a> {
+        CgiContext {
+            cfg,
+            vhost: None,
+            req,
+            root,
+            script_rel,
+            script_name: "/test",
+            path_info: "",
+            docroot: root,
+            remote_ip: "127.0.0.1",
+            remote_port: 12345,
+            local_ip: "127.0.0.1",
+            local_port: 8080,
+            https: false,
+            server_name: "localhost",
+            host: "localhost",
+            follow_symlinks: false,
+            env: &[],
+            remote_user: None,
+            auth_type: None,
+            script_file,
+        }
+    }
+
+    #[test]
+    fn find_script_body_sources_and_auth_header_filtering() {
+        let dir = tempdir("sources");
+        let cfg = config(&dir);
+        let path = script(
+            &dir,
+            "hello.sh",
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nhello\\n'\n",
+        );
+        let found = find_script(&dir, Path::new("hello.sh"), false).unwrap();
+        assert_eq!(found.rel_script, Path::new("hello.sh"));
+        assert!(found.path_info.is_empty());
+
+        let bytes = BodySource::Bytes(b"abc".to_vec());
+        assert_eq!(bytes.len(), 3);
+        let mut reader = bytes.reader().unwrap();
+        let mut got = String::new();
+        reader.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "abc");
+
+        let file = File::open(&path).unwrap();
+        let file_body = BodySource::File(file);
+        assert_eq!(file_body.len(), path.metadata().unwrap().len());
+        assert!(file_body.reader().is_ok());
+
+        let mut req = request("/test", b"body".to_vec());
+        req.headers
+            .push("Authorization", "Basic c2VjcmV0");
+        req.headers.push("Content-Type", "text/plain");
+        req.headers.push("Content-Length", "4");
+        let ctx = test_ctx(&cfg, &req, &dir, Path::new("hello.sh"), None);
+        let env = build_env(&ctx);
+        assert!(!env.iter().any(|(name, _)| name == "HTTP_AUTHORIZATION"));
+        assert!(env
+            .iter()
+            .any(|(name, value)| name == "CONTENT_TYPE"
+                && value.to_string_lossy() == "text/plain"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execute_local_stderr_missing_script_and_bad_script_fd() {
+        let dir = tempdir("execute-edges");
+        let cfg = config(&dir);
+        script(
+            &dir,
+            "stderr.sh",
+            "#!/bin/sh\nprintf 'warn\\n' >&2\nprintf 'Content-Type: text/plain\\r\\n\\r\\nok\\n'\n",
+        );
+        let req = request("/stderr.sh", Vec::new());
+        let ctx = test_ctx(&cfg, &req, &dir, Path::new("stderr.sh"), None);
+        assert_eq!(execute(&ctx).status, 200);
+
+        let missing = test_ctx(&cfg, &req, &dir, Path::new("missing.sh"), None);
+        assert_eq!(execute(&missing).status, 500);
+
+        let bad_file = std::mem::ManuallyDrop::new(closed_file(&dir.join("stderr.sh")));
+        let bad = test_ctx(
+            &cfg,
+            &req,
+            &dir,
+            Path::new("stderr.sh"),
+            Some(&*bad_file),
+        );
+        assert_eq!(execute(&bad).status, 500);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_cgi_response_edge_cases() {
+        for data in [
+            &b"Bad_Name: x\r\n\r\n"[..],
+            b"X: a\rb\r\n\r\n",
+            b"Status: 99 Nope\r\n\r\n",
+            b"Status: nope\r\n\r\n",
+            b"MissingColon\r\n\r\n",
+        ] {
+            assert!(parse_cgi_response(data, Version::Http11).is_err());
+        }
+
+        let framed = parse_cgi_response(
+            b"Content-Length: 99\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nKeep-Alive: timeout=5\r\nContent-Type: text/plain\r\n\r\nbody",
+            Version::Http11,
+        )
+        .unwrap();
+        assert_eq!(framed.status, 200);
+        assert!(response_header(&framed, "content-length").is_none());
+        assert!(response_header(&framed, "connection").is_none());
+
+        let location = parse_cgi_response(b"Location: /next\r\n\r\n", Version::Http11).unwrap();
+        assert_eq!(location.status, 302);
+        assert_eq!(response_header(&location, "location"), Some(&b"/next"[..]));
+
+        let no_type = parse_cgi_response(b"X-Test: yes\r\n\r\nbody", Version::Http11).unwrap();
+        assert_eq!(
+            response_header(&no_type, "content-type"),
+            Some(&b"text/html"[..])
+        );
+
+        let empty_part = parse_cgi_response(
+            b"X--Y: v\r\nContent-Type: text/plain\r\n\r\n",
+            Version::Http11,
+        )
+        .unwrap();
+        assert!(response_header(&empty_part, "x--y").is_some());
+
+        let mut lf = b"X-Test: ".to_vec();
+        lf.extend(std::iter::repeat(b'a').take(MAX_HEADER + 1));
+        lf.extend_from_slice(b"\n\n");
+        assert!(parse_cgi_response(&lf, Version::Http11).is_err());
+    }
+
+    #[test]
+    fn worker_ids_for_and_pool_primitives() {
+        assert_eq!(
+            worker_ids_for(1000, 1001, "ignored", "ignored").unwrap(),
+            (1000, 1001)
+        );
+        init_worker_groups("bad\0user", 0);
+        init_worker_groups("no-such-vapache-user-xyz", 0);
+
+        let (parent, child) = UnixStream::pair().unwrap();
+        assert!(prepare_worker_fd(child.as_raw_fd(), 99).is_ok());
+        unsafe {
+            libc::close(99);
+        }
+        drop(parent);
+        drop(child);
+        assert!(prepare_worker_fd(-1, 99).is_err());
+        assert!(clear_cloexec(-1).is_err());
+
+        let empty = CgiPool {
+            workers: Mutex::new(Vec::new()),
+            ready: Condvar::new(),
+            closed: AtomicBool::new(true),
+        };
+        assert!(empty.take().is_none());
+
+        let waiting = CgiPool {
+            workers: Mutex::new(Vec::new()),
+            ready: Condvar::new(),
+            closed: AtomicBool::new(false),
+        };
+        assert!(waiting.take().is_none());
+
+        let closed = CgiPool {
+            workers: Mutex::new(Vec::new()),
+            ready: Condvar::new(),
+            closed: AtomicBool::new(true),
+        };
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let _ = child.wait();
+        closed.put(CgiWorker { stream, child });
+
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let child = Command::new("/bin/true").spawn().unwrap();
+        let pool = CgiPool {
+            workers: Mutex::new(vec![CgiWorker { stream, child }]),
+            ready: Condvar::new(),
+            closed: AtomicBool::new(false),
+        };
+        shutdown_pool_inner(&pool);
+        assert!(pool.workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn worker_pool_startup_and_execute_helper_paths() {
+        let dir = tempdir("pool-startup");
+        let cfg = config(&dir);
+        let good = script(
+            &dir,
+            "worker-good.sh",
+            "#!/bin/sh\nprintf '\\1' >&3\ncat <&3 >/dev/null\n",
+        );
+        let pool = start_pool_with_exe(&good, 0, 0, "root", 1).unwrap();
+        shutdown_pool_inner(&pool);
+
+        let bad = script(
+            &dir,
+            "worker-bad.sh",
+            "#!/bin/sh\nprintf '\\2' >&3\n",
+        );
+        assert!(start_pool_with_exe(&bad, 0, 0, "root", 1).is_err());
+
+        // Exercise the worker branch through a local pool and fake responder.
+        let path = script(
+            &dir,
+            "ok.sh",
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nok\\n'\n",
+        );
+        let req = request("/ok.sh", Vec::new());
+        let ctx = test_ctx(&cfg, &req, &dir, Path::new("ok.sh"), None);
+        let (parent, mut child) = UnixStream::pair().unwrap();
+        let fake = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            write_u8(&mut child, 1).unwrap();
+            write_bytes(&mut child, b"Content-Type: text/plain\r\n\r\nok\n").unwrap();
+            write_bytes(&mut child, b"warn").unwrap();
+            child.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            write_u8(&mut child, 1).unwrap();
+            write_bytes(&mut child, b"not a cgi response").unwrap();
+            write_bytes(&mut child, b"").unwrap();
+            child.flush().unwrap();
+        });
+        let pool = CgiPool {
+            workers: Mutex::new(vec![CgiWorker {
+                stream: parent,
+                child: Command::new("/bin/true").spawn().unwrap(),
+            }]),
+            ready: Condvar::new(),
+            closed: AtomicBool::new(false),
+        };
+        let resp = execute_via_pool(
+            &pool,
+            &ctx,
+            &path,
+            &dir,
+            &[],
+            &BodySource::Bytes(Vec::new()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(resp.status, 200);
+        let resp = execute_via_pool(
+            &pool,
+            &ctx,
+            &path,
+            &dir,
+            &[],
+            &BodySource::Bytes(Vec::new()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(resp.status, 500);
+        fake.join().unwrap();
+        shutdown_pool_inner(&pool);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_pool_guard_and_feed_stdin_edges() {
+        let dir = tempdir("global-pool");
+        let cfg = config(&dir);
+        let _ = POOL.set(CgiPool {
+            workers: Mutex::new(Vec::new()),
+            ready: Condvar::new(),
+            closed: AtomicBool::new(true),
+        });
+        assert!(init_pool(&cfg).is_ok());
+        shutdown_pool();
+
+        let bad = std::mem::ManuallyDrop::new(BodySource::File(closed_file(&dir.join(
+            "httpd.conf",
+        ))));
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut child = Command::new("/bin/cat").stdin(Stdio::piped()).spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        assert!(feed_stdin(stdin, &bad, 64 * 1024).is_none());
+        let _ = child.wait();
+        drop(stream);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exchange_short_body_empty_error_and_timeout_writer() {
+        let mut broken = ErrorWriter("Broken pipe");
+        assert!(send_timeout(&mut broken, Duration::from_secs(1)).is_ok());
+        let mut failed = ErrorWriter("disk full");
+        assert_eq!(
+            send_timeout(&mut failed, Duration::from_secs(1)).unwrap_err(),
+            "disk full"
+        );
+
+        let (mut parent, child) = UnixStream::pair().unwrap();
+        let fake = std::thread::spawn(move || {
+            let mut child = child;
+            std::thread::sleep(Duration::from_millis(30));
+            write_u8(&mut child, 0).unwrap();
+            write_bytes(&mut child, b"").unwrap();
+            write_bytes(&mut child, b"").unwrap();
+            child.flush().unwrap();
+        });
+        let err = exchange(
+            &mut parent,
+            Path::new("/bin/true"),
+            Path::new("/"),
+            &[],
+            &BodySource::Bytes(Vec::new()),
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, "CGI worker reported failure");
+        fake.join().unwrap();
+
+        // A pseudo-file can report a larger stat size than the bytes it
+        // returns, exercising the short-body guard.
+        let candidates = [
+            "/sys/kernel/osrelease",
+            "/sys/devices/system/cpu/online",
+            "/proc/sys/kernel/hostname",
+        ];
+        let pseudo = candidates.iter().find_map(|path| {
+            let file = File::open(path).ok()?;
+            let len = file.metadata().ok()?.len();
+            let actual = fs::read(path).ok()?.len() as u64;
+            (len > actual).then_some((file, len))
+        });
+        if let Some((file, _len)) = pseudo {
+            let (mut parent, _child) = UnixStream::pair().unwrap();
+            let err = exchange(
+                &mut parent,
+                Path::new("/bin/true"),
+                Path::new("/"),
+                &[],
+                &BodySource::File(file),
+                Duration::from_secs(1),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err, "short CGI body");
+        }
+    }
+
+    #[test]
+    fn worker_request_spools_large_bodies_and_rejects_oversize() {
+        let dir = tempdir("worker-spool");
+        let cfg = config(&dir);
+        let _ = cfg;
+        let script_path = script(
+            &dir,
+            "drain.sh",
+            "#!/bin/sh\ncat >/dev/null\nprintf 'Content-Type: text/plain\\r\\n\\r\\nok\\n'\n",
+        );
+        let (mut parent, mut child) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || worker_request(&mut child));
+        let body = vec![b'x'; CGI_BODY_IN_MEMORY as usize + 10];
+        write_bytes(&mut parent, script_path.as_os_str().as_bytes()).unwrap();
+        write_u8(&mut parent, 0).unwrap();
+        write_bytes(&mut parent, dir.as_os_str().as_bytes()).unwrap();
+        write_u32(&mut parent, 0).unwrap();
+        write_u64(&mut parent, body.len() as u64).unwrap();
+        parent.write_all(&body).unwrap();
+        write_u64(&mut parent, 1).unwrap();
+        parent.flush().unwrap();
+        assert_eq!(read_u8(&mut parent).unwrap(), 1);
+        assert!(read_bytes(&mut parent, MAX_OUTPUT as u32, false)
+            .unwrap()
+            .is_some());
+        assert!(read_bytes(&mut parent, MAX_STDERR as u32, false)
+            .unwrap()
+            .is_some());
+        assert!(worker.join().unwrap().unwrap());
+
+        let (mut parent, mut child) = UnixStream::pair().unwrap();
+        write_bytes(&mut child, b"/bin/true").unwrap();
+        write_u8(&mut child, 0).unwrap();
+        write_bytes(&mut child, b"/").unwrap();
+        write_u32(&mut child, 0).unwrap();
+        write_u64(&mut child, MAX_WORKER_BODY + 1).unwrap();
+        child.flush().unwrap();
+        assert!(worker_request(&mut parent).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_local_inode_large_body_timeout_and_readers() {
+        let dir = tempdir("run-local-edges");
+        let cfg = config(&dir);
+        let _ = cfg;
+        let path = script(
+            &dir,
+            "ok.sh",
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nok\\n'\n",
+        );
+        let closed = std::mem::ManuallyDrop::new(closed_file(&path));
+        assert!(inheritable_fd_path(&closed).is_err());
+        assert!(run_local(
+            &path,
+            &dir,
+            &[],
+            &BodySource::Bytes(Vec::new()),
+            Duration::from_secs(1),
+            false,
+            Some((0, 0)),
+        )
+        .is_err());
+
+        let drain = script(&dir, "drain.sh", "#!/bin/sh\ncat >/dev/null\n");
+        assert!(run_local(
+            &drain,
+            &dir,
+            &[],
+            &BodySource::Bytes(vec![b'x'; 32 * 1024]),
+            Duration::from_secs(1),
+            false,
+            None,
+        )
+        .is_ok());
+
+        let slow = script(
+            &dir,
+            "slow-output.sh",
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nslow\\n'\nexec 1>&-\nsleep 5\n",
+        );
+        assert!(run_local(
+            &slow,
+            &dir,
+            &[],
+            &BodySource::Bytes(Vec::new()),
+            Duration::from_millis(50),
+            false,
+            None,
+        )
+        .is_err());
+
+        let mut out = Vec::new();
+        assert!(read_with_deadline(
+            BadFd,
+            Instant::now() + Duration::from_millis(100),
+            &mut out
+        )
+        .is_ok());
+        assert!(!poll_result(
+            -1,
+            std::io::Error::from(std::io::ErrorKind::Interrupted)
+        )
+        .unwrap());
+        assert!(poll_result(-1, std::io::Error::from(std::io::ErrorKind::Other)).is_err());
+        assert!(!poll_result(0, std::io::Error::from(std::io::ErrorKind::Other)).unwrap());
+        assert!(poll_result(1, std::io::Error::from(std::io::ErrorKind::Other)).unwrap());
+        let null = File::open("/dev/null").unwrap();
+        let mut seq = SeqRead {
+            file: File::open("/dev/null").unwrap(),
+            stage: 0,
+        };
+        assert!(read_with_deadline(
+            seq,
+            Instant::now() + Duration::from_millis(100),
+            &mut out
+        )
+        .is_err());
+        drop(null);
+        let mut flood = FloodRead {
+            file: File::open("/dev/null").unwrap(),
+        };
+        assert_eq!(
+            read_with_deadline(
+                flood,
+                Instant::now() + Duration::from_secs(10),
+                &mut out
+            )
+            .unwrap_err(),
+            "CGI output too large"
+        );
+
+        assert!(split_cgi_head(b"X-Test: y\n\nbody").is_some());
+        let mut lf = b"X-Test: ".to_vec();
+        lf.extend(std::iter::repeat(b'a').take(MAX_HEADER + 1));
+        lf.extend_from_slice(b"\n\n");
+        assert!(split_cgi_head(&lf).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn child_process_and_worker_main_paths() {
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let setup = child_process_setup(Duration::from_secs(1)).is_ok();
+            let euid = unsafe { libc::geteuid() };
+            let egid = unsafe { libc::getegid() };
+            let dropped = drop_worker_privileges(euid, egid, "root");
+            let rejected = drop_worker_privileges(u32::MAX, u32::MAX, "no-such-user");
+            std::process::exit(if setup && dropped && !rejected { 0 } else { 1 });
+        }
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        assert_eq!(
+            drop_worker_privileges_for(1000, 1001, 1000, 1001, "ignored"),
+            true
+        );
+        assert_eq!(
+            drop_worker_privileges_for(1000, 1001, 1000, 1002, "ignored"),
+            false
+        );
+        assert!(stream_from_fd(-1).is_none());
+        assert!(stream_from_fd(999_999).is_none());
+
+        // Normal worker loop: readiness, then EOF ends it cleanly.
+        let (parent, child) = UnixStream::pair().unwrap();
+        let euid = unsafe { libc::geteuid() };
+        let egid = unsafe { libc::getegid() };
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            drop(parent);
+            worker_main(child.as_raw_fd(), euid, egid, "root");
+            std::process::exit(0);
+        }
+        drop(child);
+        let mut ready = [0u8; 1];
+        let mut parent = parent;
+        parent.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [1]);
+        drop(parent);
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        // Write failure when the peer disappears before readiness.
+        let (parent, child) = UnixStream::pair().unwrap();
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            drop(parent);
+            worker_main(child.as_raw_fd(), euid, egid, "root");
+            std::process::exit(0);
+        }
+        drop(parent);
+        drop(child);
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        // An invalid control fd returns cleanly after privilege setup.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            worker_main(-1, euid, egid, "root");
+            std::process::exit(0);
+        }
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        // Privilege failure exits the worker process with status 1.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            worker_main(-1, u32::MAX, u32::MAX, "no-such-user");
+            std::process::exit(0);
+        }
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+        assert_eq!(libc::WEXITSTATUS(status), 1);
     }
 }

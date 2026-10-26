@@ -23,7 +23,7 @@ CARGO_TARGET_DIR=target/cov RUSTFLAGS="-C instrument-coverage" \
 
 CARGO_TARGET_DIR=target/cov RUSTFLAGS="-C instrument-coverage" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/unit-%p-%m.profraw" \
-    cargo test --workspace
+    cargo test --workspace -- --test-threads=1
 
 VAPACHED="$PWD/target/cov/release/vapached" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \

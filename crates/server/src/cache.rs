@@ -22,10 +22,18 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom};
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 const MAX_ENTRIES: usize = 4096;
+/// The on-disk cache has its own hard entry cap; the in-memory key cap alone
+/// would still let unique URLs fill the cache filesystem (F44).
+const MAX_DISK_ENTRIES: usize = 4096;
+/// Bound the number of stored variants for one key before evicting the oldest
+/// representation.
+const MAX_VARIANTS_PER_KEY: usize = 32;
 /// Configuration generation for persisted cache entries.  A reload bumps this
 /// value; entries from an older generation are never served, even if their
 /// body/meta files survived the reload cleanup.
@@ -65,6 +73,92 @@ struct Entry {
 fn entries() -> &'static Mutex<HashMap<String, Vec<Entry>>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Vec<Entry>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Default)]
+struct DiskUsageState {
+    total: u64,
+    /// stem -> (accounted bytes, oldest modification time)
+    stems: HashMap<PathBuf, (u64, SystemTime)>,
+}
+
+fn disk_usage() -> &'static Mutex<HashMap<PathBuf, DiskUsageState>> {
+    static USAGE: OnceLock<Mutex<HashMap<PathBuf, DiskUsageState>>> = OnceLock::new();
+    USAGE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn disk_stem(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_string_lossy();
+    let base = name
+        .strip_suffix(".body.tmp")
+        .or_else(|| name.strip_suffix(".meta.tmp"))
+        .or_else(|| name.strip_suffix(".body"))
+        .or_else(|| name.strip_suffix(".meta"))?;
+    Some(path.with_file_name(base))
+}
+
+fn disk_stem_files(stem: &Path) -> [PathBuf; 4] {
+    [
+        stem.with_extension("body"),
+        stem.with_extension("meta"),
+        stem.with_extension("body.tmp"),
+        stem.with_extension("meta.tmp"),
+    ]
+}
+
+fn remove_disk_stem_files(stem: &Path) {
+    for path in disk_stem_files(stem) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn scan_disk_usage(root: &Path) -> DiskUsageState {
+    let mut state = DiskUsageState::default();
+    fn walk(dir: &Path, state: &mut DiskUsageState) {
+        let Ok(read) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => walk(&path, state),
+                Ok(ft) if ft.is_file() => {
+                    let Some(stem) = disk_stem(&path) else {
+                        continue;
+                    };
+                    let Ok(meta) = entry.metadata() else {
+                        continue;
+                    };
+                    let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    let slot = state
+                        .stems
+                        .entry(stem)
+                        .or_insert((0, modified));
+                    slot.0 = slot.0.saturating_add(meta.len());
+                    if modified < slot.1 {
+                        slot.1 = modified;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(root, &mut state);
+    state.total = state.stems.values().map(|(size, _)| *size).sum();
+    state
+}
+
+fn remove_disk_stem(cfg: &Config, stem: &Path) {
+    remove_disk_stem_files(stem);
+    let Some(root) = &cfg.cache.root else {
+        return;
+    };
+    let mut roots = disk_usage().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(usage) = roots.get_mut(root) {
+        if let Some((size, _)) = usage.stems.remove(stem) {
+            usage.total = usage.total.saturating_sub(size);
+        }
+    }
 }
 
 fn header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
@@ -233,6 +327,23 @@ pub fn request_scope(
     }
     if !cache_enabled(&scope, path) {
         return None;
+    }
+    // `CacheIgnoreQueryString` is safe for static representations, but a
+    // query-driven CGI/FastCGI/proxy response cannot be shared across distinct
+    // queries.  Bypass the cache for those dynamic targets instead of leaking
+    // one query's representation to another (additional pass-4 review item).
+    if cfg.cache.ignore_query_string && !req.query.is_empty() {
+        let name = fs_path
+            .file_name()
+            .map(|n| n.as_encoded_bytes())
+            .unwrap_or(b"");
+        let dynamic = script_alias
+            || crate::cgi::is_cgi(cfg, &scope, name, false)
+            || crate::fastcgi::match_proxy(&scope, &url_path, &root).is_some()
+            || crate::proxy::matches_route(&scope, &url_path);
+        if dynamic {
+            return None;
+        }
     }
     // Never bypass per-directory access control or a rewrite-set environment
     // requirement by serving a cached object without running dispatch.
@@ -911,36 +1022,114 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
     let Some(stem) = cache_stem(cfg, key) else {
         return;
     };
+    let Some(root) = &cfg.cache.root else {
+        return;
+    };
     if let Some(parent) = stem.parent() {
         let _ = fs::create_dir_all(parent);
+    }
+    let meta = encode_meta(entry);
+    let incoming = (entry.body.len() as u64).saturating_add(meta.len() as u64);
+    // A single representation larger than the whole disk budget is never
+    // written; `CacheMaxFileSize` already bounds the body, while this covers
+    // metadata and the total quota.
+    if incoming > cfg.cache.max_disk_size {
+        return;
+    }
+    let mut roots = disk_usage().lock().unwrap_or_else(|e| e.into_inner());
+    let usage = roots
+        .entry(root.clone())
+        .or_insert_with(|| scan_disk_usage(root));
+    let old_size = usage.stems.get(&stem).map(|(size, _)| *size).unwrap_or(0);
+    let old_count = usize::from(old_size > 0);
+    let mut projected = usage
+        .total
+        .saturating_sub(old_size)
+        .saturating_add(incoming);
+    let mut entries = usage
+        .stems
+        .len()
+        .saturating_sub(old_count)
+        .saturating_add(1);
+    if projected > cfg.cache.max_disk_size || entries > MAX_DISK_ENTRIES {
+        let mut victims: Vec<(PathBuf, u64, SystemTime)> = usage
+            .stems
+            .iter()
+            .filter(|(candidate, _)| candidate.as_path() != stem)
+            .map(|(candidate, (size, modified))| (candidate.clone(), *size, *modified))
+            .collect();
+        victims.sort_by_key(|(_, _, modified)| *modified);
+        for (victim, size, _) in victims {
+            if projected <= cfg.cache.max_disk_size && entries <= MAX_DISK_ENTRIES {
+                break;
+            }
+            remove_disk_stem_files(&victim);
+            if usage.stems.remove(&victim).is_some() {
+                usage.total = usage.total.saturating_sub(size);
+                projected = projected.saturating_sub(size);
+                entries = entries.saturating_sub(1);
+            }
+        }
+        if projected > cfg.cache.max_disk_size || entries > MAX_DISK_ENTRIES {
+            return;
+        }
     }
     let body_path = stem.with_extension("body");
     let meta_path = stem.with_extension("meta");
     let body_tmp = stem.with_extension("body.tmp");
     let meta_tmp = stem.with_extension("meta.tmp");
-    if fs::write(&body_tmp, &entry.body).is_err()
-        || fs::write(&meta_tmp, encode_meta(entry)).is_err()
-    {
+    if fs::write(&body_tmp, &entry.body).is_err() || fs::write(&meta_tmp, &meta).is_err() {
         let _ = fs::remove_file(&body_tmp);
         let _ = fs::remove_file(&meta_tmp);
         return;
     }
-    let _ = fs::rename(&body_tmp, &body_path);
-    let _ = fs::rename(&meta_tmp, &meta_path);
+    if fs::rename(&body_tmp, &body_path).is_err()
+        || fs::rename(&meta_tmp, &meta_path).is_err()
+    {
+        let _ = fs::remove_file(&body_tmp);
+        let _ = fs::remove_file(&meta_tmp);
+        let _ = fs::remove_file(&body_path);
+        let _ = fs::remove_file(&meta_path);
+        return;
+    }
+    let actual = fs::metadata(&body_path)
+        .map(|m| m.len())
+        .unwrap_or(entry.body.len() as u64)
+        .saturating_add(fs::metadata(&meta_path).map(|m| m.len()).unwrap_or(meta.len() as u64));
+    usage.total = usage
+        .total
+        .saturating_sub(old_size)
+        .saturating_add(actual);
+    usage.stems.insert(stem, (actual, SystemTime::now()));
 }
 
 fn disk_load(cfg: &Config, key: &str) -> Option<Entry> {
     let stem = cache_stem(cfg, key)?;
-    let mut entry = decode_meta(&fs::read(stem.with_extension("meta")).ok()?)?;
-    // A reload changes the generation.  Persisted entries from an older
-    // generation remain on disk only until cleanup, but are never served.
-    if entry.epoch != current_epoch() {
+    let meta = match fs::read(stem.with_extension("meta")) {
+        Ok(meta) => meta,
+        Err(_) => return None,
+    };
+    let mut entry = match decode_meta(&meta) {
+        Some(entry) => entry,
+        None => {
+            remove_disk_stem(cfg, &stem);
+            return None;
+        }
+    };
+    // A reload changes the generation and expiry makes the representation
+    // unusable.  Remove both files instead of leaving them to fill the cache
+    // filesystem (F44).
+    if entry.epoch != current_epoch() || entry.expires <= unix_now() {
+        remove_disk_stem(cfg, &stem);
         return None;
     }
-    if entry.expires <= unix_now() {
-        return None;
+    match fs::read(stem.with_extension("body")) {
+        Ok(body) => entry.body = body,
+        Err(_) => {
+            remove_disk_stem(cfg, &stem);
+            return None;
+        }
     }
-    entry.body = fs::read(stem.with_extension("body")).ok()?;
     Some(entry)
 }
 
@@ -1054,6 +1243,9 @@ pub fn store(
         let list = guard.entry(key.clone()).or_default();
         list.retain(|e| e.vary != entry.vary);
         list.push(entry.clone());
+        while list.len() > MAX_VARIANTS_PER_KEY {
+            list.remove(0);
+        }
     }
     disk_store(cfg, &key, &entry);
     if cfg.cache.header {
@@ -1083,6 +1275,10 @@ fn invalidate_disk(cfg: &Config) {
     let Some(root) = &cfg.cache.root else {
         return;
     };
+    disk_usage()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(root);
     fn remove_cache_files(dir: &std::path::Path) {
         let Ok(read) = fs::read_dir(dir) else {
             return;
@@ -1966,9 +2162,143 @@ AddHandler cgi-script .cgi\n\
     }
 
     #[test]
+    fn ignore_query_string_never_shares_dynamic_cgi_representations() {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-cache-ignore-query-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cgi = dir.join("www").join("cgi");
+        fs::create_dir_all(&cgi).unwrap();
+        fs::write(cgi.join("wallet.cgi"), "#!/bin/sh\nexit 0\n").unwrap();
+        let conf = dir.join("httpd.conf");
+        fs::write(
+            &conf,
+            format!(
+                "Listen 127.0.0.1:0\n\
+DocumentRoot \"{www}\"\n\
+CacheRoot \"{cache}\"\n\
+CacheEnable disk /\n\
+CacheIgnoreQueryString On\n\
+CacheDefaultExpire 60\n\
+AddHandler cgi-script .cgi\n\
+<Directory \"{www}\">\n\
+    Options +ExecCGI\n\
+    Require all granted\n\
+</Directory>\n",
+                www = dir.join("www").display(),
+                cache = dir.join("cache").display(),
+            ),
+        )
+        .unwrap();
+        let cfg = crate::config::Config::load(
+            &conf,
+            &dir,
+            &Default::default(),
+            &Default::default(),
+            false,
+        )
+        .unwrap();
+        let request = crate::http::Request {
+            method: "GET".into(),
+            target: b"/cgi/wallet.cgi?nonce=1".to_vec(),
+            raw_path: b"/cgi/wallet.cgi".to_vec(),
+            query: b"nonce=1".to_vec(),
+            version: crate::http::Version::Http11,
+            headers: crate::http::Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        };
+        assert!(request_scope(
+            &cfg,
+            None,
+            &request,
+            "127.0.0.1".parse().unwrap(),
+            "/cgi/wallet.cgi",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cache_control_ttl_is_bounded() {
         let cfg = crate::config::CacheConfig::default();
         let headers = vec![("Cache-Control".into(), b"max-age=999999".to_vec())];
         assert_eq!(freshness(&cfg, &headers, 100), Some(cfg.max_expire as i64));
+    }
+
+    fn disk_test_config(name: &str) -> (std::path::PathBuf, Config) {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-cache-quota-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("httpd.conf");
+        fs::write(&conf, "Listen 127.0.0.1:0\n").unwrap();
+        let mut cfg = crate::config::Config::load(
+            &conf,
+            &dir,
+            &Default::default(),
+            &Default::default(),
+            false,
+        )
+        .unwrap();
+        cfg.cache.root = Some(dir.join("cache"));
+        (dir, cfg)
+    }
+
+    fn disk_entry(body: &[u8], expires: i64) -> Entry {
+        Entry {
+            status: 200,
+            headers: vec![("content-type".into(), b"text/plain".to_vec())],
+            body: body.to_vec(),
+            stored: unix_now(),
+            expires,
+            policy: 7,
+            epoch: current_epoch(),
+            vary: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn disk_cache_enforces_total_quota_and_rejects_oversize_entries() {
+        let (dir, mut cfg) = disk_test_config("evict");
+        cfg.cache.max_disk_size = 6_000;
+        disk_store(&cfg, "first", &disk_entry(&vec![b'a'; 4_000], unix_now() + 60));
+        let first = cache_stem(&cfg, "first").unwrap();
+        assert!(first.with_extension("body").is_file());
+        disk_store(&cfg, "second", &disk_entry(&vec![b'b'; 4_000], unix_now() + 60));
+        let second = cache_stem(&cfg, "second").unwrap();
+        assert!(second.with_extension("body").is_file());
+        assert!(!first.with_extension("body").exists());
+        assert!(!first.with_extension("meta").exists());
+
+        // A single entry larger than the total budget is never persisted.
+        cfg.cache.max_disk_size = 128;
+        disk_store(&cfg, "oversize", &disk_entry(&vec![b'c'; 1_024], unix_now() + 60));
+        let oversize = cache_stem(&cfg, "oversize").unwrap();
+        assert!(!oversize.with_extension("body").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_cache_deletes_expired_entries_on_lookup() {
+        let (dir, cfg) = disk_test_config("expired");
+        disk_store(&cfg, "expired", &disk_entry(b"stale", unix_now() - 1));
+        let stem = cache_stem(&cfg, "expired").unwrap();
+        assert!(stem.with_extension("body").is_file());
+        assert!(disk_load(&cfg, "expired").is_none());
+        assert!(!stem.with_extension("body").exists());
+        assert!(!stem.with_extension("meta").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

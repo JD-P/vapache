@@ -45,6 +45,14 @@ returning through a different directive or dispatch path.
 | F35 | Proxy request-line/forwarded-host text was interpolated without a final check | Backend hosts and `X-Forwarded-Host` are validated; `validate_proxy_head` consumes verified `proxy_request_line_admit` and `proxy_header_admit` immediately before `write_all` | I28 |
 | F36 | `.htaccess` `RequestHeader` was silently ignored | `RequestHeader` now fails closed with `500` in `.htaccess`, matching the main-config policy instead of pretending to be inert | I23 |
 | F38 | Authenticated CGI/FastCGI requests lacked `REMOTE_USER`/`AUTH_TYPE` | The grant identity is carried into `CgiContext`; `build_env` emits both variables for CGI and FastCGI and keeps configured entries from overriding them | I27 |
+| F39 | Single-file `Alias`/`ScriptAlias` skipped the target `.htaccess` and served CGI/PHP as source | Prefix file targets map to `(parent, basename)`; the access-file walk root for a file target is its parent; handler/MIME/FastCGI selection uses the resolved target basename (`alias_file_target_split`, `alias_access_root_admit`, `handler_name_from_target`) | I35, I36, I37 |
+| F40 | Effectful directives inside `<Limit>` were warn-and-ignored | Main-configuration directives inside `<Limit>` are applied to the enclosing scope (auth directives remain method-scoped); `.htaccess` still rejects non-auth directives in `<Limit>` (`limit_directive_effect`) | I38 |
+| F41 | CGI/FastCGI dispatch used lexical symlink policy | Static, PATH_INFO, CGI and FastCGI handlers re-authorize the actual opened/canonicalized target and bind that target before execution/forwarding; FastCGI sends the canonical `SCRIPT_FILENAME` (`cgi_actual_target_admit`) | I39 |
+| F42 | Capture-only `AliasMatch` used `ServerRoot` as an implicit base | Empty replacement prefixes produce an empty alias base, so `map_path()` fails closed; relative/explicit-prefix aliases keep their stable base (`capture_only_alias_admit`) | I40 |
+| F43 | FastCGI spool used a predictable `/tmp` name with truncate | Spool files use exclusive creation, mode `0600`, bounded collision retries and immediate unlink (`temp_file_create_admit`) | I41 |
+| F44 | Disk cache had no total quota or expiry cleanup | Persisted bytes are tracked per cache root; store enforces `CacheMaxDiskSize` and the entry cap by evicting the oldest stems, removes oversized entries, deletes expired/stale generations on load, and caps per-key variants (`cache_disk_size_admit`) | I42-adjacent cache bounds |
+| F45 | Expression file tests escaped the document-root confinement | `Expr::FileTest` consumes `confined_expr_path`; absolute, parent-relative and escaping-symlink tests are rejected, while main-config `<IfFile>` keeps its operator-supplied path (`expr_file_test_admit`) | I42 |
+| Additional | `Require not valid-user` dropped negation; non-HTTP control bytes passed header serialization; `close, keep-alive` re-enabled a connection; mmap allowed other-owner write races | Negation is carried into `Require::ValidUser`; header values admit only HTAB/SP/VCHAR/obs-text; `close` is sticky; mmap requires no owner/group/other write bits | I23, I33-adjacent |
 
 ## Additional hardening before the next pass
 
@@ -122,17 +130,19 @@ The closure is exercised by:
 - `tests/conformance.py`, `tests/config_semantics.py`,
   `tests/config_validity.py` and `tests/config_grammar.py`;
 - `tests/adversarial_regressions.py`, which starts a fresh server and replays
-  the F23–F38 exploit shapes (rewrite-to-proxy/redirect authorization, cache
+  the F23–F45 exploit shapes (rewrite-to-proxy/redirect authorization, cache
   reload plus PATH_INFO, relative and capture-only aliases, autoindex schemes,
   negated/env providers, `IndexIgnore`, `DirectorySlash Off`,
   `UnsafePrefixStat` re-rooting, header-selected cache entries,
-  `.htaccess` `RequestHeader` and CGI `REMOTE_USER`/`AUTH_TYPE`);
+  `.htaccess` `RequestHeader`, CGI `REMOTE_USER`/`AUTH_TYPE`, single-file
+  aliases, `<Limit>` `Options`, symlinked CGI/FastCGI targets,
+  capture-only `AliasMatch` and expression file-test confinement);
 - operator replay harnesses that reproduce the Apache-versus-vapached
   differentials in `findings.md`.
 
 Any new directive that changes a request-to-resource mapping, cache key,
 handler selection, authorization identity or inherited descriptor must state
-which of I9–I28 it preserves.  A directive that is recognized but not
+which of I9–I42 it preserves.  A directive that is recognized but not
 implemented is not allowed to pass as “inert” unless that inertness is
 explicit and local to the directive; request-mutating directives such as
 `RequestHeader` are never inert.

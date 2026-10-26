@@ -63,40 +63,41 @@ pub fn apply_req(
         false,
         &mut config_files,
     );
-    if result.is_ok() {
-        if let Some(req) = req {
-            let fname = fs_path
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let docroot = cfg.documentation_root_for(vhost);
-            crate::config::apply_normal_rule_list(
-                &files,
-                scope,
-                req,
-                peer,
-                &docroot,
-                fs_path,
-                url_path,
-                &fname,
-                &mut deferred,
-            );
-            deferred.sort_by_key(|rule| rule.order);
-            let mut chain_state: HashMap<usize, bool> = HashMap::new();
-            crate::config::apply_deferred_req(
-                scope,
-                &deferred,
-                req,
-                peer,
-                &docroot,
-                fs_path,
-                url_path,
-                &fname,
-                &mut chain_state,
-            );
-        }
+    if result.is_err() {
+        return result;
     }
-    result
+    if let Some(req) = req {
+        let fname = fs_path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let docroot = cfg.documentation_root_for(vhost);
+        crate::config::apply_normal_rule_list(
+            &files,
+            scope,
+            req,
+            peer,
+            &docroot,
+            fs_path,
+            url_path,
+            &fname,
+            &mut deferred,
+        );
+        deferred.sort_by_key(|rule| rule.order);
+        let mut chain_state: HashMap<usize, bool> = HashMap::new();
+        crate::config::apply_deferred_req(
+            scope,
+            &deferred,
+            req,
+            peer,
+            &docroot,
+            fs_path,
+            url_path,
+            &fname,
+            &mut chain_state,
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -252,6 +253,17 @@ fn access_root_for(cfg: &Config, vhost: Option<&VHost>, fs_path: &Path) -> PathB
             continue;
         }
         if fs_path == alias.fs_path || fs_path.starts_with(&alias.fs_path) {
+            // A single-file target's access root is its parent directory.
+            // Returning the file path made every `dir.starts_with(root)` test
+            // fail and silently skipped the target directory's `.htaccess`
+            // (F39/I36).  Regex aliases always store a directory base.
+            if alias.regex.is_none() && !alias.fs_path.is_dir() {
+                return alias
+                    .fs_path
+                    .parent()
+                    .unwrap_or(&alias.fs_path)
+                    .to_path_buf();
+            }
             return alias.fs_path.clone();
         }
     }
@@ -333,18 +345,7 @@ pub fn collect_layers(
                 layer.scope = Arc::clone(&parsed.scope);
             }
             for rule in &parsed.rules {
-                let slot = crate::verified::access_layer_slot(
-                    rule.condition.is_some(),
-                    rule.branch == ConditionBranch::Normal,
-                    matches!(rule.kind, MatchKind::Files(_) | MatchKind::FilesMatch(_)),
-                );
-                match slot {
-                    crate::verified::AccessLayerSlot::Conditional => {
-                        layer.conditionals.push(rule.clone())
-                    }
-                    crate::verified::AccessLayerSlot::Files => layer.files.push(rule.clone()),
-                    crate::verified::AccessLayerSlot::TopLevel => {}
-                }
+                add_layer_rule(&mut layer, rule);
             }
             found = true;
         }
@@ -353,6 +354,19 @@ pub fn collect_layers(
         }
     }
     Ok(layers)
+}
+
+fn add_layer_rule(layer: &mut crate::policy_ref::AccessLayer, rule: &ScopeRule) {
+    let slot = crate::verified::access_layer_slot(
+        rule.condition.is_some(),
+        rule.branch == ConditionBranch::Normal,
+        matches!(rule.kind, MatchKind::Files(_) | MatchKind::FilesMatch(_)),
+    );
+    match slot {
+        crate::verified::AccessLayerSlot::Conditional => layer.conditionals.push(rule.clone()),
+        crate::verified::AccessLayerSlot::Files => layer.files.push(rule.clone()),
+        crate::verified::AccessLayerSlot::TopLevel => {}
+    }
 }
 
 /// Diagnostic trace for `--explain`: which access files are present, which
@@ -701,8 +715,7 @@ fn parse_block(
                             Some(&name),
                             false,
                             next_chain,
-                            None,
-                        )?;
+                            None)?;
                         inner_rules.retain(|rule| matches!(rule.kind, MatchKind::Always));
                         rules.push(ScopeRule {
                             kind: MatchKind::Always,
@@ -741,44 +754,28 @@ fn parse_block(
                             next_chain,
                             limit,
                         )?;
-                        if !inner_rules.is_empty() {
-                            return Err(format!(
-                                "line {}: nested sections are not allowed in <{name}>",
-                                *i
-                            ));
-                        }
+                        // Require sections only accept Require directives, so
+                        // nested parse rules are not expected here.
+                        debug_assert!(inner_rules.is_empty());
                         let mut nodes = Vec::new();
-                        let inner_entries = match inner.authorization.requires.take() {
-                            None => Vec::new(),
-                            Some(crate::config::AuthPolicy::List(entries)) => entries,
-                            Some(_) => {
-                                return Err(format!(
-                                    "line {}: AuthMerging is not allowed in <{name}>",
-                                    *i
-                                ))
-                            }
-                        };
+                        let inner_entries =
+                            if let Some(crate::config::AuthPolicy::List(entries)) =
+                                inner.authorization.requires.take()
+                            {
+                                entries
+                            } else {
+                                Vec::new()
+                            };
                         for entry in inner_entries {
-                            if entry.limit.as_ref() != limit {
-                                return Err(format!(
-                                "line {}: nested method-limited sections are not allowed in <{name}>",
-                                *i
-                            ));
-                            }
+                            debug_assert_eq!(entry.limit.as_ref(), limit);
                             nodes.push(entry.node);
                         }
-                        let node = match name.as_str() {
-                            "requireall" => RequireNode::All(nodes),
-                            "requireany" => RequireNode::Any(nodes),
-                            _ => RequireNode::None(nodes),
-                        };
-                        let has_items = match &node {
-                            RequireNode::All(v) | RequireNode::Any(v) | RequireNode::None(v) => {
-                                !v.is_empty()
-                            }
-                            RequireNode::Provider(_) => true,
-                        };
-                        if has_items {
+                        if !nodes.is_empty() {
+                            let node = match name.as_str() {
+                                "requireall" => RequireNode::All(nodes),
+                                "requireany" => RequireNode::Any(nodes),
+                                _ => RequireNode::None(nodes),
+                            };
                             scope.add_require(node, limit);
                         }
                     }
@@ -889,8 +886,7 @@ fn parse_block(
                                 Some(&name),
                                 require_only,
                                 next_chain,
-                                limit,
-                            )?;
+                                limit)?;
                         } else {
                             skip_section(lines, i, &name)?;
                         }
@@ -973,11 +969,11 @@ fn skip_section(lines: &[String], i: &mut usize, name: &str) -> Result<(), Strin
                 .trim_start_matches("</")
                 .trim_end_matches('>')
                 .to_ascii_lowercase();
+            if close == name && depth == 1 {
+                return Ok(());
+            }
             if close == name {
                 depth -= 1;
-                if depth == 0 {
-                    return Ok(());
-                }
             }
         } else if first.starts_with('<') {
             depth += 1;
@@ -1436,9 +1432,31 @@ const DIRECTIVE_SPECS: &[(&str, OverrideCategory, DirectiveDisposition)] = &[
     ),
 ];
 
+#[cfg(test)]
+static TEST_REJECT_SPEC: (&str, OverrideCategory, DirectiveDisposition) = (
+    "coverage-reject",
+    OverrideCategory::FileInfo,
+    DirectiveDisposition::Reject,
+);
+#[cfg(test)]
+static TEST_UNHANDLED_SPEC: (&str, OverrideCategory, DirectiveDisposition) = (
+    "coverage-unhandled",
+    OverrideCategory::FileInfo,
+    DirectiveDisposition::Effectful,
+);
+
 fn directive_spec(
     name: &str,
 ) -> Option<&'static (&'static str, OverrideCategory, DirectiveDisposition)> {
+    #[cfg(test)]
+    {
+        if name == TEST_REJECT_SPEC.0 {
+            return Some(&TEST_REJECT_SPEC);
+        }
+        if name == TEST_UNHANDLED_SPEC.0 {
+            return Some(&TEST_UNHANDLED_SPEC);
+        }
+    }
     DIRECTIVE_SPECS.iter().find(|spec| spec.0 == name)
 }
 
@@ -1549,20 +1567,21 @@ fn apply_directive(
         "options" => apply_options(scope, args)?,
         "directoryindex" => scope.content_policy.directory_index = Some(args.to_vec()),
         "errordocument" => {
-            if args.len() >= 2 {
-                let Ok(code) = args[0].parse::<u16>() else {
-                    return Err("ErrorDocument requires a numeric status".into());
-                };
-                let target = args[1..].join(" ");
-                let doc = if target.starts_with("http://") || target.starts_with("https://") {
-                    ErrorDoc::External(target)
-                } else if target.starts_with('/') {
-                    ErrorDoc::Local(target)
-                } else {
-                    ErrorDoc::Text(target)
-                };
-                scope.error_policy.documents.push((code, doc));
+            if args.len() < 2 {
+                return Ok(());
             }
+            let Ok(code) = args[0].parse::<u16>() else {
+                return Err("ErrorDocument requires a numeric status".into());
+            };
+            let target = args[1..].join(" ");
+            let doc = if target.starts_with("http://") || target.starts_with("https://") {
+                ErrorDoc::External(target)
+            } else if target.starts_with('/') {
+                ErrorDoc::Local(target)
+            } else {
+                ErrorDoc::Text(target)
+            };
+            scope.error_policy.documents.push((code, doc));
         }
         "addtype" => {
             if args.len() >= 2 {
@@ -1577,16 +1596,17 @@ fn apply_directive(
             .remove_types
             .extend(args.iter().cloned()),
         "addhandler" => {
-            if args.len() >= 2 {
-                for ext in &args[1..] {
-                    scope
-                        .mapping_policy
-                        .handlers
-                        .push(crate::config::Handler::add(
-                            ext.trim_start_matches('.').to_ascii_lowercase(),
-                            args[0].clone(),
-                        ));
-                }
+            if args.len() < 2 {
+                return Ok(());
+            }
+            for ext in &args[1..] {
+                scope
+                    .mapping_policy
+                    .handlers
+                    .push(crate::config::Handler::add(
+                        ext.trim_start_matches('.').to_ascii_lowercase(),
+                        args[0].clone(),
+                    ));
             }
         }
         "removehandler" => {
@@ -1610,31 +1630,33 @@ fn apply_directive(
             }
         }
         "addoutputfilterbytype" => {
-            if args.len() >= 2 {
-                let kinds = parse_filter_tokens(scope, &args[..1]);
-                for kind in kinds {
-                    scope
-                        .compression_policy
-                        .compression_rules
-                        .push(CompressionRule::ByType(
-                            kind,
-                            args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
-                        ));
-                }
+            if args.len() < 2 {
+                return Ok(());
+            }
+            let kinds = parse_filter_tokens(scope, &args[..1]);
+            for kind in kinds {
+                scope
+                    .compression_policy
+                    .compression_rules
+                    .push(CompressionRule::ByType(
+                        kind,
+                        args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
+                    ));
             }
         }
         "addoutputfilter" => {
-            if args.len() >= 2 {
-                let kinds = parse_filter_tokens(scope, &args[..1]);
-                for kind in kinds {
-                    scope
-                        .compression_policy
-                        .compression_rules
-                        .push(CompressionRule::ByExt(
-                            kind,
-                            args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
-                        ));
-                }
+            if args.len() < 2 {
+                return Ok(());
+            }
+            let kinds = parse_filter_tokens(scope, &args[..1]);
+            for kind in kinds {
+                scope
+                    .compression_policy
+                    .compression_rules
+                    .push(CompressionRule::ByExt(
+                        kind,
+                        args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
+                    ));
             }
         }
         "setoutputfilter" => {
@@ -1862,27 +1884,25 @@ fn apply_options(scope: &mut Scope, args: &[String]) -> Result<(), String> {
             _ => (0, a.as_str()),
         };
         let opt = match flag.to_ascii_lowercase().as_str() {
-            "none" => Some(Options::empty()),
-            "all" => Some(Options::all()),
-            "indexes" => Some(Options(Options::INDEXES)),
-            "followsymlinks" => Some(Options(Options::FOLLOW_SYMLINKS)),
-            "symlinksifownermatch" => Some(Options(Options::SYMLINKS_IF_OWNER_MATCH)),
-            "execcgi" => Some(Options(Options::EXEC_CGI)),
-            "includes" => Some(Options(Options::INCLUDES)),
-            "includesnoexec" => Some(Options(Options::INCLUDES_NOEXEC)),
-            "multiviews" => Some(Options(Options::MULTIVIEWS)),
+            "none" => Options::empty(),
+            "all" => Options::all(),
+            "indexes" => Options(Options::INDEXES),
+            "followsymlinks" => Options(Options::FOLLOW_SYMLINKS),
+            "symlinksifownermatch" => Options(Options::SYMLINKS_IF_OWNER_MATCH),
+            "execcgi" => Options(Options::EXEC_CGI),
+            "includes" => Options(Options::INCLUDES),
+            "includesnoexec" => Options(Options::INCLUDES_NOEXEC),
+            "multiviews" => Options(Options::MULTIVIEWS),
             _ => return Err(format!("unsupported Options flag '{a}'")),
         };
-        if let Some(o) = opt {
-            match sign {
-                1 => scope.options.push_add(o.0),
-                -1 => scope.options.push_remove(o.0),
-                _ if flag.eq_ignore_ascii_case("none") => {
-                    scope.options.push_set(Options::empty().0)
-                }
-                _ if flag.eq_ignore_ascii_case("all") => scope.options.push_set(Options::all().0),
-                _ => scope.options.push_add(o.0),
+        match sign {
+            1 => scope.options.push_add(opt.0),
+            -1 => scope.options.push_remove(opt.0),
+            _ if flag.eq_ignore_ascii_case("none") => {
+                scope.options.push_set(Options::empty().0)
             }
+            _ if flag.eq_ignore_ascii_case("all") => scope.options.push_set(Options::all().0),
+            _ => scope.options.push_add(opt.0),
         }
     }
     Ok(())
@@ -1934,9 +1954,7 @@ fn apply_redirect(scope: &mut Scope, args: &[String]) -> Result<(), String> {
         Ok(s) => (s, &args[1..]),
         _ => (302, args),
     };
-    if rest.is_empty() {
-        return Err("Redirect requires a source path".into());
-    }
+    debug_assert!(!rest.is_empty());
     scope
         .mapping_policy
         .redirects
@@ -1957,9 +1975,7 @@ fn apply_redirect_match(scope: &mut Scope, args: &[String]) -> Result<(), String
         Ok(s) => (s, &args[1..]),
         _ => (302, args),
     };
-    if rest.is_empty() {
-        return Err("RedirectMatch requires a pattern".into());
-    }
+    debug_assert!(!rest.is_empty());
     let regex = crate::config::compile_regex(&rest[0])
         .map_err(|e| format!("bad RedirectMatch regex: {e}"))?;
     scope
@@ -2095,7 +2111,7 @@ mod tests {
         assert!(matches!(
             entries.as_slice(),
             [RequireEntry {
-                node: RequireNode::Provider(crate::config::Require::ValidUser),
+                node: RequireNode::Provider(crate::config::Require::ValidUser { negate: false }),
                 limit: None,
             }]
         ));
@@ -3117,6 +3133,701 @@ mod tests {
             "# hi\nRequire all \\\n denied\n\nOptions -Indexes\n",
         );
         assert_eq!(lines, vec!["Require all  denied", "Options -Indexes"]);
+    }
+
+    fn request_with_header(name: &str, value: &str) -> crate::http::Request {
+        let mut req = crate::http::Request {
+            method: "GET".into(),
+            target: b"/sub/secret.txt".to_vec(),
+            raw_path: b"/sub/secret.txt".to_vec(),
+            query: Vec::new(),
+            version: crate::http::Version::Http11,
+            headers: crate::http::Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        };
+        req.headers.push(name, value);
+        req
+    }
+
+    #[test]
+    fn access_walk_trace_collect_and_apply_request_paths() {
+        let dir = tempdir("coverage-walk");
+        let www = dir.join("www");
+        for sub in ["sub", "empty", "bad", "oversize", "loop", "parse-error"] {
+            fs::create_dir_all(www.join(sub)).unwrap();
+        }
+        fs::write(www.join("sub/secret.txt"), "secret\n").unwrap();
+        fs::write(
+            www.join(".htaccess"),
+            concat!(
+                "<Files \"secret.txt\">\n",
+                "Header set X-FileRule yes\n",
+                "</Files>\n",
+                "<If \"%{HTTP:X-Branch} == 'yes'\">\n",
+                "Header set X-CondRule yes\n",
+                "</If>\n",
+                "SetEnv ROOT yes\n",
+            ),
+        )
+        .unwrap();
+        fs::write(www.join(".htaccess2"), "SetEnv SECOND yes\n").unwrap();
+        fs::write(www.join("sub/.htaccess"), "SetEnv SUB yes\n").unwrap();
+        let cfg = config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:0\n\
+                 DocumentRoot \"{}\"\n\
+                 AccessFileName .htaccess .htaccess2\n\
+                 <Directory \"{}\">\n\
+                     AllowOverride All\n\
+                 </Directory>\n",
+                www.display(),
+                www.display()
+            ),
+        );
+        let file = www.join("sub/secret.txt");
+        let req = request_with_header("X-Branch", "yes");
+        let mut scope = Scope::default();
+        apply_req(
+            &cfg,
+            None,
+            &mut scope,
+            &file,
+            "/sub/secret.txt",
+            Some(&req),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+        let env = scope.request_env(&req);
+        for expected in ["ROOT", "SECOND", "SUB"] {
+            assert!(
+                env.iter().any(|(name, _)| name == expected),
+                "missing {expected}: {env:?}"
+            );
+        }
+        assert!(scope
+            .header_policy
+            .set_headers
+            .iter()
+            .any(|(name, _)| name == "X-FileRule"));
+        assert!(scope
+            .header_policy
+            .set_headers
+            .iter()
+            .any(|(name, _)| name == "X-CondRule"));
+
+        let layers = collect_layers(&cfg, None, &file, "/sub/secret.txt").unwrap();
+        assert_eq!(layers.len(), 2);
+
+        let trace = trace_access_files(&cfg, None, &file, "/sub/secret.txt").join("\n");
+        assert!(trace.contains(".htaccess"));
+        assert!(trace.contains(".htaccess2"));
+
+        // The non-directory start and the outer configuration phase.
+        let path_info = www.join("sub/secret.txt/more");
+        let mut files = Vec::new();
+        let mut deferred = Vec::new();
+        let mut config_files = Vec::new();
+        let mut scope = Scope::default();
+        apply_req_deferred(
+            &cfg,
+            None,
+            &mut scope,
+            &www,
+            "/",
+            Some(&req),
+            "127.0.0.1".parse().unwrap(),
+            &mut files,
+            &mut deferred,
+            true,
+            &mut config_files,
+        )
+        .unwrap();
+        let mut files = Vec::new();
+        let mut deferred = Vec::new();
+        let mut config_files = Vec::new();
+        let mut scope = Scope::default();
+        apply_req_deferred(
+            &cfg,
+            None,
+            &mut scope,
+            &path_info,
+            "/sub/secret.txt/more",
+            Some(&req),
+            "127.0.0.1".parse().unwrap(),
+            &mut files,
+            &mut deferred,
+            true,
+            &mut config_files,
+        )
+        .unwrap();
+
+        // Metadata errors and parse errors are fail-closed.
+        fs::create_dir_all(www.join("bad/.htaccess")).unwrap();
+        assert!(collect_layers(&cfg, None, &www.join("bad/x"), "/bad/x").is_err());
+        fs::write(
+            www.join("oversize/.htaccess"),
+            vec![b'#'; (MAX_HTACCESS + 1) as usize],
+        )
+        .unwrap();
+        assert!(collect_layers(&cfg, None, &www.join("oversize/x"), "/oversize/x").is_err());
+        std::os::unix::fs::symlink(".htaccess", www.join("loop/.htaccess")).unwrap();
+        assert!(collect_layers(&cfg, None, &www.join("loop/x"), "/loop/x").is_err());
+        fs::write(
+            www.join("parse-error/.htaccess"),
+            "Frobnicate something\n",
+        )
+        .unwrap();
+        let trace = trace_access_files(
+            &cfg,
+            None,
+            &www.join("parse-error/x"),
+            "/parse-error/x",
+        )
+        .join("\n");
+        assert!(trace.contains("ERROR"));
+
+        // A tree with no access files at all, and a path outside every
+        // override-enabled directory.
+        let dir2 = tempdir("coverage-walk-empty");
+        let www2 = dir2.join("www");
+        fs::create_dir_all(www2.join("empty")).unwrap();
+        fs::write(www2.join("empty/file.txt"), "x\n").unwrap();
+        let cfg2 = config(
+            &dir2,
+            &format!(
+                "Listen 127.0.0.1:0\nDocumentRoot \"{}\"\n<Directory \"{}\">\nAllowOverride All\n</Directory>\n",
+                www2.display(),
+                www2.display()
+            ),
+        );
+        let trace =
+            trace_access_files(&cfg2, None, &www2.join("empty/file.txt"), "/empty/file.txt")
+                .join("\n");
+        assert!(trace.contains("no access files present"));
+        let trace = trace_access_files(&cfg2, None, Path::new("/outside/file"), "/file").join("\n");
+        assert!(trace.contains("skipped"));
+        assert!(collect_layers(&cfg2, None, Path::new("/outside/file"), "/file")
+            .unwrap()
+            .is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn access_roots_rule_matching_and_path_helpers() {
+        let dir = tempdir("coverage-root");
+        let www = dir.join("www");
+        let alias = dir.join("alias");
+        fs::create_dir_all(&www).unwrap();
+        fs::create_dir_all(&alias).unwrap();
+        let target = alias.join("wallet.dat");
+        fs::write(&target, "wallet\n").unwrap();
+        let file_dir = dir.join("files");
+        fs::create_dir_all(&file_dir).unwrap();
+        let target = file_dir.join("wallet.dat");
+        fs::write(&target, "wallet\n").unwrap();
+        let cfg = config(
+            &dir,
+            &format!(
+                "ServerRoot \"{}\"\n\
+                 Listen 127.0.0.1:0\n\
+                 DocumentRoot \"{}\"\n\
+                 Alias /dir \"{}/\"\n\
+                 Alias /file \"{}\"\n\
+                 AliasMatch \"^/cap(.*)$\" \"$1\"\n",
+                dir.display(),
+                www.display(),
+                alias.display(),
+                target.display()
+            ),
+        );
+        assert_eq!(access_root_for(&cfg, None, &alias.join("x")), alias);
+        assert_eq!(access_root_for(&cfg, None, &target), file_dir);
+        assert_eq!(access_root_for(&cfg, None, &dir.join("other")), www);
+
+        let re = |p: &str| regex::Regex::new(p).unwrap();
+        assert!(rule_matches(&MatchKind::Always, "x", "/x"));
+        assert!(rule_matches(&MatchKind::Files(re("x")), "x", "/x"));
+        assert!(rule_matches(&MatchKind::FilesMatch(re("x")), "x", "/x"));
+        assert!(rule_matches(&MatchKind::Location(String::new()), "x", "/any"));
+        assert!(rule_matches(
+            &MatchKind::Location("/a/".into()),
+            "x",
+            "/a"
+        ));
+        assert!(rule_matches(
+            &MatchKind::Location("/a".into()),
+            "x",
+            "/a/b"
+        ));
+        assert!(!rule_matches(
+            &MatchKind::Location("/a".into()),
+            "x",
+            "/ab"
+        ));
+        assert!(rule_matches(
+            &MatchKind::LocationMatch(re("^/a")),
+            "x",
+            "/a/b"
+        ));
+        assert!(rule_matches(
+            &MatchKind::Directory(PathBuf::from("/a")),
+            "x",
+            "/a/b"
+        ));
+        assert!(rule_matches(
+            &MatchKind::DirectoryMatch(re("^/a")),
+            "x",
+            "/a/b"
+        ));
+
+        assert_eq!(mode_key(OverrideMode::None), 0);
+        assert_eq!(dir_url_base(&www, &www, "/x"), "/");
+        assert_eq!(dir_url_base(&www, &alias, "/alias/deep/file"), "/alias/deep/");
+        assert_eq!(
+            dir_url_base(Path::new("/srv/www"), Path::new("/srv/www/a/b"), "/a/b/f"),
+            "/a/b/"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parser_section_and_directive_error_branches() {
+        let dir = tempdir("coverage-parse-errors");
+        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let file = dir.join(".htaccess");
+        let parse = |text: &str,
+                     mode: OverrideMode,
+                     nonfatal: NonfatalMode,
+                     allow: &[String]| {
+            fs::write(&file, text).unwrap();
+            parse_file_with_list(&cfg, &file, mode, allow, nonfatal, "/")
+        };
+
+        let all = OverrideMode::All;
+        let cases: &[(&str, bool)] = &[
+            ("Header \"unterminated\n", false),
+            ("<Files \"x\">\n</If>\n", false),
+            (
+                "<Limit GET>\n<Files \"x\">\n</Files>\n</Limit>\n",
+                false,
+            ),
+            (
+                "<RequireAll>\n<If \"true\">\nRequire all granted\n</If>\n</RequireAll>\n",
+                false,
+            ),
+            (
+                "<IfFile ignored path>\nHeader set X-IfFile yes\n</IfFile>\n",
+                true,
+            ),
+            (
+                "<If \"true\">\n</If>\n<Else extra more>\n</Else>\n",
+                false,
+            ),
+            ("<RequireAll>\n</RequireAll>\n", true),
+            (
+                "<RequireAll>\n<Limit GET>\nRequire all granted\n</Limit>\n</RequireAll>\n",
+                false,
+            ),
+            (
+                "<Limit GET>\n<Limit POST>\nRequire all granted\n</Limit>\n</Limit>\n",
+                false,
+            ),
+            (
+                "<RequireAll>\n<Files \"x\">\nRequire all granted\n</Files>\n</RequireAll>\n",
+                false,
+            ),
+            (
+                "<FilesMatch \"[\">\nRequire all granted\n</FilesMatch>\n",
+                false,
+            ),
+            (
+                "<IfModule !mod_rewrite.c>\nRequire all denied\n</IfModule>\n",
+                true,
+            ),
+            (
+                "<IfModule>\nRequire all denied\n</IfModule>\n",
+                true,
+            ),
+            (
+                "<IfModule !mod_not_builtin.c>\nRequire all denied\n</IfModule>\n",
+                true,
+            ),
+            ("<RequireAll>\nHeader set X y\n</RequireAll>\n", false),
+            ("SetEnv\n", false),
+            ("Options\n", true),
+            ("Options All\n", true),
+            ("Options Indexes\n", true),
+            ("Header always\n", false),
+            ("Header always set\n", false),
+            ("Header always set X yes\n", true),
+            ("Header add X yes\n", true),
+            ("Header bogus X y\n", false),
+            ("Redirect\n", false),
+            ("Redirect 301 /old /new\n", true),
+            ("RedirectMatch 301 ^/old /new\n", true),
+            ("FileETag Inode MTime Size All\n", true),
+            ("AuthBasicProvider ldap\n", false),
+            ("ErrorDocument x /x\n", false),
+            ("ErrorDocument 404 http://example.test/x\n", true),
+            ("ErrorDocument 404 plain text\n", true),
+            ("Order bogus\n", false),
+            ("Allow all\n", false),
+            ("Allow from bogus\n", false),
+            ("Satisfy bogus\n", false),
+            ("AuthMerging bogus\n", false),
+            ("RewriteEngine bogus\n", false),
+            ("ReadmeFile README\n", true),
+        ];
+        for (text, ok) in cases {
+            let result = parse(text, all, NonfatalMode::None, &[]);
+            assert_eq!(result.is_ok(), *ok, "{text:?}");
+        }
+
+        // Nonfatal=Override/Unknown skip restricted material instead of
+        // failing the whole request.
+        for text in [
+            "<RequireAll>\nRequire all denied\n</RequireAll>\n",
+            "<Limit GET>\nRequire all denied\n</Limit>\n",
+            "Options +Indexes\n",
+        ] {
+            assert!(parse(text, OverrideMode::None, NonfatalMode::Override, &[]).is_ok());
+        }
+        let unknown = parse(
+            "<Unknown>\n\nplain text\n</Unknown>\n",
+            OverrideMode::None,
+            NonfatalMode::Unknown,
+            &[],
+        );
+        assert!(unknown.is_ok(), "{:?}", unknown.err());
+        let skipped = vec![
+            String::new(),
+            "\"unterminated".to_string(),
+            "<Nested>".to_string(),
+            "</Unknown>".to_string(),
+            "</Unknown>".to_string(),
+        ];
+        let mut at = 0usize;
+        assert!(skip_section(&skipped, &mut at, "unknown").is_ok());
+        assert_eq!(at, skipped.len());
+        let mut at = 0usize;
+        assert!(skip_section(&["<Unknown>".to_string()], &mut at, "unknown").is_err());
+        assert!(parse(
+            "Frobnicate x\n",
+            OverrideMode::None,
+            NonfatalMode::Unknown,
+            &[],
+        )
+        .is_ok());
+        assert!(parse(
+            "<Unknown>\nRequire all granted\n",
+            OverrideMode::None,
+            NonfatalMode::Unknown,
+            &[],
+        )
+        .is_err());
+        assert!(parse(
+            "<RequireAll>\n\"unterminated\n</RequireAll>\n",
+            OverrideMode::None,
+            NonfatalMode::Override,
+            &[],
+        )
+        .is_ok());
+        assert!(parse(
+            "<RequireAll>\nRequire all denied\n</RequireAll>\n",
+            OverrideMode::None,
+            NonfatalMode::None,
+            &[],
+        )
+        .is_err());
+        assert!(parse(
+            "Require all granted\n",
+            OverrideMode::None,
+            NonfatalMode::None,
+            &["require".to_string()],
+        )
+        .is_ok());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directive_permission_edges_options_and_cached_metadata() {
+        let args = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(directive_allowed_list(
+            OverrideMode::None,
+            &["require".to_string()],
+            "require",
+            &args(&["all", "granted"])
+        ));
+        assert!(!directive_allowed_list(
+            OverrideMode::Categories(OverrideCategories(OverrideCategories::OPT_INDEXES)),
+            &[],
+            "options",
+            &[]
+        ));
+        let per_option =
+            OverrideMode::Categories(OverrideCategories(OverrideCategories::OPT_INDEXES));
+        for flag in [
+            "+All",
+            "+Includes",
+            "+IncludesNoExec",
+            "+FollowSymLinks",
+            "+Indexes",
+            "+MultiViews",
+            "+SymLinksIfOwnerMatch",
+            "+MadeUp",
+        ] {
+            let _ = directive_allowed_list(per_option, &[], "options", &args(&[flag]));
+        }
+
+        let dir = tempdir("coverage-cache");
+        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let file = dir.join(".htaccess");
+        fs::write(&file, "Require all granted\n").unwrap();
+        let meta = fs::metadata(&file).unwrap();
+        let mut parsed = None;
+        for nonfatal in [
+            NonfatalMode::None,
+            NonfatalMode::Override,
+            NonfatalMode::Unknown,
+            NonfatalMode::All,
+        ] {
+            parsed = Some(
+                parse_cached(
+                    &cfg,
+                    &file,
+                    OverrideMode::All,
+                    &[],
+                    nonfatal,
+                    "/",
+                    &meta,
+                )
+                .unwrap(),
+            );
+        }
+        let parsed = parsed.unwrap();
+        {
+            let mut guard = cache().lock().unwrap_or_else(|e| e.into_inner());
+            for n in 0..512 {
+                guard.insert(
+                    CacheKey {
+                        path: dir.join(format!("dummy-{n}")),
+                        server_root: cfg.server_root.clone(),
+                        dev: 0,
+                        ino: n,
+                        mtime: 0,
+                        mtime_nsec: 0,
+                        ctime: 0,
+                        ctime_nsec: 0,
+                        size: 0,
+                        mode: 0,
+                        allow_list: Vec::new(),
+                        nonfatal: 0,
+                        base_url: String::new(),
+                    },
+                    Arc::clone(&parsed),
+                );
+            }
+        }
+        assert!(parse_cached(
+            &cfg,
+            &file,
+            OverrideMode::All,
+            &[],
+            NonfatalMode::None,
+            "/",
+            &meta
+        )
+        .is_ok());
+
+        let big = dir.join("big.htaccess");
+        fs::write(&big, vec![b'#'; (MAX_HTACCESS + 1) as usize]).unwrap();
+        assert!(parse_file(&cfg, &big, OverrideMode::All, "/").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remaining_walk_trace_and_unreachable_defensive_branches() {
+        let dir = tempdir("coverage-remaining");
+        let www = dir.join("www");
+        fs::create_dir_all(www.join("sub")).unwrap();
+        fs::create_dir_all(www.join("none")).unwrap();
+        fs::create_dir_all(www.join("nonfile")).unwrap();
+        fs::create_dir_all(www.join("bad2")).unwrap();
+        fs::write(www.join("sub/file.txt"), "x\n").unwrap();
+        fs::write(www.join("none/.htaccess"), "Require all granted\n").unwrap();
+        fs::write(www.join(".htaccess"), "Require all granted\n").unwrap();
+        fs::create_dir_all(www.join("nonfile/.htaccess")).unwrap();
+        fs::create_dir_all(www.join("bad2/.htaccess")).unwrap();
+        fs::write(www.join("bad2/.htaccess2"), "Require all granted\n").unwrap();
+        let mut cfg = config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:0\n\
+                 DocumentRoot \"{}\"\n\
+                 AccessFileName .htaccess .htaccess2\n\
+                 <Directory \"{}\">\n\
+                     AllowOverride All\n\
+                 </Directory>\n\
+                 <Directory \"{}/none\">\n\
+                     AllowOverride None\n\
+                 </Directory>\n",
+                www.display(),
+                www.display(),
+                www.display()
+            ),
+        );
+        cfg.access_file_names = vec![".htaccess".into(), ".htaccess2".into()];
+
+        // trace_access_files with a directory start and a non-file access name.
+        let trace = trace_access_files(&cfg, None, &www, "/").join("\n");
+        assert!(trace.contains(".htaccess"));
+        let trace = trace_access_files(&cfg, None, &www.join("nonfile/x"), "/nonfile/x").join("\n");
+        assert!(!trace.contains("nonfile/.htaccess"));
+        let layers = collect_layers(&cfg, None, &www.join("none/x"), "/none/x").unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].dir, www);
+        let trace = trace_access_files(&cfg, None, &www.join("none/x"), "/none/x").join("\n");
+        assert!(!trace.contains("none/.htaccess"));
+
+        // apply_req_deferred error branches: ELOOP, non-regular, oversized.
+        let mut scope = Scope::default();
+        let mut files = Vec::new();
+        let mut deferred = Vec::new();
+        let mut config_files = Vec::new();
+        assert!(apply_req_deferred(
+            &cfg,
+            None,
+            &mut scope,
+            &www.join("bad2/x"),
+            "/bad2/x",
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &mut files,
+            &mut deferred,
+            false,
+            &mut config_files,
+        )
+        .is_err());
+        let req = request_with_header("X-Branch", "yes");
+        assert!(apply_req(
+            &cfg,
+            None,
+            &mut Scope::default(),
+            &www.join("bad2/x"),
+            "/bad2/x",
+            Some(&req),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .is_err());
+        std::os::unix::fs::symlink(".htaccess", www.join("sub/.htaccess")).unwrap();
+        fs::write(www.join("sub/.htaccess2"), "Require all granted\n").unwrap();
+        let mut scope = Scope::default();
+        let mut files = Vec::new();
+        let mut deferred = Vec::new();
+        let mut config_files = Vec::new();
+        assert!(apply_req_deferred(
+            &cfg,
+            None,
+            &mut scope,
+            &www.join("sub/file.txt"),
+            "/sub/file.txt",
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &mut files,
+            &mut deferred,
+            false,
+            &mut config_files,
+        )
+        .is_err());
+        fs::remove_file(www.join("sub/.htaccess")).unwrap();
+        fs::write(
+            www.join("sub/.htaccess"),
+            vec![b'#'; (MAX_HTACCESS + 1) as usize],
+        )
+        .unwrap();
+        let mut scope = Scope::default();
+        let mut files = Vec::new();
+        let mut deferred = Vec::new();
+        let mut config_files = Vec::new();
+        assert!(apply_req_deferred(
+            &cfg,
+            None,
+            &mut scope,
+            &www.join("sub/file.txt"),
+            "/sub/file.txt",
+            None,
+            "127.0.0.1".parse().unwrap(),
+            &mut files,
+            &mut deferred,
+            false,
+            &mut config_files,
+        )
+        .is_err());
+
+        // A normal non-Files/non-conditional rule lands in the TopLevel slot.
+        let mut layer = crate::policy_ref::AccessLayer {
+            dir: www.clone(),
+            scope: Arc::new(Scope::default()),
+            files: Vec::new(),
+            conditionals: Vec::new(),
+        };
+        let top = ScopeRule {
+            kind: MatchKind::Always,
+            delta: Scope::default(),
+            order: 0,
+            condition: None,
+            branch: ConditionBranch::Normal,
+            chain: None,
+            nested: Vec::new(),
+        };
+        add_layer_rule(&mut layer, &top);
+        assert!(layer.files.is_empty() && layer.conditionals.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn direct_directive_errors_and_unknown_specs() {
+        let dir = tempdir("coverage-directive-errors");
+        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let file = dir.join(".htaccess");
+        let parse = |text: &str| {
+            fs::write(&file, text).unwrap();
+            parse_file(&cfg, &file, OverrideMode::All, "/")
+        };
+        for (text, ok) in [
+            ("Require ip not-an-ip\n", false),
+            ("Require dbm ignored\n", true),
+            ("RedirectMatch\n", false),
+            ("RedirectMatch 301\n", false),
+            ("FileETag made-up\n", true),
+            ("AddHandler cgi-script .cgi\n", true),
+            ("AddHandler cgi-script\n", true),
+            ("ErrorDocument 404\n", true),
+            (
+                "AddOutputFilterByType DEFLATE text/plain\n",
+                true,
+            ),
+            ("AddOutputFilterByType DEFLATE\n", true),
+            ("AddOutputFilter DEFLATE .html\n", true),
+            ("AddOutputFilter DEFLATE\n", true),
+            ("coverage-reject anything\n", false),
+            ("coverage-unhandled anything\n", false),
+        ] {
+            let result = parse(text);
+            assert_eq!(result.is_ok(), ok, "{text}: {:?}", result.err());
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 

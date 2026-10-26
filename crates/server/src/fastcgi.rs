@@ -20,6 +20,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -47,6 +48,7 @@ pub struct Backend {
     prefix: String,
 }
 
+#[derive(Clone, Debug)]
 pub struct Target {
     backend: Backend,
     pub script_filename: PathBuf,
@@ -383,6 +385,44 @@ pub fn handler_target(scope: &Scope, root: &Path, rel: &Path, url_path: &str) ->
     })
 }
 
+/// Handler selection for a resolved file.  The actual opened target supplies
+/// the handler extension and `SCRIPT_FILENAME`, so a symlink cannot carry the
+/// policy of its lexical (allowed) name into a denied target (F41/I39).
+pub(crate) fn handler_target_for_file(
+    scope: &Scope,
+    root: &Path,
+    rel: &Path,
+    url_path: &str,
+    actual_path: &Path,
+) -> Option<Target> {
+    let name = actual_path
+        .file_name()
+        .or_else(|| rel.file_name())
+        .map(|n| n.as_encoded_bytes())
+        .unwrap_or(b"");
+    let handler = crate::config::effective_handler(scope, name)?;
+    if !handler.starts_with("proxy:") {
+        return None;
+    }
+    let backend = parse_backend(handler)?;
+    let base = fastcgi_script_base(&backend, root);
+    let script_filename = clean_script_path(actual_path);
+    if !script_under_base(&script_filename, &base) {
+        return None;
+    }
+    if script_filename.is_file() && !contained_after_resolving_symlinks(&script_filename, &base) {
+        return None;
+    }
+    Some(Target {
+        backend,
+        script_filename,
+        script_name: url_path.to_string(),
+        path_info: String::new(),
+        route_order: usize::MAX,
+        logical_url: Some(handler.to_string()),
+    })
+}
+
 fn connect(backend: &Backend, timeout: Duration) -> io::Result<Box<dyn ReadWrite>> {
     match &backend.transport {
         Transport::Unix(path) => {
@@ -514,20 +554,52 @@ impl Spool {
     }
 }
 
+/// Create a private, unlinked spool file.  `create_new` makes the open atomic
+/// with respect to a pre-created symlink or file at the candidate name; the
+/// process/counter name is therefore safe even in a shared temp directory.
+/// The bounded retry handles an attacker squatting a candidate without
+/// following it (F43/I41).
+fn secure_temp_file_at(dir: &Path, seed: u64, start: u64) -> io::Result<File> {
+    let pid = std::process::id();
+    let mut last = None;
+    for offset in 0..32 {
+        let attempt = start.saturating_add(offset);
+        let name = if attempt == 0 {
+            format!("vapache-fastcgi-{pid}-{seed}.body")
+        } else {
+            format!("vapache-fastcgi-{pid}-{seed}-{attempt}.body")
+        };
+        let path = dir.join(name);
+        match OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => {
+                let _ = std::fs::remove_file(&path);
+                return Ok(file);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                last = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "spool name collision")))
+}
+
+fn secure_temp_file(dir: &Path, seed: u64) -> io::Result<File> {
+    secure_temp_file_at(dir, seed, 0)
+}
+
 fn temp_file() -> io::Result<File> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path =
-        std::env::temp_dir().join(format!("vapache-fastcgi-{}-{}.body", std::process::id(), n));
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(&path)?;
-    let _ = std::fs::remove_file(&path);
-    Ok(file)
+    secure_temp_file(&std::env::temp_dir(), n)
 }
 
 fn response_from_spool(spool: Spool, version: crate::http::Version) -> io::Result<Response> {
@@ -709,6 +781,85 @@ mod tests {
         let path = root.join("httpd.conf");
         fs::write(&path, "Listen 127.0.0.1:0\n").unwrap();
         Config::load(&path, root, &HashMap::new(), &HashMap::new(), false).unwrap()
+    }
+
+    #[test]
+    fn spool_temp_file_never_follows_a_preexisting_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-fcgi-spool-safe-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("overwrite-target");
+        fs::write(&target, b"ORIGINAL TARGET CONTENT\n").unwrap();
+        let predicted = dir.join(format!(
+            "vapache-fastcgi-{}-0.body",
+            std::process::id()
+        ));
+        std::os::unix::fs::symlink(&target, &predicted).unwrap();
+        let mut file = secure_temp_file_at(&dir, 0, 0).expect("collision-safe spool");
+        file.write_all(b"ATTACKER BODY").unwrap();
+        drop(file);
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"ORIGINAL TARGET CONTENT\n",
+            "the symlink target must not be truncated"
+        );
+        assert!(predicted.is_symlink(), "the planted symlink is left alone");
+        // The retry names are ordinary private files and were unlinked.
+        let leaked: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("-0-"))
+            .collect();
+        assert!(leaked.iter().all(|e| e.path().symlink_metadata().is_err()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spool_temp_file_reports_open_errors_and_collision_exhaustion() {
+        let missing = std::env::temp_dir().join(format!(
+            "vapache-fcgi-spool-missing-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&missing);
+        assert!(secure_temp_file_at(&missing, 1, 0).is_err());
+
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-fcgi-spool-full-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let pid = std::process::id();
+        for attempt in 0..32 {
+            let name = if attempt == 0 {
+                format!("vapache-fastcgi-{pid}-99.body")
+            } else {
+                format!("vapache-fastcgi-{pid}-99-{attempt}.body")
+            };
+            fs::write(dir.join(name), b"squatter").unwrap();
+        }
+        assert!(secure_temp_file_at(&dir, 99, 0).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spool_temp_file_is_private_and_unlinked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-fcgi-spool-mode-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = secure_temp_file_at(&dir, 7, 0).unwrap();
+        let mode = file.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(fs::read_dir(&dir).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn request(path: &str) -> Request {
@@ -1233,6 +1384,32 @@ mod tests {
         .unwrap();
         assert_eq!(handler.script_filename, root.join("index.php"));
         assert_eq!(handler.logical_url.as_deref(), Some(proxy_handler.as_str()));
+        // The resolved-target variant rejects a target outside the configured
+        // FastCGI base and a symlink whose real target escapes it.
+        assert!(handler_target_for_file(
+            &handler_scope(&proxy_handler),
+            &root,
+            Path::new("secret.php"),
+            "/secret.php",
+            &outside.join("secret.php"),
+        )
+        .is_none());
+        assert!(handler_target_for_file(
+            &handler_scope(&proxy_handler),
+            &root,
+            Path::new("link.php"),
+            "/link.php",
+            &root.join("link.php"),
+        )
+        .is_none());
+        assert!(handler_target_for_file(
+            &handler_scope(&proxy_handler),
+            &root,
+            Path::new("index.php"),
+            "/index.php",
+            &root.join("index.php"),
+        )
+        .is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 

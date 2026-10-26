@@ -831,19 +831,20 @@ mod tests {
     use std::fs::{self, File};
 
     #[test]
-    fn mmap_policy_rejects_server_writable_and_short_files() {
-        // Root-owned 0644 served by an unprivileged uid: safe to map.
-        assert!(vapache_verified::mmap_read_allowed(10, 10, 0, 33, 0o644));
+    fn mmap_policy_rejects_writable_and_short_files() {
+        // Only a file with no write bits at all is safe: an owner (including
+        // a different uid) or group member could truncate it mid-map.
         assert!(vapache_verified::mmap_read_allowed(10, 10, 0, 33, 0o444));
-
-        // Owner-writable, group-writable and world-writable files are copied.
+        assert!(!vapache_verified::mmap_read_allowed(10, 10, 0, 33, 0o644));
         assert!(!vapache_verified::mmap_read_allowed(10, 10, 33, 33, 0o644));
         assert!(!vapache_verified::mmap_read_allowed(10, 10, 0, 33, 0o664));
         assert!(!vapache_verified::mmap_read_allowed(10, 10, 0, 33, 0o646));
+        assert!(!vapache_verified::mmap_read_allowed(10, 10, 0, 33, 0o600));
+        assert!(!vapache_verified::mmap_read_allowed(10, 10, 0, 33, 0o640));
 
         // Never map beyond the representation length.
-        assert!(!vapache_verified::mmap_read_allowed(9, 10, 0, 33, 0o644));
-        assert!(vapache_verified::mmap_read_allowed(10, 0, 0, 33, 0o644));
+        assert!(!vapache_verified::mmap_read_allowed(9, 10, 0, 33, 0o444));
+        assert!(vapache_verified::mmap_read_allowed(10, 0, 0, 33, 0o444));
     }
 
     #[test]

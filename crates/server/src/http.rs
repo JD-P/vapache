@@ -114,6 +114,17 @@ impl SpooledBody {
         clone.seek(SeekFrom::Start(0))?;
         Ok(clone)
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_bytes(data: &[u8]) -> Self {
+        let mut file = spool_file().expect("spool file");
+        file.write_all(data).expect("spool write");
+        file.seek(SeekFrom::Start(0)).expect("spool seek");
+        Self {
+            file: std::sync::Mutex::new(file),
+            len: data.len() as u64,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1076,6 +1087,20 @@ mod tests {
     }
 
     #[test]
+    fn emitted_header_values_reject_non_http_controls() {
+        assert_eq!(
+            crate::verified::sanitize_header_value(b"safe\tvalue"),
+            Some(b"safe\tvalue".to_vec())
+        );
+        for control in [0x00, 0x0b, 0x0c, 0x1f, 0x7f, b'\r', b'\n'] {
+            assert!(
+                crate::verified::sanitize_header_value(&[b'a', control, b'b']).is_none(),
+                "control {control:#x} was accepted"
+            );
+        }
+    }
+
+    #[test]
     fn absolute_form_and_asterisk_targets() {
         let req = parse_head(
             b"GET http://example.com/a?b HTTP/1.1\r\nHost: example.com\r\n\r\n",
@@ -1136,6 +1161,18 @@ mod tests {
         assert!(req.keep_alive);
         let req = parse_head(
             b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            &limits(),
+        )
+        .unwrap();
+        assert!(!req.keep_alive);
+        // `close` is sticky regardless of token order.
+        for header in ["close, keep-alive", "keep-alive, close", "keep-alive, close, keep-alive"] {
+            let raw = format!("GET / HTTP/1.1\r\nHost: x\r\nConnection: {header}\r\n\r\n");
+            let req = parse_head(raw.as_bytes(), &limits()).unwrap();
+            assert!(!req.keep_alive, "{header}");
+        }
+        let req = parse_head(
+            b"GET / HTTP/1.0\r\nConnection: keep-alive, close\r\n\r\n",
             &limits(),
         )
         .unwrap();

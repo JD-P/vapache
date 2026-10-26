@@ -321,14 +321,18 @@ fn check_health(spec: &HealthSpec) -> bool {
     let mut scope = Scope::default();
     scope.proxy_policy.proxy_ca_file = spec.ca_file.clone();
     let timeout = Duration::from_secs(5);
-    let Ok(mut stream) = connect(&backend, &scope, timeout) else {
+    let Ok(stream) = connect(&backend, &scope, timeout) else {
         return false;
     };
-    let mut path = join_path(&backend.base, &spec.uri);
-    if !path.starts_with('/') {
-        path.insert(0, '/');
-    }
-    path = encode_proxy_path(&path);
+    check_health_stream(stream, spec, &backend)
+}
+
+fn check_health_stream(
+    mut stream: Box<dyn ReadWrite>,
+    spec: &HealthSpec,
+    backend: &HttpBackend,
+) -> bool {
+    let path = encode_proxy_path(&join_path(&backend.base, &spec.uri));
     let method = match spec.method.to_ascii_uppercase().as_str() {
         "HEAD" => "HEAD",
         "OPTIONS" => "OPTIONS",
@@ -339,7 +343,7 @@ fn check_health(spec: &HealthSpec) -> bool {
         "{method} {path} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
         backend.host, backend.port
     );
-    let Ok(head) = ValidatedProxyHead::new(request, &backend, None) else {
+    let Ok(head) = ValidatedProxyHead::new(request, backend, None) else {
         return false;
     };
     if stream.write_all(head.as_bytes()).is_err() {
@@ -416,9 +420,7 @@ fn next_balancer_member(
                 && (!active || member_is_healthy(&balancer.name, &m.url))
                 && !is_dead(&balancer.name, &m.url)
                 && !is_excluded(m)
-        }) {
-            return parse_http_url(&member.url);
-        }
+        }) { return parse_http_url(&member.url); }
     }
     let mut viable: Vec<&BalancerMember> = balancer.members.iter().filter(available).collect();
     if viable.is_empty() {
@@ -526,21 +528,13 @@ pub fn balancer_unavailable(cfg: &Config, scope: &Scope, url_path: &str) -> bool
         if prefix_suffix(&rule.prefix, url_path).is_none() {
             continue;
         }
-        if rule.backend.trim_start().starts_with("balancer://")
-            && resolve_backend(cfg, &rule.backend, "", None, None).is_none()
-        {
-            return true;
-        }
+        if rule.backend.trim_start().starts_with("balancer://") && resolve_backend(cfg, &rule.backend, "", None, None).is_none() { return true; }
     }
     for rule in &scope.proxy_policy.proxy_rules {
         if !rule.pattern.is_match(url_path) {
             continue;
         }
-        if rule.backend.trim_start().starts_with("balancer://")
-            && resolve_backend(cfg, &rule.backend, "", None, None).is_none()
-        {
-            return true;
-        }
+        if rule.backend.trim_start().starts_with("balancer://") && resolve_backend(cfg, &rule.backend, "", None, None).is_none() { return true; }
     }
     false
 }
@@ -575,13 +569,16 @@ pub fn match_target_req(
         let Some(suffix) = prefix_suffix(&rule.prefix, url_path) else {
             continue;
         };
-        if let Some((backend, path)) = resolve_backend(
+        let Some((backend, path)) = resolve_backend(
             cfg,
             &rule.backend,
             suffix,
             req,
             rule.sticky_cookie.as_deref(),
-        ) {
+        ) else {
+            continue;
+        };
+        {
             let balancer = rule
                 .backend
                 .strip_prefix("balancer://")
@@ -963,13 +960,10 @@ fn websocket_accept(key: &str) -> Option<String> {
 
 fn response_header<'a>(head: &'a [u8], name: &str) -> Option<&'a str> {
     let text = std::str::from_utf8(head).ok()?;
-    for line in text.split("\r\n").skip(1) {
+    text.split("\r\n").skip(1).find_map(|line| {
         let (n, v) = line.split_once(':')?;
-        if n.trim().eq_ignore_ascii_case(name) {
-            return Some(v.trim());
-        }
-    }
-    None
+        n.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+    })
 }
 
 async fn read_async_head<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Vec<u8>> {
@@ -1100,15 +1094,18 @@ where
         "X-Forwarded-Proto: {}\r\n",
         if https { "https" } else { "http" }
     ));
-    if !host.is_empty() {
-        if !valid_forwarded_host(host) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "unsafe X-Forwarded-Host",
-            ));
-        }
-        head.push_str(&format!("X-Forwarded-Host: {host}\r\n"));
+    if !host.is_empty() && !valid_forwarded_host(host) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsafe X-Forwarded-Host",
+        ));
     }
+    let forwarded_host = if host.is_empty() {
+        String::new()
+    } else {
+        format!("X-Forwarded-Host: {host}\r\n")
+    };
+    head.push_str(&forwarded_host);
     head.push_str("\r\n");
     let head = ValidatedProxyHead::new(
         head,
@@ -1223,17 +1220,6 @@ fn connect(
     Ok(Box::new(StreamOwned::new(conn, tcp)))
 }
 
-#[allow(clippy::too_many_arguments)]
-struct Pooled {
-    stream: Box<dyn ReadWrite>,
-    at: std::time::Instant,
-}
-
-fn pool() -> &'static Mutex<HashMap<String, Vec<Pooled>>> {
-    static POOL: OnceLock<Mutex<HashMap<String, Vec<Pooled>>>> = OnceLock::new();
-    POOL.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn backend_key(backend: &HttpBackend) -> String {
     format!(
         "{}:{}:{}",
@@ -1243,55 +1229,14 @@ fn backend_key(backend: &HttpBackend) -> String {
     )
 }
 
-fn take_pooled(key: &str) -> Option<Box<dyn ReadWrite>> {
-    let mut guard = pool().lock().unwrap_or_else(|e| e.into_inner());
-    let list = guard.get_mut(key)?;
-    let now = std::time::Instant::now();
-    while let Some(entry) = list.pop() {
-        if now.duration_since(entry.at) <= Duration::from_secs(30) {
-            return Some(entry.stream);
-        }
-    }
-    None
-}
-
-fn release_pooled(key: &str, stream: Box<dyn ReadWrite>) {
-    let mut guard = pool().lock().unwrap_or_else(|e| e.into_inner());
-    let list = guard.entry(key.to_string()).or_default();
-    if list.len() < 8 {
-        list.push(Pooled {
-            stream,
-            at: std::time::Instant::now(),
-        });
-    }
-}
-
-fn connect_pooled(
-    backend: &HttpBackend,
-    scope: &Scope,
-    timeout: Duration,
-) -> std::io::Result<(Box<dyn ReadWrite>, bool)> {
-    let key = backend_key(backend);
-    if let Some(stream) = take_pooled(&key) {
-        return Ok((stream, true));
-    }
-    Ok((connect(backend, scope, timeout)?, false))
-}
-
 struct PoolBodyReader {
     inner: Option<BufReader<Box<dyn ReadWrite>>>,
     remaining: u64,
-    key: String,
-    reusable: bool,
 }
 
 impl PoolBodyReader {
     fn finish(&mut self) {
-        if let Some(reader) = self.inner.take() {
-            if self.reusable {
-                release_pooled(&self.key, reader.into_inner());
-            }
-        }
+        self.inner.take();
     }
 }
 
@@ -1371,15 +1316,18 @@ fn proxy_once(
         "X-Forwarded-Proto: {}\r\n",
         if https { "https" } else { "http" }
     ));
-    if !host.is_empty() {
-        if !valid_forwarded_host(host) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "unsafe X-Forwarded-Host",
-            ));
-        }
-        head.push_str(&format!("X-Forwarded-Host: {host}\r\n"));
+    if !host.is_empty() && !valid_forwarded_host(host) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsafe X-Forwarded-Host",
+        ));
     }
+    let forwarded_host = if host.is_empty() {
+        String::new()
+    } else {
+        format!("X-Forwarded-Host: {host}\r\n")
+    };
+    head.push_str(&forwarded_host);
     head.push_str("\r\n");
     let head = ValidatedProxyHead::new(
         head,
@@ -1397,7 +1345,7 @@ fn proxy_once(
     let mut reader = BufReader::new(stream);
     let status_line = read_line(&mut reader)?;
     let mut bits = status_line.split_whitespace();
-    let version = bits
+    let _version = bits
         .next()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad status"))?
         .to_string();
@@ -1426,7 +1374,6 @@ fn proxy_once(
     let mut saw_content_length = false;
     let mut chunked = false;
     let mut saw_transfer_encoding = false;
-    let mut connection: Option<String> = None;
     let mut connection_header_tokens: Vec<String> = Vec::new();
     let mut header_count = 0usize;
     let mut head_bytes = status_line.len();
@@ -1499,7 +1446,6 @@ fn proxy_once(
             continue;
         }
         if name == "connection" {
-            connection = Some(value.to_ascii_lowercase());
             connection_header_tokens.extend(connection_tokens(value));
             continue;
         }
@@ -1545,76 +1491,44 @@ fn proxy_once(
             *value = loc.into_bytes();
         }
     }
-    let mut keep_alive = version != "HTTP/1.0";
-    if let Some(connection) = connection.as_deref() {
-        if connection.split(',').any(|v| v.trim() == "close") {
-            keep_alive = false;
-        } else if connection.split(',').any(|v| v.trim() == "keep-alive") {
-            keep_alive = true;
-        }
-    }
     let no_body =
         req.method == "HEAD" || status == 204 || status == 304 || (100..200).contains(&status);
     // Large fixed-length upstream bodies are forwarded without buffering the
     // whole response in memory.  The pool connection is returned only after
     // the body reader reaches EOF, preserving HTTP/1.1 framing.
+    const STREAM_THRESHOLD: usize = 256 * 1024;
     if !no_body && !chunked {
-        if let Some(n) = content_length {
-            const STREAM_THRESHOLD: usize = 256 * 1024;
-            if n > STREAM_THRESHOLD {
-                let body = PoolBodyReader {
-                    inner: Some(reader),
-                    remaining: n as u64,
-                    key: backend_key(&target.backend),
-                    reusable: false,
-                };
-                let mut response = Response::new(status);
-                response.headers = headers
-                    .into_iter()
-                    .map(|(n, v)| (std::borrow::Cow::Owned(n), v))
-                    .collect();
-                response.body = Body::Stream {
-                    reader: Box::new(body),
-                    len: n as u64,
-                };
-                crate::compression::finalize(scope, req, &mut response, url_path.as_bytes());
-                return Ok((response, None));
-            }
+        if let Some(n) = content_length.filter(|n| *n > STREAM_THRESHOLD) {
+            let body = PoolBodyReader {
+                inner: Some(reader),
+                remaining: n as u64,
+            };
+            let mut response = Response::new(status);
+            response.headers = headers
+                .into_iter()
+                .map(|(n, v)| (std::borrow::Cow::Owned(n), v))
+                .collect();
+            response.body = Body::Stream {
+                reader: Box::new(body),
+                len: n as u64,
+            };
+            crate::compression::finalize(scope, req, &mut response, url_path.as_bytes());
+            return Ok((response, None));
         }
     }
     let mut body = Vec::new();
-    // Do not pool backend connections.  A compliant backend is not assumed;
-    // leftover bytes after a fixed/chunked body could otherwise be reused as
-    // the next response.  Closing after every response removes that
-    // request-smuggling primitive.
-    let mut reusable = false;
     if !no_body {
         if chunked {
             read_chunked(&mut reader, &mut body)?;
         } else if let Some(n) = content_length {
-            if n > MAX_PROXY_BODY {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "proxy body too large",
-                ));
-            }
             body.resize(n, 0);
             reader.read_exact(&mut body)?;
         } else {
-            reusable = false;
             Read::by_ref(&mut reader)
                 .take(MAX_PROXY_BODY as u64 + 1)
                 .read_to_end(&mut body)?;
-            if body.len() > MAX_PROXY_BODY {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "proxy body too large",
-                ));
-            }
+            if body.len() > MAX_PROXY_BODY { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "proxy body too large")); }
         }
-    }
-    if status == 101 || !keep_alive {
-        reusable = false;
     }
     let mut response = Response::new(status);
     response.headers = headers
@@ -1630,12 +1544,7 @@ fn proxy_once(
         .header_policy
         .apply(&mut response.headers, response.status < 400);
     crate::compression::finalize(scope, req, &mut response, url_path.as_bytes());
-    let returned = if reusable {
-        Some(reader.into_inner())
-    } else {
-        None
-    };
-    Ok((response, returned))
+    Ok((response, None))
 }
 
 fn alternate_target(
@@ -1709,9 +1618,7 @@ fn authorize_failover(
     let bound = grant.bind_backend(&next_resource, binding.clone())?;
     let mut expected = next_resource;
     expected.backend_target = Some(binding);
-    if !bound.require(&expected) {
-        return None;
-    }
+    debug_assert!(bound.require(&expected), "failover grant does not cover bound backend");
     Some((next_scope, bound, expected))
 }
 
@@ -1772,32 +1679,15 @@ pub fn execute(
         let binding = current.binding_key();
         let mut expected = active_resource.clone();
         expected.backend_target = Some(binding.clone());
-        if !active_grant.require(&expected)
-            || active_resource.proxy_url.as_deref() != Some(current.proxy_url.as_str())
-            || active_resource.backend_target.as_deref() != Some(binding.as_str())
-        {
-            return error(
-                cfg,
-                vhost,
-                &active_scope,
-                req,
-                url_path,
-                local_port,
-                host,
-                peer.ip(),
-                local_ip,
-            );
-        }
-        let key = backend_key(&current.backend);
-        tried.insert(key.clone());
-        let mut retried = false;
-        let result = loop {
-            let (stream, was_pooled) =
-                match connect_pooled(&current.backend, &active_scope, timeout) {
-                    Ok(v) => v,
-                    Err(e) => break Err(e),
-                };
-            match proxy_once(
+        debug_assert!(
+            active_grant.require(&expected)
+                && active_resource.proxy_url.as_deref() == Some(current.proxy_url.as_str())
+                && active_resource.backend_target.as_deref() == Some(binding.as_str()),
+            "proxy failover grant/identity drift"
+        );
+        tried.insert(backend_key(&current.backend));
+        let result = match connect(&current.backend, &active_scope, timeout) {
+            Ok(stream) => proxy_once(
                 stream,
                 &current,
                 req,
@@ -1806,19 +1696,9 @@ pub fn execute(
                 peer,
                 https,
                 host,
-            ) {
-                Ok((response, reusable)) => {
-                    if let Some(stream) = reusable {
-                        release_pooled(&key, stream);
-                    }
-                    break Ok(response);
-                }
-                Err(e) if was_pooled && !retried => {
-                    retried = true;
-                    continue;
-                }
-                Err(e) => break Err(e),
-            }
+            )
+            .map(|(response, _)| response),
+            Err(e) => Err(e),
         };
         match result {
             Ok(response) => {
@@ -1831,40 +1711,38 @@ pub fn execute(
                             &format!("{}:{}", current.backend.host, current.backend.port),
                         );
                     }
-                    if let Some(next) = alternate_target(cfg, &current, &tried, req) {
-                        match authorize_failover(
+                    let Some(next) = alternate_target(cfg, &current, &tried, req) else {
+                        return response;
+                    };
+                    let (next_scope, next_grant, next_resource) = match authorize_failover(
+                        cfg,
+                        vhost,
+                        &active_scope,
+                        req,
+                        url_path,
+                        &next,
+                        peer,
+                        resource,
+                    ) {
+                        Some(v) => v,
+                        None => return crate::files::error_response(
                             cfg,
                             vhost,
                             &active_scope,
+                            403,
                             req,
                             url_path,
-                            &next,
-                            peer,
-                            resource,
-                        ) {
-                            Some((next_scope, next_grant, next_resource)) => {
-                                active_scope = next_scope;
-                                active_grant = next_grant;
-                                active_resource = next_resource;
-                                current = next;
-                                continue;
-                            }
-                            None => {
-                                return crate::files::error_response(
-                                    cfg,
-                                    vhost,
-                                    &active_scope,
-                                    403,
-                                    req,
-                                    url_path,
-                                    local_port,
-                                    host,
-                                    peer.ip(),
-                                    local_ip,
-                                )
-                            }
-                        }
-                    }
+                            local_port,
+                            host,
+                            peer.ip(),
+                            local_ip,
+                        ),
+                    };
+                    active_scope = next_scope;
+                    active_grant = next_grant;
+                    active_resource = next_resource;
+                    current = next;
+                    continue;
                 }
                 return response;
             }
@@ -1877,7 +1755,7 @@ pub fn execute(
                     );
                 }
                 if let Some(next) = alternate_target(cfg, &current, &tried, req) {
-                    match authorize_failover(
+                    let (next_scope, next_grant, next_resource) = match authorize_failover(
                         cfg,
                         vhost,
                         &active_scope,
@@ -1887,28 +1765,25 @@ pub fn execute(
                         peer,
                         resource,
                     ) {
-                        Some((next_scope, next_grant, next_resource)) => {
-                            active_scope = next_scope;
-                            active_grant = next_grant;
-                            active_resource = next_resource;
-                            current = next;
-                            continue;
-                        }
-                        None => {
-                            return crate::files::error_response(
-                                cfg,
-                                vhost,
-                                &active_scope,
-                                403,
-                                req,
-                                url_path,
-                                local_port,
-                                host,
-                                peer.ip(),
-                                local_ip,
-                            )
-                        }
-                    }
+                        Some(v) => v,
+                        None => return crate::files::error_response(
+                            cfg,
+                            vhost,
+                            &active_scope,
+                            403,
+                            req,
+                            url_path,
+                            local_port,
+                            host,
+                            peer.ip(),
+                            local_ip,
+                        ),
+                    };
+                    active_scope = next_scope;
+                    active_grant = next_grant;
+                    active_resource = next_resource;
+                    current = next;
+                    continue;
                 }
                 return error(
                     cfg,
@@ -3065,5 +2940,1484 @@ mod more_tests {
                 "{injected:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use crate::http::{Headers, Version};
+    use std::io::Cursor;
+    use std::net::TcpListener;
+
+    struct MockStream {
+        input: Cursor<Vec<u8>>,
+    }
+
+    impl MockStream {
+        fn new(input: impl Into<Vec<u8>>) -> Self {
+            Self {
+                input: Cursor::new(input.into()),
+            }
+        }
+    }
+
+    impl Read for MockStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            Read::read(&mut self.input, buf)
+        }
+    }
+
+    impl Write for MockStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn req(path: &str) -> Request {
+        Request {
+            method: "GET".into(),
+            target: path.as_bytes().to_vec(),
+            raw_path: path.as_bytes().to_vec(),
+            query: Vec::new(),
+            version: Version::Http11,
+            headers: Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        }
+    }
+
+    fn backend() -> HttpBackend {
+        HttpBackend {
+            host: "127.0.0.1".into(),
+            port: 9000,
+            base: "/".into(),
+            tls: false,
+        }
+    }
+
+    fn target() -> Target {
+        let backend = backend();
+        let path = "/x".to_string();
+        let proxy_url = canonical_proxy_url(&backend, &path);
+        Target {
+            backend,
+            path,
+            suffix: String::new(),
+            reverse: Vec::new(),
+            balancer: None,
+            fail_on_status: Vec::new(),
+            proxy_url,
+            logical_url: None,
+            route_order: 0,
+        }
+    }
+
+    fn run(
+        response: impl Into<Vec<u8>>,
+    ) -> std::io::Result<(Response, Option<Box<dyn ReadWrite>>)> {
+        proxy_once(
+            Box::new(MockStream::new(response)),
+            &target(),
+            &req("/x"),
+            &Scope::default(),
+            "/x",
+            "127.0.0.1:1".parse().unwrap(),
+            false,
+            "client.example",
+        )
+    }
+
+    fn invalid(response: impl Into<Vec<u8>>, what: &str) {
+        match run(response) {
+            Ok(_) => panic!("expected error for {what}"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{what}: {e}"),
+        }
+    }
+
+    #[test]
+    fn url_and_canonical_helpers() {
+        assert_eq!(
+            canonical_proxy_url(&backend(), "relative"),
+            "http://127.0.0.1:9000/relative"
+        );
+        assert_eq!(
+            canonical_proxy_url(&backend(), ""),
+            "http://127.0.0.1:9000/"
+        );
+        assert_eq!(
+            canonical_proxy_url(
+                &HttpBackend {
+                    host: "example.test".into(),
+                    port: 443,
+                    base: "/".into(),
+                    tls: true,
+                },
+                "/p"
+            ),
+            "https://example.test/p"
+        );
+
+        assert!(parse_http_url("ws://h").is_some_and(|b| !b.tls));
+        assert!(parse_http_url("wss://h").is_some_and(|b| b.tls));
+        assert_eq!(parse_http_url("http://h").unwrap().base, "/");
+        assert_eq!(parse_http_url("http://h/a/b").unwrap().base, "/a/b");
+        assert_eq!(parse_http_url("http://[::1]").unwrap().port, 80);
+        assert_eq!(parse_http_url("https://[::1]").unwrap().port, 443);
+        assert_eq!(parse_http_url("http://[::1]:8443").unwrap().port, 8443);
+        assert!(parse_http_url("http://[::1]x").is_none());
+        assert!(parse_http_url("ftp://h").is_none());
+        assert!(parse_http_url("http://h:bad").is_none());
+        assert!(parse_http_url("http://").is_none());
+    }
+
+    #[test]
+    fn read_line_and_chunked_edges() {
+        let mut empty = Cursor::new(Vec::<u8>::new());
+        assert_eq!(
+            read_line(&mut empty).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        let mut line = Cursor::new(b"a\r\n".to_vec());
+        assert_eq!(read_line(&mut line).unwrap(), "a");
+
+        let mut out = Vec::new();
+        let mut chunked = Cursor::new(b"4\r\nWiki\r\n0\r\n\r\n".to_vec());
+        read_chunked(&mut chunked, &mut out).unwrap();
+        assert_eq!(out, b"Wiki");
+
+        let mut bad_size = Cursor::new(b"zz\r\n".to_vec());
+        assert!(read_chunked(&mut bad_size, &mut Vec::new()).is_err());
+        let mut bad_crlf = Cursor::new(b"1\r\naX\r\n".to_vec());
+        assert!(read_chunked(&mut bad_crlf, &mut Vec::new()).is_err());
+        let mut too_large = Cursor::new(b"ffffffffffff\r\n".to_vec());
+        assert!(read_chunked(&mut too_large, &mut Vec::new()).is_err());
+        let mut trailer = Cursor::new(b"0\r\nX: y\r\n\r\n".to_vec());
+        read_chunked(&mut trailer, &mut Vec::new()).unwrap();
+    }
+
+    #[test]
+    fn rewrite_location_edges() {
+        let reverse = vec![ProxyReverseRule {
+            front: "/api".into(),
+            backend: "http://b:1".into(),
+        }];
+        let mut exact = "http://b:1".to_string();
+        rewrite_location(&mut exact, &reverse);
+        assert_eq!(exact, "/api/");
+        let mut child = "http://b:1/x".to_string();
+        rewrite_location(&mut child, &reverse);
+        assert_eq!(child, "/api/x");
+        let mut other = "http://other/x".to_string();
+        rewrite_location(&mut other, &reverse);
+        assert_eq!(other, "http://other/x");
+    }
+
+    #[test]
+    fn websocket_and_header_helpers() {
+        assert!(websocket_accept("not-base64").is_none());
+        assert!(websocket_accept("c2hvcnQ=").is_none());
+        assert!(websocket_accept("dGhlIHNhbXBsZSBub25jZQ==").is_some());
+
+        let head = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+        assert_eq!(response_header(head, "upgrade"), Some("websocket"));
+        assert_eq!(response_header(head, "missing"), None);
+        assert_eq!(response_header(b"HTTP/1.1 101 \xff\r\n", "x"), None);
+
+        assert_eq!(
+            encode_proxy_path("/a b%\u{7f}?#"),
+            "/a%20b%25%7F%3F%23"
+        );
+        assert!(hop_by_hop("Proxy-Authorization"));
+        assert!(!hop_by_hop("x-test"));
+        assert!(forwarded_header("Forwarded"));
+        assert!(!forwarded_header("x-test"));
+        assert_eq!(
+            connection_tokens("keep-alive, X-Hop, bad token"),
+            vec!["keep-alive", "x-hop"]
+        );
+        assert!(valid_backend_host("[::1]:80"));
+        assert!(!valid_backend_host("bad host"));
+        assert!(valid_forwarded_host("example.test"));
+        assert!(!valid_forwarded_host("bad host"));
+        assert!(!valid_forwarded_host(""));
+        assert!(client_config(&Scope::default()).is_ok());
+    }
+
+    #[test]
+    fn websocket_detection() {
+        let mut r = req("/ws");
+        assert!(!is_websocket(&r));
+        r.method = "POST".into();
+        assert!(!is_websocket(&r));
+        r.method = "GET".into();
+        r.headers.push("Upgrade", "websocket");
+        r.headers.push("Connection", "keep-alive, Upgrade");
+        r.headers.push("Sec-WebSocket-Version", "13");
+        r.headers
+            .push("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+        assert!(is_websocket(&r));
+    }
+
+    #[test]
+    fn sticky_and_balancer_member_edges() {
+        let mut balancer = Balancer {
+            name: "b".into(),
+            members: Vec::new(),
+            health: HealthTemplate::default(),
+            sticky_cookie: Some("route".into()),
+            sticky_sep: Some(".".into()),
+            fail_on_status: Vec::new(),
+        };
+        let mut r = req("/");
+        r.headers.push("Cookie", "x=1; route=node.7");
+        assert_eq!(
+            sticky_route(&balancer, Some(&r), None).as_deref(),
+            Some("7")
+        );
+        balancer.sticky_sep = Some(String::new());
+        assert_eq!(
+            sticky_route(&balancer, Some(&r), None).as_deref(),
+            Some("node.7")
+        );
+        balancer.sticky_sep = Some(".".into());
+        r.headers = Headers::default();
+        r.headers.push("Cookie", "x=1; route=node");
+        assert_eq!(
+            sticky_route(&balancer, Some(&r), None).as_deref(),
+            Some("node")
+        );
+        r.headers = Headers::default();
+        r.headers.push("Cookie", "x=1; other=node");
+        assert_eq!(sticky_route(&balancer, Some(&r), None), None);
+        r.headers = Headers::default();
+        r.headers.push("Cookie", "malformed; route=node.1");
+        assert_eq!(
+            sticky_route(&balancer, Some(&r), None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(sticky_route(&balancer, None, None), None);
+
+        assert!(next_balancer_member(&balancer, None, None, None).is_none());
+        balancer.members.push(BalancerMember {
+            url: "http://127.0.0.1:9001".into(),
+            route: Some("1".into()),
+            ..BalancerMember::default()
+        });
+        assert!(next_balancer_member(&balancer, Some(&r), None, None).is_some());
+        let mut tried = HashSet::new();
+        tried.insert(backend_key(&parse_http_url("http://127.0.0.1:9001").unwrap()));
+        assert!(next_balancer_member(&balancer, None, Some(&tried), None).is_none());
+    }
+
+    #[test]
+    fn balancer_unavailable_and_regex_targets() {
+        let dir = std::env::temp_dir().join(format!("vapache-proxy-cov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("httpd.conf");
+        std::fs::write(
+            &config_path,
+            "Listen 127.0.0.1:0\n<Proxy balancer://empty>\n</Proxy>\n",
+        )
+        .unwrap();
+        let cfg = Config::load(
+            &config_path,
+            &dir,
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+        )
+        .unwrap();
+        let mut scope = Scope::default();
+        scope.proxy_policy.proxy_passes.push(crate::config::ProxyPassRule {
+            prefix: "/b".into(),
+            backend: "balancer://empty".into(),
+            sticky_cookie: None,
+            fail_on_status: Vec::new(),
+            route_order: 0,
+        });
+        assert!(balancer_unavailable(&cfg, &scope, "/b/x"));
+        assert!(!balancer_unavailable(&cfg, &scope, "/other"));
+
+        let mut scope = Scope::default();
+        scope.proxy_policy.proxy_rules.push(crate::config::ProxyRule {
+            pattern: Arc::new(crate::config::compile_regex("^/r").unwrap()),
+            backend: "balancer://empty".into(),
+            route_order: 0,
+        });
+        assert!(balancer_unavailable(&cfg, &scope, "/r/x"));
+
+        let mut scope = Scope::default();
+        scope.proxy_policy.proxy_rules.push(crate::config::ProxyRule {
+            pattern: Arc::new(crate::config::compile_regex("^/r/(.*)$").unwrap()),
+            backend: "http://127.0.0.1:9000/base".into(),
+            route_order: 0,
+        });
+        let t = match_target(&cfg, &scope, "/r/z").unwrap();
+        assert_eq!(t.suffix, "z");
+        assert_eq!(t.path, "/base/z");
+
+        scope.proxy_policy.proxy_rules[0].backend = "http://127.0.0.1:9000/$1".into();
+        let t = match_target(&cfg, &scope, "/r/z").unwrap();
+        assert!(t.suffix.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn health_check_invalid_and_eof() {
+        let spec = HealthSpec {
+            key: "k".into(),
+            url: "ftp://invalid".into(),
+            method: "GET".into(),
+            uri: "/".into(),
+            interval: Duration::from_secs(1),
+            passes: 1,
+            fails: 1,
+            ca_file: None,
+        };
+        assert!(!check_health(&spec));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        let spec = HealthSpec {
+            url: format!("http://127.0.0.1:{port}/health"),
+            ..spec
+        };
+        assert!(!check_health(&spec));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn proxy_response_error_paths() {
+        invalid("HTTP/1.1\r\n\r\n", "missing status");
+        invalid("HTTP/1.1 99 Nope\r\n\r\n", "status range");
+        invalid("HTTP/1.1 100 Continue\r\n\r\n", "interim");
+        invalid("HTTP/1.1 200 OK\r\nNoColon\r\n\r\n", "malformed header");
+        invalid("HTTP/1.1 200 OK\r\nBad Name: x\r\n\r\n", "bad header name");
+        invalid(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+            "duplicate length",
+        );
+        invalid(
+            "HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n",
+            "bad length",
+        );
+        invalid(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "duplicate encoding",
+        );
+        invalid(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+            "unsupported encoding",
+        );
+        invalid(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
+            "multiple encodings",
+        );
+        invalid(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "both framings",
+        );
+        invalid(
+            "HTTP/1.1 200 OK\r\nLocation: /x\u{1}\r\n\r\n",
+            "bad location",
+        );
+        invalid("HTTP/1.1 200 OK\r\nX-Test: a\u{1}b\r\n\r\n", "bad value");
+        invalid(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n",
+            "chunk too large",
+        );
+
+        let mut many = String::from("HTTP/1.1 200 OK\r\n");
+        for i in 0..201 {
+            many.push_str(&format!("X-{i}: y\r\n"));
+        }
+        many.push_str("\r\n");
+        invalid(many, "too many headers");
+
+        let mut huge = String::from("HTTP/1.1 200 OK\r\n");
+        for _ in 0..5 {
+            huge.push_str(&format!("X-Long: {}\r\n", "a".repeat(15_000)));
+        }
+        huge.push_str("\r\n");
+        invalid(huge, "headers too large");
+    }
+
+    #[test]
+    fn proxy_response_success_and_streaming() {
+        let (resp, returned) = run(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok",
+        )
+        .unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(returned.is_none());
+        match resp.body {
+            Body::Bytes(body) => assert_eq!(body, b"ok"),
+            _ => panic!("expected bytes"),
+        }
+
+        let (resp, _) =
+            run("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
+        assert_eq!(resp.status, 204);
+        assert!(matches!(resp.body, Body::Empty));
+
+        let (resp, _) = run(
+            "HTTP/1.1 200 OK\r\nContent-Length: 300000\r\n\r\n",
+        )
+        .unwrap();
+        match resp.body {
+            Body::Stream { len, .. } => assert_eq!(len, 300_000),
+            _ => panic!("expected stream"),
+        }
+
+        let (resp, _) = run(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n",
+        )
+        .unwrap();
+        match resp.body {
+            Body::Bytes(body) => assert_eq!(body, b"Wiki"),
+            _ => panic!("expected bytes"),
+        }
+
+        let mut head = req("/x");
+        head.method = "HEAD".into();
+        let (resp, _) = proxy_once(
+            Box::new(MockStream::new(
+                "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n",
+            )),
+            &target(),
+            &head,
+            &Scope::default(),
+            "/x",
+            "127.0.0.1:1".parse().unwrap(),
+            false,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(resp.body, Body::Empty));
+
+        let (resp, _) = run("HTTP/1.1 200 OK\r\nKeep-Alive: timeout=5\r\nContent-Length: 0\r\n\r\n").unwrap();
+        assert!(!resp
+            .headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("keep-alive")));
+    }
+
+    #[test]
+    fn proxy_head_and_body_reader_edges() {
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let err = match proxy_once(
+            Box::new(MockStream::new(Vec::new())),
+            &target(),
+            &req("/x"),
+            &Scope::default(),
+            "/x",
+            peer,
+            false,
+            "bad host",
+        ) {
+            Ok(_) => panic!("expected unsafe host rejection"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let mut bad_target = target();
+        bad_target.backend.host = "bad host".into();
+        bad_target.proxy_url = canonical_proxy_url(&bad_target.backend, "/x");
+        let err = match proxy_once(
+            Box::new(MockStream::new(Vec::new())),
+            &bad_target,
+            &req("/x"),
+            &Scope::default(),
+            "/x",
+            peer,
+            false,
+            "",
+        ) {
+            Ok(_) => panic!("expected unsafe backend rejection"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let mut none = PoolBodyReader {
+            inner: None,
+            remaining: 3,
+        };
+        let mut buf = [0u8; 4];
+        assert_eq!(none.read(&mut buf).unwrap(), 0);
+
+        let mut eof = PoolBodyReader {
+            inner: Some(BufReader::new(
+                Box::new(MockStream::new(Vec::new())) as Box<dyn ReadWrite>
+            )),
+            remaining: 3,
+        };
+        assert_eq!(eof.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn unavailable_backends_are_skipped_in_matching() {
+        let dir = std::env::temp_dir().join(format!("vapache-proxy-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("httpd.conf");
+        std::fs::write(&path, "Listen 127.0.0.1:0\n").unwrap();
+        let cfg = Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        let mut scope = Scope::default();
+        scope
+            .proxy_policy
+            .proxy_passes
+            .push(crate::config::ProxyPassRule {
+                prefix: "/u".into(),
+                backend: "balancer://missing".into(),
+                sticky_cookie: None,
+                fail_on_status: Vec::new(),
+                route_order: 0,
+            });
+        scope
+            .proxy_policy
+            .proxy_rules
+            .push(crate::config::ProxyRule {
+                pattern: Arc::new(crate::config::compile_regex("^/r").unwrap()),
+                backend: "balancer://missing".into(),
+                route_order: 1,
+            });
+        assert!(match_target(&cfg, &scope, "/u/x").is_none());
+        assert!(match_target(&cfg, &scope, "/r/x").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execute_rejects_bad_grant_identity() {
+        let dir = std::env::temp_dir().join(format!("vapache-proxy-grant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("httpd.conf");
+        std::fs::write(&path, "Listen 127.0.0.1:0\n").unwrap();
+        let cfg = Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        let r = req("/x");
+        let t = target();
+        let scope = Scope::default();
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let resource = crate::access::ResourceKey::request(
+            None,
+            &r,
+            "/x",
+            None,
+            Some(t.proxy_url.as_str()),
+        );
+        let wrong = crate::access::ResourceKey::request(
+            None,
+            &r,
+            "/other",
+            None,
+            Some(t.proxy_url.as_str()),
+        );
+        let grant =
+            crate::access::grant_if_allowed(crate::access::Access::Allowed, wrong).unwrap();
+        let resp = super::execute(
+            &cfg,
+            None,
+            &scope,
+            &r,
+            "/x",
+            &t,
+            peer,
+            80,
+            false,
+            "host",
+            "127.0.0.1",
+            &grant,
+            &resource,
+        );
+        assert_eq!(resp.status, 502);
+
+        let mismatched = crate::access::ResourceKey::request(
+            None,
+            &r,
+            "/x",
+            None,
+            Some("http://other/x"),
+        );
+        let grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            mismatched.clone(),
+        )
+        .unwrap();
+        let resp = super::execute(
+            &cfg,
+            None,
+            &scope,
+            &r,
+            "/x",
+            &t,
+            peer,
+            80,
+            false,
+            "host",
+            "127.0.0.1",
+            &grant,
+            &mismatched,
+        );
+        assert_eq!(resp.status, 502);
+    }
+
+    struct FailWriter;
+    impl Read for FailWriter {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+    impl Write for FailWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn health_spec() -> HealthSpec {
+        HealthSpec {
+            key: "k".into(),
+            url: "http://127.0.0.1:1/health".into(),
+            method: "HEAD".into(),
+            uri: "/health".into(),
+            interval: Duration::from_secs(1),
+            passes: 1,
+            fails: 1,
+            ca_file: None,
+        }
+    }
+
+    #[test]
+    fn health_stream_branches() {
+        let spec = health_spec();
+        let good = HttpBackend {
+            host: "127.0.0.1".into(),
+            port: 1,
+            base: "/".into(),
+            tls: false,
+        };
+        assert!(check_health_stream(
+            Box::new(MockStream::new(
+                "HTTP/1.1 204 No Content\r\n\r\n"
+            )),
+            &spec,
+            &good
+        ));
+        assert!(!check_health_stream(
+            Box::new(MockStream::new(Vec::<u8>::new())),
+            &spec,
+            &good
+        ));
+        assert!(!check_health_stream(Box::new(FailWriter), &spec, &good));
+        let bad = HttpBackend {
+            host: "bad host".into(),
+            ..good
+        };
+        assert!(!check_health_stream(
+            Box::new(MockStream::new(Vec::<u8>::new())),
+            &spec,
+            &bad
+        ));
+    }
+
+    #[test]
+    fn health_check_start_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("vapache-proxy-health-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("httpd.conf");
+        std::fs::write(
+            &path,
+            "Listen 127.0.0.1:0\n<Proxy balancer://h>\nBalancerMember http://127.0.0.1:1 hcuri=/health\nProxySet hcinterval=1s\n</Proxy>\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        start_health_checks(&cfg);
+        start_health_checks(&cfg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn async_head_and_connect_edges() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, mut server) = tokio::io::duplex(256 * 1024);
+        let writer = tokio::spawn(async move {
+            let _ = server.write_all(&vec![b'a'; MAX_PROXY_HEAD + 10]).await;
+        });
+        assert!(read_async_head(&mut client).await.is_err());
+        writer.await.unwrap();
+
+        let mut empty = tokio::io::empty();
+        assert!(read_async_head(&mut empty).await.is_err());
+
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            server
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let head = read_async_head(&mut client).await.unwrap();
+        assert!(head.ends_with(b"\r\n\r\n"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let backend = HttpBackend {
+            host: "127.0.0.1".into(),
+            port,
+            base: "/".into(),
+            tls: false,
+        };
+        let err = match connect_async(&backend, &Scope::default(), Duration::from_millis(100)).await {
+            Ok(_) => panic!("expected connection failure"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn async_tls_handshake_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let backend = HttpBackend {
+            host: "127.0.0.1".into(),
+            port,
+            base: "/".into(),
+            tls: true,
+        };
+        let err = match connect_async(
+            &backend,
+            &Scope::default(),
+            Duration::from_millis(50),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected TLS timeout"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        handle.join().unwrap();
+    }
+
+    fn websocket_target() -> Target {
+        target()
+    }
+
+    fn resource(req: &Request, proxy_url: &str) -> crate::access::ResourceKey {
+        crate::access::ResourceKey::request(
+            None,
+            req,
+            "/ws",
+            None,
+            Some(proxy_url),
+        )
+    }
+
+    async fn spawn_upstream(
+        response: Vec<u8>,
+        read_initial: bool,
+    ) -> (u16, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let _ = stream.write_all(&response).await;
+            if read_initial {
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            request
+        });
+        (port, handle)
+    }
+
+    fn ws_request(key: &str) -> Request {
+        let mut r = req("/ws?x=1");
+        r.query = b"x=1".to_vec();
+        r.headers.push("Upgrade", "websocket");
+        r.headers.push("Connection", "Upgrade");
+        r.headers.push("Sec-WebSocket-Version", "13");
+        if !key.is_empty() {
+            r.headers.push("Sec-WebSocket-Key", key);
+        }
+        r
+    }
+
+    fn ws_101(accept: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn ws_context(
+        port: u16,
+        r: &Request,
+    ) -> (
+        Arc<Config>,
+        Arc<Scope>,
+        Arc<Request>,
+        Arc<Target>,
+        Arc<crate::access::AccessGrant>,
+        Arc<crate::access::ResourceKey>,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-proxy-wsctx-{}-{port}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("httpd.conf");
+        std::fs::write(&path, "Listen 127.0.0.1:0\n").unwrap();
+        let cfg = Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        let backend = HttpBackend {
+            host: "127.0.0.1".into(),
+            port,
+            base: "/".into(),
+            tls: false,
+        };
+        let path = "/ws".to_string();
+        let proxy_url = canonical_proxy_url(&backend, &path);
+        let target = Target {
+            backend,
+            path,
+            suffix: String::new(),
+            reverse: Vec::new(),
+            balancer: None,
+            fail_on_status: Vec::new(),
+            proxy_url,
+            logical_url: None,
+            route_order: 0,
+        };
+        let resource = crate::access::ResourceKey::request(
+            None,
+            r,
+            "/ws",
+            None,
+            Some(target.proxy_url.as_str()),
+        );
+        let grant =
+            crate::access::grant_if_allowed(crate::access::Access::Allowed, resource.clone())
+                .unwrap();
+        (
+            Arc::new(cfg),
+            Arc::new(Scope::default()),
+            Arc::new(r.clone()),
+            Arc::new(target),
+            Arc::new(grant),
+            Arc::new(resource),
+        )
+    }
+
+    #[tokio::test]
+    async fn websocket_async_success_query_and_initial() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let accept = websocket_accept(key).unwrap();
+        let (port, upstream) = spawn_upstream(ws_101(&accept), true).await;
+        let r = ws_request(key);
+        let (cfg, scope, r, target, grant, resource) = ws_context(port, &r);
+        let initial = b"hello".to_vec();
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move {
+            websocket_async(
+                &cfg,
+                &scope,
+                &r,
+                &target,
+                &grant,
+                &resource,
+                server,
+                "127.0.0.1:1".parse().unwrap(),
+                false,
+                "client.example",
+                &initial,
+            )
+            .await
+        });
+        let mut response = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response[..n]).contains("101 Switching Protocols"));
+        drop(client);
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
+        let request = upstream.await.unwrap();
+        let text = String::from_utf8_lossy(&request);
+        assert!(text.contains("GET /ws?x=1 HTTP/1.1"));
+        assert!(text.ends_with("hello"));
+    }
+
+    #[tokio::test]
+    async fn websocket_async_invalid_key_and_handshake() {
+        let (port, upstream) = spawn_upstream(ws_101("wrong"), false).await;
+        let r = ws_request("");
+        let (cfg, scope, r, target, grant, resource) = ws_context(port, &r);
+        let (_client, server) = tokio::io::duplex(1024);
+        let err = websocket_async(
+            &cfg,
+            &scope,
+            &r,
+            &target,
+            &grant,
+            &resource,
+            server,
+            "127.0.0.1:1".parse().unwrap(),
+            false,
+            "client.example",
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = upstream.await;
+
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let (port, upstream) = spawn_upstream(ws_101("wrong"), false).await;
+        let r = ws_request(key);
+        let (cfg, scope, r, target, grant, resource) = ws_context(port, &r);
+        let (_client, server) = tokio::io::duplex(1024);
+        let err = websocket_async(
+            &cfg,
+            &scope,
+            &r,
+            &target,
+            &grant,
+            &resource,
+            server,
+            "127.0.0.1:1".parse().unwrap(),
+            false,
+            "client.example",
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = upstream.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_async_non_upgrade_and_unsafe_host() {
+        let response = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let (port, upstream) = spawn_upstream(response, false).await;
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let r = ws_request(key);
+        let (cfg, scope, r, target, grant, resource) = ws_context(port, &r);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move {
+            websocket_async(
+                &cfg,
+                &scope,
+                &r,
+                &target,
+                &grant,
+                &resource,
+                server,
+                "127.0.0.1:1".parse().unwrap(),
+                false,
+                "",
+                &[],
+            )
+            .await
+        });
+        let mut response = vec![0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response[..n]).contains("403"));
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_ok());
+        let _ = upstream.await;
+
+        let (port, upstream) = spawn_upstream(ws_101("x"), false).await;
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let r = ws_request(key);
+        let (cfg, scope, r, target, grant, resource) = ws_context(port, &r);
+        let (_client, server) = tokio::io::duplex(1024);
+        let err = websocket_async(
+            &cfg,
+            &scope,
+            &r,
+            &target,
+            &grant,
+            &resource,
+            server,
+            "127.0.0.1:1".parse().unwrap(),
+            false,
+            "bad host",
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = upstream.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_grant_and_forwarded_host_errors() {
+        let r = {
+            let mut r = req("/ws");
+            r.headers.push("Upgrade", "websocket");
+            r.headers.push("Connection", "Upgrade");
+            r.headers.push("Sec-WebSocket-Version", "13");
+            r.headers
+                .push("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+            r
+        };
+        let target = websocket_target();
+        let dir = std::env::temp_dir().join(format!("vapache-proxy-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("httpd.conf");
+        std::fs::write(&path, "Listen 127.0.0.1:0\n").unwrap();
+        let cfg = Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        let scope = Scope::default();
+        let (client, _server) = tokio::io::duplex(1024);
+
+        let granted = resource(&r, "http://one.example/ws");
+        let grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            granted.clone(),
+        )
+        .unwrap();
+        let mismatched = resource(&r, "http://two.example/ws");
+        let err = websocket_async(
+            &cfg, &scope, &r, &target, &grant, &mismatched, client, "127.0.0.1:1".parse().unwrap(),
+            false, "client.example", &[],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let (client, _server) = tokio::io::duplex(1024);
+        let matching = resource(&r, "http://two.example/ws");
+        let grant = crate::access::grant_if_allowed(
+            crate::access::Access::Allowed,
+            matching.clone(),
+        )
+        .unwrap();
+        let err = websocket_async(
+            &cfg, &scope, &r, &target, &grant, &matching, client, "127.0.0.1:1".parse().unwrap(),
+            false, "client.example", &[],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    struct HugeStream {
+        header: Cursor<Vec<u8>>,
+        remaining: usize,
+    }
+
+    impl Read for HugeStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = Read::read(&mut self.header, buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            let n = self.remaining.min(buf.len());
+            buf[..n].fill(b'a');
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+
+    impl Write for HugeStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spooled_body_is_copied_upstream() {
+        let mut r = req("/x");
+        r.body_spool = Some(Arc::new(crate::http::SpooledBody::from_bytes(b"abc")));
+        let (resp, _) = proxy_once(
+            Box::new(MockStream::new(
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            )),
+            &target(),
+            &r,
+            &Scope::default(),
+            "/x",
+            "127.0.0.1:1".parse().unwrap(),
+            false,
+            "",
+        )
+        .unwrap();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn unbounded_body_over_limit_is_rejected() {
+        let huge = HugeStream {
+            header: Cursor::new(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()),
+            remaining: MAX_PROXY_BODY + 1,
+        };
+        let err = match proxy_once(
+            Box::new(huge),
+            &target(),
+            &req("/x"),
+            &Scope::default(),
+            "/x",
+            "127.0.0.1:1".parse().unwrap(),
+            false,
+            "",
+        ) {
+            Ok(_) => panic!("expected body limit error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn failover_authentication_is_required() {
+        let dir = std::env::temp_dir().join(format!("vapache-proxy-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let password = dir.join("htpasswd");
+        let mut hasher = Sha1::new();
+        hasher.update(b"secret");
+        let digest = STANDARD.encode(hasher.finalize());
+        std::fs::write(&password, format!("alice:{{SHA}}{digest}\n")).unwrap();
+        let port = 9;
+        let config_path = dir.join("httpd.conf");
+        std::fs::write(
+            &config_path,
+            format!(
+                "Listen 127.0.0.1:0\n<Proxy http://127.0.0.1:{port}>\nRequire valid-user\nAuthType Basic\nAuthName test\nAuthUserFile {}\n</Proxy>\n",
+                password.display()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(
+            &config_path,
+            &dir,
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+        )
+        .unwrap();
+        let backend = HttpBackend {
+            host: "127.0.0.1".into(),
+            port,
+            base: "/".into(),
+            tls: false,
+        };
+        let path = "/ws".to_string();
+        let proxy_url = canonical_proxy_url(&backend, &path);
+        let target = Target {
+            backend,
+            path,
+            suffix: String::new(),
+            reverse: Vec::new(),
+            balancer: None,
+            fail_on_status: Vec::new(),
+            proxy_url,
+            logical_url: None,
+            route_order: 0,
+        };
+        let scope = Scope::default();
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let r = req("/ws");
+        let resource = crate::access::ResourceKey::request(
+            None,
+            &r,
+            "/ws",
+            None,
+            Some(target.proxy_url.as_str()),
+        );
+        assert!(authorize_failover(&cfg, None, &scope, &r, "/ws", &target, peer, &resource)
+            .is_none());
+
+        let mut authed = req("/ws");
+        authed.headers.push(
+            "Authorization",
+            format!("Basic {}", STANDARD.encode("alice:secret")),
+        );
+        let resource = crate::access::ResourceKey::request(
+            None,
+            &authed,
+            "/ws",
+            None,
+            Some(target.proxy_url.as_str()),
+        );
+        assert!(authorize_failover(&cfg, None, &scope, &authed, "/ws", &target, peer, &resource)
+            .is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failover_to_auth_required_member_returns_403() {
+        let dir = std::env::temp_dir().join(format!("vapache-proxy-fo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let password = dir.join("htpasswd");
+        let mut hasher = Sha1::new();
+        hasher.update(b"secret");
+        let digest = STANDARD.encode(hasher.finalize());
+        std::fs::write(&password, format!("alice:{{SHA}}{digest}\n")).unwrap();
+
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second_port = second.local_addr().unwrap().port();
+        drop(second);
+        let balancer = format!("failover-auth-{}", std::process::id());
+        let config_path = dir.join("httpd.conf");
+        std::fs::write(
+            &config_path,
+            format!(
+                "Listen 127.0.0.1:0\n<Proxy balancer://{balancer}>\nBalancerMember http://127.0.0.1:{dead_port}\nBalancerMember http://127.0.0.1:{second_port}\n</Proxy>\n<Proxy http://127.0.0.1:{second_port}>\nRequire valid-user\nAuthType Basic\nAuthName test\nAuthUserFile {}\n</Proxy>\n",
+                password.display()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(
+            &config_path,
+            &dir,
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+        )
+        .unwrap();
+        let mut scope = Scope::default();
+        scope
+            .proxy_policy
+            .proxy_passes
+            .push(crate::config::ProxyPassRule {
+                prefix: "/fo".into(),
+                backend: format!("balancer://{balancer}"),
+                sticky_cookie: None,
+                fail_on_status: Vec::new(),
+                route_order: 0,
+            });
+        let target = match_target(&cfg, &scope, "/fo/x").unwrap();
+        let r = req("/fo/x");
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let resource = crate::access::ResourceKey::request(
+            None,
+            &r,
+            "/fo/x",
+            None,
+            Some(target.proxy_url.as_str()),
+        );
+        let grant =
+            crate::access::grant_if_allowed(crate::access::Access::Allowed, resource.clone())
+                .unwrap();
+        let resp = super::execute(
+            &cfg,
+            None,
+            &scope,
+            &r,
+            "/fo/x",
+            &target,
+            peer,
+            80,
+            false,
+            "host",
+            "127.0.0.1",
+            &grant,
+            &resource,
+        );
+        assert_eq!(resp.status, 403);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_status_without_alternate_returns_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let dir = std::env::temp_dir().join(format!("vapache-proxy-fs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let balancer = format!("failstatus-{}", std::process::id());
+        let config_path = dir.join("httpd.conf");
+        std::fs::write(
+            &config_path,
+            format!(
+                "Listen 127.0.0.1:0\n<Proxy balancer://{balancer}>\nBalancerMember http://127.0.0.1:{port}\nProxySet failonstatus=503\n</Proxy>\n"
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(
+            &config_path,
+            &dir,
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+        )
+        .unwrap();
+        let mut scope = Scope::default();
+        scope
+            .proxy_policy
+            .proxy_passes
+            .push(crate::config::ProxyPassRule {
+                prefix: "/fs".into(),
+                backend: format!("balancer://{balancer}"),
+                sticky_cookie: None,
+                fail_on_status: Vec::new(),
+                route_order: 0,
+            });
+        let target = match_target(&cfg, &scope, "/fs/x").unwrap();
+        let r = req("/fs/x");
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let resource = crate::access::ResourceKey::request(
+            None,
+            &r,
+            "/fs/x",
+            None,
+            Some(target.proxy_url.as_str()),
+        );
+        let grant =
+            crate::access::grant_if_allowed(crate::access::Access::Allowed, resource.clone())
+                .unwrap();
+        let resp = super::execute(
+            &cfg,
+            None,
+            &scope,
+            &r,
+            "/fs/x",
+            &target,
+            peer,
+            80,
+            false,
+            "host",
+            "127.0.0.1",
+            &grant,
+            &resource,
+        );
+        assert_eq!(resp.status, 503);
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn websocket_async_rejects_unsafe_target_path() {
+        let (port, upstream) = spawn_upstream(ws_101("x"), false).await;
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let r = ws_request(key);
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-proxy-wsbad-{}-{port}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("httpd.conf");
+        std::fs::write(&path, "Listen 127.0.0.1:0\n").unwrap();
+        let cfg = Arc::new(
+            Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap(),
+        );
+        let backend = HttpBackend {
+            host: "127.0.0.1".into(),
+            port,
+            base: "/".into(),
+            tls: false,
+        };
+        let path = "/ws\r\nX-Injected: yes".to_string();
+        let proxy_url = canonical_proxy_url(&backend, &path);
+        let target = Arc::new(Target {
+            backend,
+            path,
+            suffix: String::new(),
+            reverse: Vec::new(),
+            balancer: None,
+            fail_on_status: Vec::new(),
+            proxy_url,
+            logical_url: None,
+            route_order: 0,
+        });
+        let resource = crate::access::ResourceKey::request(
+            None,
+            &r,
+            "/ws",
+            None,
+            Some(target.proxy_url.as_str()),
+        );
+        let grant =
+            crate::access::grant_if_allowed(crate::access::Access::Allowed, resource.clone())
+                .unwrap();
+        let scope = Arc::new(Scope::default());
+        let r = Arc::new(r);
+        let grant = Arc::new(grant);
+        let resource = Arc::new(resource);
+        let (_client, server) = tokio::io::duplex(1024);
+        let err = websocket_async(
+            &cfg,
+            &scope,
+            &r,
+            &target,
+            &grant,
+            &resource,
+            server,
+            "127.0.0.1:1".parse().unwrap(),
+            false,
+            "client.example",
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = upstream.await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

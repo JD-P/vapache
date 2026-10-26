@@ -121,6 +121,8 @@ def make_case(case: dict):
     for p in case_dir(case).rglob("*"):
         if p.is_file() and not p.is_symlink():
             os.chmod(p, 0o644)
+    for rel in case.get("exec_files", []):
+        os.chmod(case_dir(case) / rel, 0o755)
     for p in case_dir(case).rglob("*"):
         if p.is_dir():
             os.chmod(p, 0o755)
@@ -390,6 +392,34 @@ CASES = [
             "</Directory>",
         ],
         "requests": [("GET", "/ao_auth_header/file.txt", None, {})],
+    },
+    {
+        "name": "limit-options-indexes",
+        "dir": "limit_options_indexes",
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    Options +Indexes",
+            "    <Limit GET>",
+            "        Options -Indexes",
+            "    </Limit>",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/limit_options_indexes/", None, {})],
+    },
+    {
+        "name": "limit-header-effect",
+        "dir": "limit_header_effect",
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    Header set X-Limit outer",
+            "    <Limit GET>",
+            "        Header set X-Limit limited",
+            "    </Limit>",
+            "</Directory>",
+        ],
+        "requests": [
+            ("GET", "/limit_header_effect/file.txt", None, {"x-limit": ["limited"]})
+        ],
     },
     {
         "name": "require-all",
@@ -1864,6 +1894,48 @@ CASES = [
             "</Directory>",
         ],
         "requests": [("GET", "/ht_indexes/", None, {})],
+    },
+    {
+        "name": "if-block-inside-directory-always-rule",
+        "dir": "if_dir",
+        "files": {"file.txt": "hello\n"},
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    <If true>",
+            "        Header set X-Always-Test yes",
+            "    </If>",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/if_dir/file.txt", None, {})],
+    },
+    {
+        "name": "if-block-inside-location-always-rule",
+        "dir": "if_loc",
+        "files": {"file.txt": "hello\n"},
+        "config": [
+            '<Location "/if_loc">',
+            "    <If true>",
+            "        Header set X-Always-Loc yes",
+            "    </If>",
+            "</Location>",
+        ],
+        "requests": [("GET", "/if_loc/file.txt", None, {})],
+    },
+    {
+        "name": "if-block-else-branch-inside-directory",
+        "dir": "if_else",
+        "files": {"file.txt": "hello\n"},
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    <If false>",
+            "        Header set X-Branch wrong",
+            "    </If>",
+            "    <Else>",
+            "        Header set X-Branch right",
+            "    </Else>",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/if_else/file.txt", None, {})],
     },
 ]
 

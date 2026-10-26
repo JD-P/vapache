@@ -92,6 +92,10 @@ class F23ToF38Tests(unittest.TestCase):
             cls.www / "tenant",
             cls.www / "reqheader",
             cls.www / "cgiauth",
+            cls.www / "private-cgi",
+            cls.www / "public-cgi",
+            cls.www / "limit-cgi",
+            cls.www / "exprtest",
             cls.logs,
             cls.cache,
             cls.base / "private" / "sub",
@@ -136,8 +140,49 @@ class F23ToF38Tests(unittest.TestCase):
         )
         (cls.www / "cgi" / "wallet.cgi").chmod(0o755)
         (cls.base / "private" / ".htaccess").write_text("Require all denied\n")
+        (cls.base / "private" / "wallet.dat").write_text(
+            "WALLET-SINGLE-FILE-ALIAS-SECRET\n"
+        )
         (cls.base / "private" / "sub" / "secret.txt").write_text(
             "WALLET-RELALIAS-SECRET\n"
+        )
+        # F39: a single-file Alias/ScriptAlias must use the target basename for
+        # handler dispatch and must read the target directory's .htaccess.
+        (cls.www / "cgi" / "alias-run.cgi").write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'WALLET-ALIAS-CGI-EXECUTED\\n'\n"
+        )
+        (cls.www / "cgi" / "alias-run.cgi").chmod(0o755)
+        # F40: Options -ExecCGI inside <Limit> must take effect.
+        (cls.www / "limit-cgi" / "script.cgi").write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'WALLET-LIMIT-EXECCGI-BYPASS\\n'\n"
+        )
+        (cls.www / "limit-cgi" / "script.cgi").chmod(0o755)
+        # F45: expression file tests must not observe paths outside docroot.
+        (cls.www / "exprtest" / "secret.txt").write_text(
+            "WALLET-EXPR-CONFINEMENT\n"
+        )
+        (cls.www / "exprtest" / ".htaccess").write_text(
+            "Require expr \"-f '/etc/passwd'\"\n"
+        )
+        # F41: a public symlink to a script in a denied directory.
+        (cls.www / "private-cgi" / "admin.cgi").write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'WALLET-PRIVATE-CGI-SECRET\\n'\n"
+        )
+        (cls.www / "private-cgi" / "admin.cgi").chmod(0o755)
+        (cls.www / "private-cgi" / "secret.php").write_text(
+            "<?php /* WALLET-PRIVATE-PHP-SECRET */ ?>\n"
+        )
+        (cls.www / "public-cgi" / "link.cgi").symlink_to(
+            "../private-cgi/admin.cgi"
+        )
+        (cls.www / "public-cgi" / "link.php").symlink_to(
+            "../private-cgi/secret.php"
         )
 
         # F31: an absolute target outside ServerRoot.  The capture-only alias
@@ -238,6 +283,21 @@ DirectoryIndex index.html
     AllowOverride All
     Require all granted
 </Directory>
+<Directory "{cls.www}/private-cgi">
+    Require all denied
+</Directory>
+<Directory "{cls.www}/limit-cgi">
+    <Limit GET>
+        Options -ExecCGI
+    </Limit>
+</Directory>
+<Files "admin.cgi">
+    Require all denied
+</Files>
+ProxyPassMatch ^/(.*\\.php)$ "unix:{cls.base}/fcgi.sock|fcgi://localhost{cls.www}/"
+Alias /wallet "{cls.base}/private/wallet.dat"
+Alias /run "{cls.www}/cgi/alias-run.cgi"
+ScriptAlias /exec "{cls.www}/cgi/alias-run.cgi"
 
 RewriteEngine On
 RewriteRule ^/admin-rewrite$ /front [L]
@@ -493,6 +553,49 @@ AliasMatch "^/escape(.*)$" "$1"
         self.assertEqual(status, 200, body[:200])
         self.assertIn(b"REMOTE_USER=[alice]", body)
         self.assertIn(b"AUTH_TYPE=[Basic]", body)
+
+    def test_f39_single_file_alias_reads_target_htaccess(self):
+        status, _, body = request(self.port, "/wallet")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"WALLET-SINGLE-FILE-ALIAS-SECRET", body)
+
+    def test_f39_single_file_alias_dispatches_cgi_target(self):
+        for path in ("/run", "/exec"):
+            status, _, body = request(self.port, path)
+            self.assertEqual(status, 200, f"{path}: {body[:200]}")
+            self.assertIn(b"WALLET-ALIAS-CGI-EXECUTED", body)
+            self.assertNotIn(b"#!/bin/sh", body)
+
+    def test_f40_limit_options_execcgi_is_enforced(self):
+        status, _, body = request(self.port, "/limit-cgi/script.cgi")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"WALLET-LIMIT-EXECCGI-BYPASS", body)
+
+    def test_f41_symlinked_cgi_and_fastcgi_use_actual_target_policy(self):
+        for path in (
+            "/private-cgi/admin.cgi",
+            "/public-cgi/link.cgi",
+            "/public-cgi/link.cgi/anything",
+            "/private-cgi/secret.php",
+            "/public-cgi/link.php",
+        ):
+            status, _, body = request(self.port, path)
+            self.assertEqual(status, 403, f"{path}: {body[:200]}")
+            self.assertNotIn(b"WALLET-PRIVATE-CGI-SECRET", body)
+            self.assertNotIn(b"WALLET-PRIVATE-PHP-SECRET", body)
+
+    def test_f45_expression_file_test_is_confined_to_docroot(self):
+        status, _, body = request(self.port, "/exprtest/secret.txt")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"WALLET-EXPR-CONFINEMENT", body)
+
+    def test_f42_capture_only_alias_cannot_read_serverroot(self):
+        for rel in (".htpasswd", "rewrite-secret.txt", "vp.conf"):
+            status, _, body = request(self.port, f"/escape{self.base}/{rel}")
+            self.assertEqual(status, 404, f"{rel}: {body[:200]}")
+            self.assertNotIn(b"WALLET-REWRITE-SECRET", body)
+            self.assertNotIn(b"ServerRoot", body)
+            self.assertNotIn(b"alice:", body)
 
 
 if __name__ == "__main__":

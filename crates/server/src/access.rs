@@ -448,8 +448,14 @@ fn eval_require(
         Require::Method { negate, methods } => {
             decide(methods.iter().any(|m| same_method(m, &req.method)), *negate)
         }
-        Require::ValidUser => {
-            if identity.is_some() {
+        Require::ValidUser { negate } => {
+            // `Require not valid-user` must carry its negation.  Like every
+            // other negated provider it can deny or stay neutral, but cannot
+            // independently grant access.
+            let hit = identity.is_some();
+            if *negate {
+                decide(hit, true)
+            } else if hit {
                 PolicyResult::Granted
             } else {
                 PolicyResult::AuthRequired
@@ -739,6 +745,50 @@ mod tests {
         assert_eq!(bound.key().file_dev, Some(meta.dev()));
         assert_eq!(bound.key().file_ino, Some(meta.ino()));
         assert!(!bound.require(&key));
+    }
+
+    #[test]
+    fn negated_valid_user_carries_its_negation() {
+        let r = req("GET");
+        let peer = "127.0.0.1".parse().unwrap();
+        let docroot = Path::new("/");
+        let identity = Identity {
+            user: "alice".into(),
+            groups: Vec::new(),
+        };
+        assert_eq!(
+            eval_require(
+                &Require::ValidUser { negate: false },
+                &r,
+                peer,
+                Some(&identity),
+                &[],
+                docroot,
+            ),
+            PolicyResult::Granted
+        );
+        assert_eq!(
+            eval_require(
+                &Require::ValidUser { negate: true },
+                &r,
+                peer,
+                Some(&identity),
+                &[],
+                docroot,
+            ),
+            PolicyResult::Denied
+        );
+        assert_eq!(
+            eval_require(
+                &Require::ValidUser { negate: true },
+                &r,
+                peer,
+                None,
+                &[],
+                docroot,
+            ),
+            PolicyResult::Neutral
+        );
     }
 
     #[test]

@@ -117,8 +117,10 @@ Implemented today:
   proxy rewrites (`P`), and `UnsafePrefixStat`.
 - `mod_cache`/`mod_cache_disk` subset: `CacheEnable`/`CacheDisable` in
   server/vhost/directory scopes, `CacheRoot`, expiration and size limits,
-  `CacheIgnoreCacheControl`, `CacheIgnoreNoLastMod`, `CacheStorePrivate`,
-  `CacheStoreNoStore`, `CacheIgnoreQueryString`, `CacheHeader`, `Age`,
+  `CacheMaxDiskSize` (total on-disk quota with oldest-entry eviction and
+  expiry cleanup), `CacheIgnoreCacheControl`, `CacheIgnoreNoLastMod`,
+  `CacheStorePrivate`, `CacheStoreNoStore`, `CacheIgnoreQueryString` (dynamic
+  query-driven CGI/FastCGI/proxy responses bypass the shared cache), `CacheHeader`, `Age`,
   conditional hits, disk warm-start metadata and invalidation on unsafe
   methods. Keys bind the listener/port, vhost, scheme, canonical URL
   (including its trailing slash), query and resolved filesystem/alias target,
@@ -191,7 +193,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **218 verified functions, 0 errors** (percent-decoding,
+Current result: **227 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -219,12 +221,13 @@ Current ledger: **50.0% weighted obligations**, **6/6 proof debt**,
 **8/8 grant-required sinks**, **4/8 inode-bound sinks**, **3/8
 backend-target-bound sinks**, **3/8 policy-key-bound sinks**, **0 partially
 bound sinks**, **0 unexplained replay failures**, and **29 adversarial replay
-cases** covering the findings classes, and **218 Verus functions with 0
-errors** (including the I3 fast-path prefilter and I14 first-match theorems).
+cases** covering the findings classes, and **227 Verus functions with 0
+errors** (including the I3 fast-path prefilter, I14 first-match, and the
+pass-4 I35–I42 alias/limit/CGI/spool/cache/expression dispositions).
 
 The ledger lives in `docs/verification-status.json`. It records:
 
-- weighted progress on the twenty-six proof obligations,
+- weighted progress on the thirty-three proof obligations,
 - named unverified security components,
 - sinks that need stronger resource binding,
 - explicit assumptions and unmodeled directive classes,
@@ -320,22 +323,21 @@ python3 tests/security_coverage.py --check
 ```
 
 `security_coverage.py` reports production-line coverage before each file's
-test module for the unproven security-critical surfaces. FastCGI, HTTP/1.1 and
-TLS are enforced at 100%; the remaining modules are tracked so they can be
-promoted one at a time.
+test module for the unproven security-critical surfaces. CGI, configuration
+parsing, the expression engine, FastCGI, `.htaccess`, HTTP/1.1, the HTTP proxy,
+rewrite execution and TLS are enforced at 100%; the remaining modules are
+tracked so they can be promoted one at a time.
 
-Latest snapshot (`coverage/SUMMARY.md`, taken before the most recent
-semantics tests): **81.9% lines**, **79.6% of functions** across the
-then-current Rust and conformance suites. The current suite is 250 Rust
-library tests, 4 CLI tests, 165 conformance tests and the generated
-configuration matrices. Authentication is at 91.7% line coverage, TLS/HTTP/2 at
-86.1%/79.7%, `.htaccess` at 84.9%, access logging at 85.1%, the verified
-security kernels at 90.7%, compression at 89.3%, FastCGI at 84.3%, the HTTP
-proxy at 90.3%, rewrite execution at 84.7%, cache at 82.0%, OCSP at 79.8%,
-the expression engine at 74.6%, and the request-parsing and file-serving
-modules at 71.8%/83.7%. CLI lifecycle, HTTP/2 error branches, OCSP
-error-cache policies, rare expression forms, `dbm`/`DPI` edge cases and
-exotic balancer policies remain the next coverage targets.
+Latest snapshot (`coverage/SUMMARY.md`): **92.0% lines**, **88.2% of
+functions** across the Rust and conformance suites. The current suite is 337
+Rust library tests, 4 CLI tests, 165 conformance tests and the generated
+configuration matrices. Authentication is at 91.8% line coverage, TLS/HTTP/2 at
+97.7%/81.8%, access logging at 84.5%, the verified security kernels at 87.0%,
+compression at 90.0%, FastCGI at 98.8%, the HTTP proxy at 100%, rewrite
+execution at 98.7%, cache at 88.9%, OCSP at 80.8%, and the request-parsing and
+file-serving modules at 93.5%/81.4%. CLI lifecycle, HTTP/2 error branches,
+OCSP error-cache policies, `dbm`/`DPI` edge cases and exotic balancer policies
+remain the next coverage targets.
 
 Known, deliberate divergences from Apache (reported by the differential run):
 

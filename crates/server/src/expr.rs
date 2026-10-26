@@ -25,6 +25,10 @@ pub enum Expr {
     Regex(Box<Expr>, String, bool, bool),
     In(Box<Expr>, Vec<Expr>),
     FileTest(String, Box<Expr>),
+    /// `<IfFile path>` from the main configuration.  Unlike per-directory
+    /// expression file tests this argument is an operator-supplied path and is
+    /// not confined to DocumentRoot.
+    IfFile(String),
     StrTest(Box<Expr>, bool),
     IpMatch(Box<Expr>, Box<Expr>, bool),
     StrMatch(Box<Expr>, Box<Expr>, bool, bool),
@@ -282,9 +286,7 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
         "document_root" => ctx.docroot.to_string_lossy().into_owned(),
         "api_version" => "20120211".into(),
         other => {
-            if let Some(rest) = other.strip_prefix("http_") {
-                ctx.req.header_str(rest).unwrap_or("").to_string()
-            } else if other.starts_with("http") {
+            if other.starts_with("http") {
                 empty
             } else {
                 return Err(format!("unknown expression variable '%{{{name}}}'"));
@@ -415,14 +417,14 @@ fn cmp(left: &Value, op: &str, right: &Value) -> bool {
 /// are canonicalized and must still be under the canonical document root.
 fn confined_expr_path(ctx: &Context<'_>, raw: &str, must_exist: bool) -> Option<PathBuf> {
     let path = Path::new(raw);
-    if path.is_absolute()
-        || path.components().any(|c| {
-            matches!(
-                c,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
+    let absolute = path.is_absolute();
+    let parent_relative = path.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    });
+    if !vapache_verified::expr_file_test_admit(absolute, parent_relative, true) {
         return None;
     }
     let joined = ctx.docroot.join(path);
@@ -507,25 +509,35 @@ impl Expr {
                     s.is_empty()
                 })
             }
+            Expr::IfFile(path) => Value::Bool(std::fs::symlink_metadata(path).is_ok()),
             Expr::FileTest(op, e) => {
                 let raw = e.eval(ctx)?.string();
-                let p = PathBuf::from(&raw);
-                let p = if p.is_absolute() {
-                    p
-                } else {
-                    ctx.docroot.join(p)
-                };
-                let meta = std::fs::symlink_metadata(&p);
+                // File tests are a metadata oracle too.  Use the same
+                // canonical document-root confinement as file()/filesize();
+                // an absolute path or a symlink leaving the root must not be
+                // observable through `.htaccess` expressions (F45/I42).
+                let p = confined_expr_path(ctx, &raw, true);
+                let meta = p.as_deref().map(std::fs::symlink_metadata);
                 Value::Bool(match op.as_str() {
-                    "-f" => meta.map(|m| m.is_file()).unwrap_or(false),
-                    "-d" => meta.map(|m| m.is_dir()).unwrap_or(false),
-                    "-e" | "-F" => meta.is_ok(),
-                    "-s" => meta.map(|m| m.len() > 0).unwrap_or(false),
-                    "-U" => {
-                        let raw = e.eval(ctx)?.string();
-                        let p = raw.trim_start_matches('/').to_string();
-                        std::fs::symlink_metadata(ctx.docroot.join(p)).is_ok()
-                    }
+                    "-f" => meta
+                        .as_ref()
+                        .and_then(|m| m.as_ref().ok())
+                        .map(|m| m.is_file())
+                        .unwrap_or(false),
+                    "-d" => meta
+                        .as_ref()
+                        .and_then(|m| m.as_ref().ok())
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false),
+                    "-e" | "-F" | "-U" => meta
+                        .as_ref()
+                        .map(|m| m.is_ok())
+                        .unwrap_or(false),
+                    "-s" => meta
+                        .as_ref()
+                        .and_then(|m| m.as_ref().ok())
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false),
                     "-R" => {
                         let spec = e.eval(ctx)?.string();
                         crate::config::parse_ip_net(&spec)
@@ -789,10 +801,10 @@ impl<'a> Parser<'a> {
                 if self.take(b',') {
                     continue;
                 }
-                if self.take(b'}') {
-                    break;
+                if !self.take(b'}') {
+                    return Err("expected ',' or '}' in list".into());
                 }
-                return Err("expected ',' or '}' in list".into());
+                break;
             }
             return Ok(Expr::In(Box::new(Expr::Str(String::new())), list));
         }
@@ -817,10 +829,6 @@ impl<'a> Parser<'a> {
                 }
             }
             return self.primary().map(|e| Expr::Neg(Box::new(e)));
-        }
-        if c == b'!' {
-            self.pos += 1;
-            return self.primary().map(|e| Expr::Not(Box::new(e)));
         }
         if c.is_ascii_digit() {
             let start = self.pos;
@@ -1104,6 +1112,32 @@ mod tests {
         assert!(outside.eval(&mut c).is_err());
         let traversal = parse("-f '../etc/passwd'").unwrap();
         assert!(!traversal.eval(&mut c).unwrap().truthy());
+        // FileTest uses the same canonical confinement as file()/filesize().
+        for expr in [
+            "-f '/etc/passwd'",
+            "-e '/etc/passwd'",
+            "-s '/etc/passwd'",
+            "-d '/etc'",
+            "-F '/etc/passwd'",
+            "-U '/etc/passwd'",
+        ] {
+            assert!(
+                !parse(expr).unwrap().eval(&mut c).unwrap().truthy(),
+                "{expr}"
+            );
+        }
+        let outside_file = dir.with_file_name(format!(
+            "vp-expr-outside-{}",
+            std::process::id()
+        ));
+        std::fs::write(&outside_file, "outside").unwrap();
+        std::os::unix::fs::symlink(&outside_file, dir.join("escape")).unwrap();
+        assert!(!parse("-f 'escape'")
+            .unwrap()
+            .eval(&mut c)
+            .unwrap()
+            .truthy());
+        let _ = std::fs::remove_file(&outside_file);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1148,5 +1182,187 @@ mod tests {
         assert!(eval("'abc' =~ /BC/i"));
         assert!(eval("%{REQUEST_METHOD} == 'GET'"));
         assert!(eval("-R '127.0.0.1'"));
+    }
+
+    fn eval_result(s: &str) -> Result<Value, String> {
+        let e = parse(s)?;
+        let r = req();
+        let mut c = Context::new(
+            &r,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+        );
+        e.eval(&mut c)
+    }
+
+    #[test]
+    fn value_conversions_and_connection_context() {
+        assert!(Value::Bool(true).truthy());
+        assert!(Value::Int(1).truthy());
+        assert!(!Value::Int(0).truthy());
+        assert!(Value::Str("x".into()).truthy());
+        assert!(!Value::Str(String::new()).truthy());
+        assert!(Value::List(vec![Value::Int(1)]).truthy());
+        assert!(!Value::List(Vec::new()).truthy());
+        assert_eq!(Value::Bool(true).string(), "true");
+        assert_eq!(Value::Bool(false).string(), "false");
+        assert_eq!(
+            Value::List(vec![Value::Int(1), Value::Str("x".into())]).string(),
+            "1,x"
+        );
+        assert_eq!(Value::Bool(true).int(), Some(1));
+        assert_eq!(Value::Bool(false).int(), Some(0));
+        assert_eq!(Value::List(Vec::new()).int(), None);
+        assert_eq!(Value::Str(" 42 ".into()).int(), Some(42));
+
+        assert!(!request_is_https());
+        assert_eq!(request_port(), 80);
+        let guard = set_server_name("canonical.test");
+        assert_eq!(request_server_name().as_deref(), Some("canonical.test"));
+        drop(guard);
+        assert_eq!(request_server_name(), None);
+        with_connection(true, 8443, || {
+            assert!(request_is_https());
+            assert_eq!(request_port(), 8443);
+        });
+        assert!(!request_is_https());
+        assert_eq!(request_port(), 80);
+
+        let r = req();
+        let c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), Path::new("/tmp"));
+        assert_eq!(function_arg(&c, "literal").unwrap(), "literal");
+        assert_eq!(function_arg(&c, "REQUEST_METHOD").unwrap(), "GET");
+        assert_eq!(function_arg(&c, "%{REQUEST_METHOD}").unwrap(), "GET");
+        assert_eq!(
+            confined_expr_path(&c, "relative.txt", false),
+            Some(PathBuf::from("/tmp/relative.txt"))
+        );
+    }
+
+    #[test]
+    fn var_expand_and_encoding_edge_paths() {
+        let mut r = req();
+        r.headers.push("X-Test", "Header");
+        r.headers.push("Host", "example.test:8080");
+        let env = vec![("FOO".to_string(), "bar".to_string())];
+        let mut c = Context::new(&r, &env, "127.0.0.1".parse().unwrap(), Path::new("/tmp"));
+        assert_eq!(var(&c, "req:x-test").unwrap().string(), "Header");
+        assert_eq!(var(&c, "http:x-test").unwrap().string(), "Header");
+        assert_eq!(var(&c, "env:foo").unwrap().string(), "bar");
+        assert_eq!(var(&c, "http_x_test").unwrap().string(), "Header");
+        assert_eq!(
+            var(&c, "server_name").unwrap().string(),
+            "example.test"
+        );
+        assert_eq!(var(&c, "httpfoo").unwrap().string(), "");
+        assert!(var(&c, "unknown_variable").is_err());
+        assert_eq!(var(&c, "tolower:ABC").unwrap().string(), "abc");
+        assert_eq!(var(&c, "escape:a b").unwrap().string(), "a%20b");
+        assert_eq!(var(&c, "unescape:a%20b").unwrap().string(), "a b");
+        assert_eq!(var(&c, "TIME_YEAR").unwrap().string().len(), 4);
+        assert_eq!(var(&c, "REQUEST_SCHEME").unwrap().string(), "http");
+        assert_eq!(var(&c, "HTTPS").unwrap().string(), "off");
+
+        assert_eq!(expand("plain text", &c).unwrap(), "plain text");
+        assert_eq!(expand("%{toupper:%{REQUEST_METHOD}}", &c).unwrap(), "GET");
+        assert_eq!(expand("%{unescape:a%20b}", &c).unwrap(), "a b");
+        assert!(expand("%{unknown:%{REQUEST_METHOD}}", &c).is_err());
+        assert!(expand("%{REQUEST_METHOD", &c).is_err());
+        assert_eq!(percent_encode("a b/?~"), "a%20b%2f%3f~");
+        assert_eq!(percent_decode("a%20b%2f%3F%zz"), "a b/?%zz");
+        assert_eq!(hex(b'0'), Some(0));
+        assert_eq!(hex(b'a'), Some(10));
+        assert_eq!(hex(b'F'), Some(15));
+        assert_eq!(hex(b'z'), None);
+        assert_eq!(sha1_hex("abc").len(), 40);
+        assert_eq!(md5_hex("abc").len(), 32);
+        assert_eq!(base64_encode(b"abc"), "YWJj");
+        assert_eq!(base64_decode("YWJj"), b"abc");
+        assert_eq!(base64_decode("!!!"), Vec::<u8>::new());
+        assert_eq!(compare_op(">="), Some(vapache_verified::ExprCompareOp::Ge));
+        assert!(compare_op("bogus").is_none());
+        assert!(!cmp(&Value::Int(1), "bogus", &Value::Int(1)));
+    }
+
+    #[test]
+    fn eval_branch_coverage() {
+        assert_eq!(eval_result("-1 < 0").unwrap().string(), "true");
+        assert!(!eval_result("false && true").unwrap().truthy());
+        assert!(!eval_result("false || false").unwrap().truthy());
+        assert!(eval_result("'ABC' -strcmatch 'abc'").unwrap().truthy());
+        assert!(eval_result("req('x-test') == ''").unwrap().truthy());
+        assert!(eval_result("env('FOO') == ''").unwrap().truthy());
+        let dir = std::env::temp_dir().join(format!(
+            "vp-expr-branches-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("inside.txt"), "inside").unwrap();
+        let r = req();
+        let mut file_ctx =
+            Context::new(&r, &[], "127.0.0.1".parse().unwrap(), &dir);
+        let size = parse("filesize('inside.txt')").unwrap();
+        assert_eq!(size.eval(&mut file_ctx).unwrap().int(), Some(6));
+        let forbidden = parse("filesize('/etc/passwd')").unwrap();
+        assert!(forbidden.eval(&mut file_ctx).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(eval_result("unescape('a%20b')").unwrap().string(), "a b");
+        assert_eq!(eval_result("sha1('abc')").unwrap().string(), sha1_hex("abc"));
+        assert_eq!(eval_result("md5('abc')").unwrap().string(), md5_hex("abc"));
+        assert_eq!(eval_result("base64('abc')").unwrap().string(), "YWJj");
+        assert_eq!(eval_result("unbase64('YWJj')").unwrap().string(), "abc");
+        assert!(eval_result("bogus()").is_err());
+        assert!(eval_result("'a' =~ /(a)\\1/").is_err());
+
+        let r = req();
+        let mut c = Context::new(
+            &r,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+        );
+        let bad_test = Expr::FileTest("-x".into(), Box::new(Expr::Str("x".into())));
+        assert!(!bad_test.eval(&mut c).unwrap().truthy());
+    }
+
+    #[test]
+    fn parser_error_and_escape_branches() {
+        for text in [
+            "'unterminated",
+            "%{unterminated",
+            "'a' =~ /unterminated",
+            "(true",
+            "true trailing",
+            "?",
+            "unknown_token",
+            "req('x'",
+            "req('x' 'y')",
+            "'a' -in { 'b'",
+            "'a' -in 'b'",
+            "{ 'a' 'b' }",
+            "=",
+            "-inx",
+            "-foo",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+        assert!(parse("'a\\nb\\rc\\td\\xe'").is_ok());
+        assert!(parse("%{nested{brace}}").is_ok());
+        assert!(parse("'a' -in { 'b', 'c' }").is_ok());
+        assert!(parse("'a' -in { }").is_ok());
+        assert!(parse("{ }").is_ok());
+        assert!(parse("{ 'a', }").is_ok());
+        assert!(parse("{ 'a', 'b' }").is_ok());
+        assert!(parse("(true)").is_ok());
+        assert!(parse("!true").is_ok());
+        assert!(parse("-in").is_ok());
+        let mut direct = Parser::new("-n");
+        assert!(matches!(direct.primary().unwrap(), Expr::Str(ref s) if s == "-n"));
+        assert!(parse("-1").is_ok());
+        assert!(parse("req()").is_ok());
+        assert!(parse("req('x',)").is_ok());
+        assert!(eval("-in == '-in'"));
     }
 }

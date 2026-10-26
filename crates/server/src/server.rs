@@ -2318,106 +2318,9 @@ fn dispatch_inner(
 
     match resolve_target_checked(&root, &rel, follow, owner_match_only) {
         Target::File { file, meta } => {
-            let name = rel.file_name().map(|n| n.as_encoded_bytes()).unwrap_or(b"");
-            if req.method == "OPTIONS" {
-                return options_response(cfg, mime_type(cfg, &scope, name));
-            }
-            if !scope.mapping_policy.unsupported_filters.is_empty() {
-                eprintln!(
-                    "vapached: unsupported output filter(s) {:?} for {}",
-                    scope.mapping_policy.unsupported_filters, url_path
-                );
-                return error_response(
-                    cfg,
-                    vhost,
-                    &scope,
-                    500,
-                    req,
-                    &url_path,
-                    local_port,
-                    &server_name,
-                    peer.ip(),
-                    local_ip,
-                );
-            }
-            if let Some(target) = fastcgi::handler_target(&scope, &root, &rel, &url_path) {
-                return run_fastcgi(
-                    cfg,
-                    vhost,
-                    req,
-                    &url_path,
-                    &server_name,
-                    peer,
-                    local_ip,
-                    local_port,
-                    &scope,
-                    &target,
-                    &grant,
-                    &resource,
-                );
-            }
-            if cgi::is_cgi(cfg, &scope, name, script_alias) {
-                return run_cgi(
-                    cfg,
-                    vhost,
-                    req,
-                    &root,
-                    &rel,
-                    &url_path,
-                    "",
-                    &url_path,
-                    &server_name,
-                    peer,
-                    local_ip,
-                    local_port,
-                    &scope,
-                    &grant,
-                    &resource,
-                    Some(&file),
-                    Some(&meta),
-                );
-            }
-            if let Some(handler) = crate::config::effective_handler(&scope, name) {
-                let handler = handler.trim();
-                if !handler.is_empty()
-                    && !handler.eq_ignore_ascii_case("default-handler")
-                    && !handler.eq_ignore_ascii_case("none")
-                {
-                    eprintln!(
-                        "vapached: unsupported handler '{}' for {}",
-                        handler, url_path
-                    );
-                    return error_response(
-                        cfg,
-                        vhost,
-                        &scope,
-                        500,
-                        req,
-                        &url_path,
-                        local_port,
-                        &server_name,
-                        peer.ip(),
-                        local_ip,
-                    );
-                }
-            }
-            if !matches!(req.method.as_str(), "GET" | "HEAD") {
-                let mut r = error_response(
-                    cfg,
-                    vhost,
-                    &scope,
-                    405,
-                    req,
-                    &url_path,
-                    local_port,
-                    &server_name,
-                    peer.ip(),
-                    local_ip,
-                );
-                r.headers
-                    .push(("Allow".into(), b"GET, HEAD, OPTIONS".to_vec()));
-                return r;
-            }
+            // Re-authorize and bind the actual opened target before selecting
+            // any handler.  A symlink must not inherit the lexical URL's
+            // policy (F41/I39).
             let actual_path = crate::files::fd_path(&file).unwrap_or_else(|| fs_path.clone());
             let (target_grant, target_resource, target_scope) = match bind_target_grant(
                 cfg,
@@ -2438,9 +2341,148 @@ fn dispatch_inner(
                 Ok(v) => v,
                 Err(r) => return r,
             };
+            let scope = &target_scope;
+            let grant = &target_grant;
+            let resource = &target_resource;
+            // Handler, MIME and dispatch decisions use the resolved target
+            // basename, never the URL remainder (F39/I37).
+            let name = actual_path
+                .file_name()
+                .or_else(|| fs_path.file_name())
+                .or_else(|| rel.file_name())
+                .map(|n| n.as_encoded_bytes())
+                .unwrap_or(b"");
+            let (script_root, script_rel) = match actual_path.parent() {
+                Some(parent) => (
+                    parent.to_path_buf(),
+                    actual_path
+                        .file_name()
+                        .map(PathBuf::from)
+                        .unwrap_or_default(),
+                ),
+                None => (root.clone(), rel.clone()),
+            };
+            if req.method == "OPTIONS" {
+                return options_response(cfg, mime_type(cfg, scope, name));
+            }
+            if !scope.mapping_policy.unsupported_filters.is_empty() {
+                eprintln!(
+                    "vapached: unsupported output filter(s) {:?} for {}",
+                    scope.mapping_policy.unsupported_filters, url_path
+                );
+                return error_response(
+                    cfg,
+                    vhost,
+                    scope,
+                    500,
+                    req,
+                    &url_path,
+                    local_port,
+                    &server_name,
+                    peer.ip(),
+                    local_ip,
+                );
+            }
+            if let Some(target) =
+                fastcgi::handler_target_for_file(scope, &root, &rel, &url_path, &actual_path)
+            {
+                return run_fastcgi(
+                    cfg,
+                    vhost,
+                    req,
+                    &url_path,
+                    &server_name,
+                    peer,
+                    local_ip,
+                    local_port,
+                    scope,
+                    &target,
+                    grant,
+                    resource,
+                );
+            }
+            if cgi::is_cgi(cfg, scope, name, script_alias) {
+                return run_cgi(
+                    cfg,
+                    vhost,
+                    req,
+                    &script_root,
+                    &script_rel,
+                    &url_path,
+                    "",
+                    &url_path,
+                    &server_name,
+                    peer,
+                    local_ip,
+                    local_port,
+                    scope,
+                    grant,
+                    resource,
+                    Some(&file),
+                    Some(&meta),
+                );
+            }
+            if let Some(handler) = crate::config::effective_handler(scope, name) {
+                let handler = handler.trim();
+                if handler.eq_ignore_ascii_case("cgi-script") {
+                    // The handler is configured but `Options ExecCGI` is off.
+                    // Apache denies the request; a 500 here would not match,
+                    // but never fall through to static source disclosure.
+                    return error_response(
+                        cfg,
+                        vhost,
+                        scope,
+                        403,
+                        req,
+                        &url_path,
+                        local_port,
+                        &server_name,
+                        peer.ip(),
+                        local_ip,
+                    );
+                }
+                if !handler.is_empty()
+                    && !handler.eq_ignore_ascii_case("default-handler")
+                    && !handler.eq_ignore_ascii_case("none")
+                {
+                    eprintln!(
+                        "vapached: unsupported handler '{}' for {}",
+                        handler, url_path
+                    );
+                    return error_response(
+                        cfg,
+                        vhost,
+                        scope,
+                        500,
+                        req,
+                        &url_path,
+                        local_port,
+                        &server_name,
+                        peer.ip(),
+                        local_ip,
+                    );
+                }
+            }
+            if !matches!(req.method.as_str(), "GET" | "HEAD") {
+                let mut r = error_response(
+                    cfg,
+                    vhost,
+                    scope,
+                    405,
+                    req,
+                    &url_path,
+                    local_port,
+                    &server_name,
+                    peer.ip(),
+                    local_ip,
+                );
+                r.headers
+                    .push(("Allow".into(), b"GET, HEAD, OPTIONS".to_vec()));
+                return r;
+            }
             serve_file(
                 cfg,
-                &target_scope,
+                scope,
                 req,
                 file,
                 &meta,
@@ -2570,6 +2612,13 @@ fn dispatch_inner(
             // CGI script.  Policy is then re-evaluated for the actual script
             // path before the script inode is executed.
             if let Some(st) = cgi::find_script_checked(&root, &rel, follow, owner_match_only) {
+                let actual_path = crate::files::fd_path(&st.file)
+                    .unwrap_or_else(|| root.join(&st.rel_script));
+                let actual_name = actual_path
+                    .file_name()
+                    .or_else(|| st.rel_script.file_name())
+                    .map(|n| n.as_encoded_bytes())
+                    .unwrap_or(b"");
                 let script_name = if st.path_info.is_empty() {
                     url_path.clone()
                 } else {
@@ -2578,22 +2627,21 @@ fn dispatch_inner(
                         .unwrap_or(&url_path)
                         .to_string()
                 };
-                let script_base = st
-                    .rel_script
-                    .file_name()
-                    .map(|n| n.as_encoded_bytes())
-                    .unwrap_or(b"");
                 let requested_base = norm.rsplit(|b| *b == b'/').next().unwrap_or(&norm);
                 let path_info_selected_cgi = cgi::is_cgi(cfg, &scope, requested_base, false);
-                if script_alias || cgi::is_cgi(cfg, &scope, script_base, false) {
-                    let script_fs = root.join(&st.rel_script);
+                let selected = script_alias || cgi::is_cgi(cfg, &scope, actual_name, false);
+                if selected {
+                    // Authorize the actual opened target, not the lexical
+                    // `st.rel_script`: a public symlink to a denied script
+                    // must not execute with the public directory's policy
+                    // (F41/I39), including with PATH_INFO.
                     let (target_grant, target_resource, target_scope) =
                         match authorize_resolved_target(
                             cfg,
                             vhost,
                             req,
                             peer.ip(),
-                            &script_fs,
+                            &actual_path,
                             &script_name,
                             None,
                             local_port,
@@ -2603,25 +2651,37 @@ fn dispatch_inner(
                             Ok(v) => v,
                             Err(r) => return r,
                         };
-                    return run_cgi(
-                        cfg,
-                        vhost,
-                        req,
-                        &root,
-                        &st.rel_script,
-                        &url_path,
-                        &st.path_info,
-                        &script_name,
-                        &server_name,
-                        peer,
-                        local_ip,
-                        local_port,
-                        &target_scope,
-                        &target_grant,
-                        &target_resource,
-                        Some(&st.file),
-                        Some(&st.meta),
-                    );
+                    let (script_root, script_rel) = match actual_path.parent() {
+                        Some(parent) => (
+                            parent.to_path_buf(),
+                            actual_path
+                                .file_name()
+                                .map(PathBuf::from)
+                                .unwrap_or_default(),
+                        ),
+                        None => (root.clone(), st.rel_script.clone()),
+                    };
+                    if script_alias || cgi::is_cgi(cfg, &target_scope, actual_name, false) {
+                        return run_cgi(
+                            cfg,
+                            vhost,
+                            req,
+                            &script_root,
+                            &script_rel,
+                            &url_path,
+                            &st.path_info,
+                            &script_name,
+                            &server_name,
+                            peer,
+                            local_ip,
+                            local_port,
+                            &target_scope,
+                            &target_grant,
+                            &target_resource,
+                            Some(&st.file),
+                            Some(&st.meta),
+                        );
+                    }
                 }
                 if path_info_selected_cgi {
                     // A suffix such as `/.cgi` must not turn an arbitrary
@@ -2670,8 +2730,26 @@ pub(crate) fn map_path(
     for a in &base_scope.mapping_policy.aliases {
         if a.regex.is_none() {
             if let Some(rest) = alias_remainder(&a.virtual_path, &url) {
-                let rel = PathBuf::from(rest.trim_start_matches('/'));
-                return Some((a.fs_path.clone(), rel, a.script));
+                let rest_rel = PathBuf::from(rest.trim_start_matches('/'));
+                // A prefix Alias/ScriptAlias may name a single regular file.
+                // Using the file itself as the root and an empty `rel` hid the
+                // target basename from handler/MIME selection and skipped the
+                // target directory's `.htaccess` (F39).  Split the file target
+                // into its parent directory plus its own name.
+                if a.fs_path.is_file() {
+                    let Some(name) = a.fs_path.file_name() else {
+                        return None;
+                    };
+                    let Some(parent) = a.fs_path.parent() else {
+                        return None;
+                    };
+                    let mut rel = PathBuf::from(name);
+                    if !rest_rel.as_os_str().is_empty() {
+                        rel.push(rest_rel);
+                    }
+                    return Some((parent.to_path_buf(), rel, a.script));
+                }
+                return Some((a.fs_path.clone(), rest_rel, a.script));
             }
             continue;
         }
@@ -2817,6 +2895,15 @@ fn run_fastcgi(
     // `ProxyPassMatch`/`SetHandler` can resolve PATH_INFO to a real script
     // whose own `<Files>`/`<Directory>` policy differs from the requested URL.
     // Re-evaluate policy for the script target before binding the backend.
+    // Resolve the actual script first: forwarding the lexical symlink path let
+    // PHP-FPM execute a file whose real `<Directory>` policy was never checked
+    // (F41/I39).
+    let mut target = target.clone();
+    if let Ok(actual) = std::fs::canonicalize(&target.script_filename) {
+        if actual.is_file() {
+            target.script_filename = actual;
+        }
+    }
     let script_url = if target.path_info.is_empty() {
         url_path.to_string()
     } else {
@@ -2907,7 +2994,7 @@ fn run_fastcgi(
         auth_type,
         script_file: None,
     };
-    let mut r = fastcgi::execute(&ctx, scope, target);
+    let mut r = fastcgi::execute(&ctx, scope, &target);
     scope.header_policy.apply(&mut r.headers, r.status < 400);
     r
 }
@@ -3133,6 +3220,44 @@ mod tests {
     }
 
     #[test]
+    fn single_file_prefix_aliases_split_parent_and_basename() {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-server-file-alias-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("private")).unwrap();
+        let file = dir.join("private").join("secret.cgi");
+        std::fs::write(&file, "#!/bin/sh\n").unwrap();
+        let conf = dir.join("httpd.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "Listen 127.0.0.1:0\n\
+                 Alias /run \"{}\"\n\
+                 ScriptAlias /exec \"{}\"\n",
+                file.display(),
+                file.display()
+            ),
+        )
+        .unwrap();
+        let cfg =
+            Config::load(&conf, &dir, &Default::default(), &Default::default(), false).unwrap();
+        for (url, script) in [(b"/run".as_slice(), false), (b"/exec".as_slice(), true)] {
+            let (root, rel, got_script) = map_path(&cfg, None, url).unwrap();
+            assert_eq!(root, dir.join("private"));
+            assert_eq!(rel, PathBuf::from("secret.cgi"));
+            assert_eq!(got_script, script);
+        }
+        // A suffix remains below the file name and therefore cannot turn the
+        // file target into a directory traversal.
+        let (root, rel, _) = map_path(&cfg, None, b"/run/extra").unwrap();
+        assert_eq!(root, dir.join("private"));
+        assert_eq!(rel, PathBuf::from("secret.cgi/extra"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn regex_alias_cannot_re_root_outside_its_configured_base() {
         let dir = std::env::temp_dir().join(format!(
             "vapache-server-alias-escape-{}",
@@ -3154,9 +3279,19 @@ mod tests {
         .unwrap();
         let cfg =
             Config::load(&conf, &dir, &Default::default(), &Default::default(), false).unwrap();
-        // Capture-only absolute replacements outside ServerRoot are a failed
-        // mapping, not a new parent-rooted target.
+        // Capture-only replacements have no stable base at all: both an
+        // outside path and a ServerRoot secret must fail closed (F42/I40).
         assert!(map_path(&cfg, None, b"/capture/tmp/elsewhere/secret.txt").is_none());
+        let inside = format!("/capture{}/secret.txt", dir.display());
+        assert!(map_path(&cfg, None, inside.as_bytes()).is_none());
+        let capture = cfg
+            .global
+            .mapping_policy
+            .aliases
+            .iter()
+            .find(|a| a.target_template.as_deref() == Some("$1"))
+            .expect("capture-only alias");
+        assert!(capture.fs_path.as_os_str().is_empty());
         // A fixed absolute target still maps relative to its stable parent.
         let (root, rel, _) = map_path(&cfg, None, b"/fixed").unwrap();
         assert_eq!(root, PathBuf::from("/srv/fixed"));

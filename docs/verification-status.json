@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-10-25",
   "verus": {
-    "verified_functions": 218,
+    "verified_functions": 227,
     "errors": 0
   },
   "obligations": [
@@ -123,14 +123,14 @@
       "title": "Autoindex and generated headers use sink-context encoders",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "safe_relative_href prefixes './' before URL encoding so hostile names cannot become javascript:/data:/scheme-relative links; header values still pass the verified CR/LF/NUL sanitizer"
+      "evidence": "safe_relative_href prefixes './' before URL encoding so hostile names cannot become javascript:/data:/scheme-relative links; header values pass the verified sanitizer that now rejects every control byte except HTAB plus DEL"
     },
     {
       "id": "provider_operand_binding",
       "title": "Require providers consume exactly the post-not operand",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "parse_require uses rest.first() for env and rest.join(' ') for expr, and Require::Expr carries negation; unit and HTTP-level tests cover not env, not env NAME=VALUE and not expr"
+      "evidence": "parse_require uses rest.first() for env and rest.join(' ') for expr; Require::Expr and Require::ValidUser both carry negation; unit and HTTP-level tests cover not env, not env NAME=VALUE, not expr and not valid-user"
     },
     {
       "id": "directive_effect_completeness",
@@ -187,6 +187,55 @@
       "status": "partial",
       "weight": 1.0,
       "evidence": "the access-grant identity is carried into CgiContext and build_env emits REMOTE_USER/AUTH_TYPE for local CGI and FastCGI; configured environment entries remain unable to override reserved names; unit and F38 replay cases cover Basic auth"
+    },
+    {
+      "id": "alias_file_target_split",
+      "title": "Single-file aliases map to parent plus basename",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "prefix Alias/ScriptAlias file targets are split into parent plus basename, the access-file walk uses the parent, and handler/MIME/FastCGI selection consumes the resolved basename; alias_file_target_split, alias_access_root_admit and handler_name_from_target are mechanized and the F39 replay covers .htaccess deny plus CGI source disclosure"
+    },
+    {
+      "id": "limit_directive_effect",
+      "title": "Effectful directives inside <Limit> are applied or rejected",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "main-configuration Options/Header/AddHandler/SetHandler inside <Limit> are applied to the enclosing scope instead of warn-and-ignored, while auth/access directives remain method-scoped; .htaccess rejects non-auth directives; limit_directive_effect is mechanized and config/unit plus F40 replay cases cover Options -ExecCGI and -Indexes"
+    },
+    {
+      "id": "cgi_actual_target_policy",
+      "title": "CGI/FastCGI reauthorize and bind the actual target",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "the dispatcher binds the opened target before handler selection; PATH_INFO reauthorizes fd_path(file); FastCGI canonicalizes SCRIPT_FILENAME and reauthorizes the actual path before backend binding; cgi_actual_target_admit is mechanized and the F41 replay covers direct, PATH_INFO and FastCGI symlink targets"
+    },
+    {
+      "id": "capture_only_alias_base",
+      "title": "Capture-only regex aliases have no implicit ServerRoot base",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Alias::regex keeps an empty base for leading-capture replacements and map_path fails closed for every empty-base mapping; capture_only_alias_admit is mechanized and the F42 replay asserts .htpasswd, rewrite secrets and the configuration are not readable"
+    },
+    {
+      "id": "temp_file_exclusive",
+      "title": "Spool/temp files use exclusive creation and private mode",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "the FastCGI spool uses create_new, mode 0600, bounded collision retries and immediate unlink; temp_file_create_admit is mechanized and unit cases plant a symlink at the predicted name and verify the target is untouched and the descriptor is private"
+    },
+    {
+      "id": "cache_disk_bounds",
+      "title": "Disk cache has a total quota, entry cap and expiry cleanup",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "persisted bytes are tracked per cache root, CacheMaxDiskSize and MAX_DISK_ENTRIES are enforced by evicting the oldest stems, oversized entries are refused, expired/old-generation files are deleted on load, per-key variants are capped, and CacheIgnoreQueryString bypasses dynamic CGI/FastCGI/proxy targets; cache_disk_size_admit is mechanized and unit cases cover eviction, oversize refusal, expiry deletion and dynamic query bypass"
+    },
+    {
+      "id": "expr_file_test_confined",
+      "title": "Expression file tests use the document-root confinement",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Expr::FileTest consumes confined_expr_path for -f/-d/-e/-s/-F/-U, rejecting absolute, parent-relative and escaping-symlink arguments; main-config <IfFile> uses a separate operator-supplied Expr::IfFile; expr_file_test_admit is mechanized and unit cases cover absolute paths and an escaping symlink"
     }
   ],
   "minimum_weighted_score": 3.5,
@@ -276,6 +325,14 @@
     "Proxy route order and logical/concrete balancer identity binding",
     "Main-config directive disposition and explicit compatibility-inert warnings",
     "Framing and resource-bound closure across HTTP, proxy, CGI and FastCGI streams",
-    "Exhaustive .htaccess directive disposition and override-category matrix"
+    "Exhaustive .htaccess directive disposition and override-category matrix",
+    "Single-file alias target split and parent access-root admission",
+    "Resolved-target basename selection for handlers, MIME and FastCGI",
+    "Effectful <Limit> directive disposition (applied or rejected)",
+    "CGI/FastCGI actual-target reauthorization and binding",
+    "Capture-only regex alias base rejection",
+    "Exclusive private spool-file creation",
+    "Disk-cache total quota, entry cap and expiry cleanup",
+    "Expression file-test document-root confinement"
   ]
 }

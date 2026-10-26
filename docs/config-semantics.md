@@ -850,6 +850,106 @@ reviewed presentation/module-absence surface (for example `AddDescription`,
 unhandled directive.  The disposition matrix test asserts the fail-closed set,
 the explicit warning set and strict-mode rejection.
 
+### I35 — Single-file alias target split
+
+```text
+prefix_alias(target is file) -> (root = target.parent, rel = target.file_name)
+prefix_alias(target is directory) -> (root = target, rel = URL remainder)
+```
+
+A file target never produces an empty `rel`.  The basename is what carries the
+handler/MIME extension and `SCRIPT_FILENAME`; treating the file as a root hid
+the extension and served scripts as static source (F39).  The split obligation
+is mechanized as `alias_file_target_split`.
+
+### I36 — Single-file alias access root
+
+```text
+access_root(alias target) == target             if target is a directory
+access_root(alias target) == target.parent      otherwise
+```
+
+The access-file walk stops at and includes the target directory.  Returning the
+file itself made every `dir.starts_with(root)` check fail, silently skipping
+the target `.htaccess` (F39).  `alias_access_root_admit` states the file case.
+
+### I37 — Handler selection from the resolved target
+
+```text
+handler/MIME/FastCGI selection consumes resolve(req).target.file_name
+```
+
+The URL remainder or lexical alias name may not reclassify a resolved script
+as static.  `handler_name_from_target` is the mechanized predicate; the
+dispatcher passes the resolved basename to `effective_handler`,
+`cgi::is_cgi`, `mime_type` and FastCGI handler selection.
+
+### I38 — `<Limit>` directive effect
+
+```text
+accepted_in_limit(d) && effectful(d) -> applied(d) or rejected(d)
+not (accepted_in_limit(d) && effectful(d) && ignored(d))
+```
+
+Apache applies `Options`, `Header`, `AddHandler` and `SetHandler` written
+inside `<Limit>`; discarding them let `Options -ExecCGI` become a
+remote-execution bypass (F40).  Main-configuration directives inside a
+method-limited section are now applied to the enclosing scope, and auth/access
+directives still consume the method set.  `.htaccess` continues to reject
+non-auth directives in `<Limit>`.  `limit_directive_effect` is the verified
+disposition predicate.
+
+### I39 — CGI/FastCGI actual-target policy
+
+```text
+actual_target != lexical_target ->
+    authorize(actual_target) && bind(actual_target) before execute/forward
+```
+
+CGI and FastCGI dispatch re-authorize the opened or canonicalized target and
+bind the sink to it before execution or before sending `SCRIPT_FILENAME`.  This
+includes `PATH_INFO`, `SetHandler` and `ProxyPassMatch` routes; a public
+symlink cannot inherit the allowed directory's policy (F41).
+`cgi_actual_target_admit` is the mechanized implication.
+
+### I40 — Capture-only regex alias base
+
+```text
+replacement has leading capture and no stable prefix -> no base
+no base -> map_path returns None
+```
+
+An `AliasMatch`/`ScriptAliasMatch` replacement such as `"$1"` has no implicit
+`ServerRoot` base.  Falling back to `ServerRoot` admitted arbitrary reads of
+`.htpasswd`, keys and configuration (F42).  Only an explicit directory prefix
+(`/srv/private/$1`, `private/$1`) creates a base;
+`capture_only_alias_admit` is the verified decision.
+
+### I41 — Exclusive private temporary files
+
+```text
+temp_file_create -> create_new && private_mode && unlink_after_open
+```
+
+The FastCGI output spool uses `create_new` (`O_EXCL`), mode `0600`, a bounded
+collision retry and immediate unlink.  A pre-created shared-temp symlink can
+neither redirect nor truncate a server-writable file (F43).
+`temp_file_create_admit` states the exclusive/private conjunction.
+
+### I42 — Expression file-test confinement
+
+```text
+expr_file_test(arg) -> !absolute(arg)
+                     && !parent_relative(arg)
+                     && canonical(arg) under canonical(DocumentRoot)
+```
+
+`-f`, `-d`, `-e`, `-s`, `-F` and `-U` use the same confinement as
+`file()`/`filesize()`; `<IfFile>` remains the explicit main-configuration
+exception because its argument is operator supplied.  Without this, a writable
+`.htaccess` could use absolute paths or escaping symlinks as a metadata oracle
+(F45).  `expr_file_test_admit` is consumed by `confined_expr_path`.
+
 ## 9. Formalization boundary
 
 The first Verus model should cover:
@@ -922,7 +1022,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **218 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **227 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `require_none_result`.
   `crates/server/src/access.rs` calls these for
@@ -964,6 +1064,16 @@ construction: there is no second production interleaver.
   the proxy serializer admits the outbound method, target, version and every
   header through the same token/header predicates immediately before
   `write_all`.
+- `alias_file_target_split`, `alias_access_root_admit`,
+  `handler_name_from_target`, `limit_directive_effect`,
+  `cgi_actual_target_admit`, `capture_only_alias_admit`,
+  `temp_file_create_admit`, `cache_disk_size_admit` and
+  `expr_file_test_admit`.  These are the pass-4 disposition predicates for
+  single-file aliases, `<Limit>` effects, actual-target handler
+  reauthorization, capture-only aliases, exclusive spool creation, disk-cache
+  quota and expression file-test confinement (I35–I42).  `confined_expr_path`
+  consumes `expr_file_test_admit`; the remaining predicates document and
+  mechanize the runtime branches exercised by the F39–F45 replay suite.
 - `regex_dialect_admit` / `guard_regex` / `compile_regex`.  Every
   configuration- and expression-supplied regex is admitted only after the
   verified dialect guard: backreferences, look-around, other PCRE-only

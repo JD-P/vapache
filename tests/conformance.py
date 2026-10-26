@@ -1643,8 +1643,9 @@ class StaticTests(Base):
         # Unimplemented filters (SSI here) must fail closed rather than
         # serving the unfiltered source.
         self.assertEqual(self.get("/filter-unsupported/test.html")[0], 500)
-        # cgi-script without ExecCGI must not fall through to static serving.
-        self.assertEqual(self.get("/cgi-noexec/x.cgi")[0], 500)
+        # cgi-script without ExecCGI must not fall through to static serving;
+        # Apache denies it with 403.
+        self.assertEqual(self.get("/cgi-noexec/x.cgi")[0], 403)
 
     def test_access_directory_match(self):
         self.assertEqual(self.get("/access/secret-dir/file.txt")[0], 403)

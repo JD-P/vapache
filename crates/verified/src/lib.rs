@@ -50,6 +50,17 @@ pub open spec fn no_crlf_nul(s: Seq<u8>) -> bool {
     forall|i: int| 0 <= i < s.len() ==> s[i] != 0x0a && s[i] != 0x0d && s[i] != 0
 }
 
+/// RFC 9110 field-value bytes: HTAB, SP, visible ASCII and obs-text.  All
+/// other controls and DEL are rejected so downstream parsers cannot disagree
+/// with the serializer about a field boundary.
+pub open spec fn header_value_byte_ok(b: u8) -> bool {
+    b == b'\t' || (b >= 0x20 && b != 0x7f)
+}
+
+pub open spec fn header_value_ok(s: Seq<u8>) -> bool {
+    forall|i: int| 0 <= i < s.len() ==> header_value_byte_ok(s[i])
+}
+
 spec fn hex_val(b: u8) -> Option<u8> {
     if b >= b'0' && b <= b'9' {
         Some((b - b'0') as u8)
@@ -808,6 +819,100 @@ pub fn path_under_base(target: &[u8], base: &[u8]) -> (ok: bool)
     target[base.len()] == b'/'
 }
 
+/// F39/I35: a prefix `Alias`/`ScriptAlias` whose target is a regular file is
+/// resolved as `(parent, basename)`, never `(file, empty)`.  The nonempty
+/// basename is what carries the handler and MIME extension.
+pub fn alias_file_target_split(
+    target_is_file: bool,
+    root_is_parent: bool,
+    rel_is_basename: bool,
+    rel_nonempty: bool,
+) -> (ok: bool)
+    ensures
+        ok == (!target_is_file
+            || (root_is_parent && rel_is_basename && rel_nonempty)),
+{
+    !target_is_file || (root_is_parent && rel_is_basename && rel_nonempty)
+}
+
+/// F39/I36: the access-file walk root for a file target is its parent, not the
+/// file itself.
+pub fn alias_access_root_admit(
+    target_is_file: bool,
+    root_is_parent: bool,
+    root_is_target: bool,
+) -> (ok: bool)
+    ensures ok == (!target_is_file || (root_is_parent && !root_is_target)),
+{
+    !target_is_file || (root_is_parent && !root_is_target)
+}
+
+/// F39/I37: when a target has been resolved, handler/MIME/FastCGI selection
+/// uses that target's basename rather than the URL remainder.
+pub fn handler_name_from_target(resolved: bool, name_is_target_basename: bool) -> (ok: bool)
+    ensures ok == (!resolved || name_is_target_basename),
+{
+    !resolved || name_is_target_basename
+}
+
+/// F40/I38: an effectful directive accepted inside `<Limit>` must be applied or
+/// rejected; it may never be warn-and-ignored.
+pub fn limit_directive_effect(effectful: bool, applied: bool, rejected: bool) -> (ok: bool)
+    ensures ok == (!effectful || applied || rejected),
+{
+    !effectful || applied || rejected
+}
+
+/// F41/I39: if the opened/resolved target differs from the lexical mapping,
+/// CGI/FastCGI dispatch must reauthorize the actual target and bind to it
+/// before execution or backend forwarding.
+pub fn cgi_actual_target_admit(
+    actual_differs: bool,
+    reauthorized: bool,
+    bound: bool,
+) -> (ok: bool)
+    ensures ok == (!actual_differs || (reauthorized && bound)),
+{
+    !actual_differs || (reauthorized && bound)
+}
+
+/// F42/I40: a capture-only/leading-capture regex alias has no implicit
+/// `ServerRoot` base.  Mapping is admitted only with an explicit stable
+/// directory prefix.
+pub fn capture_only_alias_admit(has_stable_prefix: bool) -> (ok: bool)
+    ensures ok == has_stable_prefix,
+{
+    has_stable_prefix
+}
+
+/// F43/I41: a spool creation is admitted only with exclusive creation and a
+/// private mode, so a pre-created shared-temp symlink cannot redirect it.
+pub fn temp_file_create_admit(create_new: bool, private_mode: bool) -> (ok: bool)
+    ensures ok == (create_new && private_mode),
+{
+    create_new && private_mode
+}
+
+/// F44: a new disk-cache representation fits only when the incoming bytes plus
+/// the current usage stay within the configured total budget.
+pub fn cache_disk_size_admit(used: u64, incoming: u64, limit: u64) -> (ok: bool)
+    ensures ok == (used <= limit && incoming <= limit - used),
+{
+    used <= limit && incoming <= limit - used
+}
+
+/// F45/I42: an expression file test must be relative, free of parent
+/// components, and (after canonicalization) beneath the document root.
+pub fn expr_file_test_admit(
+    absolute: bool,
+    parent_relative: bool,
+    under_root: bool,
+) -> (ok: bool)
+    ensures ok == (!absolute && !parent_relative && under_root),
+{
+    !absolute && !parent_relative && under_root
+}
+
 /// Escape access-log text so a hostile request field cannot inject a
 /// newline, NUL, terminal escape or quote/backslash sequence.  This is the
 /// verified primitive used by the access-log formatter (CVE-2001-1556).
@@ -858,14 +963,16 @@ pub fn escape_log_bytes(input: &[u8]) -> (out: Vec<u8>)
 
 /// Validate a header value before it is written to the wire.
 ///
-/// Rejects CR, LF and NUL.  This is the single choke point for every header
-/// the daemon emits, including headers derived from file names and CGI
-/// output, which is how response-splitting vulnerabilities usually enter.
+/// Rejects every control byte except HTAB, plus DEL.  This is the single choke
+/// point for every header the daemon emits, including headers derived from
+/// file names and CGI output, which is how response-splitting vulnerabilities
+/// usually enter.
 pub fn sanitize_header_value(input: &[u8]) -> (out: Option<Vec<u8>>)
     ensures
         match out {
             Some(v) => {
                 &&& no_crlf_nul(v@)
+                &&& header_value_ok(v@)
                 &&& v@.len() == input@.len()
                 &&& forall|i: int| 0 <= i < v@.len() ==> v@[i] == input@[i]
             }
@@ -876,16 +983,18 @@ pub fn sanitize_header_value(input: &[u8]) -> (out: Option<Vec<u8>>)
     while i < input.len()
         invariant
             i <= input.len(),
+            forall|k: int| 0 <= k < i ==> #[trigger] header_value_byte_ok(input@[k]),
             forall|k: int| 0 <= k < i ==> #[trigger] input@[k] != 0
                 && input@[k] != b'\r' && input@[k] != b'\n',
         decreases input.len() - i,
     {
         let b = input[i];
-        if b == 0 || b == b'\r' || b == b'\n' {
+        if !(b == b'\t' || (b >= 0x20 && b != 0x7f)) {
             return None;
         }
         i = i + 1;
     }
+    assert(header_value_ok(input@));
     assert(no_crlf_nul(input@));
     let mut out: Vec<u8> = Vec::with_capacity(input.len());
     let mut j: usize = 0;
@@ -894,8 +1003,10 @@ pub fn sanitize_header_value(input: &[u8]) -> (out: Option<Vec<u8>>)
             j <= input.len(),
             out@.len() == j,
             forall|k: int| 0 <= k < j ==> out@[k] == input@[k],
+            header_value_ok(out@),
             no_crlf_nul(out@),
             no_crlf_nul(input@),
+            header_value_ok(input@),
         decreases input.len() - j,
     {
         out.push(input[j]);
@@ -1756,7 +1867,11 @@ fn split_target(target: &[u8]) -> (res: Result<(Vec<u8>, Vec<u8>), HeadError>)
 }
 
 fn apply_connection_tokens(value: &[u8], keep_alive: bool) -> (out: bool) {
+    // `close` is sticky: a later `keep-alive` token must not re-enable a
+    // connection that either side asked to close (RFC 9110 connection options
+    // are a set, not a last-token-wins list).
     let mut out = keep_alive;
+    let mut saw_close = false;
     let mut i: usize = 0;
     while i <= value.len()
         invariant i <= value.len(),
@@ -1774,8 +1889,9 @@ fn apply_connection_tokens(value: &[u8], keep_alive: bool) -> (out: bool) {
         let tok = &sub[ts..te];
         if te > ts {
             if eq_ignore_ascii_case(tok, b"close") {
+                saw_close = true;
                 out = false;
-            } else if eq_ignore_ascii_case(tok, b"keep-alive") {
+            } else if eq_ignore_ascii_case(tok, b"keep-alive") && !saw_close {
                 out = true;
             }
         }
@@ -2325,35 +2441,30 @@ pub fn parse_request_head(
 /// a user buffer.
 ///
 /// The length check prevents mapping past EOF.  The permission check refuses
-/// to map a file that the server's effective uid could truncate: an mmap of a
-/// file truncated concurrently can raise SIGBUS, so files writable by the
-/// server fall back to a copied read.
+/// to map any file with an owner, group or other write bit set.  A file
+/// writable by the server can be truncated by the server itself, and a file
+/// writable by a different owner can be truncated by that owner; either race
+/// raises SIGBUS in the mapping (F41-adjacent SIGBUS hardening).
 pub open spec fn mmap_read_ok(
     file_len: u64,
     requested: u64,
-    file_uid: u32,
-    euid: u32,
+    _file_uid: u32,
+    _euid: u32,
     mode: u32,
 ) -> bool {
-    requested <= file_len
-        && !((file_uid == euid && mode & 0o200 != 0)
-            || mode & 0o020 != 0
-            || mode & 0o002 != 0)
+    requested <= file_len && mode & 0o222 == 0
 }
 
 pub fn mmap_read_allowed(
     file_len: u64,
     requested: u64,
-    file_uid: u32,
-    euid: u32,
+    _file_uid: u32,
+    _euid: u32,
     mode: u32,
 ) -> (ok: bool)
-    ensures ok == mmap_read_ok(file_len, requested, file_uid, euid, mode),
+    ensures ok == mmap_read_ok(file_len, requested, _file_uid, _euid, mode),
 {
-    requested <= file_len
-        && !((file_uid == euid && mode & 0o200 != 0)
-            || mode & 0o020 != 0
-            || mode & 0o002 != 0)
+    requested <= file_len && mode & 0o222 == 0
 }
 
 /// A response body is compressed only while it stays within the fixed

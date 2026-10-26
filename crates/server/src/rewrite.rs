@@ -838,6 +838,24 @@ fn rewrite_map_lookup<'a>(maps: &'a [(String, RewriteMap)], name: &str) -> Optio
         .map(|(_, map)| map)
 }
 
+fn map_value(map: Option<&RewriteMap>, key: &str) -> String {
+    match map {
+        Some(RewriteMap::Txt(m)) => m.get(key).cloned().unwrap_or_default(),
+        Some(RewriteMap::Rnd(m)) => m
+            .get(key)
+            .and_then(|choices| {
+                choices.get(
+                    key.bytes().map(|b| b as usize).sum::<usize>() % choices.len().max(1),
+                )
+            })
+            .cloned()
+            .unwrap_or_default(),
+        Some(RewriteMap::Prg(program)) => run_prg_map(program, key),
+        Some(RewriteMap::Int(function)) => int_map(function, key),
+        None => String::new(),
+    }
+}
+
 fn variable_value(
     name: &str,
     req: &Request,
@@ -888,21 +906,7 @@ fn variable_value(
             && rewrite_map_lookup(maps, n.split_once(':').unwrap().0).is_some() =>
         {
             let (map_name, key) = n.split_once(':').unwrap();
-            match rewrite_map_lookup(maps, map_name) {
-                Some(RewriteMap::Txt(m)) => m.get(key).cloned().unwrap_or_default(),
-                Some(RewriteMap::Rnd(m)) => m
-                    .get(key)
-                    .and_then(|choices| {
-                        choices.get(
-                            key.bytes().map(|b| b as usize).sum::<usize>() % choices.len().max(1),
-                        )
-                    })
-                    .cloned()
-                    .unwrap_or_default(),
-                Some(RewriteMap::Prg(program)) => run_prg_map(program, key),
-                Some(RewriteMap::Int(function)) => int_map(function, key),
-                None => String::new(),
-            }
+            map_value(rewrite_map_lookup(maps, map_name), key)
         }
         "THE_REQUEST" => format!(
             "{} {} {}",
@@ -963,6 +967,10 @@ fn int_map(function: &str, key: &str) -> String {
     }
 }
 
+fn write_prg_key(stdin: &mut impl Write, key: &str) -> bool {
+    stdin.write_all(key.as_bytes()).is_ok() && stdin.write_all(b"\n").is_ok()
+}
+
 fn run_prg_map(program: &str, key: &str) -> String {
     let mut parts = program.split_whitespace();
     let Some(command) = parts.next() else {
@@ -978,12 +986,32 @@ fn run_prg_map(program: &str, key: &str) -> String {
         Ok(child) => child,
         Err(_) => return String::new(),
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(key.as_bytes()).is_err() || stdin.write_all(b"\n").is_err() {
-            let _ = child.kill();
-            return String::new();
-        }
+    let stdin = child.stdin.take();
+    finish_prg_map(child, stdin, key)
+}
+
+fn finish_prg_map(
+    mut child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    key: &str,
+) -> String {
+    let Some(mut stdin) = stdin else {
+        return wait_prg_output(child);
+    };
+    if !write_prg_key(&mut stdin, key) {
+        return abort_prg_map(child);
     }
+    drop(stdin);
+    wait_prg_output(child)
+}
+
+fn abort_prg_map(mut child: std::process::Child) -> String {
+    let _ = child.kill();
+    let _ = child.wait();
+    String::new()
+}
+
+fn wait_prg_output(child: std::process::Child) -> String {
     match child.wait_with_output() {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
             .lines()
@@ -2105,5 +2133,623 @@ mod tests {
         assert_eq!(normalize_rewrite_base("sub"), "/sub/");
         let rule = parse_rewrite_rule(&["!^keep$".into(), "x".into()], "/", true).unwrap();
         assert!(rule.negated);
+    }
+
+    fn parsed_rule(pattern: &str, sub: &str, flags: &str, base: &str, per_dir: bool) -> RewriteRule {
+        parse_rewrite_rule(
+            &[pattern.into(), sub.into(), flags.into()],
+            base,
+            per_dir,
+        )
+        .unwrap()
+    }
+
+    fn scope_with(rules: Vec<RewriteRule>) -> Scope {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules = rules;
+        scope
+    }
+
+    #[test]
+    fn cookie_escape_and_effect_helpers() {
+        let mut flags = crate::config::RewriteFlags::default();
+        flags.escape_backrefs = true;
+        flags.noescape_backrefs = true;
+        let spec = escape_spec(&flags).unwrap();
+        assert_eq!(escape_backref_value("a&b c", &spec), "a&b+c");
+
+        flags.noescape_backrefs = false;
+        flags.escape_controls = true;
+        flags.escape_chars = " .".into();
+        flags.backref_no_plus = true;
+        let spec = escape_spec(&flags).unwrap();
+        assert_eq!(escape_backref_value("a b.c", &spec), "a%20b%2ec");
+
+        assert_eq!(
+            build_cookie("name:value:example.test:10:/:secure:httponly:lax").unwrap(),
+            "name=value; Domain=example.test; Max-Age=600; Path=/; Secure; HttpOnly; SameSite=lax"
+        );
+        assert_eq!(
+            build_cookie("name:value:example.test:-1:/:true:1:None").unwrap(),
+            "name=value; Domain=example.test; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=None"
+        );
+        assert_eq!(
+            build_cookie(";name;value;example.test;10;/;secure;httponly;lax").unwrap(),
+            "name=value; Domain=example.test; Max-Age=600; Path=/; Secure; HttpOnly; SameSite=lax"
+        );
+        assert_eq!(
+            build_cookie("name:value:example.test:1:/:1:true:false").unwrap(),
+            "name=value; Domain=example.test; Max-Age=60; Path=/; Secure; HttpOnly"
+        );
+        assert!(build_cookie(":value").is_err());
+        assert!(build_cookie("name:value:example.test:nope").is_err());
+        assert!(build_cookie("name=bad\u{1}value").is_err());
+
+        let r = req();
+        let root = Path::new("/tmp");
+        let old_path = root.join("old");
+        let c = ctx("/old", &old_path, root);
+        let rule = parsed_rule(
+            "^/old$",
+            "-",
+            "[E=FOO:bar,CO=name:value:example.test:1:/:secure:httponly:lax,H=handler,T=text/plain]",
+            "/",
+            false,
+        );
+        let e = rule_effects(&rule, &[], &[], &r, &c, "/old", b"", &[], &[]).unwrap();
+        assert_eq!(e.env, vec![("FOO".into(), Some("bar".into()))]);
+        assert_eq!(e.cookies.len(), 1);
+        assert_eq!(e.handler.as_deref(), Some("handler"));
+        assert_eq!(e.content_type.as_deref(), Some("text/plain"));
+
+        let mut bad = rule.clone();
+        bad.flags.env.push((String::new(), Some("x".into())));
+        assert!(rule_effects(&bad, &[], &[], &r, &c, "/old", b"", &[], &[]).is_err());
+        bad.flags.env.clear();
+        bad.flags.cookies.push(":value".into());
+        assert!(rule_effects(&bad, &[], &[], &r, &c, "/old", b"", &[], &[]).is_err());
+
+        for which in 0..5 {
+            let mut broken = rule.clone();
+            broken.flags.env.clear();
+            broken.flags.cookies.clear();
+            broken.flags.handler = None;
+            broken.flags.content_type = None;
+            match which {
+                0 => broken.flags.env.push(("${UNKNOWN}".into(), None)),
+                1 => broken
+                    .flags
+                    .env
+                    .push(("X".into(), Some("${UNKNOWN}".into()))),
+                2 => broken.flags.cookies.push("${UNKNOWN}".into()),
+                3 => broken.flags.handler = Some("${UNKNOWN}".into()),
+                _ => broken.flags.content_type = Some("${UNKNOWN}".into()),
+            }
+            assert!(rule_effects(&broken, &[], &[], &r, &c, "/old", b"", &[], &[]).is_err());
+        }
+
+        let mut left = Effects::default();
+        left.env.push(("A".into(), Some("1".into())));
+        let mut right = Effects::default();
+        right.handler = Some("h".into());
+        right.content_type = Some("text/plain".into());
+        right.vary = vec!["X-A".into(), "X-A".into()];
+        left.merge(right);
+        assert!(!left.is_empty());
+        assert_eq!(left.handler.as_deref(), Some("h"));
+        assert_eq!(left.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(left.vary, vec!["X-A"]);
+    }
+
+    #[test]
+    fn condition_evaluation_and_header_extraction() {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-rewrite-cond-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("file.txt"), "content").unwrap();
+        fs::write(dir.join("empty.txt"), "").unwrap();
+        std::os::unix::fs::symlink("file.txt", dir.join("link.txt")).unwrap();
+        let r = req();
+        let x_path = dir.join("x");
+        let c = ctx("/x", &x_path, &dir);
+        let mut caps = Vec::new();
+
+        assert!(eval_cond(
+            &parse_rewrite_cond(&["x".into(), "-f".into()]).unwrap(),
+            "file.txt",
+            &c,
+            &mut caps
+        )
+        .unwrap());
+        assert!(eval_cond(
+            &parse_rewrite_cond(&["x".into(), "-d".into()]).unwrap(),
+            "sub",
+            &c,
+            &mut caps
+        )
+        .unwrap());
+        assert!(eval_cond(
+            &parse_rewrite_cond(&["x".into(), "-s".into()]).unwrap(),
+            "file.txt",
+            &c,
+            &mut caps
+        )
+        .unwrap());
+        assert!(!eval_cond(
+            &parse_rewrite_cond(&["x".into(), "-s".into()]).unwrap(),
+            "empty.txt",
+            &c,
+            &mut caps
+        )
+        .unwrap());
+        assert!(eval_cond(
+            &parse_rewrite_cond(&["x".into(), "-l".into()]).unwrap(),
+            "link.txt",
+            &c,
+            &mut caps
+        )
+        .unwrap());
+        for (pattern, value, expected) in [
+            (">=10", "10", true),
+            ("<=10", "10", true),
+            (">9", "10", true),
+            ("<11", "10", true),
+            ("=abc", "abc", true),
+            ("!def", "abc", true),
+            ("!^/no$", "/yes", true),
+            ("!^/no$", "/no", false),
+        ] {
+            assert_eq!(
+                eval_cond(
+                    &parse_rewrite_cond(&["x".into(), pattern.into()]).unwrap(),
+                    value,
+                    &c,
+                    &mut caps
+                )
+                .unwrap(),
+                expected,
+                "{pattern}"
+            );
+        }
+        let nocase_eq = parse_rewrite_cond(&["x".into(), "=ABC".into(), "[NC]".into()]).unwrap();
+        assert!(eval_cond(&nocase_eq, "abc", &c, &mut caps).unwrap());
+        let nocase_ne = parse_rewrite_cond(&["x".into(), "!ABC".into(), "[NC]".into()]).unwrap();
+        assert!(!eval_cond(&nocase_ne, "abc", &c, &mut caps).unwrap());
+        let double_ne = parse_rewrite_cond(&["x".into(), "!!ABC".into()]).unwrap();
+        assert!(!eval_cond(&double_ne, "abc", &c, &mut caps).unwrap());
+        assert!(eval_cond(&double_ne, "ABC", &c, &mut caps).unwrap());
+        let double_ne_nc =
+            parse_rewrite_cond(&["x".into(), "!!ABC".into(), "[NC]".into()]).unwrap();
+        assert!(eval_cond(&double_ne_nc, "abc", &c, &mut caps).unwrap());
+        assert!(!eval_cond(&double_ne_nc, "abd", &c, &mut caps).unwrap());
+        let regex = parse_rewrite_cond(&["x".into(), "^(a)(b)$".into()]).unwrap();
+        assert!(eval_cond(&regex, "ab", &c, &mut caps).unwrap());
+        assert_eq!(caps, vec!["ab", "a", "b"]);
+        assert!(!eval_cond(&regex, "zz", &c, &mut caps).unwrap());
+        assert!(caps.is_empty());
+
+        assert_eq!(
+            compare_cond("10", "9", false),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_cond("ABC", "abc", true),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_cond("ABC", "abc", false),
+            std::cmp::Ordering::Less
+        );
+        assert!(file_test("file.txt", &c, |p| p.is_file()));
+        assert!(file_test(&dir.join("file.txt").to_string_lossy(), &c, |p| p.is_file()));
+        assert!(!file_test("../etc/passwd", &c, |_| true));
+        assert!(!file_test("/etc/passwd", &c, |_| true));
+
+        assert_eq!(
+            condition_header("x %{HTTP_X_TEST} y").as_deref(),
+            Some("X-Test")
+        );
+        assert_eq!(
+            condition_header("%{HTTP:host}").as_deref(),
+            Some("Host")
+        );
+        assert_eq!(
+            condition_header("%{HTTP:}%{ENV:X}%{HTTP:X-A}").as_deref(),
+            Some("X-A")
+        );
+        assert_eq!(condition_header("%{HTTPX}%{HTTP_X_TEST}").as_deref(), Some("X-Test"));
+        assert_eq!(
+            condition_header("%{HTTP_X__Y}").as_deref(),
+            Some("X--Y")
+        );
+        assert_eq!(condition_header("plain"), None);
+
+        assert_eq!(
+            expand_vars(
+                "${REQUEST_URI}-%{REQUEST_URI}-%1-é",
+                &r,
+                &c,
+                "/path",
+                b"q=1",
+                &["zero".to_string(), "cap".to_string()],
+                &[],
+                &[],
+            )
+            .unwrap(),
+            "/path?q=1-/path?q=1-cap-é"
+        );
+        assert!(expand_vars(
+            "%{NOPE}",
+            &r,
+            &c,
+            "/path",
+            b"",
+            &[],
+            &[],
+            &[]
+        )
+        .is_err());
+        assert_eq!(
+            expand_vars("${unterminated", &r, &c, "/", b"", &[], &[], &[]).unwrap(),
+            "${unterminated"
+        );
+        assert_eq!(
+            expand_vars("%{unterminated", &r, &c, "/", b"", &[], &[], &[]).unwrap(),
+            "%{unterminated"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maps_backrefs_and_url_helpers() {
+        use std::collections::HashMap;
+        let r = req();
+        let root = Path::new("/tmp");
+        let old_path = root.join("old");
+        let c = ctx("/old", &old_path, root);
+        let mut txt = HashMap::new();
+        txt.insert("key".into(), "value".to_string());
+        let mut rnd = HashMap::new();
+        rnd.insert("key".into(), vec!["a".into(), "b".into()]);
+        let maps = vec![
+            ("txt".into(), RewriteMap::Txt(txt)),
+            ("rnd".into(), RewriteMap::Rnd(rnd)),
+            ("prg".into(), RewriteMap::Prg("/bin/cat".into())),
+            ("int".into(), RewriteMap::Int("toupper".into())),
+        ];
+        assert_eq!(
+            variable_value("ENV:FOO", &r, &c, "/old", b"", &[], &[("FOO".into(), "bar".into())])
+                .unwrap(),
+            "bar"
+        );
+        assert_eq!(
+            variable_value("REQUEST_URI", &r, &c, "/old", b"q=1", &[], &[]).unwrap(),
+            "/old?q=1"
+        );
+        assert_eq!(
+            variable_value("REQUEST_FILENAME", &r, &c, "/old", b"", &[], &[]).unwrap(),
+            root.join("old").to_string_lossy()
+        );
+        assert_eq!(
+            variable_value("HTTP_HOST", &r, &c, "/old", b"", &[], &[]).unwrap(),
+            "localhost"
+        );
+        assert_eq!(
+            variable_value("HTTP_X_TEST", &r, &c, "/old", b"", &[], &[]).unwrap(),
+            ""
+        );
+        assert_eq!(
+            variable_value("txt:key", &r, &c, "/old", b"", &maps, &[]).unwrap(),
+            "value"
+        );
+        assert_eq!(
+            variable_value("txt:missing", &r, &c, "/old", b"", &maps, &[]).unwrap(),
+            ""
+        );
+        assert!(["a", "b"].contains(
+            &variable_value("rnd:key", &r, &c, "/old", b"", &maps, &[])
+                .unwrap()
+                .as_str()
+        ));
+        assert_eq!(
+            variable_value("rnd:missing", &r, &c, "/old", b"", &maps, &[]).unwrap(),
+            ""
+        );
+        assert_eq!(
+            variable_value("prg:abc", &r, &c, "/old", b"", &maps, &[]).unwrap(),
+            "abc"
+        );
+        assert_eq!(
+            variable_value("int:abc", &r, &c, "/old", b"", &maps, &[]).unwrap(),
+            "ABC"
+        );
+        assert_eq!(
+            variable_value("THE_REQUEST", &r, &c, "/old", b"", &[], &[]).unwrap(),
+            "GET /old.html?x=1 HTTP/1.1"
+        );
+        assert!(variable_value("UNKNOWN", &r, &c, "/old", b"", &[], &[]).is_err());
+
+        assert_eq!(int_map("tolower", "ABC"), "abc");
+        assert_eq!(int_map("toupper", "abc"), "ABC");
+        assert_eq!(int_map("escape", "a b/%"), "a+b/%25");
+        assert_eq!(int_map("unescape", "a+b%2f%zz"), "a b/%zz");
+        assert_eq!(int_map("unknown", "x"), "");
+        assert_eq!(run_prg_map("", "x"), "");
+        assert_eq!(run_prg_map("no-such-program-xyz", "x"), "");
+        assert_eq!(run_prg_map("/bin/cat", "abc"), "abc");
+        assert_eq!(run_prg_map("/bin/false", "abc"), "");
+        assert_eq!(map_value(None, "key"), "");
+        let mut bad = ErrorWriter;
+        assert!(!write_prg_key(&mut bad, "x"));
+        let mut dead = Command::new("/bin/true")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let dead_stdin = dead.stdin.take();
+        assert_eq!(finish_prg_map(dead, dead_stdin, "x"), "");
+        let no_stdin = Command::new("/bin/true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert_eq!(finish_prg_map(no_stdin, None, "x"), "");
+        let sleeping = Command::new("/bin/sleep")
+            .arg("5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert_eq!(abort_prg_map(sleeping), "");
+        let mut killed = Command::new("/bin/sleep")
+            .arg("5")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let killed_stdin = killed.stdin.take();
+        let _ = killed.kill();
+        let _ = killed.wait();
+        assert_eq!(finish_prg_map(killed, killed_stdin, "x"), "");
+
+        let caps = vec!["zero".to_string(), "one".to_string()];
+        let cond = vec!["condzero".to_string(), "cond".to_string()];
+        assert_eq!(
+            expand_caps("$0/$1/%0/\\1/$9", &caps, &cond),
+            "zero/one/condzero/one/"
+        );
+        assert_eq!(
+            expand_backrefs(
+                "${REQUEST_URI}-%{REQUEST_URI}-$1-%1-\\1",
+                &caps,
+                &cond,
+                &r,
+                &c,
+                "/old",
+                b"q=1",
+                &[],
+                &[],
+                false,
+                None,
+            )
+            .unwrap(),
+            "/old%3fq=1-/old%3fq=1-one-cond-one"
+        );
+        let spec = EscapeSpec {
+            custom: None,
+            controls: false,
+            preserve: vec![],
+            no_plus: false,
+        };
+        assert_eq!(
+            expand_backrefs(
+                "$1 $9",
+                &caps,
+                &cond,
+                &r,
+                &c,
+                "/old",
+                b"",
+                &[],
+                &[],
+                true,
+                Some(&spec),
+            )
+            .unwrap(),
+            "one "
+        );
+        assert!(expand_backrefs(
+            "${REQUEST_URI}",
+            &caps,
+            &cond,
+            &r,
+            &c,
+            "/old",
+            b"q=1",
+            &[],
+            &[],
+            true,
+            Some(&spec),
+        )
+        .unwrap()
+        .contains("%2f"));
+        assert!(expand_backrefs(
+            "%{REQUEST_URI}",
+            &caps,
+            &cond,
+            &r,
+            &c,
+            "/old",
+            b"q=1",
+            &[],
+            &[],
+            true,
+            Some(&spec),
+        )
+        .unwrap()
+        .contains("%2f"));
+        assert_eq!(
+            expand_backrefs(
+                "${unterminated %{unterminated",
+                &caps,
+                &cond,
+                &r,
+                &c,
+                "/old",
+                b"",
+                &[],
+                &[],
+                true,
+                None,
+            )
+            .unwrap(),
+            "${unterminated %{unterminated"
+        );
+        assert_eq!(
+            escape_redirect_location("a b\"<>\\^`{|}"),
+            "a%20b%22%3c%3e%5c%5e%60%7b%7c%7d"
+        );
+
+        let mut host_req = req();
+        host_req.headers.push("Host", "localhost:80");
+        assert_eq!(
+            same_host_internal(&c, &host_req, "//localhost:80/path").as_deref(),
+            Some("/path")
+        );
+        assert_eq!(
+            same_host_internal(&c, &host_req, "http://localhost:80").as_deref(),
+            Some("/")
+        );
+        assert!(same_host_internal(&c, &host_req, "http://other.test/x").is_none());
+        let no_host = req();
+        assert!(same_host_internal(&c, &no_host, "http://localhost:80/x").is_some());
+    }
+
+    struct ErrorWriter;
+    impl Write for ErrorWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "closed"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn process_flag_and_error_branches() {
+        let r = req();
+        let root = Path::new("/tmp");
+        let x_path = root.join("x");
+        let c = ctx("/x", &x_path, root);
+
+        // Subject mismatch and condition failure both honor [C].
+        let chain_subject = scope_with(vec![
+            parsed_rule("^x$", "/y", "[C]", "/dir/", true),
+            parsed_rule("^/x$", "/hit", "[L]", "/", false),
+        ]);
+        assert_eq!(process(&chain_subject, &r, &c), Outcome::None);
+        let mut cond_rule = parsed_rule("^/x$", "/hit", "[C]", "/", false);
+        cond_rule
+            .conditions
+            .push(parse_rewrite_cond(&["%{REQUEST_METHOD}".into(), "^POST$".into()]).unwrap());
+        let chain_cond = scope_with(vec![
+            cond_rule,
+            parsed_rule("^/x$", "/hit", "[L]", "/", false),
+        ]);
+        assert_eq!(process(&chain_cond, &r, &c), Outcome::None);
+
+        // Negated pattern match with [C], and negated non-match applies.
+        let neg_skip = scope_with(vec![
+            parsed_rule("!^/x$", "/hit", "[C]", "/", false),
+            parsed_rule("^/x$", "/later", "[L]", "/", false),
+        ]);
+        assert_eq!(process(&neg_skip, &r, &c), Outcome::None);
+        let neg_apply = scope_with(vec![parsed_rule("!^/other$", "/hit", "[L]", "/", false)]);
+        assert!(matches!(
+            process(&neg_apply, &r, &c),
+            Outcome::Internal { path, .. } if path == "/hit"
+        ));
+
+        // [QSD], skip and [L] on a dash substitution.
+        let dash = scope_with(vec![
+            parsed_rule("^/x$", "-", "[QSD]", "/", false),
+            parsed_rule("^/x$", "/skipme", "[L]", "/", false),
+        ]);
+        match process(&dash, &r, &c) {
+            Outcome::Internal { query, .. } => assert!(query.is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
+        let dash_skip = scope_with(vec![
+            parsed_rule("^/x$", "-", "[S=2]", "/", false),
+            parsed_rule("^/x$", "/one", "[L]", "/", false),
+            parsed_rule("^/x$", "/two", "[L]", "/", false),
+        ]);
+        assert_eq!(process(&dash_skip, &r, &c), Outcome::None);
+        let dash_last = scope_with(vec![parsed_rule("^/x$", "-", "[L]", "/", false)]);
+        assert_eq!(process(&dash_last, &r, &c), Outcome::None);
+
+        // The [N] loop limit is enforced for both dash and substituted rules.
+        for sub in ["-", "/x"] {
+            let next = scope_with(vec![parsed_rule("^/x$", sub, "[N]", "/", false)]);
+            assert!(matches!(process(&next, &r, &c), Outcome::Error(_)));
+        }
+
+        let bad_expand = scope_with(vec![parsed_rule(
+            "^/x$",
+            "${UNKNOWN}",
+            "[L]",
+            "/",
+            false,
+        )]);
+        assert!(matches!(
+            process(&bad_expand, &r, &c),
+            Outcome::Error(_)
+        ));
+
+        let mut bad_effect = parsed_rule("^/x$", "/y", "[L]", "/", false);
+        bad_effect.flags.env.push((String::new(), Some("x".into())));
+        assert!(matches!(
+            process(&scope_with(vec![bad_effect]), &r, &c),
+            Outcome::Error(_)
+        ));
+
+        let qsl_no_query = scope_with(vec![parsed_rule("^/x$", "/new", "[QSL,L]", "/", false)]);
+        match process(&qsl_no_query, &r, &c) {
+            Outcome::Internal { path, query, .. } => {
+                assert_eq!(path, "/new");
+                assert_eq!(query, b"x=1");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let mut empty_rule = parsed_rule("^/x$", "/tmp", "[L]", "/", false);
+        empty_rule.substitution.clear();
+        assert!(matches!(
+            process(&scope_with(vec![empty_rule]), &r, &c),
+            Outcome::Error(_)
+        ));
+
+        let relative = scope_with(vec![parsed_rule("^/x$", "new", "[L]", "/", false)]);
+        assert!(matches!(
+            process(&relative, &r, &c),
+            Outcome::Internal { path, .. } if path == "/new"
+        ));
+
+        let control_path = root.join("x");
+        let mut control_ctx = ctx("/x", &control_path, root);
+        control_ctx.query = b"bad\x01";
+        let clean = scope_with(vec![parsed_rule("^/x$", "/new", "[L]", "/", false)]);
+        assert!(matches!(
+            process(&clean, &r, &control_ctx),
+            Outcome::Error(_)
+        ));
     }
 }

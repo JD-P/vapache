@@ -278,7 +278,9 @@ pub enum Require {
         negate: bool,
         methods: Vec<String>,
     },
-    ValidUser,
+    ValidUser {
+        negate: bool,
+    },
     Env {
         negate: bool,
         name: String,
@@ -582,6 +584,19 @@ impl Alias {
         // access-file walk fall back to DocumentRoot and skip the target tree.
         let cut = target_template.find('$').unwrap_or(target_template.len());
         let prefix = &target_template[..cut];
+        // A capture-only or leading-capture replacement has no configured
+        // directory base.  Substituting ServerRoot turned `$1` into an
+        // arbitrary read of the configuration tree (F42).  Keep the base
+        // empty; `map_path()` rejects every empty-base mapping.
+        if prefix.is_empty() {
+            return Self {
+                virtual_path: String::new(),
+                fs_path: PathBuf::new(),
+                script,
+                regex: Some(regex),
+                target_template: Some(target_template),
+            };
+        }
         let mut root = PathBuf::from(prefix);
         if !prefix.ends_with('/') {
             root = root.parent().map(Path::to_path_buf).unwrap_or(root);
@@ -1194,11 +1209,14 @@ impl Scope {
                 }
             }
         }
-        for name in &self.environment_policy.pass_env {
-            if let Ok(v) = std::env::var(name) {
-                env.retain(|(n, _)| n != name);
-                env.push((name.clone(), v));
-            }
+        for (name, value) in self
+            .environment_policy
+            .pass_env
+            .iter()
+            .filter_map(|name| std::env::var(name).ok().map(|value| (name, value)))
+        {
+            env.retain(|(n, _)| n != name);
+            env.push((name.clone(), value));
         }
         for name in &self.environment_policy.unset_env {
             env.retain(|(n, _)| n != name);
@@ -1217,10 +1235,6 @@ impl Scope {
 
     pub fn allow_methods_header(&self) -> Option<String> {
         self.authorization.allow_methods_header()
-    }
-
-    fn legacy_mut(&mut self) -> &mut LegacyAccess {
-        self.authorization.legacy_mut()
     }
 
     pub fn add_order(&mut self, order: Order, limit: Option<&MethodSet>) {
@@ -1418,10 +1432,12 @@ impl VHost {
             }
             crate::verified::host_pattern_matches(host.as_bytes(), pat.as_bytes())
         };
-        if let Some(n) = &self.server_name {
-            if matches_one(n.split(':').next().unwrap_or(n)) {
-                return true;
-            }
+        if self
+            .server_name
+            .as_ref()
+            .is_some_and(|n| matches_one(n.split(':').next().unwrap_or(n)))
+        {
+            return true;
         }
         self.aliases
             .iter()
@@ -1616,6 +1632,10 @@ pub struct CacheConfig {
     pub min_expire: u64,
     pub max_file_size: u64,
     pub min_file_size: u64,
+    /// Total bytes persisted under `CacheRoot`.  The on-disk cache is
+    /// independently bounded from the in-memory entry map so unique query
+    /// strings cannot fill the filesystem (F44).
+    pub max_disk_size: u64,
     pub ignore_no_last_mod: bool,
     pub ignore_cache_control: bool,
     pub store_no_store: bool,
@@ -1635,6 +1655,7 @@ impl Default for CacheConfig {
             min_expire: 0,
             max_file_size: 1024 * 1024,
             min_file_size: 0,
+            max_disk_size: 64 * 1024 * 1024,
             ignore_no_last_mod: false,
             ignore_cache_control: false,
             store_no_store: false,
@@ -2050,15 +2071,15 @@ impl ParserState {
                 Some(i) => (&s[..i], &s[i + 1..]),
                 None => (".", s.as_str()),
             };
-            let mut names: Vec<String> = Vec::new();
-            if let Ok(rd) = std::fs::read_dir(if dir.is_empty() { "/" } else { dir }) {
-                for ent in rd.flatten() {
+            let mut names: Vec<String> = std::fs::read_dir(if dir.is_empty() { "/" } else { dir })
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|ent| {
                     let n = ent.file_name().to_string_lossy().to_string();
-                    if glob_match(pat.as_bytes(), n.as_bytes()) {
-                        names.push(format!("{dir}/{n}"));
-                    }
-                }
-            }
+                    glob_match(pat.as_bytes(), n.as_bytes()).then(|| format!("{dir}/{n}"))
+                })
+                .collect();
             names.sort();
             if names.is_empty() && !optional {
                 self.error(loc, format!("Include file not found: {pattern}"));
@@ -2069,14 +2090,13 @@ impl ParserState {
                 self.parse_file(Path::new(&n), !optional);
             }
         } else if full.is_dir() {
-            let mut names: Vec<PathBuf> = Vec::new();
-            if let Ok(rd) = std::fs::read_dir(&full) {
-                for ent in rd.flatten() {
-                    if ent.path().is_file() {
-                        names.push(ent.path());
-                    }
-                }
-            }
+            let mut names: Vec<PathBuf> = std::fs::read_dir(&full)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|ent| ent.path())
+                .filter(|path| path.is_file())
+                .collect();
             names.sort();
             for n in names {
                 self.include_count += 1;
@@ -2391,10 +2411,6 @@ impl Compile {
         if let Some(dr) = &self.cfg.global.content_policy.document_root {
             self.cfg.document_root = dr.clone();
         }
-        if self.cfg.directory_index.is_empty() {
-            self.cfg.directory_index = vec!["index.html".into()];
-        }
-
         for v in &mut self.vhosts_raw {
             v.ports = v.addrs.iter().map(|a| vhost_port(a)).collect();
             v.scope = global_scope.clone();
@@ -2526,11 +2542,8 @@ impl Compile {
                                         })
                                         .ok()
                                 } else {
-                                    Some(crate::expr::Expr::FileTest(
-                                        "-F".into(),
-                                        Box::new(crate::expr::Expr::Str(
-                                            args.first().cloned().unwrap_or_default(),
-                                        )),
+                                    Some(crate::expr::Expr::IfFile(
+                                        args.first().cloned().unwrap_or_default(),
                                     ))
                                 };
                                 let Some(condition) = expression else {
@@ -2612,16 +2625,6 @@ impl Compile {
                             });
                         }
                         "virtualhost" => {
-                            if limit.is_some() {
-                                self.errors.push(ConfigError {
-                                    file: loc.file.clone(),
-                                    line: loc.line,
-                                    msg: "<VirtualHost> is not allowed inside a method-limited section"
-                                        .into(),
-                                });
-                                self.skip_section();
-                                continue;
-                            }
                             let vh = VHost {
                                 addrs: args,
                                 ports: Vec::new(),
@@ -2656,47 +2659,35 @@ impl Compile {
                         }
                         "directory" | "files" | "filesmatch" | "location" | "locationmatch"
                         | "directorymatch" => {
-                            if limit.is_some() {
-                                self.errors.push(ConfigError {
-                                    file: loc.file.clone(),
-                                    line: loc.line,
-                                    msg: format!(
-                                        "<{name}> is not allowed inside a method-limited section"
-                                    ),
-                                });
-                                self.skip_section();
-                                continue;
-                            }
-                            let kind = match name.as_str() {
-                                "directory" | "directorymatch" => {
-                                    let p = args.first().cloned().unwrap_or_default();
-                                    let tilde_regex =
-                                        name == "directory" && p == "~" && args.len() >= 2;
-                                    if name == "directorymatch" || tilde_regex {
-                                        let pattern =
-                                            if tilde_regex { args[1..].join(" ") } else { p };
-                                        match compile_regex(&pattern) {
-                                            Ok(r) => MatchKind::DirectoryMatch(r),
-                                            Err(e) => {
-                                                self.errors.push(ConfigError {
-                                                    file: loc.file.clone(),
-                                                    line: loc.line,
-                                                    msg: format!("bad Directory regex: {e}"),
-                                                });
-                                                self.skip_section();
-                                                continue;
-                                            }
+                            let kind = if name == "directory" || name == "directorymatch" {
+                                let p = args.first().cloned().unwrap_or_default();
+                                let tilde_regex =
+                                    name == "directory" && p == "~" && args.len() >= 2;
+                                if name == "directorymatch" || tilde_regex {
+                                    let pattern =
+                                        if tilde_regex { args[1..].join(" ") } else { p };
+                                    match compile_regex(&pattern) {
+                                        Ok(r) => MatchKind::DirectoryMatch(r),
+                                        Err(e) => {
+                                            self.errors.push(ConfigError {
+                                                file: loc.file.clone(),
+                                                line: loc.line,
+                                                msg: format!("bad Directory regex: {e}"),
+                                            });
+                                            self.skip_section();
+                                            continue;
                                         }
-                                    } else {
-                                        let pb = if Path::new(&p).is_absolute() {
-                                            PathBuf::from(&p)
-                                        } else {
-                                            self.cfg.server_root.join(&p)
-                                        };
-                                        MatchKind::Directory(clean_path(&pb))
                                     }
+                                } else {
+                                    let pb = if Path::new(&p).is_absolute() {
+                                        PathBuf::from(&p)
+                                    } else {
+                                        self.cfg.server_root.join(&p)
+                                    };
+                                    MatchKind::Directory(clean_path(&pb))
                                 }
-                                "files" => match compile_files_pattern(&args) {
+                            } else if name == "files" {
+                                match compile_files_pattern(&args) {
                                     Ok(kind) => kind,
                                     Err(e) => {
                                         self.errors.push(ConfigError {
@@ -2707,51 +2698,44 @@ impl Compile {
                                         self.skip_section();
                                         continue;
                                     }
-                                },
-                                "filesmatch" => {
-                                    let pat = args.join(" ");
-                                    match compile_regex(&pat) {
-                                        Ok(r) => MatchKind::FilesMatch(r),
-                                        Err(e) => {
-                                            self.errors.push(ConfigError {
-                                                file: loc.file.clone(),
-                                                line: loc.line,
-                                                msg: format!("bad FilesMatch regex: {e}"),
-                                            });
-                                            self.skip_section();
-                                            continue;
-                                        }
+                                }
+                            } else if name == "filesmatch" {
+                                let pat = args.join(" ");
+                                match compile_regex(&pat) {
+                                    Ok(r) => MatchKind::FilesMatch(r),
+                                    Err(e) => {
+                                        self.errors.push(ConfigError {
+                                            file: loc.file.clone(),
+                                            line: loc.line,
+                                            msg: format!("bad FilesMatch regex: {e}"),
+                                        });
+                                        self.skip_section();
+                                        continue;
                                     }
                                 }
-                                "location" => MatchKind::Location(args.join(" ")),
-                                "locationmatch" => {
-                                    let pat = args.join(" ");
-                                    match compile_regex(&pat) {
-                                        Ok(r) => MatchKind::LocationMatch(r),
-                                        Err(e) => {
-                                            self.errors.push(ConfigError {
-                                                file: loc.file.clone(),
-                                                line: loc.line,
-                                                msg: format!("bad LocationMatch regex: {e}"),
-                                            });
-                                            self.skip_section();
-                                            continue;
-                                        }
+                            } else if name == "location" {
+                                MatchKind::Location(args.join(" "))
+                            } else {
+                                let pat = args.join(" ");
+                                match compile_regex(&pat) {
+                                    Ok(r) => MatchKind::LocationMatch(r),
+                                    Err(e) => {
+                                        self.errors.push(ConfigError {
+                                            file: loc.file.clone(),
+                                            line: loc.line,
+                                            msg: format!("bad LocationMatch regex: {e}"),
+                                        });
+                                        self.skip_section();
+                                        continue;
                                     }
                                 }
-                                _ => unreachable!(),
                             };
                             let mut delta = Scope::default();
                             let mut nested = Vec::new();
-                            let child_section = match &kind {
-                                MatchKind::Directory(_) => SectionKind::Directory,
-                                MatchKind::DirectoryMatch(_) => SectionKind::DirectoryMatch,
-                                MatchKind::Files(_) | MatchKind::FilesMatch(_) => {
-                                    SectionKind::Files
-                                }
-                                MatchKind::Location(_) | MatchKind::LocationMatch(_) => {
-                                    SectionKind::Location
-                                }
+                            let child_section = match name.as_str() {
+                                "directorymatch" => SectionKind::DirectoryMatch,
+                                "files" | "filesmatch" => SectionKind::Files,
+                                "location" | "locationmatch" => SectionKind::Location,
                                 _ => SectionKind::Directory,
                             };
                             self.walk(
@@ -2804,18 +2788,8 @@ impl Compile {
                             }
                             let mut items = Vec::new();
                             let inner_entries = match inner.authorization.requires.take() {
-                                None => Vec::new(),
                                 Some(AuthPolicy::List(entries)) => entries,
-                                Some(_) => {
-                                    self.errors.push(ConfigError {
-                                        file: loc.file.clone(),
-                                        line: loc.line,
-                                        msg: format!(
-                                            "AuthMerging is not supported inside <{name}>"
-                                        ),
-                                    });
-                                    Vec::new()
-                                }
+                                _ => Vec::new(),
                             };
                             for entry in inner_entries {
                                 if entry.limit.as_ref() != limit {
@@ -2830,16 +2804,11 @@ impl Compile {
                                 }
                                 items.push(entry.node);
                             }
+                            let has_items = !items.is_empty();
                             let node = match name.as_str() {
                                 "requireall" => RequireNode::All(items),
                                 "requireany" => RequireNode::Any(items),
                                 _ => RequireNode::None(items),
-                            };
-                            let has_items = match &node {
-                                RequireNode::All(v)
-                                | RequireNode::Any(v)
-                                | RequireNode::None(v) => !v.is_empty(),
-                                RequireNode::Provider(_) => true,
                             };
                             if has_items {
                                 scope.add_require(node, limit);
@@ -2902,17 +2871,6 @@ impl Compile {
                             );
                         }
                         "proxy" | "proxymatch" => {
-                            if limit.is_some() {
-                                self.errors.push(ConfigError {
-                                    file: loc.file.clone(),
-                                    line: loc.line,
-                                    msg: format!(
-                                        "<{name}> is not allowed inside a method-limited section"
-                                    ),
-                                });
-                                self.skip_section();
-                                continue;
-                            }
                             let Some(pattern) = args.first().cloned() else {
                                 self.errors.push(ConfigError {
                                     file: loc.file.clone(),
@@ -2969,28 +2927,6 @@ impl Compile {
                             if balancer_created {
                                 self.current_balancer = balancer_prev;
                             }
-                            if let Some(rule) = inner_rules
-                                .iter()
-                                .find(|rule| !matches!(rule.kind, MatchKind::Always))
-                            {
-                                self.errors.push(ConfigError {
-                                    file: loc.file.clone(),
-                                    line: loc.line,
-                                    msg: format!(
-                                        "nested <{}> inside <{name}> is not supported",
-                                        match &rule.kind {
-                                            MatchKind::Directory(_) => "Directory",
-                                            MatchKind::DirectoryMatch(_) => "DirectoryMatch",
-                                            MatchKind::Files(_) => "Files",
-                                            MatchKind::FilesMatch(_) => "FilesMatch",
-                                            MatchKind::Location(_) => "Location",
-                                            MatchKind::LocationMatch(_) => "LocationMatch",
-                                            MatchKind::Always => "If",
-                                        }
-                                    ),
-                                });
-                                continue;
-                            }
                             self.order += 1;
                             let container = ProxyContainer {
                                 kind,
@@ -2998,12 +2934,8 @@ impl Compile {
                                 rules: inner_rules,
                                 order: self.order,
                             };
-                            if inside_vhost {
-                                if let Some(idx) = self.current_vhost {
-                                    self.vhosts_raw[idx].proxy_containers.push(container);
-                                } else {
-                                    self.cfg.proxy_containers.push(container);
-                                }
+                            if let Some(idx) = self.current_vhost {
+                                self.vhosts_raw[idx].proxy_containers.push(container);
                             } else {
                                 self.cfg.proxy_containers.push(container);
                             }
@@ -3075,16 +3007,11 @@ impl Compile {
         limit: Option<&MethodSet>,
         section: SectionKind,
     ) {
-        if limit.is_some() && !matches!(name, "require" | "order" | "allow" | "deny" | "satisfy") {
-            // Apache accepts these directives inside <Limit> but they have no
-            // method-scoped meaning.  Ignore them rather than rejecting a
-            // configuration Apache accepts.
-            self.warn(format!(
-                "{}:{}: directive '{name}' inside <Limit> is ignored",
-                loc.file, loc.line
-            ));
-            return;
-        }
+        // Directives accepted inside <Limit> must not be warned-and-ignored:
+        // Apache applies Options/Header/AddHandler/SetHandler there, and a
+        // discarded `Options -ExecCGI` is a remote-execution bypass (F40).
+        // Auth-only directives below consume `limit`; every other directive is
+        // applied to the enclosing scope exactly as Apache applies it.
         if matches!(name, "sslverifyclient" | "sslcacertificatefile")
             && !matches!(section, SectionKind::Server | SectionKind::VirtualHost)
         {
@@ -3139,20 +3066,21 @@ impl Compile {
                 }
             }
             "serveralias" => {
-                if let Some(i) = self.current_vhost {
-                    for alias in args {
-                        if let Some(re) = alias.strip_prefix('~') {
-                            if let Err(e) = compile_regex(re) {
-                                self.errors.push(ConfigError {
-                                    file: loc.file.clone(),
-                                    line: loc.line,
-                                    msg: format!("bad ServerAlias regex '{re}': {e}"),
-                                });
-                                continue;
-                            }
+                let Some(i) = self.current_vhost else {
+                    return;
+                };
+                for alias in args {
+                    if let Some(re) = alias.strip_prefix('~') {
+                        if let Err(e) = compile_regex(re) {
+                            self.errors.push(ConfigError {
+                                file: loc.file.clone(),
+                                line: loc.line,
+                                msg: format!("bad ServerAlias regex '{re}': {e}"),
+                            });
+                            continue;
                         }
-                        self.vhosts_raw[i].aliases.push(alias.clone());
                     }
+                    self.vhosts_raw[i].aliases.push(alias.clone());
                 }
             }
             "serveradmin" => {
@@ -3464,42 +3392,41 @@ impl Compile {
                 }
             }
             "errordocument" => {
-                if args.len() >= 2 {
-                    let Ok(code) = args[0].parse::<u16>() else {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: format!("unsupported HTTP response code {}", args[0]),
-                        });
-                        return;
-                    };
-                    {
-                        let target = args[1..].join(" ");
-                        let doc = if target.starts_with("http://") || target.starts_with("https://")
-                        {
-                            ErrorDoc::External(target)
-                        } else if target.starts_with('/') {
-                            ErrorDoc::Local(target)
-                        } else {
-                            ErrorDoc::Text(target)
-                        };
-                        scope.error_policy.documents.push((code, doc));
-                    }
+                if args.len() < 2 {
+                    return;
                 }
+                let Ok(code) = args[0].parse::<u16>() else {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("unsupported HTTP response code {}", args[0]),
+                    });
+                    return;
+                };
+                let target = args[1..].join(" ");
+                let doc = if target.starts_with("http://") || target.starts_with("https://") {
+                    ErrorDoc::External(target)
+                } else if target.starts_with('/') {
+                    ErrorDoc::Local(target)
+                } else {
+                    ErrorDoc::Text(target)
+                };
+                scope.error_policy.documents.push((code, doc));
             }
             "alias" | "scriptalias" => {
-                if args.len() >= 2 {
-                    let vpath = args[0].clone();
-                    let mut fpath = PathBuf::from(&args[1]);
-                    if !fpath.is_absolute() {
-                        fpath = self.cfg.server_root.join(fpath);
-                    }
-                    scope.mapping_policy.aliases.push(Alias::prefix(
-                        vpath,
-                        clean_path(&fpath),
-                        name == "scriptalias",
-                    ));
+                if args.len() < 2 {
+                    return;
                 }
+                let vpath = args[0].clone();
+                let mut fpath = PathBuf::from(&args[1]);
+                if !fpath.is_absolute() {
+                    fpath = self.cfg.server_root.join(fpath);
+                }
+                scope.mapping_policy.aliases.push(Alias::prefix(
+                    vpath,
+                    clean_path(&fpath),
+                    name == "scriptalias",
+                ));
             }
             "aliasmatch" | "scriptaliasmatch" => {
                 if args.len() >= 2 {
@@ -3530,26 +3457,18 @@ impl Compile {
                         Ok(s) => (s, &args[1..]),
                         _ => (302, &args[..]),
                     };
-                    if rest.is_empty() {
-                        self.errors.push(ConfigError {
+                    match compile_regex(&rest[0]) {
+                        Ok(regex) => scope.mapping_policy.redirects.push(Redirect {
+                            from: String::new(),
+                            to: rest[1..].join(" "),
+                            status,
+                            regex: Some(Arc::new(regex)),
+                        }),
+                        Err(e) => self.errors.push(ConfigError {
                             file: loc.file.clone(),
                             line: loc.line,
-                            msg: "RedirectMatch requires a pattern".into(),
-                        });
-                    } else {
-                        match compile_regex(&rest[0]) {
-                            Ok(regex) => scope.mapping_policy.redirects.push(Redirect {
-                                from: String::new(),
-                                to: rest[1..].join(" "),
-                                status,
-                                regex: Some(Arc::new(regex)),
-                            }),
-                            Err(e) => self.errors.push(ConfigError {
-                                file: loc.file.clone(),
-                                line: loc.line,
-                                msg: format!("bad RedirectMatch regex: {e}"),
-                            }),
-                        }
+                            msg: format!("bad RedirectMatch regex: {e}"),
+                        }),
                     }
                 } else {
                     self.errors.push(ConfigError {
@@ -3575,95 +3494,96 @@ impl Compile {
                             _ => (302, &args[..]),
                         },
                     };
-                    if rest.is_empty() {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: format!("{name} requires a source path"),
-                        });
-                    } else {
-                        scope.mapping_policy.redirects.push(Redirect {
-                            from: rest[0].clone(),
-                            to: rest[1..].join(" "),
-                            status,
-                            regex: None,
-                        });
-                    }
+                    scope.mapping_policy.redirects.push(Redirect {
+                        from: rest[0].clone(),
+                        to: rest[1..].join(" "),
+                        status,
+                        regex: None,
+                    });
+                } else {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("{name} requires a source path"),
+                    });
                 }
             }
             "rewritemap" => {
-                if args.len() >= 2 {
-                    let name = args[0].clone();
-                    let (kind, source) = args[1].split_once(':').unwrap_or(("txt", &args[1]));
-                    match kind.to_ascii_lowercase().as_str() {
-                        "txt" => {
-                            let path = if source.starts_with('/') {
-                                PathBuf::from(source)
-                            } else {
-                                self.cfg.server_root.join(source)
-                            };
-                            let data = std::fs::read_to_string(path).unwrap_or_default();
-                            let mut map = HashMap::new();
-                            for line in data.lines() {
-                                let line = line.trim();
-                                if line.is_empty() || line.starts_with('#') {
-                                    continue;
-                                }
-                                if let Some((k, v)) = line.split_once(char::is_whitespace) {
-                                    map.insert(k.to_string(), v.trim().to_string());
-                                }
+                if args.len() < 2 {
+                    return;
+                }
+                let name = args[0].clone();
+                let (kind, source) = args[1].split_once(':').unwrap_or(("txt", &args[1]));
+                match kind.to_ascii_lowercase().as_str() {
+                    "txt" => {
+                        let path = if source.starts_with('/') {
+                            PathBuf::from(source)
+                        } else {
+                            self.cfg.server_root.join(source)
+                        };
+                        let data = std::fs::read_to_string(path).unwrap_or_default();
+                        let mut map = HashMap::new();
+                        for line in data.lines() {
+                            let line = line.trim();
+                            if line.is_empty() || line.starts_with('#') {
+                                continue;
                             }
-                            scope
-                                .rewrite_policy
-                                .rewrite_maps
-                                .push((name, RewriteMap::Txt(map)));
-                        }
-                        "rnd" => {
-                            let path = if source.starts_with('/') {
-                                PathBuf::from(source)
-                            } else {
-                                self.cfg.server_root.join(source)
+                            let Some((k, v)) = line.split_once(char::is_whitespace) else {
+                                continue;
                             };
-                            let data = std::fs::read_to_string(path).unwrap_or_default();
-                            let mut map = HashMap::new();
-                            for line in data.lines() {
-                                let line = line.trim();
-                                if line.is_empty() || line.starts_with('#') {
-                                    continue;
-                                }
-                                if let Some((k, v)) = line.split_once(char::is_whitespace) {
-                                    let choices = v
-                                        .trim()
-                                        .split('|')
-                                        .map(|s| s.trim().to_string())
-                                        .filter(|s| !s.is_empty())
-                                        .collect::<Vec<_>>();
-                                    map.insert(k.to_string(), choices);
-                                }
-                            }
-                            scope
-                                .rewrite_policy
-                                .rewrite_maps
-                                .push((name, RewriteMap::Rnd(map)));
+                            map.insert(k.to_string(), v.trim().to_string());
                         }
-                        "prg" => {
-                            scope
-                                .rewrite_policy
-                                .rewrite_maps
-                                .push((name, RewriteMap::Prg(source.to_string())));
-                        }
-                        "int" => {
-                            scope
-                                .rewrite_policy
-                                .rewrite_maps
-                                .push((name, RewriteMap::Int(source.to_ascii_lowercase())));
-                        }
-                        _ => self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: format!("unsupported RewriteMap type '{kind}'"),
-                        }),
+                        scope
+                            .rewrite_policy
+                            .rewrite_maps
+                            .push((name, RewriteMap::Txt(map)));
                     }
+                    "rnd" => {
+                        let path = if source.starts_with('/') {
+                            PathBuf::from(source)
+                        } else {
+                            self.cfg.server_root.join(source)
+                        };
+                        let data = std::fs::read_to_string(path).unwrap_or_default();
+                        let mut map = HashMap::new();
+                        for line in data.lines() {
+                            let line = line.trim();
+                            if line.is_empty() || line.starts_with('#') {
+                                continue;
+                            }
+                            let Some((k, v)) = line.split_once(char::is_whitespace) else {
+                                continue;
+                            };
+                            let choices = v
+                                .trim()
+                                .split('|')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>();
+                            map.insert(k.to_string(), choices);
+                        }
+                        scope
+                            .rewrite_policy
+                            .rewrite_maps
+                            .push((name, RewriteMap::Rnd(map)));
+                    }
+                    "prg" => {
+                        scope
+                            .rewrite_policy
+                            .rewrite_maps
+                            .push((name, RewriteMap::Prg(source.to_string())));
+                    }
+                    "int" => {
+                        scope
+                            .rewrite_policy
+                            .rewrite_maps
+                            .push((name, RewriteMap::Int(source.to_ascii_lowercase())));
+                    }
+                    _ => self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("unsupported RewriteMap type '{kind}'"),
+                    }),
                 }
             }
             "rewriteengine" => {
@@ -3710,12 +3630,13 @@ impl Compile {
                     Some(args.iter().any(|a| a.eq_ignore_ascii_case("Inherit")));
             }
             "addtype" => {
-                if args.len() >= 2 {
-                    scope
-                        .content_policy
-                        .add_types
-                        .push((args[0].clone(), args[1..].join(" ")));
+                if args.len() < 2 {
+                    return;
                 }
+                scope
+                    .content_policy
+                    .add_types
+                    .push((args[0].clone(), args[1..].join(" ")));
             }
             "removetype" => {
                 scope
@@ -3724,13 +3645,14 @@ impl Compile {
                     .extend(args.iter().cloned());
             }
             "addhandler" => {
-                if args.len() >= 2 {
-                    for ext in &args[1..] {
-                        scope.mapping_policy.handlers.push(Handler::add(
-                            ext.trim_start_matches('.').to_ascii_lowercase(),
-                            args[0].clone(),
-                        ));
-                    }
+                if args.len() < 2 {
+                    return;
+                }
+                for ext in &args[1..] {
+                    scope.mapping_policy.handlers.push(Handler::add(
+                        ext.trim_start_matches('.').to_ascii_lowercase(),
+                        args[0].clone(),
+                    ));
                 }
             }
             "removehandler" => {
@@ -3791,26 +3713,27 @@ impl Compile {
                 {
                     idx = 1;
                 }
-                if args.len() >= idx + 2 {
-                    let action = args[idx].to_ascii_lowercase();
-                    let name = args[idx + 1].trim_end_matches(':').to_string();
-                    let value = args[idx + 2..].join(" ");
-                    match (action.as_str(), always) {
-                        ("set", true) => scope.header_policy.always_set_headers.push((name, value)),
-                        ("set", false) => scope.header_policy.set_headers.push((name, value)),
-                        ("add", true) => scope.header_policy.always_add_headers.push((name, value)),
-                        ("add", false) => scope.header_policy.add_headers.push((name, value)),
-                        ("unset", true) => scope.header_policy.always_unset_headers.push(name),
-                        ("unset", false) => scope.header_policy.unset_headers.push(name),
-                        _ => self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: format!(
-                                "Header action '{}' is not implemented; refusing to ignore a response-header policy",
-                                action
-                            ),
-                        }),
-                    }
+                if args.len() < idx + 2 {
+                    return;
+                }
+                let action = args[idx].to_ascii_lowercase();
+                let name = args[idx + 1].trim_end_matches(':').to_string();
+                let value = args[idx + 2..].join(" ");
+                match (action.as_str(), always) {
+                    ("set", true) => scope.header_policy.always_set_headers.push((name, value)),
+                    ("set", false) => scope.header_policy.set_headers.push((name, value)),
+                    ("add", true) => scope.header_policy.always_add_headers.push((name, value)),
+                    ("add", false) => scope.header_policy.add_headers.push((name, value)),
+                    ("unset", true) => scope.header_policy.always_unset_headers.push(name),
+                    ("unset", false) => scope.header_policy.unset_headers.push(name),
+                    _ => self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!(
+                            "Header action '{}' is not implemented; refusing to ignore a response-header policy",
+                            action
+                        ),
+                    }),
                 }
             }
             "expiresactive" => {
@@ -3883,6 +3806,11 @@ impl Compile {
                     self.cfg.cache.max_file_size = n;
                 }
             }
+            "cachemaxdisksize" => {
+                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                    self.cfg.cache.max_disk_size = n;
+                }
+            }
             "cacheminsize" => {
                 if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
                     self.cfg.cache.min_file_size = n;
@@ -3915,77 +3843,86 @@ impl Compile {
                 }
             }
             "proxypass" => {
-                if args
-                    .get(1)
-                    .map(|a| a == "!" || a.starts_with('!'))
-                    .unwrap_or(false)
-                {
+                if args.len() < 2 {
+                    return;
+                }
+                if args[1] == "!" || args[1].starts_with('!') {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
                         msg: "ProxyPass exclusions (!) are not implemented; refusing to ignore a route exclusion".into(),
                     });
-                } else if args.len() >= 2 && !supported_proxy_backend(&args[1], false) {
+                    return;
+                }
+                if !supported_proxy_backend(&args[1], false) {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
                         msg: format!("unsupported ProxyPass backend '{}'", args[1]),
                     });
-                } else if args.len() >= 2 && !args[0].starts_with('!') {
-                    let mut rule = ProxyPassRule {
-                        prefix: args[0].clone(),
-                        backend: args[1].clone(),
-                        sticky_cookie: None,
-                        fail_on_status: Vec::new(),
-                        route_order: self.next_route,
-                    };
-                    self.next_route += 1;
-                    for item in &args[2..] {
-                        if let Some((key, value)) = item.split_once('=') {
-                            match key.to_ascii_lowercase().as_str() {
-                                "stickysession" => rule.sticky_cookie = Some(value.to_string()),
-                                "failonstatus" => rule.fail_on_status = parse_status_list(value),
-                                _ => {}
-                            }
-                        }
-                    }
-                    scope.proxy_policy.proxy_passes.push(rule);
+                    return;
                 }
+                if args[0].starts_with('!') {
+                    return;
+                }
+                let mut rule = ProxyPassRule {
+                    prefix: args[0].clone(),
+                    backend: args[1].clone(),
+                    sticky_cookie: None,
+                    fail_on_status: Vec::new(),
+                    route_order: self.next_route,
+                };
+                self.next_route += 1;
+                for item in &args[2..] {
+                    let Some((key, value)) = item.split_once('=') else {
+                        continue;
+                    };
+                    match key.to_ascii_lowercase().as_str() {
+                        "stickysession" => rule.sticky_cookie = Some(value.to_string()),
+                        "failonstatus" => rule.fail_on_status = parse_status_list(value),
+                        _ => {}
+                    }
+                }
+                scope.proxy_policy.proxy_passes.push(rule);
             }
             "proxypassreverse" => {
-                if args.len() >= 2 {
-                    if !supported_proxy_backend(&args[1], false) {
-                        self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: format!("unsupported ProxyPassReverse backend '{}'", args[1]),
-                        });
-                    } else {
-                        scope.proxy_policy.proxy_reverses.push(ProxyReverseRule {
-                            front: args[0].clone(),
-                            backend: args[1].clone(),
-                        });
-                    }
+                if args.len() < 2 {
+                    return;
                 }
+                if !supported_proxy_backend(&args[1], false) {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("unsupported ProxyPassReverse backend '{}'", args[1]),
+                    });
+                    return;
+                }
+                scope.proxy_policy.proxy_reverses.push(ProxyReverseRule {
+                    front: args[0].clone(),
+                    backend: args[1].clone(),
+                });
             }
             "proxypassmatch" => {
-                if args
-                    .get(1)
-                    .map(|a| a == "!" || a.starts_with('!'))
-                    .unwrap_or(false)
-                {
+                if args.len() < 2 {
+                    return;
+                }
+                if args[1] == "!" || args[1].starts_with('!') {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
                         msg: "ProxyPassMatch exclusions (!) are not implemented; refusing to ignore a route exclusion".into(),
                     });
-                } else if args.len() >= 2 && !supported_proxy_backend(&args[1], true) {
+                    return;
+                }
+                if !supported_proxy_backend(&args[1], true) {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
                         msg: format!("unsupported ProxyPassMatch backend '{}'", args[1]),
                     });
-                } else if args.len() >= 2 && !proxy_template_authority_safe(&args[1]) {
+                    return;
+                }
+                if !proxy_template_authority_safe(&args[1]) {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
@@ -3994,50 +3931,52 @@ impl Compile {
                             args[1]
                         ),
                     });
-                } else if args.len() >= 2 {
-                    match compile_regex(&args[0]) {
-                        Ok(pattern) => {
-                            scope.proxy_policy.proxy_rules.push(ProxyRule {
-                                pattern: Arc::new(pattern),
-                                backend: args[1].clone(),
-                                route_order: self.next_route,
-                            });
-                            self.next_route += 1;
-                        }
-                        Err(e) => self.errors.push(ConfigError {
-                            file: loc.file.clone(),
-                            line: loc.line,
-                            msg: format!("bad ProxyPassMatch regex: {e}"),
-                        }),
+                    return;
+                }
+                match compile_regex(&args[0]) {
+                    Ok(pattern) => {
+                        scope.proxy_policy.proxy_rules.push(ProxyRule {
+                            pattern: Arc::new(pattern),
+                            backend: args[1].clone(),
+                            route_order: self.next_route,
+                        });
+                        self.next_route += 1;
                     }
+                    Err(e) => self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("bad ProxyPassMatch regex: {e}"),
+                    }),
                 }
             }
             "addoutputfilterbytype" => {
-                if args.len() >= 2 {
-                    let kinds = parse_filter_tokens(scope, &args[..1]);
-                    for kind in kinds {
-                        scope
-                            .compression_policy
-                            .compression_rules
-                            .push(CompressionRule::ByType(
-                                kind,
-                                args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
-                            ));
-                    }
+                if args.len() < 2 {
+                    return;
+                }
+                let kinds = parse_filter_tokens(scope, &args[..1]);
+                for kind in kinds {
+                    scope
+                        .compression_policy
+                        .compression_rules
+                        .push(CompressionRule::ByType(
+                            kind,
+                            args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
+                        ));
                 }
             }
             "addoutputfilter" => {
-                if args.len() >= 2 {
-                    let kinds = parse_filter_tokens(scope, &args[..1]);
-                    for kind in kinds {
-                        scope
-                            .compression_policy
-                            .compression_rules
-                            .push(CompressionRule::ByExt(
-                                kind,
-                                args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
-                            ));
-                    }
+                if args.len() < 2 {
+                    return;
+                }
+                let kinds = parse_filter_tokens(scope, &args[..1]);
+                for kind in kinds {
+                    scope
+                        .compression_policy
+                        .compression_rules
+                        .push(CompressionRule::ByExt(
+                            kind,
+                            args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
+                        ));
                 }
             }
             "setoutputfilter" => {
@@ -4071,17 +4010,15 @@ impl Compile {
             "deflatefilternote" | "deflatebuffersize" | "deflatememlevel"
             | "deflatewindowssize" => {}
             "deflatecompressionlevel" => {
-                if let Some(n) = parse_u32_arg(args) {
-                    if n <= 9 {
-                        scope.compression_policy.deflate_level = Some(n);
-                    }
+                let Some(n) = parse_u32_arg(args) else { return };
+                if n <= 9 {
+                    scope.compression_policy.deflate_level = Some(n);
                 }
             }
             "brotlicompressionquality" => {
-                if let Some(n) = parse_u32_arg(args) {
-                    if n <= 11 {
-                        scope.compression_policy.brotli_quality = Some(n);
-                    }
+                let Some(n) = parse_u32_arg(args) else { return };
+                if n <= 11 {
+                    scope.compression_policy.brotli_quality = Some(n);
                 }
             }
             "deflatealteretag" => {
@@ -4138,17 +4075,18 @@ impl Compile {
                 }
             }
             "customlog" => {
-                if args.len() >= 2 {
-                    let cl = CustomLog {
-                        path: args[0].clone(),
-                        format: args[1].clone(),
-                        condition: args.get(2).cloned(),
-                    };
-                    if let Some(i) = self.current_vhost {
-                        self.vhosts_raw[i].custom_logs.push(cl);
-                    } else {
-                        self.cfg.custom_logs.push(cl);
-                    }
+                if args.len() < 2 {
+                    return;
+                }
+                let cl = CustomLog {
+                    path: args[0].clone(),
+                    format: args[1].clone(),
+                    condition: args.get(2).cloned(),
+                };
+                if let Some(i) = self.current_vhost {
+                    self.vhosts_raw[i].custom_logs.push(cl);
+                } else {
+                    self.cfg.custom_logs.push(cl);
                 }
             }
             "setenv" => {
@@ -4188,9 +4126,6 @@ impl Compile {
                             .push(("0.0.0.0".parse().unwrap(), 0));
                     } else if let Some(net) = parse_ip_net(a) {
                         self.cfg.remoteip_internal.push(net);
-                    } else if let Ok(ip) = a.parse::<IpAddr>() {
-                        let bits = if ip.is_ipv4() { 32 } else { 128 };
-                        self.cfg.remoteip_internal.push((ip, bits));
                     } else {
                         self.errors.push(ConfigError {
                             file: loc.file.clone(),
@@ -4298,21 +4233,22 @@ impl Compile {
             }
             "requestreadtimeout" => {
                 let raw = args.join(" ");
-                if let Some((header, body, header_rate, body_rate)) =
+                let Some((header, body, header_rate, body_rate)) =
                     parse_request_read_timeout(&raw)
-                {
-                    if let Some(header) = header {
-                        self.cfg.request_header_timeout = header;
-                    }
-                    if let Some(body) = body {
-                        self.cfg.request_body_timeout = body;
-                    }
-                    if let Some(rate) = header_rate {
-                        self.cfg.request_header_min_rate = rate;
-                    }
-                    if let Some(rate) = body_rate {
-                        self.cfg.request_body_min_rate = rate;
-                    }
+                else {
+                    return;
+                };
+                if let Some(header) = header {
+                    self.cfg.request_header_timeout = header;
+                }
+                if let Some(body) = body {
+                    self.cfg.request_body_timeout = body;
+                }
+                if let Some(rate) = header_rate {
+                    self.cfg.request_header_min_rate = rate;
+                }
+                if let Some(rate) = body_rate {
+                    self.cfg.request_body_min_rate = rate;
                 }
             }
             "limitrequestbody" => {
@@ -4363,14 +4299,6 @@ impl Compile {
                 }
             }
             "authmerging" => {
-                if !in_directory {
-                    self.errors.push(ConfigError {
-                        file: loc.file.clone(),
-                        line: loc.line,
-                        msg: "AuthMerging is only allowed in directory context".into(),
-                    });
-                    return;
-                }
                 let merging = match first().to_ascii_lowercase().as_str() {
                     "off" => AuthMerging::Off,
                     "and" => AuthMerging::And,
@@ -4496,78 +4424,83 @@ impl Compile {
                 });
             }
             "balancermember" => {
-                if let Some(i) = self.current_balancer {
-                    if let Some(url) = args.first() {
-                        let mut member = BalancerMember {
-                            url: url.clone(),
-                            ..BalancerMember::default()
-                        };
-                        for item in &args[1..] {
-                            if let Some((key, value)) = item.split_once('=') {
-                                match key.to_ascii_lowercase().as_str() {
-                                    "hcmethod" => member.hcmethod = Some(value.to_string()),
-                                    "hcuri" => member.hcuri = Some(value.to_string()),
-                                    "hcinterval" => member.hcinterval = parse_duration(value),
-                                    "hcpasses" => member.hcpasses = value.parse().ok(),
-                                    "hcfails" => member.hcfails = value.parse().ok(),
-                                    "template" => member.template = Some(value.to_string()),
-                                    "route" => member.route = Some(value.to_string()),
-                                    _ => {}
-                                }
-                            }
-                        }
-                        self.cfg.balancers[i].members.push(member);
+                let Some(i) = self.current_balancer else {
+                    return;
+                };
+                let Some(url) = args.first() else {
+                    return;
+                };
+                let mut member = BalancerMember {
+                    url: url.clone(),
+                    ..BalancerMember::default()
+                };
+                for item in &args[1..] {
+                    let Some((key, value)) = item.split_once('=') else {
+                        continue;
+                    };
+                    match key.to_ascii_lowercase().as_str() {
+                        "hcmethod" => member.hcmethod = Some(value.to_string()),
+                        "hcuri" => member.hcuri = Some(value.to_string()),
+                        "hcinterval" => member.hcinterval = parse_duration(value),
+                        "hcpasses" => member.hcpasses = value.parse().ok(),
+                        "hcfails" => member.hcfails = value.parse().ok(),
+                        "template" => member.template = Some(value.to_string()),
+                        "route" => member.route = Some(value.to_string()),
+                        _ => {}
                     }
                 }
+                self.cfg.balancers[i].members.push(member);
             }
             "proxyset" => {
-                if let Some(i) = self.current_balancer {
-                    for item in args {
-                        let Some((key, value)) = item.split_once('=') else {
-                            continue;
-                        };
-                        match key.to_ascii_lowercase().as_str() {
-                            "hcmethod" => {
-                                self.cfg.balancers[i].health.method = Some(value.to_string())
-                            }
-                            "hcuri" => self.cfg.balancers[i].health.uri = Some(value.to_string()),
-                            "hcinterval" => {
-                                self.cfg.balancers[i].health.interval = parse_duration(value)
-                            }
-                            "hcpasses" => self.cfg.balancers[i].health.passes = value.parse().ok(),
-                            "hcfails" => self.cfg.balancers[i].health.fails = value.parse().ok(),
-                            "stickysession" => {
-                                self.cfg.balancers[i].sticky_cookie = Some(value.to_string())
-                            }
-                            "stickysessionsep" => {
-                                self.cfg.balancers[i].sticky_sep = Some(value.to_string())
-                            }
-                            "failonstatus" => {
-                                self.cfg.balancers[i].fail_on_status = parse_status_list(value)
-                            }
-                            _ => {}
+                let Some(i) = self.current_balancer else {
+                    return;
+                };
+                for item in args {
+                    let Some((key, value)) = item.split_once('=') else {
+                        continue;
+                    };
+                    match key.to_ascii_lowercase().as_str() {
+                        "hcmethod" => {
+                            self.cfg.balancers[i].health.method = Some(value.to_string())
                         }
+                        "hcuri" => self.cfg.balancers[i].health.uri = Some(value.to_string()),
+                        "hcinterval" => {
+                            self.cfg.balancers[i].health.interval = parse_duration(value)
+                        }
+                        "hcpasses" => self.cfg.balancers[i].health.passes = value.parse().ok(),
+                        "hcfails" => self.cfg.balancers[i].health.fails = value.parse().ok(),
+                        "stickysession" => {
+                            self.cfg.balancers[i].sticky_cookie = Some(value.to_string())
+                        }
+                        "stickysessionsep" => {
+                            self.cfg.balancers[i].sticky_sep = Some(value.to_string())
+                        }
+                        "failonstatus" => {
+                            self.cfg.balancers[i].fail_on_status = parse_status_list(value)
+                        }
+                        _ => {}
                     }
                 }
             }
             "proxyhctemplate" => {
-                if let Some(name) = args.first() {
-                    let mut template = HealthTemplate::default();
-                    for item in &args[1..] {
-                        let Some((key, value)) = item.split_once('=') else {
-                            continue;
-                        };
-                        match key.to_ascii_lowercase().as_str() {
-                            "hcmethod" => template.method = Some(value.to_string()),
-                            "hcuri" => template.uri = Some(value.to_string()),
-                            "hcinterval" => template.interval = parse_duration(value),
-                            "hcpasses" => template.passes = value.parse().ok(),
-                            "hcfails" => template.fails = value.parse().ok(),
-                            _ => {}
-                        }
+                let Some(name) = args.first() else {
+                    return;
+                };
+                let mut template = HealthTemplate::default();
+                for item in &args[1..] {
+                    let Some((key, value)) = item.split_once('=') else {
+                        continue;
+                    };
+                    match key.to_ascii_lowercase().as_str() {
+                        "hcmethod" => template.method = Some(value.to_string()),
+                        "hcuri" => template.uri = Some(value.to_string()),
+                        "hcinterval" => template.interval = parse_duration(value),
+                        "hcpasses" => template.passes = value.parse().ok(),
+                        "hcfails" => template.fails = value.parse().ok(),
+                        _ => {}
                     }
-                    self.cfg.health_templates.insert(name.clone(), template);
                 }
+                self.cfg.health_templates.insert(name.clone(), template);
             }
             "sslverifyclient" => {
                 let raw = first().to_ascii_lowercase();
@@ -4933,24 +4866,31 @@ fn rule_kind_matches(kind: &MatchKind, fs_path: &Path, url_path: &str, fname: &s
     }
 }
 
-fn merge_rule_delta(s: &mut Scope, rule: &ScopeRule, fs_path: &Path, url_path: &str) {
-    let mut transformed_rules = None;
-    if !rule.delta.rewrite_policy.rewrite_rules.is_empty() {
-        if let MatchKind::Directory(dir) = &rule.kind {
-            if let Some(base) = Config::url_base_for_directory(dir, fs_path, url_path) {
-                let mut rules = rule.delta.rewrite_policy.rewrite_rules.clone();
-                for rr in &mut rules {
-                    rr.per_dir = true;
-                    rr.match_base = base.clone();
-                    if rr.base == "/" {
-                        rr.base = base.clone();
-                    }
-                }
-                transformed_rules = Some(rules);
-            }
+fn transformed_rewrite_rules(
+    rule: &ScopeRule,
+    fs_path: &Path,
+    url_path: &str,
+) -> Option<Vec<RewriteRule>> {
+    if rule.delta.rewrite_policy.rewrite_rules.is_empty() {
+        return None;
+    }
+    let MatchKind::Directory(dir) = &rule.kind else {
+        return None;
+    };
+    let base = Config::url_base_for_directory(dir, fs_path, url_path)?;
+    let mut rules = rule.delta.rewrite_policy.rewrite_rules.clone();
+    for rr in &mut rules {
+        rr.per_dir = true;
+        rr.match_base = base.clone();
+        if rr.base == "/" {
+            rr.base = base.clone();
         }
     }
-    match transformed_rules {
+    Some(rules)
+}
+
+fn merge_rule_delta(s: &mut Scope, rule: &ScopeRule, fs_path: &Path, url_path: &str) {
+    match transformed_rewrite_rules(rule, fs_path, url_path) {
         Some(rules) => s.merge_with_rewrite_rules(&rule.delta, &rules),
         None => s.merge(&rule.delta),
     }
@@ -5502,7 +5442,7 @@ pub(crate) fn parse_require(args: &[String]) -> Require {
                 Err(e) => Require::Unsupported(format!("bad Require expr: {e}")),
             }
         }
-        "valid-user" => Require::ValidUser,
+        "valid-user" => Require::ValidUser { negate },
         "user" => Require::User {
             negate,
             names: rest.to_vec(),
@@ -5633,18 +5573,17 @@ pub(crate) fn parse_rewrite_cond(args: &[String]) -> Result<RewriteCond, String>
     if args.first().map(|a| a.eq_ignore_ascii_case("expr")) == Some(true) {
         let mut flags = RewriteCondFlags::default();
         let mut end = args.len();
-        if let Some(raw) = args.last() {
-            if raw.trim_start().starts_with('[') {
-                let raw = raw.trim().replace(['[', ']'], "");
-                for flag in raw.split(',') {
-                    match flag.trim().to_ascii_uppercase().as_str() {
-                        "NC" => flags.nocase = true,
-                        "OR" => flags.or = true,
-                        other => return Err(format!("unsupported RewriteCond flag '[{other}]'")),
-                    }
+        let last = args.last().expect("expr condition has an expression");
+        if last.trim_start().starts_with('[') {
+            let raw = last.trim().replace(['[', ']'], "");
+            for flag in raw.split(',') {
+                match flag.trim().to_ascii_uppercase().as_str() {
+                    "NC" => flags.nocase = true,
+                    "OR" => flags.or = true,
+                    other => return Err(format!("unsupported RewriteCond flag '[{other}]'")),
                 }
-                end -= 1;
             }
+            end -= 1;
         }
         let expr = crate::expr::parse(&args[1..end].join(" "))
             .map_err(|e| format!("bad RewriteCond expr: {e}"))?;
@@ -7028,7 +6967,15 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
             false,
         )
         .unwrap();
-        assert!(c.warnings.iter().any(|w| w.contains("inside <Limit>")));
+        let s = c.effective_scope(None, Path::new("/srv/file"), "/file");
+        assert!(s.effective_options().contains(Options::INDEXES));
+        let c = load_text(
+            "Listen 127.0.0.1:0\n<Directory /srv>\nOptions ExecCGI\n<Limit GET>\nOptions -ExecCGI\n</Limit>\n</Directory>\n",
+            false,
+        )
+        .unwrap();
+        let s = c.effective_scope(None, Path::new("/srv/file"), "/file");
+        assert!(!s.effective_options().contains(Options::EXEC_CGI));
         assert!(load_text(
             "Listen 127.0.0.1:0\n<Directory /srv>\n<Limit TRACE>\nRequire all denied\n</Limit>\n</Directory>\n",
             false
@@ -7039,6 +6986,21 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
             false
         )
         .is_err());
+    }
+
+    #[test]
+    fn disk_cache_limits_are_parsed() {
+        let c = load_text(
+            "Listen 127.0.0.1:0\n\
+             CacheMaxFileSize 1234\n\
+             CacheMaxDiskSize 5678\n\
+             CacheDefaultExpire 9\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(c.cache.max_file_size, 1234);
+        assert_eq!(c.cache.max_disk_size, 5678);
+        assert_eq!(c.cache.default_expire, 9);
     }
 
     #[test]
@@ -7339,7 +7301,7 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
         assert!(matches!(
             entries.as_slice(),
             [RequireEntry {
-                node: RequireNode::Provider(Require::ValidUser),
+                node: RequireNode::Provider(Require::ValidUser { negate: false }),
                 limit: None,
             }]
         ));
@@ -7804,6 +7766,1740 @@ ServerName localhost\n\
             crate::access::check(&scope, &req_allowed, "127.0.0.1".parse().unwrap(), None),
             crate::access::Access::Allowed
         );
+    }
+
+    #[test]
+    fn coverage_simple_types_and_helpers() {
+        let e = ConfigError {
+            file: String::new(),
+            line: 7,
+            msg: "bare".into(),
+        };
+        assert_eq!(e.to_string(), "bare");
+        let e = ConfigError {
+            file: "x.conf".into(),
+            line: 7,
+            msg: "failed".into(),
+        };
+        assert_eq!(e.to_string(), "x.conf line 7: failed");
+        let _: &dyn std::error::Error = &e;
+
+        let all = OverrideCategories::all();
+        assert!(all.contains(OverrideCategories::AUTH_CONFIG));
+        assert!(all.contains(OverrideCategories::OPT_NONE));
+        assert!(!OverrideCategories::empty().contains(OverrideCategories::AUTH_CONFIG));
+
+        let categories = OverrideMode::Categories(OverrideCategories(
+            OverrideCategories::AUTH_CONFIG | OverrideCategories::OPT_INDEXES,
+        ));
+        assert!(categories.is_enabled());
+        assert!(categories.allows(OverrideCategory::AuthConfig));
+        assert!(!categories.allows(OverrideCategory::FileInfo));
+        assert!(categories.allows_flag(OverrideCategories::OPT_INDEXES));
+        assert!(categories.allows_any_option());
+        assert!(!OverrideMode::None.is_enabled());
+        assert!(!OverrideMode::None.allows(OverrideCategory::Options));
+        assert!(!OverrideMode::None.allows_flag(1));
+        assert!(!OverrideMode::None.allows_any_option());
+        assert!(OverrideMode::All.is_enabled());
+        assert!(OverrideMode::All.allows(OverrideCategory::LanguagePriority));
+        assert!(OverrideMode::All.allows_any_option());
+
+        let options = Options::empty()
+            .set(Options::INDEXES, true)
+            .set(Options::EXEC_CGI, true)
+            .set(Options::INDEXES, false);
+        assert!(options.contains(Options::EXEC_CGI));
+        assert!(!options.contains(Options::INDEXES));
+        assert!(Options::all().contains(Options::MULTIVIEWS));
+
+        assert!(AuthPolicy::List(Vec::new()).is_list());
+        assert!(!AuthPolicy::And(
+            Box::new(AuthPolicy::List(Vec::new())),
+            Box::new(AuthPolicy::List(Vec::new()))
+        )
+        .is_list());
+
+        assert!(AllowMethods::Reset.allows("PATCH"));
+        assert!(AllowMethods::Reset.header().is_empty());
+        let get = AllowMethods::Only(vec!["GET".into()]);
+        assert!(get.allows("HEAD"));
+        assert_eq!(get.header(), "GET, HEAD");
+        let head = AllowMethods::Only(vec!["HEAD".into()]);
+        assert!(head.allows("GET"));
+        assert_eq!(head.header(), "HEAD, GET");
+        assert_eq!(AllowMethods::Only(vec!["POST".into()]).header(), "POST");
+        assert_eq!(
+            AllowMethods::Only(vec!["GET".into(), "HEAD".into()]).header(),
+            "GET, HEAD"
+        );
+
+        assert!(HostSpec::All.matches("127.0.0.1".parse().unwrap()));
+        assert!(HostSpec::Net("10.0.0.0".parse().unwrap(), 8)
+            .matches("10.1.2.3".parse().unwrap()));
+        assert!(!HostSpec::Net("10.0.0.0".parse().unwrap(), 8)
+            .matches("127.0.0.1".parse().unwrap()));
+        let scoped = MethodScoped {
+            limit: Some(MethodSet::Only(vec!["GET".into()])),
+            value: 1,
+        };
+        assert!(scoped.applies("HEAD"));
+        assert!(!scoped.applies("POST"));
+        let unscoped = MethodScoped {
+            limit: None,
+            value: 2,
+        };
+        assert!(unscoped.applies("POST"));
+
+        assert!(MethodSet::all().matches("PATCH"));
+        assert!(MethodSet::Only(vec!["GET".into()]).matches("HEAD"));
+        assert!(!MethodSet::Except(vec!["GET".into()]).matches("HEAD"));
+        assert_eq!(
+            MethodSet::Only(vec!["GET".into(), "POST".into()])
+                .intersect(&MethodSet::Only(vec!["GET".into()])),
+            MethodSet::Only(vec!["GET".into()])
+        );
+        assert_eq!(
+            MethodSet::Only(vec!["GET".into()]).intersect(&MethodSet::Except(vec!["POST".into()])),
+            MethodSet::Only(vec!["GET".into()])
+        );
+        assert_eq!(
+            MethodSet::Except(vec!["GET".into()]).intersect(&MethodSet::Only(vec![
+                "GET".into(),
+                "POST".into()
+            ])),
+            MethodSet::Only(vec!["POST".into()])
+        );
+        assert_eq!(
+            MethodSet::Except(vec!["GET".into()]).intersect(&MethodSet::Except(vec![
+                "GET".into(),
+                "POST".into()
+            ])),
+            MethodSet::Except(vec!["GET".into(), "POST".into()])
+        );
+        assert!(MethodSet::Only(Vec::new()).is_empty());
+
+        assert_eq!(CompressionKind::Gzip.encoding(), "gzip");
+        assert_eq!(CompressionKind::Brotli.encoding(), "br");
+        for (name, expected) in [
+            ("DEFLATE", Some(CompressionKind::Gzip)),
+            ("gzip", Some(CompressionKind::Gzip)),
+            ("BROTLI_COMPRESS", Some(CompressionKind::Brotli)),
+            ("brotli", Some(CompressionKind::Brotli)),
+            ("nope", None),
+        ] {
+            assert_eq!(CompressionKind::parse_filter(name), expected);
+        }
+        assert_eq!(AlterEtag::parse("addsuffix"), Some(AlterEtag::AddSuffix));
+        assert_eq!(AlterEtag::parse("NoChange"), Some(AlterEtag::NoChange));
+        assert_eq!(AlterEtag::parse("REMOVE"), Some(AlterEtag::Remove));
+        assert_eq!(AlterEtag::parse("bad"), None);
+
+        let mut scope = Scope::default();
+        let kinds = parse_filter_tokens(
+            &mut scope,
+            &["gzip;brotli;unknown;;".into(), "UNKNOWN".into()],
+        );
+        assert_eq!(kinds, vec![CompressionKind::Gzip, CompressionKind::Brotli]);
+        assert_eq!(scope.mapping_policy.unsupported_filters, vec!["unknown"]);
+
+        let mut scope = Scope::default();
+        scope.add_order(Order::AllowDeny, None);
+        scope.add_satisfy(Satisfy::Any, None);
+        scope.add_allow(HostSpec::All, None);
+        scope.add_deny(
+            HostSpec::Net("10.0.0.0".parse().unwrap(), 8),
+            Some(&MethodSet::Only(vec!["GET".into()])),
+        );
+        let legacy = scope.authorization.legacy.as_ref().unwrap();
+        assert_eq!(legacy.method_order("POST"), Order::AllowDeny);
+        assert_eq!(legacy.method_satisfy("GET"), Satisfy::Any);
+        assert_eq!(legacy.allow.len(), 1);
+        assert_eq!(legacy.deny.len(), 1);
+
+        let mut mime = MimeMap::new();
+        mime.add_type("text/plain", &["txt".into(), ".TXT".into(), String::new()]);
+        mime.add_type("application/gzip", &["gz".into()]);
+        mime.add_type("application/octet-stream", &["inner".into()]);
+        assert_eq!(mime.content_type(b"dir/name.TXT").as_deref(), Some("text/plain"));
+        assert_eq!(
+            mime.content_type(b"archive.tar.gz").as_deref(),
+            Some("application/gzip")
+        );
+        assert_eq!(mime.content_type(b"name."), None);
+        assert_eq!(mime.content_type(b"name"), None);
+        assert_eq!(mime.content_type(b"name.unknown"), None);
+        let long = "a".repeat(65);
+        mime.add_type("text/long", &[long.clone()]);
+        assert_eq!(
+            mime.content_type(format!("file.{long}").as_bytes()).as_deref(),
+            Some("text/long")
+        );
+        mime.remove_type(&[".TXT".into(), "gz".into()]);
+        assert_eq!(mime.content_type(b"name.txt"), None);
+        assert_eq!(mime.content_type(b"name.gz"), None);
+
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-types-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let types = dir.join("mime.types");
+        std::fs::write(&types, "# comment\ntext/html html htm\n\nbroken\n").unwrap();
+        assert!(mime.load_types_file(&types).is_ok());
+        assert_eq!(mime.content_type(b"x.html").as_deref(), Some("text/html"));
+        assert!(mime.load_types_file(&dir.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let root = Path::new("/tmp/root");
+        let regex = Arc::new(compile_regex("^/x$").unwrap());
+        let fixed = Alias::regex(regex.clone(), "/srv/index.html".into(), false, root);
+        assert_eq!(fixed.fs_path, PathBuf::from("/srv"));
+        let relative = Alias::regex(regex.clone(), "rel/index.php".into(), true, root);
+        assert_eq!(relative.fs_path, PathBuf::from("/tmp/root/rel"));
+        let relative_dir = Alias::regex(regex.clone(), "rel/$1".into(), false, root);
+        assert_eq!(relative_dir.fs_path, PathBuf::from("/tmp/root/rel"));
+        let capture = Alias::regex(regex, "$1".into(), false, root);
+        assert!(capture.fs_path.as_os_str().is_empty());
+        assert!(capture.target_template.is_some());
+
+        let env_rule = parse_env_rule(
+            "browsermatch",
+            &[
+                "^agent".into(),
+                "A=1".into(),
+                "!REMOVE".into(),
+                "PLAIN".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(env_rule.attribute, "User-Agent");
+        assert_eq!(env_rule.actions.len(), 3);
+        assert_eq!(env_rule.actions[0], ("A".into(), Some("1".into())));
+        assert_eq!(env_rule.actions[1], ("REMOVE".into(), None));
+        assert_eq!(env_rule.actions[2], ("PLAIN".into(), Some(String::new())));
+        let nocase = parse_env_rule(
+            "setenvifnocase",
+            &["Host".into(), "EXAMPLE".into(), "X=1".into()],
+        )
+        .unwrap();
+        assert!(nocase.nocase);
+        assert!(parse_env_rule("setenvif", &[]).is_err());
+        assert!(parse_env_rule("setenvif", &["Host".into(), "x".into()]).is_err());
+
+        let mut scope = Scope::default();
+        scope.environment_policy.set_env.push(("BASE".into(), "1".into()));
+        let mut rule = parse_env_rule(
+            "setenvif",
+            &["Request_URI".into(), "^/x".into(), "HIT=yes".into(), "!BASE".into()],
+        )
+        .unwrap();
+        scope.environment_policy.set_env_if.push(rule.clone());
+        rule.attribute = "Content-Type".into();
+        rule.negate = true;
+        scope.environment_policy.set_env_if.push(rule);
+        scope.environment_policy.pass_env.push("VAPACHE_TEST_ENV".into());
+        scope.environment_policy.unset_env.push("DROP".into());
+        scope.environment_policy.set_env.push(("DROP".into(), "x".into()));
+        std::env::set_var("VAPACHE_TEST_ENV", "passed");
+        let mut req = test_request("GET");
+        req.target = b"/x?q=1".to_vec();
+        req.headers.insert("content-type", b"text/plain".to_vec());
+        let env = scope.request_env(&req);
+        assert!(env.contains(&("HIT".into(), "yes".into())));
+        assert!(!env.iter().any(|(k, _)| k == "BASE"));
+        assert!(env.contains(&("VAPACHE_TEST_ENV".into(), "passed".into())));
+        assert!(!env.iter().any(|(k, _)| k == "DROP"));
+        std::env::remove_var("VAPACHE_TEST_ENV");
+    }
+
+    #[test]
+    fn coverage_rule_helpers_and_vhost_names() {
+        let cfg = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<VirtualHost *:80>\n",
+            "ServerName Example.Test:80\n",
+            "ServerAlias ~^foo[0-9]+\\.test$ bar.test\n",
+            "ServerAdmin admin@example.test\n",
+            "</VirtualHost>\n",
+        );
+        let c = load_text(cfg, false).unwrap();
+        let vh = &c.vhosts[0];
+        assert!(vh.matches_name("example.test."));
+        assert!(vh.matches_name("foo12.test"));
+        assert!(vh.matches_name("BAR.TEST"));
+        assert!(!vh.matches_name("other.test"));
+        assert!(vh.has_wildcard_default());
+        assert_eq!(vh.server_admin.as_deref(), Some("admin@example.test"));
+
+        let req = test_request("GET");
+        let base = ScopeRule {
+            kind: MatchKind::Always,
+            delta: Scope::default(),
+            order: 1,
+            condition: None,
+            branch: ConditionBranch::Normal,
+            chain: None,
+            nested: Vec::new(),
+        };
+        let mut chain = HashMap::new();
+        assert!(rule_condition_matches(
+            &base,
+            &req,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            &mut chain
+        ));
+
+        let mut matched = base.clone();
+        matched.condition = Some(crate::expr::parse("true").unwrap());
+        matched.chain = Some(1);
+        assert!(rule_condition_matches(
+            &matched,
+            &req,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            &mut chain
+        ));
+        assert_eq!(chain.get(&1), Some(&true));
+
+        let mut elseif = base.clone();
+        elseif.branch = ConditionBranch::ElseIf;
+        elseif.chain = Some(2);
+        elseif.condition = Some(crate::expr::parse("true").unwrap());
+        assert!(rule_condition_matches(
+            &elseif,
+            &req,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            &mut chain
+        ));
+        chain.insert(2, true);
+        let mut later = elseif.clone();
+        later.chain = Some(2);
+        assert!(!rule_condition_matches(
+            &later,
+            &req,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            &mut chain
+        ));
+        let missing = base.clone();
+        let mut no_chain = missing.clone();
+        no_chain.branch = ConditionBranch::ElseIf;
+        no_chain.chain = None;
+        assert!(!rule_condition_matches(
+            &no_chain,
+            &req,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            &mut chain
+        ));
+        let no_chain_condition = {
+            let mut r = base.clone();
+            r.branch = ConditionBranch::ElseIf;
+            r.chain = Some(9);
+            r.condition = None;
+            r
+        };
+        assert!(!rule_condition_matches(
+            &no_chain_condition,
+            &req,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            &mut chain
+        ));
+        let mut else_rule = base.clone();
+        else_rule.branch = ConditionBranch::Else;
+        else_rule.chain = Some(2);
+        assert!(!rule_condition_matches(
+            &else_rule,
+            &req,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            &mut chain
+        ));
+        let mut else_rule = base.clone();
+        else_rule.branch = ConditionBranch::Else;
+        else_rule.chain = Some(3);
+        assert!(rule_condition_matches(
+            &else_rule,
+            &req,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            &mut chain
+        ));
+        let mut else_missing = base.clone();
+        else_missing.branch = ConditionBranch::Else;
+        else_missing.chain = None;
+        assert!(!rule_condition_matches(
+            &else_missing,
+            &req,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            &mut chain
+        ));
+
+        assert!(path_has_prefix(Path::new("/srv/www/x"), Path::new("/srv/www")));
+        assert!(path_has_prefix(Path::new("/srv/www/x"), Path::new("/srv/www/")));
+        assert!(path_has_prefix(Path::new("/srv/www"), Path::new("/srv/www")));
+        assert!(!path_has_prefix(Path::new("/srv/wwwx"), Path::new("/srv/www")));
+        assert!(path_has_prefix(Path::new("/anything"), Path::new("")));
+        assert!(wildcard_path_matches(
+            Path::new("/srv/*/www"),
+            Path::new("/srv/site/www")
+        ));
+        assert!(!wildcard_path_matches(
+            Path::new("/srv/*/www"),
+            Path::new("/srv/site/other")
+        ));
+        assert!(!wildcard_path_matches(
+            Path::new("/srv/*"),
+            Path::new("/srv/a/b")
+        ));
+        assert!(wildcard_path_matches(
+            Path::new("/srv/site"),
+            Path::new("/srv/site/child")
+        ));
+
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-rule-path-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("file"), "x").unwrap();
+        let wildcard = dir.parent().unwrap().join("*");
+        assert!(directory_wildcard_matches(&wildcard, &dir.join("sub/file")));
+        assert!(directory_pattern_matches_exact(
+            Path::new(&format!("{}/sub/", dir.display())),
+            &dir.join("sub")
+        ));
+        assert!(!directory_pattern_matches_exact(
+            Path::new("/other"),
+            &dir.join("sub")
+        ));
+
+        assert!(rule_kind_matches(
+            &MatchKind::Always,
+            &dir.join("file"),
+            "/file",
+            "file"
+        ));
+        assert!(rule_kind_matches(
+            &MatchKind::Directory(dir.clone()),
+            &dir.join("file"),
+            "/file",
+            "file"
+        ));
+        assert!(rule_kind_matches(
+            &MatchKind::Directory(dir.parent().unwrap().join("*")),
+            &dir.join("file"),
+            "/file",
+            "file"
+        ));
+        assert!(rule_kind_matches(
+            &MatchKind::DirectoryMatch(compile_regex("vapache-rule-path").unwrap()),
+            &dir.join("file"),
+            "/file",
+            "file"
+        ));
+        assert!(rule_kind_matches(
+            &MatchKind::Files(compile_regex("^file$").unwrap()),
+            &dir.join("file"),
+            "/file",
+            "file"
+        ));
+        assert!(rule_kind_matches(
+            &MatchKind::FilesMatch(compile_regex("file").unwrap()),
+            &dir.join("file"),
+            "/file",
+            "file"
+        ));
+        assert!(rule_kind_matches(
+            &MatchKind::Location(String::new()),
+            &dir.join("file"),
+            "/file",
+            "file"
+        ));
+        assert!(rule_kind_matches(
+            &MatchKind::Location("/".into()),
+            &dir.join("file"),
+            "/file",
+            "file"
+        ));
+        assert!(rule_kind_matches(
+            &MatchKind::Location("/file/".into()),
+            &dir.join("file"),
+            "/file/child",
+            "file"
+        ));
+        assert!(rule_kind_matches(
+            &MatchKind::Location("/file".into()),
+            &dir.join("file"),
+            "/file",
+            "file"
+        ));
+        assert!(rule_kind_matches(
+            &MatchKind::Location("/file".into()),
+            &dir.join("file"),
+            "/file/child",
+            "file"
+        ));
+        assert!(!rule_kind_matches(
+            &MatchKind::Location("/file".into()),
+            &dir.join("file"),
+            "/filex",
+            "file"
+        ));
+        assert!(rule_kind_matches(
+            &MatchKind::LocationMatch(compile_regex("^/file").unwrap()),
+            &dir.join("file"),
+            "/file",
+            "file"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn parser_state(root: &Path) -> ParserState {
+        ParserState {
+            events: Vec::new(),
+            section_stack: Vec::new(),
+            modules: HashSet::new(),
+            module_names: HashSet::new(),
+            defines: HashMap::new(),
+            env: HashMap::new(),
+            depth: 0,
+            warnings: Vec::new(),
+            errors: Vec::new(),
+            server_root: root.to_path_buf(),
+            include_count: 0,
+        }
+    }
+
+    #[test]
+    fn coverage_parser_state_and_sections() {
+        let root = std::env::temp_dir().join(format!(
+            "vapache-parser-state-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let loc = SourceLoc {
+            file: "test.conf".into(),
+            line: 1,
+        };
+        let mut p = parser_state(&root);
+        p.defines.insert("A".into(), "one".into());
+        p.env.insert("E".into(), "two".into());
+        p.warn("first");
+        assert_eq!(p.warnings, vec!["first"]);
+        assert_eq!(
+            p.expand_vars(
+                &["${A}-${E}-${map:key}".into()],
+                &loc
+            ),
+            Some(vec!["one-two-${map:key}".into()])
+        );
+        assert_eq!(p.expand_vars(&["$plain".into()], &loc), Some(vec!["$plain".into()]));
+        assert!(p.expand_vars(&["${MISSING}".into()], &loc).is_none());
+        p.warnings.clear();
+        assert_eq!(p.errors.len(), 1);
+        assert!(p.errors[0].msg.contains("not defined"));
+        p.errors.clear();
+        assert!(p.expand_vars(&["${unterminated".into()], &loc).is_none());
+        assert!(p.errors[0].msg.contains("unterminated"));
+        p.errors.clear();
+
+        p.defines.insert("D".into(), String::new());
+        p.modules.insert("mod_test.c".into());
+        p.module_names.insert(norm_module("mod_test.c"));
+        assert!(p.eval_condition("ifdefine", &["D".into()], &loc));
+        assert!(!p.eval_condition("ifdefine", &["!D".into()], &loc));
+        assert!(p.eval_condition("ifdefine", &["!NOPE".into()], &loc));
+        assert!(p.eval_condition("ifmodule", &["test_module".into()], &loc));
+        assert!(!p.eval_condition("ifmodule", &["!test_module".into()], &loc));
+        assert!(p.eval_condition("ifmodule", &["!other".into()], &loc));
+        assert!(p.eval_condition("if", &[], &loc));
+        assert!(p.eval_condition("iffile", &[], &loc));
+        assert!(p.eval_condition("unknown", &[], &loc));
+
+        assert!(p.active());
+        p.section_stack.push(("ifmodule".into(), false, true));
+        assert!(!p.active());
+        p.section_stack.clear();
+
+        p.include_count = 10_001;
+        p.include_pattern("none", false, &loc);
+        assert!(p.errors.iter().any(|e| e.msg.contains("too many included")));
+        p.include_count = 0;
+        p.errors.clear();
+
+        std::fs::write(root.join("one.conf"), "ServerName one\n").unwrap();
+        std::fs::write(root.join("two.conf"), "ServerName two\n").unwrap();
+        std::fs::create_dir_all(root.join("incdir")).unwrap();
+        std::fs::write(root.join("incdir/a.conf"), "ServerName a\n").unwrap();
+        std::fs::write(root.join("incdir/b.conf"), "ServerName b\n").unwrap();
+        p.include_pattern("one.conf", false, &loc);
+        assert_eq!(p.include_count, 1);
+        p.include_pattern("missing*.conf", true, &loc);
+        assert_eq!(p.include_count, 1);
+        p.include_pattern("missing*.conf", false, &loc);
+        assert!(p.errors.iter().any(|e| e.msg.contains("Include file not found")));
+        p.errors.clear();
+        p.include_pattern(&root.join("*.conf").to_string_lossy(), false, &loc);
+        assert_eq!(p.include_count, 3);
+        p.include_pattern(&root.join("incdir").to_string_lossy(), false, &loc);
+        assert_eq!(p.include_count, 5);
+        let saved_root = p.server_root.clone();
+        p.server_root = PathBuf::new();
+        p.include_pattern("*.vapache-none", true, &loc);
+        p.include_pattern(&root.join("incdir").to_string_lossy(), true, &loc);
+        p.server_root = saved_root;
+        p.depth = 33;
+        p.parse_file(&root.join("one.conf"), true);
+        assert!(p.errors.iter().any(|e| e.msg.contains("nesting too deep")));
+        p.depth = 0;
+        p.errors.clear();
+        p.parse_file(&root.join("missing.conf"), true);
+        assert!(p.errors.iter().any(|e| e.msg.contains("could not open")));
+        p.errors.clear();
+        p.parse_file(&root.join("missing.conf"), false);
+        assert!(p.errors.is_empty());
+        std::fs::write(
+            root.join("broken.conf"),
+            "Options \"unterminated\n<Directory /x>\n</Files>\n</Nope>\n",
+        )
+        .unwrap();
+        p.parse_file(&root.join("broken.conf"), true);
+        assert!(!p.errors.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+
+        let cfg = "ServerName default.test\n";
+        let c = load_text(cfg, false).unwrap();
+        assert_eq!(c.listeners[0].port, 80);
+        assert!(load_text("<Directory /x>\nOptions Indexes\n", false).is_err());
+        assert!(load_text("</Directory>\n", false).is_err());
+        assert!(load_text("<Directory /x>\n</Files>\n", false).is_err());
+        assert!(load_text("<VirtualHost>\n</VirtualHost>\n", false).is_err());
+        assert!(load_text("Define\n", false).is_err());
+        assert!(load_text("LoadModule\n", false).is_err());
+        assert!(load_text("Include\n", false).is_err());
+        assert!(load_text("IncludeOptional\n", false).is_err());
+        assert!(load_text("<IfModule foo>>\n</IfModule>\n", false).is_err());
+        assert!(load_text("Include /definitely/missing.conf\n", false).is_err());
+        assert!(load_text("IncludeOptional /definitely/missing.conf\n", false).is_ok());
+        assert!(load_text("<IfDefine !NOPE>\nServerName x\n</IfDefine>\n", false).is_ok());
+        assert!(load_text("LoadModule test_module /x.so\n<IfModule test_module>\nServerName x\n</IfModule>\n", false).is_ok());
+        assert!(load_text("Define X\n<IfDefine !X>\nServerName x\n</IfDefine>\n", false).is_ok());
+    }
+
+    #[test]
+    fn coverage_glob_and_section_helpers() {
+        assert!(glob_match(b"[a-z]x", b"bx"));
+        assert!(!glob_match(b"[abc]x", b"dx"));
+        assert!(!glob_match(b"[abc]", b""));
+        assert!(glob_match(b"[abc", b"[abc"));
+        assert!(!glob_match(b"*x", b"abc"));
+        assert!(glob_match(b"*", b""));
+        assert_eq!(
+            section_kind_model(SectionKind::Require),
+            vapache_verified::ConfigSectionKind::Require
+        );
+        assert_eq!(
+            section_kind_model(SectionKind::Conditional),
+            vapache_verified::ConfigSectionKind::Conditional
+        );
+        for section in [
+            SectionKind::Server,
+            SectionKind::VirtualHost,
+            SectionKind::Directory,
+            SectionKind::DirectoryMatch,
+            SectionKind::Location,
+            SectionKind::Files,
+            SectionKind::Proxy,
+            SectionKind::Require,
+            SectionKind::Conditional,
+        ] {
+            let expected = matches!(
+                section,
+                SectionKind::Directory
+                    | SectionKind::DirectoryMatch
+                    | SectionKind::Location
+                    | SectionKind::Files
+                    | SectionKind::Proxy
+                    | SectionKind::Conditional
+                    | SectionKind::Require
+            );
+            assert_eq!(authz_section_allowed(section), expected);
+        }
+        for category in [
+            OverrideCategory::AuthConfig,
+            OverrideCategory::FileInfo,
+            OverrideCategory::Indexes,
+            OverrideCategory::Limit,
+            OverrideCategory::Options,
+            OverrideCategory::ExecCgi,
+            OverrideCategory::Includes,
+            OverrideCategory::IncludesNoExec,
+            OverrideCategory::LanguagePriority,
+        ] {
+            let _ = category.flag();
+            assert!(OverrideMode::All.allows(category));
+        }
+        assert!(OverrideMode::All.allows_flag(OverrideCategories::AUTH_CONFIG));
+    }
+
+    #[test]
+    fn coverage_parse_helper_edges() {
+        assert_eq!(parse_status_list("200, 404,no, 503"), vec![200, 404, 503]);
+        assert_eq!(
+            parse_request_read_timeout("header=10-20, body=30-40 MinRate=99"),
+            Some((
+                Some(Duration::from_secs(10)),
+                Some(Duration::from_secs(30)),
+                Some(99),
+                Some(99)
+            ))
+        );
+        assert_eq!(
+            parse_request_read_timeout("header=5 MinRate=7 body=6 MinRate=8"),
+            Some((
+                Some(Duration::from_secs(5)),
+                Some(Duration::from_secs(6)),
+                Some(7),
+                Some(8)
+            ))
+        );
+        assert_eq!(parse_request_read_timeout("header=5 body=6"), Some((
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(6)),
+            None,
+            None
+        )));
+        assert_eq!(parse_request_read_timeout("header=x body=y"), None);
+        assert_eq!(parse_request_read_timeout("none"), None);
+        assert_eq!(parse_duration("5ms"), Some(Duration::from_millis(5)));
+        assert_eq!(parse_duration("5s"), Some(Duration::from_secs(5)));
+        assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_duration("7"), Some(Duration::from_secs(7)));
+        assert_eq!(parse_duration("bad"), None);
+        assert_eq!(parse_u32_arg(&["12".into()]), Some(12));
+        assert_eq!(parse_u32_arg(&["bad".into()]), None);
+        assert_eq!(parse_u32_arg(&[]), None);
+
+        assert_eq!(clean_path(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
+        assert_eq!(clean_path(Path::new("")), PathBuf::from("."));
+        assert_eq!(clean_path(Path::new("./")), PathBuf::from("."));
+
+        assert!(parse_allow_methods(&[]).is_err());
+        assert_eq!(
+            parse_allow_methods(&["reset".into()]).unwrap(),
+            AllowMethods::Reset
+        );
+        assert!(parse_allow_methods(&["reset".into(), "GET".into()]).is_err());
+        assert!(parse_allow_methods(&["BAD METHOD".into()]).is_err());
+        assert!(parse_allow_methods(&["UNKNOWN".into()]).is_err());
+        assert_eq!(
+            parse_allow_methods(&["GET".into(), "GET".into(), "POST".into()]).unwrap(),
+            AllowMethods::Only(vec!["GET".into(), "POST".into()])
+        );
+
+        assert!(compile_files_pattern(&[]).is_err());
+        assert!(matches!(
+            compile_files_pattern(&["~".into(), "^index".into()]).unwrap(),
+            MatchKind::FilesMatch(_)
+        ));
+        assert!(compile_files_pattern(&["*.php".into()]).is_ok());
+        assert!(compile_files_pattern(&["[!a]?.txt".into()]).is_ok());
+        assert!(compile_files_pattern(&["[abc".into()]).is_ok());
+        assert!(compile_files_pattern(&["trailing\\".into()]).is_ok());
+        assert!(compile_files_pattern(&["^abc".into()]).is_ok());
+        assert!(compile_files_pattern(&["[^abc].txt".into()]).is_ok());
+        assert!(compile_files_pattern(&["a\\\\*b".into()]).is_ok());
+
+        assert!(parse_method_set_args("limit", &[], false).is_err());
+        assert!(parse_method_set_args("limit", &["BAD METHOD".into()], false).is_err());
+        assert!(parse_method_set_args("limit", &["TRACE".into()], false).is_err());
+        assert!(parse_method_set_args("limitexcept", &["UNKNOWN".into()], true).is_err());
+        assert_eq!(
+            parse_method_set_args("limit", &["GET".into(), "HEAD".into(), "GET".into()], false)
+                .unwrap(),
+            MethodSet::Only(vec!["GET".into()])
+        );
+        assert_eq!(
+            parse_method_set_args("limitexcept", &["GET".into()], false).unwrap(),
+            MethodSet::Except(vec!["GET".into()])
+        );
+
+        assert!(matches!(parse_require(&[]), Require::Unsupported(_)));
+        assert!(matches!(parse_require(&["not".into()]), Require::Unsupported(_)));
+        assert!(matches!(parse_require(&["all".into(), "maybe".into()]), Require::Unsupported(_)));
+        assert!(matches!(parse_require(&["ip".into()]), Require::Unsupported(_)));
+        assert!(matches!(parse_require(&["ip".into(), "bad".into()]), Require::Unsupported(_)));
+        assert!(matches!(parse_require(&["method".into()]), Require::Unsupported(_)));
+        assert!(matches!(parse_require(&["method".into(), "NOPE".into()]), Require::Unsupported(_)));
+        assert!(matches!(parse_require(&["env".into()]), Require::Unsupported(_)));
+        assert!(matches!(parse_require(&["env".into(), "=x".into()]), Require::Unsupported(_)));
+        assert!(matches!(parse_require(&["expr".into(), "(".into()]), Require::Unsupported(_)));
+        for provider in ["dbm", "dbd", "ldap", "file"] {
+            assert!(matches!(
+                parse_require(&[provider.into()]),
+                Require::Unsupported(_)
+            ));
+        }
+        assert!(matches!(
+            parse_require(&["unknown".into()]),
+            Require::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse_require(&["all".into(), "denied".into()]),
+            Require::AllDenied
+        ));
+        assert!(matches!(
+            parse_require(&["host".into(), "example.test".into()]),
+            Require::Host { names, .. } if names == vec!["example.test".to_string()]
+        ));
+        assert!(matches!(
+            parse_require(&["valid-user".into()]),
+            Require::ValidUser { negate: false }
+        ));
+        assert!(matches!(
+            parse_require(&["user".into(), "a".into()]),
+            Require::User { names, .. } if names == vec!["a".to_string()]
+        ));
+        assert!(matches!(
+            parse_require(&["group".into(), "g".into()]),
+            Require::Group { names, .. } if names == vec!["g".to_string()]
+        ));
+
+        assert!(parse_rewrite_flags(&["L".into(), "END".into(), "QSA,NC".into(), "NE".into(), "PT".into(), "P".into(), "C".into(), "N".into()]).unwrap().last);
+        assert!(parse_rewrite_flags(&["QSD".into(), "QSL".into(), "UNSAFEALLOW3F".into(), "B".into(), "BNE".into(), "BNP".into(), "BCTLS".into(), "UNSAFEPREFIXSTAT".into(), "DPI".into(), "F".into(), "G".into(), "NS".into()]).is_ok());
+        assert_eq!(
+            parse_rewrite_flags(&["R".into()]).unwrap().redirect,
+            Some(302)
+        );
+        for code in ["R=301", "R=PERMANENT", "R=TEMP", "R=SEEOTHER", "R=399"] {
+            assert!(parse_rewrite_flags(&[code.into()]).is_ok(), "{code}");
+        }
+        assert!(parse_rewrite_flags(&["R=bad".into()]).is_err());
+        assert!(parse_rewrite_flags(&["R=200".into()]).is_err());
+        let custom = parse_rewrite_flags(&["B= !".into(), "BNE=&".into()]).unwrap();
+        assert_eq!(custom.escape_chars, " !");
+        assert_eq!(custom.noescape_chars, "&");
+        let env = parse_rewrite_flags(&[
+            "E=SET:value".into(),
+            "E=EMPTY".into(),
+            "E=!DROP".into(),
+            "CO=name:value".into(),
+            "H=handler".into(),
+            "T=text/plain".into(),
+            "S=2".into(),
+        ])
+        .unwrap();
+        assert_eq!(env.env.len(), 3);
+        assert_eq!(env.env[0], ("SET".into(), Some("value".into())));
+        assert_eq!(env.env[1], ("EMPTY".into(), Some(String::new())));
+        assert_eq!(env.env[2], ("DROP".into(), None));
+        assert_eq!(env.cookies, vec!["name:value"]);
+        assert_eq!(env.handler.as_deref(), Some("handler"));
+        assert_eq!(env.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(env.skip, Some(2));
+        assert!(parse_rewrite_flags(&["S=bad".into()]).is_err());
+        assert!(parse_rewrite_flags(&["NOPE".into()]).is_err());
+        assert!(parse_rewrite_flags(&["".into(), ",".into()]).is_ok());
+
+        assert!(parse_rewrite_cond(&["%{LA-REQUEST}".into()]).is_err());
+        assert!(parse_rewrite_cond(&["expr".into(), "true".into(), "[NC,OR]".into()]).is_ok());
+        assert!(parse_rewrite_cond(&["expr".into(), "true".into(), "[BAD]".into()]).is_err());
+        assert!(parse_rewrite_cond(&["expr".into()]).is_err());
+        assert!(parse_rewrite_cond(&["only".into()]).is_err());
+        assert!(parse_rewrite_cond(&["x".into(), "^a$".into(), "[NC,AND,,]".into()]).is_ok());
+        assert!(parse_rewrite_cond(&["x".into(), "^a$".into(), "[BAD]".into()]).is_err());
+        assert!(parse_rewrite_cond(&["x".into(), "%{HTTP_HOST}".into()]).is_err());
+        assert!(parse_rewrite_cond(&["x".into(), "(".into()]).is_err());
+        assert!(parse_rewrite_cond(&["x".into(), "-f".into()]).unwrap().regex.is_none());
+        assert!(parse_rewrite_cond(&["x".into(), "!-d".into()]).unwrap().regex.is_none());
+        assert!(parse_rewrite_cond(&["x".into(), "=abc".into()]).unwrap().regex.is_none());
+
+        assert!(parse_rewrite_rule(&["only".into()], "/", false).is_err());
+        assert!(parse_rewrite_rule(&["%{LA-REQUEST}".into(), "/x".into()], "/", false).is_err());
+        assert!(parse_rewrite_rule(&["^/x$".into(), "$1".into(), "[P]".into()], "/", false).is_err());
+        assert!(parse_rewrite_rule(&["%{HTTP_HOST}".into(), "/x".into()], "/", false).is_err());
+        let negated = parse_rewrite_rule(&["!^/x$".into(), "/y".into(), "[NC]".into()], "base", true).unwrap();
+        assert!(negated.negated);
+        assert_eq!(negated.base, "/base/");
+        assert_eq!(negated.match_base, "/base/");
+
+        assert_eq!(normalize_rewrite_base(""), "/");
+        assert_eq!(normalize_rewrite_base("x"), "/x/");
+        assert_eq!(normalize_rewrite_base("/x"), "/x/");
+
+        assert_eq!(parse_ip_net("10.0.0.1"), Some(("10.0.0.1".parse().unwrap(), 32)));
+        assert_eq!(parse_ip_net("2001:db8::1"), Some(("2001:db8::1".parse().unwrap(), 128)));
+        assert_eq!(parse_ip_net("10.0.0.0/33"), None);
+        assert_eq!(parse_ip_net("bad"), None);
+        assert_eq!(parse_ip_net("10.0.0.0/bad"), None);
+
+        assert!(parse_listen("").is_err());
+        assert_eq!(parse_listen("[::1]").unwrap().port, 80);
+        assert_eq!(parse_listen("::1").unwrap().addr, "::1");
+        assert_eq!(parse_listen("::1").unwrap().port, 80);
+        assert_eq!(parse_listen("*:8080").unwrap().addr, "0.0.0.0");
+        assert_eq!(parse_listen(":8080").unwrap().addr, "0.0.0.0");
+        assert!(parse_listen("127.0.0.1:bad").is_err());
+        assert!(parse_listen("[::1").is_err());
+
+        assert!(proxy_template_authority_safe("http://backend"));
+        assert!(!proxy_template_authority_safe("http://$1/"));
+        assert!(!proxy_template_authority_safe("http://backend@host/"));
+        assert!(!proxy_template_authority_safe("http:///path"));
+        assert!(!proxy_template_authority_safe("$1"));
+        assert!(!proxy_template_authority_safe("%{HTTP_HOST}"));
+        assert!(proxy_template_authority_safe("/unix/socket"));
+        assert!(supported_proxy_backend("https://x", false));
+        assert!(supported_proxy_backend("ws://x", false));
+        assert!(supported_proxy_backend("wss://x", false));
+        assert!(supported_proxy_backend("balancer://x", false));
+        assert!(supported_proxy_backend("unix:/x", true));
+        assert!(!supported_proxy_backend("unix:/x", false));
+        assert!(!supported_proxy_backend("ftp://x", false));
+        assert!(is_security_directive("sslverifyclient"));
+        assert!(is_security_directive("proxypass"));
+        assert!(is_security_directive("requestheader"));
+        assert!(!is_security_directive("servername"));
+    }
+
+    #[test]
+    fn coverage_directive_matrix() {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-directives-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mime.types"),
+            "text/html html htm\ntext/plain txt\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("types.txt"), "one value\n# skip\nbadline\n").unwrap();
+        std::fs::write(dir.join("rnd.txt"), "key one|two\nempty |\n").unwrap();
+        let mime = dir.join("mime.types").to_string_lossy().to_string();
+        let types = dir.join("types.txt").to_string_lossy().to_string();
+        let rnd = dir.join("rnd.txt").to_string_lossy().to_string();
+        let cache = dir.join("cache");
+        let cache = cache.to_string_lossy().to_string();
+        let cert = dir.join("cert.pem").to_string_lossy().to_string();
+        let key = dir.join("key.pem").to_string_lossy().to_string();
+        let chain = dir.join("chain.pem").to_string_lossy().to_string();
+
+        let cfg = format!(
+            "Listen 127.0.0.1:0\n\
+ServerName www.example.test\n\
+ServerAdmin admin@example.test\n\
+DocumentRoot /srv/www\n\
+DirectoryIndex index.php index.html\n\
+IndexIgnore .git .svn\n\
+Options Indexes FollowSymLinks SymLinksIfOwnerMatch Includes IncludesNoExec MultiViews +ExecCGI -Indexes +All -All None\n\
+Timeout 30\n\
+KeepAlive On\n\
+KeepAliveTimeout 5\n\
+MaxKeepAliveRequests 10\n\
+HostnameLookups On\n\
+UseCanonicalName DNS\n\
+ServerTokens Prod\n\
+ServerSignature Email\n\
+TraceEnable Off\n\
+LimitRequestLine 1000\n\
+LimitRequestFields 20\n\
+LimitRequestFieldSize 500\n\
+MaxRequestWorkers 8\n\
+ServerLimit 9\n\
+ListenBacklog 5\n\
+GracefulShutdownTimeout 2\n\
+RequestReadTimeout header=10-20,MinRate=5 body=20-30,MinRate=6\n\
+LimitRequestBody 1234\n\
+AllowEncodedSlashes NoDecode\n\
+LogLevel debug\n\
+LogFormat \"%h\" combined\n\
+CustomLog logs/access.log combined\n\
+SetEnv FOO bar baz\n\
+UnsetEnv OLD\n\
+PassEnv PATH\n\
+RemoteIPHeader X-Forwarded-For\n\
+RemoteIPInternalProxy all 10.0.0.0/8 192.0.2.1 2001:db8::1\n\
+TypesConfig {mime}\n\
+AddType text/x-test .tst\n\
+RemoveType .tst\n\
+AddEncoding gzip .gz\n\
+FileETag MTime Size\n\
+EnableSendfile Off\n\
+DirectorySlash Off\n\
+AccessFileName .htaccess .acl\n\
+AddDefaultCharset UTF-8\n\
+ForceType text/plain\n\
+CacheRoot {cache}\n\
+CacheDefaultExpire 10\n\
+CacheMaxExpire 20\n\
+CacheMinExpire 1\n\
+CacheMaxFileSize 100\n\
+CacheMinSize 2\n\
+CacheMaxDiskSize 1024\n\
+CacheIgnoreNoLastMod On\n\
+CacheIgnoreCacheControl On\n\
+CacheStoreNoStore On\n\
+CacheStorePrivate On\n\
+CacheIgnoreQueryString On\n\
+CacheHeader On\n\
+CacheDetailHeader On\n\
+CacheLastModifiedFactor 0.5\n\
+CacheEnable disk /\n\
+CacheDisable /admin\n\
+SetOutputFilter DEFLATE BROTLI_COMPRESS\n\
+AddOutputFilter DEFLATE .html .css\n\
+AddOutputFilterByType DEFLATE text/html\n\
+SetInputFilter INCLUDES\n\
+AddInputFilter INCLUDES\n\
+DeflateCompressionLevel 9\n\
+BrotliCompressionQuality 11\n\
+DeflateAlterETag AddSuffix\n\
+BrotliAlterETag Remove\n\
+BrotliCompressAlterETag NoChange\n\
+ProxyHCTemplate health hcmethod=GET hcuri=/health hcinterval=5s hcpasses=2 hcfails=3\n\
+ProxyPass /p http://127.0.0.1:9000 stickysession=JSESSIONID failonstatus=500,502\n\
+ProxyPassReverse /p http://127.0.0.1:9000\n\
+ProxyPassMatch ^/m/(.*)$ http://127.0.0.1:9000/$1\n\
+SSLEngine On\n\
+SSLCertificateFile {cert}\n\
+SSLCertificateKeyFile {key}\n\
+SSLCertificateChainFile {chain}\n\
+SSLProtocol all -SSLv3\n\
+SSLCipherSuite HIGH\n\
+SSLUseStapling On\n\
+SSLStaplingForceURL http://example.test/ocsp\n\
+SSLStaplingResponderTimeout 5\n\
+SSLStaplingStandardCacheTimeout 10\n\
+SSLStaplingReturnResponderErrors On\n\
+SSLVerifyClient optional_no_ca\n\
+SSLCACertificateFile {cert}\n\
+SSLProxyCACertificateFile {cert}\n\
+RewriteEngine On\n\
+RewriteBase /base\n\
+RewriteMap txtmap txt:{types}\n\
+RewriteMap rndmap rnd:{rnd}\n\
+RewriteMap prgmap prg:/bin/cat\n\
+RewriteMap intmap int:toupper\n\
+RewriteCond %{{REQUEST_URI}} ^/old [NC]\n\
+RewriteRule ^/old$ /new [L,QSA]\n\
+RewriteOptions Inherit\n"
+        );
+        let c = load_text(&cfg, false).unwrap();
+        assert_eq!(c.server_name.as_deref(), Some("www.example.test"));
+        assert_eq!(c.server_admin, "admin@example.test");
+        assert_eq!(c.server_tokens, ServerTokens::Prod);
+        assert_eq!(c.server_software, "Apache");
+        assert_eq!(c.server_signature, ServerSignature::Email);
+        assert!(!c.trace_enable);
+        assert_eq!(c.limit_request_line, 1000);
+        assert_eq!(c.limit_request_fields, 20);
+        assert_eq!(c.limit_request_field_size, 500);
+        assert_eq!(c.limit_request_body, 1234);
+        assert_eq!(c.max_request_workers, 9);
+        assert_eq!(c.listen_backlog, 5);
+        assert_eq!(c.graceful_shutdown_timeout, Duration::from_secs(2));
+        assert_eq!(c.request_header_min_rate, 5);
+        assert_eq!(c.request_body_min_rate, 6);
+        assert_eq!(c.encoded_slashes, EncodedSlashes::NoDecode);
+        assert_eq!(c.cache.max_expire, 20);
+        assert_eq!(c.cache.min_expire, 1);
+        assert_eq!(c.cache.max_file_size, 100);
+        assert_eq!(c.cache.min_file_size, 2);
+        assert_eq!(c.cache.max_disk_size, 1024);
+        assert!(c.cache.ignore_no_last_mod);
+        assert!(c.cache.ignore_cache_control);
+        assert!(c.cache.store_no_store);
+        assert!(c.cache.store_private);
+        assert!(c.cache.ignore_query_string);
+        assert!(c.cache.header);
+        assert!(c.cache.detail_header);
+        assert_eq!(c.cache.last_modified_factor, 0.5);
+        assert_eq!(c.remoteip_internal.len(), 4);
+        assert_eq!(c.remoteip_header.as_deref(), Some("X-Forwarded-For"));
+        assert_eq!(c.mime.content_type(b"x.html").as_deref(), Some("text/html"));
+        assert_eq!(c.mime.encodings.get("gz").map(String::as_str), Some("gzip"));
+        assert_eq!(c.health_templates["health"].method.as_deref(), Some("GET"));
+        let s = c.effective_scope(None, Path::new("/srv/www/file"), "/file");
+        assert_eq!(s.rewrite_policy.rewrite_rules.len(), 1);
+        assert_eq!(s.rewrite_policy.rewrite_maps.len(), 4);
+        assert_eq!(s.proxy_policy.proxy_passes.len(), 1);
+        assert_eq!(s.proxy_policy.proxy_rules.len(), 1);
+        assert_eq!(s.proxy_policy.proxy_reverses.len(), 1);
+        assert_eq!(s.compression_policy.compression_rules.len(), 3);
+        assert_eq!(s.compression_policy.deflate_level, Some(9));
+        assert_eq!(s.compression_policy.brotli_quality, Some(11));
+        assert_eq!(
+            s.compression_policy.deflate_alter_etag,
+            Some(AlterEtag::AddSuffix)
+        );
+        assert_eq!(
+            s.compression_policy.brotli_alter_etag,
+            Some(AlterEtag::Remove)
+        );
+        assert!(s.mapping_policy.unsupported_filters.iter().any(|f| f == "INCLUDES"));
+        assert_eq!(s.content_policy.force_type.as_deref(), Some("text/plain"));
+        assert_eq!(s.content_policy.default_charset.as_deref(), Some("UTF-8"));
+        assert_eq!(s.content_policy.file_etag, Some(ETAG_MTIME | ETAG_SIZE));
+        assert_eq!(s.content_policy.enable_sendfile, Some(false));
+        assert_eq!(s.content_policy.directory_slash, Some(false));
+        assert_eq!(s.content_policy.access_file_names.as_ref().unwrap().len(), 2);
+        assert_eq!(c.ssl.verify_client, Some(ClientVerify::Optional));
+        assert!(c.ssl.engine);
+        assert!(c.ssl.stapling);
+        assert_eq!(c.ssl.stapling_responder_timeout, Duration::from_secs(5));
+        assert_eq!(c.ssl.stapling_standard_cache_timeout, Duration::from_secs(10));
+        assert!(c.ssl.stapling_return_responder_errors);
+
+        let directory = format!(
+            "<Directory /srv/www>\n\
+Options None\n\
+AllowOverride All\n\
+AllowOverrideList None\n\
+DirectoryIndex index.php\n\
+Require all granted\n\
+Order deny,allow\n\
+Allow from all 10.0.0.0/8\n\
+Deny from 10.1.0.0/16\n\
+Satisfy any\n\
+AllowMethods GET HEAD POST\n\
+AuthMerging And\n\
+AuthType Basic\n\
+AuthName \"realm\"\n\
+AuthUserFile /tmp/passwd\n\
+AuthGroupFile /tmp/group\n\
+AuthBasicProvider file\n\
+AddHandler cgi-script .cgi\n\
+RemoveHandler .php\n\
+SetHandler handler\n\
+AddType text/plain .txt\n\
+RemoveType .html\n\
+Alias /alias /srv/alias\n\
+ScriptAlias /cgi /srv/cgi\n\
+AliasMatch ^/am/(.*)$ /srv/$1\n\
+ScriptAliasMatch ^/sam/(.*)$ /srv/cgi/$1\n\
+Redirect 301 /old /new\n\
+RedirectPermanent /old2 /new2\n\
+RedirectTemp /old3 /new3\n\
+RedirectMatch 302 ^/rm/(.*)$ /new/$1\n\
+ErrorDocument 404 /404.html\n\
+ErrorDocument 500 \"text\"\n\
+ErrorDocument 502 http://example.test/error\n\
+Header always set X-Test v\n\
+Header add X-Add v\n\
+Header unset X-Remove\n\
+Header always unset X-Remove2\n\
+ExpiresActive On\n\
+ExpiresDefault \"access plus 1 day\"\n\
+ExpiresByType text/html \"access plus 1 hour\"\n\
+SetEnv DIR yes\n\
+</Directory>\n"
+        );
+        let cfg = format!("Listen 127.0.0.1:0\n{directory}");
+        let c = load_text(&cfg, false).unwrap();
+        let s = c.effective_scope(None, Path::new("/srv/www/file"), "/file");
+        assert_eq!(s.options.effective_bits(0), 0);
+        assert_eq!(s.override_policy.raw_mode(), Some(OverrideMode::All));
+        assert!(s.authorization.auth_merging.is_none() || s.authorization.auth_merging == Some(AuthMerging::And));
+        assert_eq!(
+            s.authorization.allow_methods,
+            Some(AllowMethods::Only(vec![
+                "GET".into(),
+                "HEAD".into(),
+                "POST".into()
+            ]))
+        );
+        assert_eq!(s.authorization.auth_type.as_deref(), Some("basic"));
+        assert_eq!(s.authorization.auth_name.as_deref(), Some("realm"));
+        assert_eq!(s.authorization.auth_user_file.as_deref(), Some(Path::new("/tmp/passwd")));
+        assert_eq!(s.authorization.auth_group_file.as_deref(), Some(Path::new("/tmp/group")));
+        assert_eq!(s.mapping_policy.handlers.len(), 3);
+        assert_eq!(s.mapping_policy.aliases.len(), 4);
+        assert_eq!(s.mapping_policy.redirects.len(), 4);
+        assert_eq!(s.error_policy.documents.len(), 3);
+        assert_eq!(s.header_policy.always_set_headers.len(), 1);
+        assert_eq!(s.header_policy.add_headers.len(), 1);
+        assert_eq!(s.header_policy.unset_headers.len(), 1);
+        assert_eq!(s.header_policy.always_unset_headers.len(), 1);
+        assert_eq!(s.header_policy.expires_by_type.len(), 1);
+        assert_eq!(
+            s.header_policy.expires_default.as_deref(),
+            Some("access plus 1 day")
+        );
+        assert!(s.header_policy.expires_active.unwrap());
+        assert!(s.environment_policy.set_env.iter().any(|(n, _)| n == "DIR"));
+
+        let vhost = format!(
+            "<VirtualHost *:443>\n\
+ServerName vhost.test\n\
+ServerAdmin vhost@example.test\n\
+DocumentRoot /srv/vh\n\
+ErrorLog logs/vh-error.log\n\
+CustomLog logs/vh-access.log combined\n\
+SSLEngine On\n\
+SSLCertificateFile {cert}\n\
+SSLCertificateKeyFile {key}\n\
+SSLCertificateChainFile {chain}\n\
+SSLUseStapling On\n\
+SSLStaplingForceURL http://example.test/ocsp\n\
+SSLStaplingResponderTimeout 4\n\
+SSLStaplingStandardCacheTimeout 8\n\
+SSLStaplingReturnResponderErrors On\n\
+SSLVerifyClient require\n\
+SSLCACertificateFile {cert}\n\
+SSLProtocol all\n\
+SSLCipherSuite HIGH\n\
+</VirtualHost>\n\
+<VirtualHost *:80>\n\
+ServerName plain.test\n\
+</VirtualHost>\n"
+        );
+        let cfg = format!("Listen 127.0.0.1:443 https\n{vhost}");
+        let c = load_text(&cfg, false).unwrap();
+        let v = c
+            .vhosts
+            .iter()
+            .find(|v| v.server_name.as_deref() == Some("vhost.test"))
+            .unwrap();
+        assert_eq!(v.server_admin.as_deref(), Some("vhost@example.test"));
+        assert!(v.ssl.engine);
+        assert_eq!(v.ssl.verify_client, Some(ClientVerify::Require));
+        assert_eq!(v.ssl.stapling_responder_timeout, Duration::from_secs(4));
+        assert_eq!(v.ssl.stapling_standard_cache_timeout, Duration::from_secs(8));
+        assert!(v.ssl.stapling_return_responder_errors);
+        assert_eq!(v.custom_logs.len(), 1);
+        assert_eq!(v.error_log.as_deref(), Some("logs/vh-error.log"));
+        let plain = c
+            .vhosts
+            .iter()
+            .find(|v| v.server_name.as_deref() == Some("plain.test"))
+            .unwrap();
+        assert_eq!(plain.error_log.as_deref(), Some(c.error_log.as_str()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coverage_directive_edge_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-directive-edges-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("rel")).unwrap();
+        std::fs::write(dir.join("mime.types"), "text/html html\n").unwrap();
+        std::fs::write(dir.join("types.txt"), "one value\n# skip\nbadline\n").unwrap();
+        std::fs::write(
+            dir.join("rnd.txt"),
+            "key one|two\nempty |\n# skip\nbadline\n",
+        )
+        .unwrap();
+        let relative = dir
+            .strip_prefix(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let cfg = format!(
+            "Listen 127.0.0.1:0\n\
+Define TEMP 1\n\
+Undefine TEMP\n\
+DocumentRoot rel/www\n\
+Options\n\
+Options +NoSuchOption\n\
+Options All\n\
+FileETag Unknown\n\
+TypesConfig {relative}/mime.types\n\
+CacheRoot rel/cache\n\
+SSLProxyCACertificateFile rel/ca.pem\n\
+Alias /rel rel/alias\n\
+Redirect /old /new\n\
+RedirectMatch ^/rm/(.*)$ /new/$1\n\
+RewriteMap reltxt txt:{relative}/types.txt\n\
+RewriteMap relrnd rnd:{relative}/rnd.txt\n\
+<Directory /srv/edge>\n\
+Options\n\
+Options +NoSuchOption\n\
+Options All\n\
+AllowOverride All Nonfatal=Override\n\
+AllowOverride AuthConfig Nonfatal=Unknown\n\
+AllowOverride FileInfo Nonfatal=All\n\
+AllowOverride Options=FollowSymLinks,Indexes,SymLinksIfOwnerMatch,All,None,ExecCGI,Includes,IncludesNoExec\n\
+AllowOverrideList Directive1 Directive2\n\
+AuthUserFile rel/passwd\n\
+AuthGroupFile rel/group\n\
+</Directory>\n\
+<Directory rel>\n\
+Options None\n\
+</Directory>\n\
+<Directory /dbm>\n\
+Require dbm\n\
+</Directory>\n\
+<LocationMatch ^/x>\n\
+Options None\n\
+</LocationMatch>\n\
+<Proxy balancer://pool>\n\
+BalancerMember http://127.0.0.1:9000 hcmethod=GET hcuri=/health hcinterval=1s hcpasses=1 hcfails=2 template=health route=r1 nonsense unknown=1\n\
+ProxySet hcmethod=POST hcuri=/health hcinterval=2s hcpasses=2 hcfails=3 stickysession=S stickysessionsep=. failonstatus=500,502 nonsense unknown=1\n\
+</Proxy>\n\
+ProxyPass /extra http://127.0.0.1:9000 unknown=1 stickysession=S nonsense\n\
+ProxyHCTemplate edge hcmethod=GET hcuri=/health hcinterval=3s hcpasses=4 hcfails=5 nonsense unknown=1\n\
+DefaultType text/plain\n\
+DefaultRuntimeDir /tmp\n\
+AllowEncodedSlashes On\n\
+AllowEncodedSlashes Off\n\
+RemoteIPInternalProxy 192.0.2.5\n\
+ServerAlias at.example\n\
+ErrorDocument 404\n\
+Alias /onlyone\n\
+RewriteMap onlyone\n\
+AddType text/plain\n\
+AddHandler handler\n\
+Header set X\n\
+Header set\n\
+ProxyPass /shortun\n\
+ProxyPass ! http://127.0.0.1:9000\n\
+ProxyPassReverse /shortun\n\
+ProxyPassMatch ^/short$\n\
+AddOutputFilterByType DEFLATE\n\
+AddOutputFilter DEFLATE\n\
+CustomLog logs/short.log\n\
+RequestReadTimeout nonsense\n\
+BalancerMember\n\
+ProxySet foo=bar\n\
+ProxyHCTemplate\n\
+<Proxy balancer://empty>\n\
+BalancerMember\n\
+</Proxy>\n\
+<VirtualHost *:443>\n\
+SSLEngine On\n\
+SSLCertificateFile rel/cert.pem\n\
+SSLCertificateKeyFile rel/key.pem\n\
+SSLCACertificateFile rel/ca.pem\n\
+<Proxy *>\n\
+Require all granted\n\
+</Proxy>\n\
+</VirtualHost>\n"
+        );
+        let c = load_text(&cfg, false).unwrap();
+        assert_eq!(c.document_root, PathBuf::from("/tmp/rel/www"));
+        assert_eq!(c.cache.root.as_deref(), Some(Path::new("/tmp/rel/cache")));
+        assert_eq!(c.remoteip_internal.len(), 1);
+        assert_eq!(c.balancers.len(), 2);
+        let b = &c.balancers[0];
+        assert_eq!(b.members.len(), 1);
+        assert_eq!(b.members[0].template.as_deref(), Some("health"));
+        assert_eq!(b.members[0].route.as_deref(), Some("r1"));
+        assert_eq!(b.health.uri.as_deref(), Some("/health"));
+        assert_eq!(b.health.passes, Some(2));
+        assert_eq!(b.health.fails, Some(3));
+        assert_eq!(b.sticky_cookie.as_deref(), Some("S"));
+        assert_eq!(b.sticky_sep.as_deref(), Some("."));
+        assert_eq!(b.fail_on_status, vec![500, 502]);
+        assert!(c.health_templates.contains_key("edge"));
+        let s = c.effective_scope(None, Path::new("/srv/edge/file"), "/file");
+        assert_eq!(s.options.effective_bits(0), Options::all().0);
+        assert!(s.override_policy.raw_mode().is_some());
+        assert_eq!(
+            s.authorization.auth_user_file.as_deref(),
+            Some(Path::new("/tmp/rel/passwd"))
+        );
+        assert_eq!(
+            s.authorization.auth_group_file.as_deref(),
+            Some(Path::new("/tmp/rel/group"))
+        );
+        assert_eq!(s.rewrite_policy.rewrite_maps.len(), 2);
+        assert_eq!(
+            s.proxy_policy.proxy_ca_file.as_deref(),
+            Some(Path::new("/tmp/rel/ca.pem"))
+        );
+        assert_eq!(
+            c.vhosts[0].ssl.cert_file.as_deref(),
+            Some(Path::new("/tmp/rel/cert.pem"))
+        );
+
+        for (value, expected) in [
+            ("OS", "Apache/2.4.62 (Debian)"),
+            ("Minimal", "Apache/2.4.62"),
+            ("Minor", "Apache/2.4"),
+            ("Major", "Apache/2"),
+            ("Prod", "Apache"),
+        ] {
+            let cfg = format!("Listen 127.0.0.1:0\nServerTokens {value}\n");
+            let c = load_text(&cfg, false).unwrap();
+            assert_eq!(c.server_software, expected);
+        }
+        for value in ["Full", "Unknown"] {
+            let cfg = format!("Listen 127.0.0.1:0\nServerTokens {value}\n");
+            let c = load_text(&cfg, false).unwrap();
+            assert_eq!(c.server_tokens, ServerTokens::Full);
+        }
+        let c = load_text(
+            "Listen 127.0.0.1:0\nUseCanonicalName On\nServerSignature Off\n",
+            false,
+        )
+        .unwrap();
+        assert!(c.use_canonical_name);
+        assert_eq!(c.server_signature, ServerSignature::Off);
+        let c = load_text(
+            "Listen 127.0.0.1:0\nUseCanonicalName Off\nServerSignature Email\n",
+            false,
+        )
+        .unwrap();
+        assert!(!c.use_canonical_name);
+        assert_eq!(c.server_signature, ServerSignature::Email);
+        let c = load_text("Listen 127.0.0.1:0\nServerSignature On\n", false).unwrap();
+        assert_eq!(c.server_signature, ServerSignature::On);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coverage_section_and_directive_errors() {
+        let err = |cfg: &str| {
+            assert!(load_text(cfg, false).is_err(), "{cfg}");
+        };
+        err("<RequireAll>\n</RequireAll>\n");
+        err("<RequireAll>\nOptions Indexes\n</RequireAll>\n");
+        err("<Directory /x>\n<RequireAll>\nOptions Indexes\n</RequireAll>\n</Directory>\n");
+        err("<Directory /x>\n<Directory /y>\n</Directory>\n</Directory>\n");
+        err("<Directory /x>\n<Limit GET>\n<If true>\n</If>\n</Limit>\n</Directory>\n");
+        err("<If (>\n</If>\n");
+        err("<If true>\n</If>\n<ElseIf (>\n</ElseIf>\n");
+        err("<If true>\n</If>\n<Else foo>\n</Else>\n");
+        err("<DirectoryMatch (>\n</DirectoryMatch>\n");
+        err("<Files>\n</Files>\n");
+        err("<FilesMatch (>\n</FilesMatch>\n");
+        err("<LocationMatch (>\n</LocationMatch>\n");
+        err("<Directory /x>\n<RequireAll>\n</RequireAll>\n</Directory>\n");
+        err("<Directory /x>\n<Limit GET>\n<Limit POST>\n</Limit>\n</Limit>\n</Directory>\n");
+        err("<Directory /x>\n<RequireAll>\n<Limit GET>\nRequire all granted\n</Limit>\n</RequireAll>\n</Directory>\n");
+        err("<Proxy>\n</Proxy>\n");
+        err("<ProxyMatch (>\n</ProxyMatch>\n");
+        err("<Directory /x>\n<Limit GET>\n<Unknown>\n</Unknown>\n</Limit>\n</Directory>\n");
+        err("<Directory /x>\n<Limit GET>\n<If true>\n</If>\n</Limit>\n</Directory>\n");
+        err("<VirtualHost *:80>\nServerAlias ~(\n</VirtualHost>\n");
+        err("AllowOverride All\n");
+        err("<Directory /x>\nAllowOverride\n</Directory>\n");
+        err("<Directory /x>\nAllowOverride Nonfatal=bad\n</Directory>\n");
+        err("<Directory /x>\nAllowOverride Options=\n</Directory>\n");
+        err("<Directory /x>\nAllowOverride Options=Bad\n</Directory>\n");
+        err("AllowOverrideList None\n");
+        err("<Directory /x>\nAllowOverrideList\n</Directory>\n");
+        err("<Directory /x>\nAllowOverrideList None Foo\n</Directory>\n");
+        err("<Directory /x>\nRequire all maybe\n</Directory>\n");
+        err("<Directory /x>\nRequire nonsense\n</Directory>\n");
+        err("<Directory /x>\nOrder sideways\n</Directory>\n");
+        err("<Directory /x>\nAllow all\n</Directory>\n");
+        err("<Directory /x>\nDeny from host.example\n</Directory>\n");
+        err("ErrorDocument nope /x\n");
+        err("<Directory /x>\nAliasMatch ( /x\n</Directory>\n");
+        err("<Directory /x>\nAliasMatch onlyone\n</Directory>\n");
+        err("<Directory /x>\nRedirectMatch ( /x\n</Directory>\n");
+        err("<Directory /x>\nRedirectMatch\n</Directory>\n");
+        err("<Directory /x>\nRedirect\n</Directory>\n");
+        err("<Directory /x>\nRedirectTemp\n</Directory>\n");
+        err("<Directory /x>\nRedirectPermanent\n</Directory>\n");
+        err("<Directory /x>\nRewriteMap bad urldb:/tmp/x\n</Directory>\n");
+        err("<Directory /x>\nHeader bad X y\n</Directory>\n");
+        err("TypesConfig /definitely/missing.types\n");
+        err("ProxyPass /x ftp://backend\n");
+        err("ProxyPass /x !\n");
+        err("ProxyPassReverse /x ftp://backend\n");
+        err("ProxyPassMatch ^/x$ !\n");
+        err("ProxyPassMatch ^/x$ ftp://backend\n");
+        err("ProxyPassMatch ^/x$ http://$1/\n");
+        err("ProxyPassMatch ( http://backend/\n");
+        err("Listen 127.0.0.1:bad\n");
+        err("SetEnvIf Host\n");
+        err("SetEnvIf Host ( X=1\n");
+        err("RemoteIPInternalProxy bad-address\n");
+        err("UseCanonicalName sometimes\n");
+        err("<Directory /x>\nSatisfy maybe\n</Directory>\n");
+        err("<Directory /x>\nAllowMethods\n</Directory>\n");
+        err("AllowMethods GET\n");
+        err("<Directory /x>\nAllowMethods BAD\n</Directory>\n");
+        err("AuthMerging And\n");
+        err("<Directory /x>\nAuthMerging Maybe\n</Directory>\n");
+        err("<IfModule \"a>b\">\n</IfModule>\n");
+        err("SSLRequireSSL\n");
+        err("SSLRequire true\n");
+        err("SecRuleEngine On\n");
+        err("SSLVerifyClient maybe\n");
+        err("AuthBasicProvider ldap\n");
+        err("<Directory /x>\nAuthBasicProvider ldap\n</Directory>\n");
+
+        let ok = "<Directory /x>\n<RequireAny>\nRequire all granted\n<If true>\nOptions Indexes\n</If>\n</RequireAny>\n</Directory>\n";
+        let c = load_text(ok, false).unwrap();
+        assert!(c.warnings.iter().any(|w| w.contains("nested sections")));
+        let ok = "<UnknownSection>\nServerName unknown.test\n</UnknownSection>\n";
+        let c = load_text(ok, false).unwrap();
+        assert!(c.warnings.iter().any(|w| w.contains("unsupported section")));
+        let ok = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<If true>\n",
+            "<Files x>\n",
+            "Options Indexes\n",
+            "</Files>\n",
+            "</If>\n",
+        );
+        let c = load_text(ok, false).unwrap();
+        assert!(c
+            .warnings
+            .iter()
+            .any(|w| w.contains("nested Directory/Files/Location")));
+        let ok = concat!(
+            "Listen 127.0.0.1:0\n",
+            "<Location />\nAllowOverride All\n</Location>\n",
+            "<Location /list>\nAllowOverrideList None\n</Location>\n",
+            "AllowEncodedSlashes maybe\n",
+            "SecRuleEngine Off\n",
+            "DeflateCompressionLevel 10\n",
+            "BrotliCompressionQuality 12\n",
+        );
+        let c = load_text(ok, false).unwrap();
+        assert!(c.warnings.iter().any(|w| w.contains("useless use of AllowOverride")));
+        assert!(c.warnings.iter().any(|w| w.contains("useless use of AllowOverrideList")));
+        assert_eq!(c.encoded_slashes, EncodedSlashes::Off);
+    }
+
+    #[test]
+    fn coverage_too_many_modules() {
+        let mut cfg = String::from("Listen 127.0.0.1:0\n");
+        for i in 0..4097 {
+            cfg.push_str(&format!("LoadModule m{i} /tmp/m{i}.so\n"));
+        }
+        assert!(load_text(&cfg, false).is_err());
+    }
+
+    #[test]
+    fn coverage_rule_application_phases() {
+        let req = test_request("GET");
+        let peer = "127.0.0.1".parse().unwrap();
+        let root = Path::new("/tmp");
+        let fs_path = Path::new("/srv/www/file.php");
+        let fname = "file.php";
+        let url_path = "/file.php";
+
+        let mut dir_rule = ScopeRule {
+            kind: MatchKind::Directory(PathBuf::from("/srv/www")),
+            delta: Scope::default(),
+            order: 1,
+            condition: None,
+            branch: ConditionBranch::Normal,
+            chain: None,
+            nested: Vec::new(),
+        };
+        dir_rule.delta.header_policy.add_headers.push(("X-Dir".into(), "1".into()));
+        let mut files_rule = ScopeRule {
+            kind: MatchKind::Files(compile_regex("^file").unwrap()),
+            delta: Scope::default(),
+            order: 2,
+            condition: None,
+            branch: ConditionBranch::Normal,
+            chain: None,
+            nested: Vec::new(),
+        };
+        files_rule.delta.header_policy.add_headers.push(("X-Files".into(), "1".into()));
+        let mut loc_rule = ScopeRule {
+            kind: MatchKind::Location("/file.php".into()),
+            delta: Scope::default(),
+            order: 3,
+            condition: None,
+            branch: ConditionBranch::Normal,
+            chain: None,
+            nested: Vec::new(),
+        };
+        loc_rule.delta.header_policy.add_headers.push(("X-Loc".into(), "1".into()));
+        let mut conditional = ScopeRule {
+            kind: MatchKind::Always,
+            delta: Scope::default(),
+            order: 4,
+            condition: Some(crate::expr::parse("true").unwrap()),
+            branch: ConditionBranch::Normal,
+            chain: Some(1),
+            nested: Vec::new(),
+        };
+        conditional.delta.header_policy.add_headers.push(("X-If".into(), "1".into()));
+        let nested_conditional = ScopeRule {
+            kind: MatchKind::Always,
+            delta: Scope::default(),
+            order: 5,
+            condition: Some(crate::expr::parse("true").unwrap()),
+            branch: ConditionBranch::Normal,
+            chain: Some(2),
+            nested: Vec::new(),
+        };
+        let plain_always = ScopeRule {
+            kind: MatchKind::Always,
+            delta: Scope::default(),
+            order: 6,
+            condition: None,
+            branch: ConditionBranch::Normal,
+            chain: None,
+            nested: Vec::new(),
+        };
+        let mut plain_always_nested = plain_always.clone();
+        plain_always_nested.order = 7;
+        let nonmatching = ScopeRule {
+            kind: MatchKind::Files(compile_regex("^nomatch$").unwrap()),
+            delta: Scope::default(),
+            order: 8,
+            condition: None,
+            branch: ConditionBranch::Normal,
+            chain: None,
+            nested: Vec::new(),
+        };
+        let mut files_nested = files_rule.clone();
+        files_nested.nested.push(conditional.clone());
+        dir_rule.nested.push(files_rule.clone());
+        dir_rule.nested.push(loc_rule.clone());
+        dir_rule.nested.push(nested_conditional.clone());
+        dir_rule.nested.push(conditional.clone());
+        dir_rule.nested.push(plain_always_nested);
+
+        let mut scope = Scope::default();
+        let mut files = Vec::new();
+        let mut locations = Vec::new();
+        let mut conditionals = Vec::new();
+        collect_directory_phase(
+            &[
+                dir_rule.clone(),
+                files_rule.clone(),
+                loc_rule.clone(),
+                conditional.clone(),
+                plain_always.clone(),
+                nonmatching.clone(),
+            ],
+            &mut scope,
+            &req,
+            peer,
+            root,
+            fs_path,
+            url_path,
+            fname,
+            &mut files,
+            &mut locations,
+            &mut conditionals,
+        );
+        assert_eq!(files.len(), 2);
+        assert_eq!(locations.len(), 2);
+        assert_eq!(conditionals.len(), 4);
+        assert!(scope.header_policy.add_headers.iter().any(|(n, _)| n == "X-Dir"));
+
+        let mut scope = Scope::default();
+        let mut conditionals = Vec::new();
+        apply_normal_rule_list(
+            &[
+                files_rule.clone(),
+                files_nested,
+                loc_rule.clone(),
+                conditional.clone(),
+                nonmatching.clone(),
+            ],
+            &mut scope,
+            &req,
+            peer,
+            root,
+            fs_path,
+            url_path,
+            fname,
+            &mut conditionals,
+        );
+        assert!(scope.header_policy.add_headers.iter().any(|(n, _)| n == "X-Files"));
+        assert!(scope.header_policy.add_headers.iter().any(|(n, _)| n == "X-Loc"));
+        assert_eq!(conditionals.len(), 2);
+
+        let mut scope = Scope::default();
+        let mut deferred = Vec::new();
+        collect_rules_req(
+            &[
+                dir_rule.clone(),
+                files_rule.clone(),
+                loc_rule.clone(),
+                conditional.clone(),
+                plain_always.clone(),
+                nonmatching.clone(),
+            ],
+            &mut scope,
+            &req,
+            peer,
+            root,
+            fs_path,
+            url_path,
+            fname,
+            &mut deferred,
+        );
+        assert_eq!(deferred.len(), 3);
+        let mut chain = HashMap::new();
+        apply_deferred_req(
+            &mut scope,
+            &deferred,
+            &req,
+            peer,
+            root,
+            fs_path,
+            url_path,
+            fname,
+            &mut chain,
+        );
+        assert!(scope.header_policy.add_headers.iter().any(|(n, _)| n == "X-If"));
+
+        let mut non_dir_rewrite = files_rule.clone();
+        non_dir_rewrite
+            .delta
+            .rewrite_policy
+            .rewrite_rules
+            .push(parse_rewrite_rule(&["^x$".into(), "/y".into()], "/", false).unwrap());
+        let mut non_dir_scope = Scope::default();
+        merge_rule_delta(&mut non_dir_scope, &non_dir_rewrite, fs_path, url_path);
+
+        let mut scope = Scope::default();
+        apply_rules_config(&[dir_rule.clone()], &mut scope, fs_path, url_path, fname);
+        assert!(scope.header_policy.add_headers.iter().any(|(n, _)| n == "X-Dir"));
+        let mut scope = Scope::default();
+        apply_rules_req(
+            &[dir_rule, files_rule, loc_rule, conditional],
+            &mut scope,
+            &req,
+            peer,
+            root,
+            fs_path,
+            url_path,
+            fname,
+            &mut chain,
+        );
+        assert!(scope.header_policy.add_headers.iter().any(|(n, _)| n == "X-If"));
+
+        let mut rules = vec![
+            ScopeRule { kind: MatchKind::LocationMatch(compile_regex("x").unwrap()), ..nested_conditional.clone() },
+            ScopeRule { kind: MatchKind::LocationMatch(compile_regex("y").unwrap()), ..nested_conditional.clone() },
+            ScopeRule { kind: MatchKind::Location("/a".into()), ..nested_conditional.clone() },
+            ScopeRule { kind: MatchKind::Location("/abcdef".into()), ..nested_conditional.clone() },
+            ScopeRule { kind: MatchKind::DirectoryMatch(compile_regex("x").unwrap()), ..nested_conditional.clone() },
+            ScopeRule { kind: MatchKind::Directory(PathBuf::from("/a")), ..nested_conditional.clone() },
+            ScopeRule { kind: MatchKind::Files(compile_regex("x").unwrap()), ..nested_conditional.clone() },
+        ];
+        sort_rules(&mut rules);
+        assert_eq!(rules.len(), 7);
     }
 }
 
