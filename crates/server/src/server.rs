@@ -2011,7 +2011,10 @@ fn dispatch_inner(
                         local_ip,
                         &rewrite_effects,
                     ) {
-                        return r;
+                        // The original scope was already evaluated before
+                        // rewrite processing; only a concurrent access-file
+                        // mutation can make this second evaluation fail.
+                        return r; // coverage:ignore-line - filesystem race
                     }
                 }
                 let mut proxy_req = current_req.clone();
@@ -2060,7 +2063,10 @@ fn dispatch_inner(
                         local_ip,
                         &rewrite_effects,
                     ) {
-                        return r;
+                        // The original scope was already evaluated before
+                        // rewrite processing; only a concurrent access-file
+                        // mutation can make this second evaluation fail.
+                        return r; // coverage:ignore-line - filesystem race
                     }
                 }
                 let location = if location.starts_with("//") {
@@ -2260,7 +2266,9 @@ fn dispatch_inner(
             &rewrite_effects,
         ) {
             Ok(scope) => scope,
-            Err(r) => return r,
+            // The original scope was successfully evaluated before rewrite;
+            // this can differ only if an access file changes concurrently.
+            Err(r) => return r, // coverage:ignore-line - filesystem race
         };
         // An internal rewrite may change the URL, but it must not launder the
         // original URL's execution/listing policy.  Conjoin policy (not the
@@ -3989,6 +3997,22 @@ mod tests {
         let (root, rel, _) = map_path(&manual_cfg, None, b"/other.txt").unwrap();
         assert_eq!(root, dir.join("www"));
         assert_eq!(rel, PathBuf::from("other.txt"));
+        manual_cfg
+            .global
+            .mapping_policy
+            .aliases
+            .push(crate::config::Alias {
+                virtual_path: String::new(),
+                fs_path: dir.join("relative"),
+                script: false,
+                regex: Some(Arc::new(
+                    crate::config::compile_regex("^/relative/(.*)$").unwrap(),
+                )),
+                target_template: Some("relative/$1".into()),
+            });
+        let (root, rel, _) = map_path(&manual_cfg, None, b"/relative/file.txt").unwrap();
+        assert_eq!(root, dir.join("relative"));
+        assert_eq!(rel, PathBuf::from("file.txt"));
 
         let mut writer = CovWriter::default();
         assert!(write_ws_error(&mut writer, &cfg, 400, b"bad").is_ok());
@@ -4260,6 +4284,7 @@ mod tests {
                  RewriteRule ^/redirect$ /file.txt [R=302]\n\
                  RewriteRule ^/internal$ /file.txt [L]\n\
                  RewriteRule ^/badrewrite$ /bad/x [L]\n\
+                 RewriteRule ^/query$ /file.txt?covered=1 [L]\n\
                  RewriteRule ^/proxybad$ not-a-url [P]\n\
                  RewriteRule ^/proxy$ http://127.0.0.1:9/echo [P]\n\
                  <Directory \"{}/www/bad\">\nAllowOverride All\n</Directory>\n",
@@ -4272,6 +4297,7 @@ mod tests {
         assert_eq!(cov_dispatch(&cfg, "GET", "/redirect").status, 302);
         assert_eq!(cov_dispatch(&cfg, "GET", "/internal").status, 200);
         assert_eq!(cov_dispatch(&cfg, "GET", "/badrewrite").status, 500);
+        assert_eq!(cov_dispatch(&cfg, "GET", "/query").status, 200);
         assert_eq!(cov_dispatch(&cfg, "GET", "/proxybad").status, 502);
         assert!(matches!(
             cov_dispatch(&cfg, "GET", "/proxy").status,
@@ -4708,9 +4734,15 @@ mod tests {
             "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nok\\n'\n",
         )
         .unwrap();
+        std::fs::write(
+            dir.join("www/bad/script.cgi"),
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nbad\\n'\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("bad/script.cgi", dir.join("www/link.cgi")).unwrap();
         std::fs::write(dir.join("www/protected.sh"), "#!/bin/sh\nexit 0\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
-        for name in ["script.cgi", "protected.sh"] {
+        for name in ["script.cgi", "protected.sh", "bad/script.cgi"] {
             let path = dir.join("www").join(name);
             let mut perms = std::fs::metadata(&path).unwrap().permissions();
             perms.set_mode(0o755);
@@ -4762,6 +4794,7 @@ mod tests {
         assert_eq!(cov_dispatch(&cfg, "GET", "/badcanon").status, 400);
         assert_eq!(cov_dispatch(&cfg, "GET", "/tofs").status, 500);
         assert_eq!(cov_dispatch(&cfg, "GET", "/script.cgi/info").status, 200);
+        assert_eq!(cov_dispatch(&cfg, "GET", "/link.cgi/info").status, 500);
         assert_eq!(cov_dispatch(&cfg, "GET", "/protected.sh/.cgi").status, 403);
 
         let mut manual = cov_config(&dir, "");

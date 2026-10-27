@@ -329,9 +329,7 @@ pub fn server_config(
         let exact_available = vhosts
             .iter()
             .any(|v| Config::vhost_address_is_specific(v, ip, port));
-        vhosts.retain(|v| {
-            !exact_available || Config::vhost_address_is_specific(v, ip, port)
-        });
+        vhosts.retain(|v| !exact_available || Config::vhost_address_is_specific(v, ip, port));
     }
     let global_only = cfg.ssl.engine && vhosts.is_empty();
     if vhosts.is_empty() && !global_only {

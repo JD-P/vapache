@@ -468,4 +468,48 @@ mod tests {
             assert!(!href.contains('"'), "{href}");
         }
     }
+
+    #[test]
+    fn helper_error_and_boundary_cases() {
+        let far_future = days_from_civil(10_000, 1, 1) * 86_400;
+        assert!(http_date(far_future).contains("10000"));
+        assert_eq!(system_time_secs(UNIX_EPOCH - Duration::from_secs(2)), -2);
+        with_http_date_now(|first| assert_eq!(first.len(), 29));
+        with_http_date_now(|second| assert_eq!(second.len(), 29));
+
+        for invalid in [
+            &b"Sunday, broken 08:49:37 GMT"[..],
+            b"Sun, 06 Nov 1994 24:49:37 GMT",
+            b"Sun, 06 Nov 1994 08:60:37 GMT",
+            b"Sun, 06 Nov 1994 08:49:61 GMT",
+            b"Sun, 06 Nov 1994 08:49:37:00 GMT",
+            b"Sun, 06 Xxx 1994 08:49:37 GMT",
+        ] {
+            assert!(parse_http_date(invalid).is_none());
+        }
+
+        assert!(eq_ignore_ascii_case(b"Host", b"hOsT"));
+        assert!(!eq_ignore_ascii_case(b"Host", b"hosts"));
+        assert!(!eq_ignore_ascii_case(b"Host", b"post"));
+        assert_eq!(trim_ascii(b" \t "), b"");
+        assert_eq!(comma_list(b" a, ,b\t,"), [b"a".to_vec(), b"b".to_vec()]);
+
+        assert!(!is_canonical_path(b""));
+        assert!(!is_canonical_path(b"relative"));
+        assert!(!is_canonical_path(b"/bad\x01"));
+        assert!(path_to_rel(b"relative").is_none());
+        assert_eq!(path_to_rel(b"/"), Some(Vec::new()));
+
+        assert_eq!(
+            html_escape(b"&<>\"' printable \x01"),
+            "&amp;&lt;&gt;&quot;&#39; printable \u{fffd}"
+        );
+        assert_eq!(parse_hex_u64(b""), None);
+        assert_eq!(parse_hex_u64(b"aF"), Some(0xaf));
+        assert_eq!(parse_hex_u64(b"G"), None);
+        assert_eq!(parse_hex_u64(b"10000000000000000"), None);
+        assert_eq!(parse_u64(b""), None);
+        assert_eq!(parse_u64(b"x"), None);
+        assert_eq!(parse_u64(b"18446744073709551616"), None);
+    }
 }

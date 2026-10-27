@@ -957,6 +957,164 @@ pub fn rewrite_target_external(target: &[u8]) -> (external: bool)
             && target[7] == b'/')
 }
 
+/// Terminal sink selected after a rewrite substitution has been expanded.
+/// Proxying has precedence over redirect classification because `[P]` is an
+/// explicit capability; an external URL or `[R]` otherwise redirects, and
+/// only the remaining case may re-enter internal URL mapping.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RewriteSink {
+    Internal,
+    Redirect,
+    Proxy,
+}
+
+pub open spec fn rewrite_sink_spec(
+    proxy: bool,
+    external: bool,
+    redirect: bool,
+) -> RewriteSink {
+    if proxy {
+        RewriteSink::Proxy
+    } else if external || redirect {
+        RewriteSink::Redirect
+    } else {
+        RewriteSink::Internal
+    }
+}
+
+pub fn rewrite_sink(proxy: bool, external: bool, redirect: bool) -> (sink: RewriteSink)
+    ensures sink == rewrite_sink_spec(proxy, external, redirect),
+{
+    if proxy {
+        RewriteSink::Proxy
+    } else if external || redirect {
+        RewriteSink::Redirect
+    } else {
+        RewriteSink::Internal
+    }
+}
+
+pub proof fn rewrite_proxy_sink_is_explicit(external: bool, redirect: bool)
+    ensures rewrite_sink_spec(true, external, redirect) == RewriteSink::Proxy,
+{
+}
+
+pub proof fn rewrite_internal_sink_has_no_terminal_flag(
+    proxy: bool,
+    external: bool,
+    redirect: bool,
+)
+    ensures
+        rewrite_sink_spec(proxy, external, redirect) == RewriteSink::Internal
+            ==> !proxy && !external && !redirect,
+{
+}
+
+/// Query-state operation after splitting the expanded substitution.  The
+/// returned action is consumed directly by `mod_rewrite`'s runtime path so
+/// QSA/QSD precedence and the no-target-query preservation rule cannot drift
+/// between branches.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RewriteQueryAction {
+    Replace,
+    Append,
+    Preserve,
+    Discard,
+}
+
+pub open spec fn rewrite_query_action_spec(
+    has_target_query: bool,
+    query_string_append: bool,
+    query_string_discard: bool,
+    original_query_present: bool,
+) -> RewriteQueryAction {
+    if has_target_query {
+        if query_string_append && !query_string_discard && original_query_present {
+            RewriteQueryAction::Append
+        } else {
+            RewriteQueryAction::Replace
+        }
+    } else if query_string_discard {
+        RewriteQueryAction::Discard
+    } else {
+        RewriteQueryAction::Preserve
+    }
+}
+
+pub fn rewrite_query_action(
+    has_target_query: bool,
+    query_string_append: bool,
+    query_string_discard: bool,
+    original_query_present: bool,
+) -> (action: RewriteQueryAction)
+    ensures
+        action == rewrite_query_action_spec(
+            has_target_query,
+            query_string_append,
+            query_string_discard,
+            original_query_present,
+        ),
+{
+    if has_target_query {
+        if query_string_append && !query_string_discard && original_query_present {
+            RewriteQueryAction::Append
+        } else {
+            RewriteQueryAction::Replace
+        }
+    } else if query_string_discard {
+        RewriteQueryAction::Discard
+    } else {
+        RewriteQueryAction::Preserve
+    }
+}
+
+pub proof fn rewrite_qsd_without_target_query_discards(
+    query_string_append: bool,
+    original_query_present: bool,
+)
+    ensures
+        rewrite_query_action_spec(
+            false,
+            query_string_append,
+            true,
+            original_query_present,
+        ) == RewriteQueryAction::Discard,
+{
+}
+
+pub proof fn rewrite_target_query_never_preserves_original(
+    query_string_append: bool,
+    query_string_discard: bool,
+    original_query_present: bool,
+)
+    ensures
+        rewrite_query_action_spec(
+            true,
+            query_string_append,
+            query_string_discard,
+            original_query_present,
+        ) != RewriteQueryAction::Preserve,
+{
+}
+
+/// Admit another `[N]` restart.  Checking before increment makes the bound
+/// overflow-free: exactly `limit` restarts are possible, and the next one is
+/// rejected without modifying the counter.
+pub open spec fn rewrite_restart_admit_spec(completed: u64, limit: u64) -> bool {
+    completed < limit
+}
+
+pub fn rewrite_restart_admit(completed: u64, limit: u64) -> (ok: bool)
+    ensures ok == rewrite_restart_admit_spec(completed, limit),
+{
+    completed < limit
+}
+
+pub proof fn rewrite_restart_rejects_at_limit(limit: u64)
+    ensures !rewrite_restart_admit_spec(limit, limit),
+{
+}
+
 /// Add the single leading slash required for an internal rewrite target.
 /// External targets are classified before this function is called.
 pub fn rewrite_internal_path(joined: &[u8]) -> (out: Vec<u8>)
@@ -991,6 +1149,97 @@ pub fn rewrite_filesystem_admit(is_file: bool, under_base: bool) -> (ok: bool)
     ensures ok == (is_file && under_base),
 {
     is_file && under_base
+}
+
+/// Shape gate for interpreting an expanded substitution as a filesystem
+/// target.  External URLs and `[PT]` substitutions must remain in URL space;
+/// relative substitutions cannot name a host filesystem object.
+pub open spec fn rewrite_filesystem_shape_spec(
+    external: bool,
+    passthrough: bool,
+    absolute: bool,
+) -> bool {
+    !external && !passthrough && absolute
+}
+
+pub fn rewrite_filesystem_shape_admit(
+    external: bool,
+    passthrough: bool,
+    absolute: bool,
+) -> (ok: bool)
+    ensures ok == rewrite_filesystem_shape_spec(external, passthrough, absolute),
+{
+    !external && !passthrough && absolute
+}
+
+/// Complete filesystem-target gate, including the post-canonicalization file
+/// and containment checks.  This spec connects target classification to the
+/// existing CVE-2024-38475 boundary instead of proving each half in isolation.
+pub open spec fn rewrite_filesystem_candidate_spec(
+    external: bool,
+    passthrough: bool,
+    absolute: bool,
+    is_file: bool,
+    under_base: bool,
+) -> bool {
+    rewrite_filesystem_shape_spec(external, passthrough, absolute)
+        && is_file
+        && under_base
+}
+
+pub fn rewrite_filesystem_candidate_admit(
+    external: bool,
+    passthrough: bool,
+    absolute: bool,
+    is_file: bool,
+    under_base: bool,
+) -> (ok: bool)
+    ensures
+        ok == rewrite_filesystem_candidate_spec(
+            external,
+            passthrough,
+            absolute,
+            is_file,
+            under_base,
+        ),
+{
+    rewrite_filesystem_shape_admit(external, passthrough, absolute)
+        && rewrite_filesystem_admit(is_file, under_base)
+}
+
+pub proof fn rewrite_passthrough_never_selects_filesystem(
+    external: bool,
+    absolute: bool,
+    is_file: bool,
+    under_base: bool,
+)
+    ensures
+        !rewrite_filesystem_candidate_spec(
+            external,
+            true,
+            absolute,
+            is_file,
+            under_base,
+        ),
+{
+}
+
+pub proof fn rewrite_filesystem_candidate_is_local_and_contained(
+    external: bool,
+    passthrough: bool,
+    absolute: bool,
+    is_file: bool,
+    under_base: bool,
+)
+    ensures
+        rewrite_filesystem_candidate_spec(
+            external,
+            passthrough,
+            absolute,
+            is_file,
+            under_base,
+        ) ==> !external && !passthrough && absolute && is_file && under_base,
+{
 }
 
 /// Component-aware lexical containment for an absolute filesystem target.
@@ -4326,6 +4575,29 @@ pub fn options_apply(bits: u32, op: u8, mask: u32) -> (out: u32)
     } else {
         bits & !mask
     }
+}
+
+pub proof fn options_set_replaces_parent(bits: u32, mask: u32)
+    ensures options_apply_spec(bits, 0, mask) == mask,
+{
+}
+
+pub proof fn options_add_preserves_and_adds(bits: u32, mask: u32)
+    ensures
+        options_apply_spec(bits, 1, mask) & bits == bits,
+        options_apply_spec(bits, 1, mask) & mask == mask,
+{
+    assert((bits | mask) & bits == bits) by (bit_vector);
+    assert((bits | mask) & mask == mask) by (bit_vector);
+}
+
+pub proof fn options_remove_never_grants_and_clears(bits: u32, mask: u32)
+    ensures
+        options_apply_spec(bits, 2, mask) & bits == options_apply_spec(bits, 2, mask),
+        options_apply_spec(bits, 2, mask) & mask == 0,
+{
+    assert((bits & !mask) & bits == bits & !mask) by (bit_vector);
+    assert((bits & !mask) & mask == 0) by (bit_vector);
 }
 
 

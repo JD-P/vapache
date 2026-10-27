@@ -27,10 +27,27 @@ LLVM_PROFILE_FILE="$PROFILE_DIR/unit-%p-%m.profraw" \
 
 VAPACHED="$PWD/target/cov/release/vapached" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+PYTHONDONTWRITEBYTECODE=1 \
+    python3 tests/config_grammar.py
+
+VAPACHED="$PWD/target/cov/release/vapached" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+PYTHONDONTWRITEBYTECODE=1 \
+    python3 tests/config_validity.py
+
+VAPACHED="$PWD/target/cov/release/vapached" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+PYTHONDONTWRITEBYTECODE=1 \
+    python3 tests/config_semantics.py
+
+VAPACHED="$PWD/target/cov/release/vapached" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/conformance.py
 
 VAPACHED="$PWD/target/cov/release/vapached" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/adversarial_regressions.py
 
 "$LLVM_BIN/llvm-profdata" merge -sparse "$PROFILE_DIR"/*.profraw \
@@ -39,6 +56,9 @@ LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
 # Pass the release binary plus every instrumented test executable so the
 # report covers both the daemon and the unit-test-only code paths.
 set -- target/cov/release/vapached
+if [ -x target/cov/debug/vapached ]; then
+    set -- "$@" -object target/cov/debug/vapached
+fi
 for bin in target/cov/debug/deps/vapache*; do
     if [ -x "$bin" ] && [ ! -d "$bin" ]; then
         set -- "$@" -object "$bin"

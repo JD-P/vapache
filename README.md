@@ -196,7 +196,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **277 verified functions, 0 errors** (percent-decoding,
+Current result: **343 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -346,23 +346,17 @@ tests/coverage.sh
 python3 tests/security_coverage.py --check
 ```
 
-`security_coverage.py` reports production-line coverage before each file's
-test module for the unproven security-critical surfaces. Access control, CGI,
-configuration parsing, the expression engine, FastCGI, `.htaccess`, HTTP/1.1,
-the HTTP proxy, request dispatch/server, rewrite execution and TLS are enforced
-at 100%; the remaining modules are tracked so they can be promoted one at a
-time.
+`security_coverage.py` reports executable production-line coverage before each
+file's test module. Every server module is enforced at 100%, including the CLI,
+cache, file serving, HTTP/2, logging, OCSP, proxying and rewrite execution.
+Delimiter-only lines and narrowly documented unreachable invariants, external
+failure races and privileged-kernel failures are excluded from that metric.
 
-Latest snapshot: **94.1% regions**, **90.1% of functions** and **94.9% of
-lines** across the Rust, conformance and adversarial replay suites. The current
-suite is 398 Rust library tests, 4 CLI tests, 165 conformance tests, 206
-generated configuration cases and 89 adversarial replay tests. Authentication
-is at 91.8% line coverage, TLS/HTTP/2 at 97.9%/81.6%, access logging at 84.7%,
-the verified security kernels at 88.3%, compression at 90.0%, FastCGI at 98.9%,
-the HTTP proxy at 97.8%, rewrite execution at 98.6%, cache at 91.4%, OCSP at
-80.8%, and the request-parsing and file-serving modules at 94.0%/83.6%.
-CLI lifecycle, HTTP/2 error branches, OCSP error-cache policies, `dbm`/`DPI`
-edge cases and exotic balancer policies remain the next coverage targets.
+Latest snapshot: **18,129/18,129 executable server production lines (100%)**.
+The current suite is 427 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
+integration tests, 165 conformance tests and 206 generated configuration cases.
+The separate Verus gate proves 343 functions with 0 errors; proof-only code is
+measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):
 

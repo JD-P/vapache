@@ -504,6 +504,10 @@ mod tests {
             LayerIdentity::with_url_mount(Path::new("/srv/www"), Path::new("/srv/www"), "sub");
         assert_eq!(identity.url_mount, "/sub/");
         assert_eq!(identity.mapping_root, Path::new("/srv/www"));
+        assert_eq!(
+            identity.subject(Path::new("/srv/www/dir/file"), "/dir/file"),
+            Some("dir/file".into())
+        );
     }
 
     #[test]

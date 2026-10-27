@@ -1,0 +1,393 @@
+#![cfg(unix)]
+
+use std::fs;
+use std::io::Write;
+use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
+static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+
+fn binary() -> &'static str {
+    env!("CARGO_BIN_EXE_vapached")
+}
+
+fn test_dir(name: &str) -> PathBuf {
+    let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "vapache-cli-{name}-{}-{sequence}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&path);
+    fs::create_dir_all(path.join("www")).unwrap();
+    path
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn service_ids() -> (u32, u32) {
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    if uid == 0 {
+        (65534, 65534)
+    } else {
+        (uid, gid)
+    }
+}
+
+fn config_text(root: &Path, port: u16, extra: &str) -> String {
+    let (uid, gid) = service_ids();
+    format!(
+        "ServerRoot {root}\n\
+         Listen 127.0.0.1:{port}\n\
+         ServerName localhost\n\
+         User {uid}\n\
+         Group {gid}\n\
+         PidFile {root}/vapached.pid\n\
+         ErrorLog {root}/error.log\n\
+         DocumentRoot {root}/www\n\
+         <Directory {root}/www>\n\
+         Require all granted\n\
+         </Directory>\n\
+         {extra}\n",
+        root = root.display(),
+    )
+}
+
+fn write_config(root: &Path, port: u16, extra: &str) -> PathBuf {
+    let path = root.join("httpd.conf");
+    fs::write(&path, config_text(root, port, extra)).unwrap();
+    path
+}
+
+fn command(root: &Path, config: &Path) -> Command {
+    let mut command = Command::new(binary());
+    command.args(["-d", root.to_str().unwrap(), "-f", config.to_str().unwrap()]);
+    command
+}
+
+fn output(root: &Path, config: &Path, args: &[&str]) -> Output {
+    command(root, config).args(args).output().unwrap()
+}
+
+fn spawn_foreground(root: &Path, config: &Path, args: &[&str]) -> Child {
+    command(root, config)
+        .args(args)
+        .arg("-X")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+fn wait_until(mut predicate: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if predicate() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for vapached lifecycle transition");
+}
+
+fn wait_running(root: &Path, port: u16) {
+    wait_until(|| {
+        root.join("vapached.pid").exists() && TcpStream::connect(("127.0.0.1", port)).is_ok()
+    });
+}
+
+fn read_pid(root: &Path) -> i32 {
+    fs::read_to_string(root.join("vapached.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+fn signal(pid: i32, sig: i32) {
+    assert_eq!(unsafe { libc::kill(pid, sig) }, 0);
+}
+
+fn wait_success(mut child: Child) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "vapached exited with {status}");
+            return;
+        }
+        assert!(Instant::now() < deadline, "vapached did not exit");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn cli_information_explain_and_startup_failures() {
+    let root = test_dir("information");
+    fs::write(root.join("www/index.txt"), "ok\n").unwrap();
+    let port = free_port();
+    let config = write_config(&root, port, "");
+
+    for args in [["--help"].as_slice(), ["--not-a-real-option"].as_slice()] {
+        assert!(!output(&root, &config, args).status.success());
+    }
+
+    for args in [
+        &["-v"][..],
+        &["-l"][..],
+        &["-V"][..],
+        &["-M"][..],
+        &["-S"][..],
+        &["-t"][..],
+        &["--explain", "/index.txt", "--explain-header", "X-Test: yes"][..],
+    ] {
+        let result = output(&root, &config, args);
+        assert!(result.status.success(), "{args:?}: {result:?}");
+    }
+
+    assert_eq!(
+        output(&root, &config, &["-k", "status"]).status.code(),
+        Some(3)
+    );
+    assert!(!output(&root, &config, &["-k", "stop"]).status.success());
+    assert!(!output(&root, &config, &["-k", "graceful"]).status.success());
+    assert!(!output(&root, &config, &["-k", "graceful-stop"])
+        .status
+        .success());
+    assert!(!output(&root, &config, &["-k", "unsupported"])
+        .status
+        .success());
+    assert!(!output(&root, &config, &["--explain", "/bad%2fpath"])
+        .status
+        .success());
+
+    let malformed = root.join("malformed.conf");
+    fs::write(&malformed, "Listen not-a-port\n").unwrap();
+    assert!(!output(&root, &malformed, &["-t"]).status.success());
+
+    let relative = root.file_name().unwrap().to_str().unwrap();
+    let relative_result = Command::new(binary())
+        .current_dir(root.parent().unwrap())
+        .args([
+            "-d",
+            relative,
+            "-f",
+            config.to_str().unwrap(),
+            "--no-envvars",
+            "-t",
+        ])
+        .output()
+        .unwrap();
+    assert!(relative_result.status.success(), "{relative_result:?}");
+
+    let display_config = root.join("display.conf");
+    fs::write(
+        &display_config,
+        config_text(
+            &root,
+            port,
+            &format!(
+                "LoadModule sample_module modules/sample.so\n\
+                 <VirtualHost *:{port}>\n\
+                 ServerName vhost.test\n\
+                 DocumentRoot {}\n\
+                 </VirtualHost>",
+                root.join("www").display()
+            ),
+        ),
+    )
+    .unwrap();
+    assert!(output(&root, &display_config, &["-M"]).status.success());
+    assert!(output(&root, &display_config, &["-S"]).status.success());
+
+    let tls_config = root.join("tls-failure.conf");
+    fs::write(
+        &tls_config,
+        config_text(
+            &root,
+            free_port(),
+            "SSLEngine On\nSSLCertificateFile missing.crt\nSSLCertificateKeyFile missing.key",
+        ),
+    )
+    .unwrap();
+    assert!(!output(&root, &tls_config, &["-t"]).status.success());
+
+    let held = TcpListener::bind(("127.0.0.1", free_port())).unwrap();
+    let held_port = held.local_addr().unwrap().port();
+    let bind_config = write_config(&root, held_port, "");
+    assert!(!output(&root, &bind_config, &["-X"]).status.success());
+    drop(held);
+
+    let blocker = root.join("blocker");
+    fs::write(&blocker, "not a directory").unwrap();
+    let log_config = root.join("log-failure.conf");
+    fs::write(
+        &log_config,
+        config_text(
+            &root,
+            free_port(),
+            &format!("ErrorLog {}/child.log", blocker.display()),
+        ),
+    )
+    .unwrap();
+    assert!(!output(&root, &log_config, &["-X"]).status.success());
+
+    let pid_config = root.join("pid-failure.conf");
+    fs::write(
+        &pid_config,
+        config_text(
+            &root,
+            free_port(),
+            &format!("PidFile {}/child.pid", blocker.display()),
+        ),
+    )
+    .unwrap();
+    assert!(!output(&root, &pid_config, &["-X"]).status.success());
+
+    let cgi = root.join("www/test.cgi");
+    fs::write(
+        &cgi,
+        "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nok\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&cgi, fs::Permissions::from_mode(0o755)).unwrap();
+    let user_config = root.join("missing-user.conf");
+    let mut missing_user = config_text(
+        &root,
+        free_port(),
+        &format!(
+            "ScriptAlias /cgi-bin/ {}/\nAddHandler cgi-script .cgi\n<Directory {}>\nOptions +ExecCGI\n</Directory>",
+            root.join("www").display(),
+            root.join("www").display(),
+        ),
+    );
+    missing_user = missing_user.replace(
+        &format!("User {}", service_ids().0),
+        "User vapache-user-that-does-not-exist",
+    );
+    fs::write(&user_config, missing_user).unwrap();
+    assert!(!output(&root, &user_config, &["-X"]).status.success());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn foreground_reload_reopen_bind_and_actions() {
+    let root = test_dir("foreground");
+    fs::write(root.join("www/index.txt"), "ok\n").unwrap();
+    let port = free_port();
+    let config = write_config(&root, port, "");
+    let child = spawn_foreground(&root, &config, &[]);
+    wait_running(&root, port);
+    let pid = read_pid(&root);
+
+    assert!(output(&root, &config, &["-k", "status"]).status.success());
+    assert!(!output(&root, &config, &["-X"]).status.success());
+    signal(pid, libc::SIGUSR1);
+
+    assert!(output(&root, &config, &["-k", "graceful"]).status.success());
+    thread::sleep(Duration::from_millis(150));
+
+    fs::write(&config, "Listen invalid\n").unwrap();
+    signal(pid, libc::SIGHUP);
+    thread::sleep(Duration::from_millis(150));
+
+    let occupied = TcpListener::bind(("127.0.0.1", free_port())).unwrap();
+    fs::write(
+        &config,
+        config_text(&root, occupied.local_addr().unwrap().port(), ""),
+    )
+    .unwrap();
+    signal(pid, libc::SIGHUP);
+    thread::sleep(Duration::from_millis(150));
+    drop(occupied);
+
+    let blocker = root.join("reload-log-blocker");
+    fs::write(&blocker, "not a directory").unwrap();
+    fs::write(
+        &config,
+        config_text(
+            &root,
+            port,
+            &format!("ErrorLog {}/child.log", blocker.display()),
+        ),
+    )
+    .unwrap();
+    signal(pid, libc::SIGHUP);
+    thread::sleep(Duration::from_millis(150));
+
+    fs::write(&config, config_text(&root, port, "")).unwrap();
+    signal(pid, libc::SIGHUP);
+    thread::sleep(Duration::from_millis(150));
+    assert!(output(&root, &config, &["-k", "stop"]).status.success());
+    wait_success(child);
+
+    let child = spawn_foreground(&root, &config, &["-k", "start"]);
+    wait_running(&root, port);
+    assert!(output(&root, &config, &["-k", "graceful-stop"])
+        .status
+        .success());
+    wait_success(child);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn daemon_and_active_graceful_drain() {
+    let daemon_root = test_dir("daemon");
+    fs::write(daemon_root.join("www/index.txt"), "ok\n").unwrap();
+    let daemon_port = free_port();
+    let daemon_config = write_config(&daemon_root, daemon_port, "");
+    assert!(output(&daemon_root, &daemon_config, &[]).status.success());
+    wait_running(&daemon_root, daemon_port);
+    assert!(output(&daemon_root, &daemon_config, &["-k", "status"])
+        .status
+        .success());
+    assert!(output(&daemon_root, &daemon_config, &["-k", "stop"])
+        .status
+        .success());
+    wait_until(|| TcpStream::connect(("127.0.0.1", daemon_port)).is_err());
+    let _ = fs::remove_file(daemon_root.join("vapached.pid"));
+
+    let drain_root = test_dir("drain");
+    let script = drain_root.join("www/slow.cgi");
+    fs::write(
+        &script,
+        "#!/bin/sh\nsleep 10\nprintf 'Content-Type: text/plain\\r\\n\\r\\nslow\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let drain_port = free_port();
+    let drain_config = write_config(
+        &drain_root,
+        drain_port,
+        "Timeout 60\nGracefulShutdownTimeout 1\nAddHandler cgi-script .cgi\n<Directory /tmp>\nOptions +ExecCGI\n</Directory>",
+    );
+    let child = spawn_foreground(&drain_root, &drain_config, &[]);
+    wait_running(&drain_root, drain_port);
+    // The listener is bound before CGI pool setup and signal-handler
+    // installation complete.  Do not send SIGTERM in that narrow window.
+    thread::sleep(Duration::from_secs(2));
+    let mut request = TcpStream::connect(("127.0.0.1", drain_port)).unwrap();
+    request
+        .write_all(b"GET /slow.cgi HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+    signal(read_pid(&drain_root), libc::SIGTERM);
+    wait_success(child);
+    drop(request);
+
+    let _ = fs::remove_dir_all(daemon_root);
+    let _ = fs::remove_dir_all(drain_root);
+}

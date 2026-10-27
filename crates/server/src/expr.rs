@@ -1769,4 +1769,54 @@ mod pass11_kernel_tests {
             );
         }
     }
+
+    #[test]
+    fn validate_vars_covers_transforms_and_every_tree_shape() {
+        for arg in [
+            "req:Host",
+            "http:Host",
+            "env:NAME",
+            "HTTP_HOST",
+            "TIME",
+            "TIME_YEAR",
+            "TIME_MON",
+            "TIME_DAY",
+            "TIME_HOUR",
+            "TIME_MIN",
+            "TIME_SEC",
+            "REQUEST_METHOD",
+            "QUERY_STRING",
+            "REQUEST_URI",
+            "REQUEST_SCHEME",
+            "HTTPS",
+            "REMOTE_ADDR",
+            "SERVER_NAME",
+            "SERVER_PORT",
+            "DOCUMENT_ROOT",
+            "API_VERSION",
+            "literal",
+        ] {
+            let _ = validate_vars(&Expr::Str(format!("%{{tolower:{arg}}}")));
+        }
+        assert!(validate_vars(&Expr::Str("%{tolower:%{REQUEST_METHOD}}".into())).is_ok());
+        assert!(validate_vars(&Expr::Str("%{REQUEST_METHOD".into())).is_err());
+
+        let leaf = || Expr::Str("literal".into());
+        let shapes = vec![
+            Expr::Func("tolower".into(), vec![leaf()]),
+            Expr::Concat(vec![leaf()]),
+            Expr::And(vec![leaf()]),
+            Expr::Or(vec![leaf()]),
+            Expr::Not(Box::new(leaf())),
+            Expr::Neg(Box::new(leaf())),
+            Expr::Compare(Box::new(leaf()), "==".into(), Box::new(leaf())),
+            Expr::Regex(Box::new(leaf()), "x".into(), false, false),
+            Expr::In(Box::new(leaf()), vec![leaf()]),
+            Expr::FileTest("-f".into(), Box::new(leaf())),
+            Expr::StrTest(Box::new(leaf()), true),
+            Expr::IpMatch(Box::new(leaf()), Box::new(leaf()), false),
+            Expr::StrMatch(Box::new(leaf()), Box::new(leaf()), false, false),
+        ];
+        assert!(shapes.iter().all(|expr| validate_vars(expr).is_ok()));
+    }
 }

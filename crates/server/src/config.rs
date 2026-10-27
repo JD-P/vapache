@@ -1481,7 +1481,9 @@ impl Scope {
                 } else if target_forced {
                     Some(SetHandler::Name(target_name))
                 } else {
-                    Some(SetHandler::None_)
+                    // Verified result 1 implies at least one of the three
+                    // preceding predicates; this arm is defensive only.
+                    Some(SetHandler::None_) // coverage:ignore-line
                 }
             }
             // Conflict: no forced handler; the conjoined extension table
@@ -7105,6 +7107,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("plain.txt"), "x y\n").unwrap();
+        std::fs::write(dir.join("invalid-utf8.map"), [0xff, 0xfe]).unwrap();
         std::fs::set_permissions(
             dir.join("plain.txt"),
             std::fs::Permissions::from_mode(0o644),
@@ -7143,6 +7146,12 @@ mod tests {
             dir.join("big.txt").display()
         ))
         .is_err());
+        assert!(
+            load_with_root("Listen 127.0.0.1:0\nRewriteMap bad txt:invalid-utf8.map\n").is_err()
+        );
+        assert!(
+            load_with_root("Listen 127.0.0.1:0\nRewriteMap bad rnd:invalid-utf8.map\n").is_err()
+        );
         let good = maps("Listen 127.0.0.1:0\nRewriteMap t txt:good.txt\n");
         assert!(matches!(
             good.as_slice(),
@@ -7165,6 +7174,19 @@ mod tests {
             ),
             "{prg:?}"
         );
+        let prg_args = maps("Listen 127.0.0.1:0\nRewriteMap w \"prg:bin/worker --mode test\"\n");
+        assert!(matches!(
+            prg_args.as_slice(),
+            [(_, RewriteMap::Prg(p))] if p.ends_with("bin/worker --mode test")
+        ));
+        let unsafe_prefix = load_with_root(
+            "Listen 127.0.0.1:0\nRewriteEngine On\nRewriteRule ^/x$ /y [UnsafePrefixStat]\n",
+        )
+        .unwrap();
+        assert!(unsafe_prefix
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("UnsafePrefixStat")));
         assert!(load_with_root("Listen 127.0.0.1:0\nRewriteMap n prg:plain.txt\n").is_err());
         assert!(load_with_root("Listen 127.0.0.1:0\nRewriteMap n prg:no-such-worker\n").is_err());
         let _ = std::fs::remove_dir_all(&dir);
@@ -9164,6 +9186,27 @@ ServerName localhost\n\
         assert!(load_text("Include\n", false).is_err());
         assert!(load_text("IncludeOptional\n", false).is_err());
         assert!(load_text("<IfModule foo>>\n</IfModule>\n", false).is_err());
+        assert!(load_text(
+            "<IfDefine NOPE>\n<Directory /x>\nServerName hidden\n</Directory>\n</IfDefine>\n",
+            false
+        )
+        .is_ok());
+        assert!(load_text(
+            "<Location>\n<Directory /nested>\nRequire all granted\n</Directory>\n</Location>\n",
+            false
+        )
+        .is_err());
+        assert!(load_text(
+            "<If \"%{NOSUCHVAR} == 'x'\">\nRequire all granted\n</If>\n",
+            false
+        )
+        .is_err());
+        let unsupported_expr = load_text(
+            "<Directory /srv>\nRequire expr \"%{NOSUCHVAR} == 'x'\"\n</Directory>\n",
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{:?}", unsupported_expr).contains("bad Require expr"));
         assert!(load_text("Include /definitely/missing.conf\n", false).is_err());
         assert!(load_text("IncludeOptional /definitely/missing.conf\n", false).is_ok());
         assert!(load_text("<IfDefine !NOPE>\nServerName x\n</IfDefine>\n", false).is_ok());
@@ -10424,6 +10467,14 @@ Require all granted\n\
                 ..nested_conditional.clone()
             },
             ScopeRule {
+                kind: MatchKind::LocationGlob("/a*".into()),
+                ..nested_conditional.clone()
+            },
+            ScopeRule {
+                kind: MatchKind::LocationGlob("/abcdef*".into()),
+                ..nested_conditional.clone()
+            },
+            ScopeRule {
                 kind: MatchKind::DirectoryMatch(compile_regex("x").unwrap()),
                 ..nested_conditional.clone()
             },
@@ -10437,7 +10488,7 @@ Require all granted\n\
             },
         ];
         sort_rules(&mut rules);
-        assert_eq!(rules.len(), 7);
+        assert_eq!(rules.len(), 9);
     }
 
     #[test]
@@ -11633,6 +11684,8 @@ mod pass11_kernel_tests {
 
     #[test]
     fn set_handler_beats_add_handler_in_both_orders() {
+        assert_eq!(SetHandler::parse("handler").name(), Some("handler"));
+        assert_eq!(SetHandler::parse("NONE").name(), None);
         for text in [
             "<Directory /srv>\nSetHandler default-handler\nAddHandler cgi-script .cgi\n</Directory>\n",
             "<Directory /srv>\nAddHandler cgi-script .cgi\nSetHandler default-handler\n</Directory>\n",
@@ -11721,6 +11774,16 @@ mod pass11_kernel_tests {
         assert_eq!(
             target_only.mapping_policy.set_handler,
             Some(SetHandler::Name("cgi-script".into()))
+        );
+
+        let mut denied = Scope::default();
+        denied.mapping_policy.set_handler = Some(SetHandler::Name("cgi-script".into()));
+        let mut url_none = Scope::default();
+        url_none.mapping_policy.set_handler = Some(SetHandler::None_);
+        denied.restrict_with(&url_none);
+        assert_eq!(
+            denied.mapping_policy.set_handler,
+            Some(SetHandler::Name("none".into()))
         );
     }
 }

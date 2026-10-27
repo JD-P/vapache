@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-10-27",
   "verus": {
-    "verified_functions": 322,
+    "verified_functions": 343,
     "errors": 0
   },
   "obligations": [
@@ -158,7 +158,7 @@
       "title": "Internal rewrite filesystem targets never change the authorization base",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "verified rewrite_filesystem_admit admits only files below the current document/alias root; its under_base input is produced by the verified component-aware path_under_base kernel; UnsafePrefixStat cannot re-root at the target parent; rewrite unit tests and the F32 replay cover the former server-root escape; the rewrite target scope is conjoined with the rewritten URL and original URL policy rather than replacing it (I61); rewrite-condition file tests probe the canonicalized target path through path_under_base rather than the lexical spelling"
+      "evidence": "verified rewrite_filesystem_shape_admit rejects external, passthrough and relative substitutions before filesystem lookup; rewrite_filesystem_candidate_admit composes that shape gate with the existing is-file and component-aware path_under_base containment checks. The runtime consumes both verified gates directly, UnsafePrefixStat cannot re-root at the target parent, and rewrite-condition file tests probe the canonicalized target path rather than its lexical spelling. The rewrite target scope remains conjoined with both rewritten and original URL policy."
     },
     {
       "id": "fastcgi_script_containment",
@@ -333,14 +333,14 @@
       "title": "Rewrite flags and rounds select one target: [PT] maps URLs, overrides are not sticky, dead flags warn",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "Partially implemented; agent handoff item H2 (findings_p10 F67/F68). [PT] is now honoured: a passthrough-flagged rule keeps its substitution in URL space and the filesystem promotion is skipped in rewrite.rs process(), so an absolute substitution under [PT] can no longer execute a host file (F67). The per-rule filesystem override is replaced unconditionally every rule and the server clears the per-round target (server.rs rewrite_filesystem), so a later URL-only [L] rewrite no longer lets an earlier round's file target win (F68 sticky override). [UnsafePrefixStat] remains parsed-but-inert by design and now logs a load-time warning ('[UnsafePrefixStat] ... has no effect') from the main-config rewriterule arm; .htaccess rules still have no warning surface. Differential regressions: tests/adversarial_regressions.py (F67PassthroughTargetTests, F68StickyFilesystemOverrideTests). The Verus flags/round state-machine (spec fn over RewriteFlags and the 10-round loop) from the handoff is still not mechanized."
+      "evidence": "Partially implemented. The verified rewrite_sink kernel gives proxying explicit precedence over redirect classification and permits internal remapping only when no terminal sink applies. rewrite_query_action mechanizes QSA/QSD and target-query precedence, rewrite_restart_admit bounds [N] restarts with a pre-increment overflow-free check, and the filesystem shape/candidate kernels keep [PT] substitutions in URL space. rewrite.rs consumes all four decisions directly and an exhaustive Boolean truth-table unit test covers their executable forms. Per-rule filesystem overrides are still replaced unconditionally so an earlier target cannot become sticky. The regex and substitution interpreters remain outside Verus."
     },
     {
       "id": "apache_options_reset",
       "title": "Signless Options words reset the set like Apache",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "Implemented; agent handoff item H3. Both parsers (config.rs main-config Options arm and htaccess.rs apply_options) now collect recognized signless words into a reset mask and apply push_set(Options::empty()) followed by the mask and the compiled FollowSymLinks default BEFORE the per-word loop, so `Options Indexes` resets the inheritance set exactly as the Apache oracle (local httpd 2.4.69) does: inherited ExecCGI is dropped and the compiled default bits return. Differential coverage agrees on both engines (htaccess-options-absolute-resets-inherited, htaccess-options-none-removes-indexes in tests/config_semantics.py); +/- sign and per-word semantics are unchanged."
+      "evidence": "Implemented; agent handoff item H3. Both parsers (config.rs main-config Options arm and htaccess.rs apply_options) now collect recognized signless words into a reset mask and apply push_set(Options::empty()) followed by the mask and the compiled FollowSymLinks default BEFORE the per-word loop, so `Options Indexes` resets the inheritance set exactly as the Apache oracle does: inherited ExecCGI is dropped and the compiled default bits return. Differential coverage agrees on both engines (htaccess-options-absolute-resets-inherited, htaccess-options-none-removes-indexes in tests/config_semantics.py); +/- sign and per-word semantics are unchanged. The runtime options_apply transition now has proofs that Set replaces the parent, Add preserves every existing bit while adding the mask, and Remove cannot grant bits and clears the requested mask."
     },
     {
       "id": "rewritemap_load_validation",

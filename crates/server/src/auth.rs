@@ -77,8 +77,13 @@ fn read_small(path: &Path) -> Option<String> {
     if !meta.is_file() || meta.len() > MAX_PASSWORD_FILE {
         return None;
     }
+    read_bounded(file)
+}
+
+fn read_bounded(reader: impl Read) -> Option<String> {
     let mut data = Vec::new();
-    file.take(MAX_PASSWORD_FILE + 1)
+    reader
+        .take(MAX_PASSWORD_FILE + 1)
         .read_to_end(&mut data)
         .ok()?;
     if data.len() as u64 > MAX_PASSWORD_FILE {
@@ -257,6 +262,121 @@ fn b64_from_24(out: &mut String, a: u8, b: u8, c: u8, n: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::{BodyFraming, Headers, Version};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "vapache-auth-{label}-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn request(authorization: Option<Vec<u8>>) -> Request {
+        let mut headers = Headers::default();
+        if let Some(value) = authorization {
+            headers.insert("Authorization", value);
+        }
+        Request {
+            method: "GET".into(),
+            target: b"/".to_vec(),
+            raw_path: b"/".to_vec(),
+            query: Vec::new(),
+            version: Version::Http11,
+            headers,
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: BodyFraming::None,
+        }
+    }
+
+    fn basic(value: &[u8]) -> Vec<u8> {
+        format!("Basic {}", STANDARD.encode(value)).into_bytes()
+    }
+
+    #[test]
+    fn authenticate_rejects_malformed_and_unsafe_credentials() {
+        let mut scope = Scope::default();
+        assert!(authenticate(&scope, &request(None)).is_none());
+        scope.authorization.auth_type = Some("basic".into());
+        for header in [
+            b"Bearer abc".to_vec(),
+            b"Basic ".to_vec(),
+            b"Basic %%%".to_vec(),
+            basic(b"missing-colon"),
+            basic(b"\xff:secret"),
+            basic(b":secret"),
+            basic(b"bad\nname:secret"),
+        ] {
+            assert!(authenticate(&scope, &request(Some(header))).is_none());
+        }
+        let mut oversized = b"alice:".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', 4097));
+        assert!(authenticate(&scope, &request(Some(basic(&oversized)))).is_none());
+        assert!(authenticate(&scope, &request(Some(basic(b"alice:secret")))).is_none());
+    }
+
+    #[test]
+    fn authenticate_reads_unique_user_and_groups() {
+        let users = temp_path("users");
+        let groups = temp_path("groups");
+        std::fs::write(
+            &users,
+            "# comment\nmalformed\nalice:$apr1$gqijKP2Z$nBjZURLWP3/zSfPLTfhVM0\r\n",
+        )
+        .unwrap();
+        std::fs::write(&groups, "malformed\n admins: alice bob\nother: bob\n").unwrap();
+        let mut scope = Scope::default();
+        scope.authorization.auth_type = Some("BASIC".into());
+        scope.authorization.auth_user_file = Some(users.clone());
+        scope.authorization.auth_group_file = Some(groups.clone());
+
+        let identity = authenticate(&scope, &request(Some(basic(b"alice:secret")))).unwrap();
+        assert_eq!(identity.user, "alice");
+        assert_eq!(identity.groups, ["admins"]);
+        assert!(authenticate(&scope, &request(Some(basic(b"alice:wrong")))).is_none());
+        assert!(authenticate(&scope, &request(Some(basic(b"nobody:secret")))).is_none());
+
+        std::fs::write(
+            &users,
+            "alice:$apr1$gqijKP2Z$nBjZURLWP3/zSfPLTfhVM0\nalice:duplicate\n",
+        )
+        .unwrap();
+        assert!(authenticate(&scope, &request(Some(basic(b"alice:secret")))).is_none());
+        std::fs::remove_file(users).unwrap();
+        std::fs::remove_file(groups).unwrap();
+    }
+
+    #[test]
+    fn password_file_and_hash_error_edges_fail_closed() {
+        let directory = temp_path("directory");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(read_small(&directory).is_none());
+        assert!(groups_for(&directory.join("missing"), "alice").is_empty());
+        std::fs::remove_dir(directory).unwrap();
+        assert!(read_bounded(std::io::Cursor::new(vec![
+            b'x';
+            MAX_PASSWORD_FILE as usize + 1
+        ]))
+        .is_none());
+
+        assert!(!verify_password(b"x", "{SHA}%%%"));
+        assert!(!verify_password(b"x", "{SSHA}%%%"));
+        assert!(!verify_password(b"x", "{SSHA}eA=="));
+        assert!(!verify_password(
+            b"\xff",
+            "$2y$05$lFdvgVrS6ROEENEOjKS5h.y4SA05OvKSOFRPC1BcjARNhNt.DQ8jC"
+        ));
+        assert!(!verify_password(b"x", "$1$x$bad"));
+        assert!(!md5_crypt_matches(b"x", "$1$x$bad", "$apr1$"));
+        assert!(!md5_crypt_matches(b"x", "$apr1$missing", "$apr1$"));
+        assert!(!md5_crypt_matches(b"x", "$apr1$123456789$bad", "$apr1$"));
+    }
 
     #[test]
     fn apr1_matches_apache_htpasswd() {

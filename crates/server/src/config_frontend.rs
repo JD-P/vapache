@@ -220,7 +220,7 @@ pub fn parse_line(text: &str) -> Result<ConfigLine, String> {
                 .trim()
                 .to_ascii_lowercase();
             if name.is_empty() {
-                return Err("empty section name".into());
+                return Err("empty section name".into()); // coverage:ignore-line - tokenizer rejects `<>` first
             }
             Ok(ConfigLine::SectionStart {
                 name,
@@ -245,6 +245,30 @@ mod tests {
         assert_eq!(tokenize("\"^\\.ht\"").unwrap(), vec!["^\\.ht"]);
         assert_eq!(tokenize("\"a \\\"b\\\"\"").unwrap(), vec!["a \"b\""]);
         assert!(tokenize("\"unterminated").is_err());
+    }
+
+    #[test]
+    fn frontend_error_and_continuation_edges() {
+        assert_eq!(
+            logical_lines_with_numbers(concat!("one \\", "\n  two \\", "\n three\nfour \\")),
+            vec![(1, "one  two  three".into()), (4, "four ".into())]
+        );
+        assert_eq!(logical_lines("value\\"), vec!["value"]);
+        assert!(tokenize("\"closed\"suffix").is_err());
+        let too_many = std::iter::repeat_n("x", 257).collect::<Vec<_>>().join(" ");
+        assert!(tokenize(&too_many).is_err());
+        assert!(tokenize_config("</Directory> trailing").is_err());
+        assert!(tokenize_config("<Directory> trailing").is_err());
+        assert!(tokenize_config("<>").is_err());
+        assert!(parse_line("</>").is_err());
+        assert!(parse_line("").is_err());
+
+        let directive = parse_line("Require all granted").unwrap();
+        let start = parse_line("<Directory /srv>").unwrap();
+        let end = parse_line("</Directory>").unwrap();
+        assert_eq!(directive.name(), "require");
+        assert_eq!(start.name(), "directory");
+        assert_eq!(end.name(), "directory");
     }
 
     #[test]

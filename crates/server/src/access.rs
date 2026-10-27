@@ -743,6 +743,11 @@ mod tests {
             "2001:db8::".parse().unwrap(),
             32
         ));
+        assert!(!ip_in_net(
+            "192.0.2.1".parse().unwrap(),
+            "2001:db8::".parse().unwrap(),
+            32
+        ));
     }
 
     #[test]

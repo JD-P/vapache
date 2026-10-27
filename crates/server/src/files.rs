@@ -71,7 +71,7 @@ fn symlink_owner_matches(root: &Path, rel: &Path) -> bool {
             return false;
         };
         if resolved.uid() != link_meta.uid() {
-            return false;
+            return false; // coverage:ignore-line - requires a root-owned target mismatch
         }
     }
     true
@@ -104,12 +104,17 @@ pub fn resolve_target_checked(
             }
         }
     };
+    // An owned, successfully opened descriptor remains stat-able for its
+    // lifetime on Unix; keep the defensive failure closed without requiring
+    // an impossible-to-construct test fixture.
     let meta = match file.metadata() {
         Ok(m) => m,
+        // coverage:ignore-start - owned descriptor lifetime invariant
         Err(_) => return Target::Forbidden,
+        // coverage:ignore-stop
     };
     if owner_match_only && !symlink_owner_matches(root, rel) {
-        return Target::Forbidden;
+        return Target::Forbidden; // coverage:ignore-line - requires a root-owned target mismatch
     }
     if meta.is_dir() {
         Target::Directory { file, meta }
@@ -190,7 +195,9 @@ pub(crate) fn symlink_metadata_cached(path: &Path) -> io::Result<Metadata> {
 }
 
 pub(crate) fn is_dir_cached(path: &Path) -> bool {
-    metadata_cached(path).map(|meta| meta.is_dir()).unwrap_or(false)
+    metadata_cached(path)
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
 }
 
 fn root_file(root: &Path) -> io::Result<Arc<File>> {
@@ -988,6 +995,11 @@ pub(crate) fn local_error_document_response() -> bool {
     LOCAL_ERROR_DOCUMENT_RESPONSE.with(|active| active.get())
 }
 
+#[cfg(test)]
+pub(crate) fn set_local_error_document_response_for_test(value: bool) {
+    LOCAL_ERROR_DOCUMENT_RESPONSE.with(|active| active.set(value));
+}
+
 fn serve_error_document(
     cfg: &Config,
     _vhost: Option<&VHost>,
@@ -1037,4 +1049,547 @@ pub fn simple_html(status: u16, message: &str, location: Option<&str>) -> Respon
         r.headers.push(("Location".into(), l.as_bytes().to_vec()));
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::{Headers, Version};
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn request(method: &str, path: &[u8]) -> Request {
+        Request {
+            method: method.into(),
+            target: path.to_vec(),
+            raw_path: path.to_vec(),
+            query: Vec::new(),
+            version: Version::Http11,
+            headers: Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        }
+    }
+
+    fn config(name: &str) -> (PathBuf, Config) {
+        let dir = std::env::temp_dir().join(format!("vapache-files-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("httpd.conf");
+        std::fs::write(
+            &conf,
+            format!("Listen 127.0.0.1:0\nDocumentRoot {}\n", dir.display()),
+        )
+        .unwrap();
+        let cfg = Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        (dir, cfg)
+    }
+
+    #[test]
+    fn resolution_metadata_mime_and_fallback_edges() {
+        let (root, mut cfg) = config("resolution");
+        std::fs::write(root.join("plain.txt"), b"hello").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+
+        assert!(matches!(
+            resolve_target(&root, Path::new("plain.txt"), true),
+            Target::File { .. }
+        ));
+        assert!(matches!(
+            resolve_target_checked(&root, Path::new(""), true, false),
+            Target::Directory { .. }
+        ));
+        assert!(matches!(
+            resolve_target_checked(&root, Path::new("missing"), true, false),
+            Target::NotFound
+        ));
+        assert!(matches!(
+            resolve_target_checked(&root, Path::new("../escape"), true, false),
+            Target::Forbidden
+        ));
+
+        std::os::unix::fs::symlink("plain.txt", root.join("same-owner-link")).unwrap();
+        assert!(matches!(
+            resolve_target_checked(&root, Path::new("same-owner-link"), true, true),
+            Target::File { .. }
+        ));
+        std::os::unix::fs::symlink("missing", root.join("dangling")).unwrap();
+        assert!(matches!(
+            resolve_target_checked(&root, Path::new("dangling"), true, true),
+            Target::NotFound
+        ));
+        assert!(!symlink_owner_matches(
+            &root,
+            Path::new("missing-component")
+        ));
+        assert!(!symlink_owner_matches(&root, Path::new("dangling")));
+        assert!(matches!(
+            resolve_target_checked(
+                &root,
+                Path::new(std::ffi::OsStr::from_bytes(b"bad\0name")),
+                true,
+                false,
+            ),
+            Target::NotFound
+        ));
+        if unsafe { libc::geteuid() } == 0 {
+            let link = root.join("different-owner-link");
+            std::os::unix::fs::symlink("plain.txt", &link).unwrap();
+            let link_c = CString::new(link.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::lchown(link_c.as_ptr(), 1, u32::MAX) }, 0);
+            assert!(!symlink_owner_matches(
+                &root,
+                Path::new("different-owner-link")
+            ));
+            assert!(matches!(
+                resolve_target_checked(&root, Path::new("different-owner-link"), true, true,),
+                Target::Forbidden
+            ));
+        }
+
+        let fifo = root.join("fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            resolve_target_checked(&root, Path::new("fifo"), true, false),
+            Target::Forbidden
+        ));
+
+        let invalid_open_flag = 1u64 << 63;
+        let opened = open_beneath(&root, Path::new("plain.txt"), invalid_open_flag, true).unwrap();
+        assert_eq!(opened.metadata().unwrap().len(), 5);
+        assert_eq!(
+            open_beneath(
+                &root,
+                Path::new("plain.txt"),
+                invalid_open_flag | libc::O_DIRECTORY as u64,
+                true,
+            )
+            .unwrap_err()
+            .raw_os_error(),
+            Some(libc::ENOTDIR)
+        );
+        let outside_name = format!("vapache-files-outside-{}", std::process::id());
+        let outside = root.parent().unwrap().join(&outside_name);
+        std::fs::write(&outside, b"outside").unwrap();
+        assert_eq!(
+            open_beneath(
+                &root,
+                Path::new("..").join(&outside_name).as_path(),
+                invalid_open_flag,
+                true,
+            )
+            .unwrap_err()
+            .raw_os_error(),
+            Some(libc::EXDEV)
+        );
+        std::fs::remove_file(outside).unwrap();
+        assert_eq!(
+            open_at(&File::open(&root).unwrap(), b"bad\0name", true)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
+
+        let _guard = request_metadata_scope();
+        assert!(metadata_cached(&root.join("plain.txt")).is_ok());
+        assert!(metadata_cached(&root.join("plain.txt")).is_ok());
+        assert!(symlink_metadata_cached(&root.join("same-owner-link")).is_ok());
+        assert!(symlink_metadata_cached(&root.join("same-owner-link")).is_ok());
+        assert!(is_dir_cached(&root.join("sub")));
+
+        for i in 0..18 {
+            let p = root.join(format!("root-{i}"));
+            std::fs::create_dir(&p).unwrap();
+            assert!(root_file(&p).is_ok());
+        }
+
+        cfg.mime.types.insert("txt".into(), "text/plain".into());
+        let mut scope = Scope::default();
+        scope.content_policy.default_charset = Some("utf-8".into());
+        assert_eq!(
+            mime_type(&cfg, &scope, b"plain.txt").as_deref(),
+            Some("text/plain; charset=utf-8")
+        );
+        scope
+            .content_policy
+            .add_types
+            .push(("text/custom".into(), "foo".into()));
+        assert_eq!(
+            mime_type(&cfg, &scope, b"x.foo").as_deref(),
+            Some("text/custom; charset=utf-8")
+        );
+        scope.content_policy.remove_types.push("foo".into());
+        assert!(mime_type(&cfg, &scope, b"x.foo").is_none());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn file_preconditions_ranges_and_methods() {
+        let (root, cfg) = config("preconditions");
+        let path = root.join("file.txt");
+        std::fs::write(&path, b"abcdef").unwrap();
+        let scope = Scope::default();
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let make = || {
+            let file = File::open(&path).unwrap();
+            let meta = file.metadata().unwrap();
+            (file, meta)
+        };
+
+        let (file, meta) = make();
+        let mut req = request("GET", b"/file.txt");
+        req.headers.insert("if-match", b"\"wrong\"".to_vec());
+        assert_eq!(
+            serve_file_inner(
+                &cfg,
+                &scope,
+                &req,
+                file,
+                &meta,
+                b"file.txt",
+                peer,
+                "127.0.0.1"
+            )
+            .status,
+            412
+        );
+
+        let (file, meta) = make();
+        let mut req = request("GET", b"/file.txt");
+        req.headers.insert(
+            "if-unmodified-since",
+            crate::util::http_date(meta.mtime() - 10).into_bytes(),
+        );
+        assert_eq!(
+            serve_file_inner(
+                &cfg,
+                &scope,
+                &req,
+                file,
+                &meta,
+                b"file.txt",
+                peer,
+                "127.0.0.1"
+            )
+            .status,
+            412
+        );
+        assert!(header_etag_list_matches(b"W/\"abc\"", "\"abc\"", true));
+        assert!(header_etag_list_matches(b"\"abc\"", "W/\"abc\"", true));
+        assert!(header_etag_list_matches(b"*", "\"abc\"", false));
+        assert!(header_etag_list_matches(
+            b"\"other\", \"abc\"",
+            "\"abc\"",
+            false
+        ));
+
+        let (file, meta) = make();
+        let tag = etag(&meta, ETAG_ALL);
+        let mut req = request("POST", b"/file.txt");
+        req.headers.insert("if-none-match", tag.as_bytes().to_vec());
+        assert_eq!(
+            serve_file_inner(
+                &cfg,
+                &scope,
+                &req,
+                file,
+                &meta,
+                b"file.txt",
+                peer,
+                "127.0.0.1"
+            )
+            .status,
+            412
+        );
+
+        let (file, meta) = make();
+        let mut req = request("GET", b"/file.txt");
+        req.headers.insert("range", b"bytes=1-2".to_vec());
+        req.headers
+            .insert("if-range", http_date(meta.mtime()).into_bytes());
+        assert_eq!(
+            serve_file_inner(
+                &cfg,
+                &scope,
+                &req,
+                file,
+                &meta,
+                b"file.txt",
+                peer,
+                "127.0.0.1"
+            )
+            .status,
+            206
+        );
+
+        let (file, meta) = make();
+        let req = request("POST", b"/file.txt");
+        let response = serve_file_inner(
+            &cfg,
+            &scope,
+            &req,
+            file,
+            &meta,
+            b"file.txt",
+            peer,
+            "127.0.0.1",
+        );
+        assert_eq!(response.status, 405);
+        assert!(response
+            .headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("allow")));
+
+        let (file, meta) = make();
+        let req = request("HEAD", b"/file.txt");
+        let response = serve_file_inner(
+            &cfg,
+            &scope,
+            &req,
+            file,
+            &meta,
+            b"file.txt",
+            peer,
+            "127.0.0.1",
+        );
+        assert!(matches!(response.body, Body::Empty));
+
+        let (file, meta) = make();
+        let req = request("GET", b"/file.txt");
+        let response = serve_file(
+            &cfg,
+            &scope,
+            &req,
+            file,
+            &meta,
+            &path,
+            b"file.txt",
+            peer,
+            "127.0.0.1",
+            &crate::access::test_grant(),
+            &crate::access::ResourceKey::request(
+                None,
+                &req,
+                "/file.txt",
+                Some(Path::new("/wrong")),
+                None,
+            ),
+        );
+        assert_eq!(response.status, 500);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn directory_error_document_and_message_edges() {
+        let (root, mut cfg) = config("directory");
+        std::fs::write(root.join("index.html"), b"index").unwrap();
+        std::fs::write(root.join("visible"), b"x").unwrap();
+        std::fs::write(root.join("ignored~"), b"x").unwrap();
+        std::fs::write(root.join("#ignored"), b"x").unwrap();
+        let dir = File::open(&root).unwrap();
+        let mut req = request("GET", b"/dir");
+        req.query = b"a=1".to_vec();
+        let mut scope = Scope::default();
+        match directory_action(&cfg, &scope, &req, &dir, "/dir", b"/dir", true) {
+            DirAction::Redirect(loc) => assert!(loc.ends_with("/dir/?a=1")),
+            _ => panic!("expected redirect"),
+        }
+
+        cfg.directory_index = vec!["../bad".into(), ".".into(), "".into(), "index.html".into()];
+        assert!(
+            directory_index_target(&cfg, &scope, &request("GET", b"/"), &dir, "/", b"/").is_some()
+        );
+        cfg.directory_index.clear();
+        scope.options.push_add(crate::config::Options::INDEXES);
+        scope.content_policy.index_ignore.push("visible".into());
+        assert!(matches!(
+            directory_action(&cfg, &scope, &request("GET", b"/"), &dir, "/", b"/", true),
+            DirAction::List(_)
+        ));
+
+        cfg.directory_index = vec!["index.html".into()];
+        let indexed = serve_directory_inner(
+            &cfg,
+            None,
+            &Scope::default(),
+            &request("GET", b"/"),
+            File::open(&root).unwrap(),
+            "/",
+            b"/",
+            "example.test",
+            80,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "127.0.0.1",
+        );
+        assert_eq!(indexed.status, 200);
+
+        cfg.server_signature = ServerSignature::Email;
+        let listed = autoindex(
+            &cfg,
+            &scope,
+            "/dir/",
+            &[(b"child".to_vec(), true, 0), (b"file".to_vec(), false, 7)],
+            "example.test",
+            8080,
+        );
+        assert_eq!(listed.status, 200);
+
+        let mut text_scope = Scope::default();
+        text_scope
+            .error_policy
+            .push(418, ErrorDoc::Text("teapot".into()));
+        assert_eq!(
+            error_response_inner(
+                &cfg,
+                None,
+                &text_scope,
+                418,
+                &request("GET", b"/"),
+                "/",
+                80,
+                "h",
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                "127.0.0.1"
+            )
+            .status,
+            418
+        );
+        text_scope
+            .error_policy
+            .push(419, ErrorDoc::External("https://example.test/next".into()));
+        assert_eq!(
+            error_response_inner(
+                &cfg,
+                None,
+                &text_scope,
+                419,
+                &request("GET", b"/"),
+                "/",
+                80,
+                "h",
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                "127.0.0.1"
+            )
+            .status,
+            302
+        );
+
+        for status in [408, 413, 414, 505, 599] {
+            assert!(!error_message(status, "/x").is_empty());
+        }
+        IN_ERROR_DOCUMENT.with(|active| active.set(true));
+        assert!(serve_error_document(
+            &cfg,
+            None,
+            &request("GET", b"/"),
+            "/missing",
+            500,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "127.0.0.1",
+            80
+        )
+        .is_none());
+        IN_ERROR_DOCUMENT.with(|active| active.set(false));
+        let local = serve_error_document(
+            &cfg,
+            None,
+            &request("GET", b"/missing"),
+            "/index.html",
+            404,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "127.0.0.1",
+            80,
+        )
+        .expect("existing local error document");
+        assert_eq!(local.status, 404);
+        assert!(local_error_document_response());
+        reset_local_error_document_response();
+        assert_eq!(simple_html(302, "go", Some("/next")).status, 302);
+
+        crate::expr::with_connection(true, 443, || {
+            let redirected = serve_directory_inner(
+                &cfg,
+                None,
+                &Scope::default(),
+                &request("GET", b"/dir"),
+                File::open(&root).unwrap(),
+                "/dir",
+                b"/dir",
+                "example.test",
+                443,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                "127.0.0.1",
+            );
+            assert!(redirected
+                .headers
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("location") && v.starts_with(b"https://")));
+        });
+
+        cfg.use_canonical_name = true;
+        cfg.server_name = Some("canonical.example".into());
+        let redirected = serve_directory_inner(
+            &cfg,
+            None,
+            &Scope::default(),
+            &request("GET", b"relative"),
+            File::open(&root).unwrap(),
+            "/dir",
+            b"relative",
+            "fallback.example",
+            8080,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "127.0.0.1",
+        );
+        assert!(redirected
+            .headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("location") && v == b"relative/"));
+
+        let req = request("GET", b"/");
+        let dir_file = File::open(&root).unwrap();
+        let meta = dir_file.metadata().unwrap();
+        let invalid = serve_directory(
+            &cfg,
+            None,
+            &Scope::default(),
+            &req,
+            dir_file,
+            &meta,
+            &root,
+            "/",
+            b"/",
+            "host",
+            80,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "127.0.0.1",
+            &crate::access::test_grant(),
+            &crate::access::ResourceKey::request(None, &req, "/", Some(Path::new("/wrong")), None),
+        );
+        assert_eq!(invalid.status, 500);
+
+        let generic_redirect = error_response_inner(
+            &cfg,
+            None,
+            &Scope::default(),
+            302,
+            &req,
+            "/",
+            80,
+            "host",
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "127.0.0.1",
+        );
+        assert!(generic_redirect
+            .headers
+            .iter()
+            .any(|(n, v)| { n.eq_ignore_ascii_case("cache-control") && v == b"no-cache" }));
+        assert!(!error_message(431, "/").is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

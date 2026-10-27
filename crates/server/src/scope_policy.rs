@@ -69,6 +69,7 @@ mod tests {
         assert_eq!(p.effective_bits(0b1), 0b1);
         p.push_remove(0b1);
         assert_eq!(p.effective_bits(0b1), 0);
+        assert_eq!(p.changes(), &[(0, 0b1), (2, 0b1)]);
     }
 
     #[test]

@@ -2276,6 +2276,23 @@ mod tests {
     }
 
     #[test]
+    fn enabled_override_on_a_non_directory_is_skipped() {
+        let dir = tempdir("non-directory-layer");
+        let blocked = dir.join("not-a-directory");
+        fs::write(&blocked, "file").unwrap();
+        let cfg = config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:0\n<Directory \"{}\">\nAllowOverride All\n</Directory>\n",
+                blocked.display()
+            ),
+        );
+        let layers = collect_layers(&cfg, None, &blocked.join("child"), "/child").unwrap();
+        assert!(layers.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn parses_access_auth_and_media_directives() {
         let dir = tempdir("directives");
         let cfg = config(&dir, "Listen 127.0.0.1:0\n");
@@ -3683,6 +3700,11 @@ mod tests {
         assert!(rule_matches(&MatchKind::Location("/a".into()), "x", "/a/b"));
         assert!(!rule_matches(&MatchKind::Location("/a".into()), "x", "/ab"));
         assert!(rule_matches(
+            &MatchKind::LocationGlob("/a/*".into()),
+            "x",
+            "/a/b"
+        ));
+        assert!(rule_matches(
             &MatchKind::LocationMatch(re("^/a")),
             "x",
             "/a/b"
@@ -3849,6 +3871,10 @@ mod tests {
             ("Options\n", true),
             ("Options All\n", true),
             ("Options Indexes\n", true),
+            (
+                "Options Indexes FollowSymLinks SymLinksIfOwnerMatch ExecCGI Includes IncludesNoExec MultiViews\n",
+                true,
+            ),
             ("Header always\n", false),
             ("Header always set\n", false),
             ("Header always set X yes\n", true),

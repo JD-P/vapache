@@ -238,7 +238,9 @@ fn parse_cert(der_bytes: &[u8]) -> Option<CertInfo> {
                     ocsp_url = parse_aia(der_bytes, t);
                 }
             }
-            _ => {}
+            // `stage` is initialized at zero and is only advanced through
+            // six; no parser transition can construct another value.
+            _ => {} // coverage:ignore-line
         }
     }
     Some(CertInfo {
@@ -486,6 +488,56 @@ pub fn staple_response(
 mod tests {
     use super::*;
 
+    fn minimal_cert(url: Option<&str>) -> Vec<u8> {
+        let mut fields = vec![
+            der(0x02, &[1]),
+            der(0x30, &[]),
+            der(0x30, &[]),
+            der(0x30, &[]),
+            der(0x30, &[0x05, 0x00]),
+            der(0x30, &der(0x03, &[0, 1, 2, 3])),
+        ];
+        if let Some(url) = url {
+            let access = der(
+                0x30,
+                &[
+                    der(0x06, &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01]),
+                    der(0x86, url.as_bytes()),
+                ]
+                .concat(),
+            );
+            let aia_value = der(0x04, &der(0x30, &access));
+            let extension = der(
+                0x30,
+                &[
+                    der(0x06, &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01]),
+                    aia_value,
+                ]
+                .concat(),
+            );
+            fields.push(der(0xa3, &der(0x30, &extension)));
+        }
+        der(0x30, &der(0x30, &fields.concat()))
+    }
+
+    fn serve(response: Vec<u8>) -> Option<Vec<u8>> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(&response);
+        });
+        let result = fetch_response(
+            &format!("http://{addr}/ocsp"),
+            b"request",
+            Duration::from_secs(2),
+        );
+        handle.join().unwrap();
+        result
+    }
+
     #[test]
     fn cached_responses_must_be_successful() {
         let dir = std::env::temp_dir().join(format!("vapache-ocsp-cache-{}", std::process::id()));
@@ -521,5 +573,156 @@ mod tests {
         let t = parse_tlv(&encoded, 0).unwrap();
         assert_eq!(t.tag, 0x04);
         assert_eq!(&encoded[t.content_start..t.content_end], b"abc");
+    }
+
+    #[test]
+    fn der_certificate_and_url_parsers_cover_malformed_edges() {
+        assert!(parse_tlv(&[], 0).is_none());
+        assert!(parse_tlv(&[0x04, 0x80], 0).is_none());
+        assert!(parse_tlv(&[0x04, 0x89], 0).is_none());
+        assert!(parse_tlv(&[0x04, 0x82, 0x01], 0).is_none());
+        assert!(parse_tlv(&[0x04, 3, 1], 0).is_none());
+
+        let empty_spki = der(0x30, &[]);
+        assert!(parse_spki(&empty_spki, parse_tlv(&empty_spki, 0).unwrap()).is_none());
+        for content in [&[][..], &[8, 1][..]] {
+            let spki = der(0x30, &der(0x03, content));
+            assert!(parse_spki(&spki, parse_tlv(&spki, 0).unwrap()).is_none());
+        }
+
+        let not_a_sequence = der(0x04, &der(0x04, b"x"));
+        assert!(parse_aia_value(&not_a_sequence, parse_tlv(&not_a_sequence, 0).unwrap()).is_none());
+        let skipped_ad = der(0x04, &der(0x30, &der(0x04, b"x")));
+        assert!(parse_aia_value(&skipped_ad, parse_tlv(&skipped_ad, 0).unwrap()).is_none());
+        let missing_general_name = der(0x04, &der(0x30, &der(0x30, &der(0x06, &[0x2b]))));
+        assert!(parse_aia_value(
+            &missing_general_name,
+            parse_tlv(&missing_general_name, 0).unwrap()
+        )
+        .is_none());
+        let bad_wrapper = der(0xa3, &der(0x04, b"x"));
+        assert!(parse_aia(&bad_wrapper, parse_tlv(&bad_wrapper, 0).unwrap()).is_none());
+        let skipped_extension = der(0xa3, &der(0x30, &der(0x04, b"x")));
+        assert!(parse_aia(
+            &skipped_extension,
+            parse_tlv(&skipped_extension, 0).unwrap()
+        )
+        .is_none());
+
+        let cert = minimal_cert(Some("http://ocsp.example.test/check"));
+        let info = parse_cert(&cert).unwrap();
+        assert_eq!(
+            info.ocsp_url.as_deref(),
+            Some("http://ocsp.example.test/check")
+        );
+        assert!(!build_request(&info, &info).unwrap().is_empty());
+        assert!(parse_cert(&der(0x04, b"bad")).is_none());
+        assert!(parse_cert(&der(0x30, &der(0x04, b"bad"))).is_none());
+
+        assert_eq!(
+            parse_http_url("http://example.test:8080/path"),
+            Some(("example.test".into(), 8080, "/path".into()))
+        );
+        assert_eq!(
+            parse_http_url("http://example.test"),
+            Some(("example.test".into(), 80, "/".into()))
+        );
+        assert!(parse_http_url("https://example.test/").is_none());
+        assert!(parse_http_url("http:///path").is_none());
+        assert!(parse_http_url("http://host:bad/").is_none());
+
+        assert!(!successful_response(&[]));
+        assert!(!successful_response(&der(0x04, b"bad")));
+        assert!(!successful_response(&der(0x30, &[])));
+        assert!(fetch_fresh(&[], None, Duration::ZERO).is_none());
+        assert!(staple_response(&[], None, Duration::ZERO).is_none());
+        let chain = [
+            CertificateDer::from(cert),
+            CertificateDer::from(minimal_cert(None)),
+        ];
+        assert!(response_key(&chain, Some("http://forced/")).ends_with(b"http://forced/"));
+        assert!(cache_path(std::path::Path::new("/tmp"), &chain, None)
+            .extension()
+            .is_some_and(|ext| ext == "ocsp"));
+    }
+
+    #[test]
+    fn ocsp_http_fetch_handles_length_eof_status_and_header_limits() {
+        assert_eq!(
+            serve(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec()),
+            Some(b"hello".to_vec())
+        );
+        assert_eq!(
+            serve(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody".to_vec()),
+            Some(b"body".to_vec())
+        );
+        assert!(serve(b"HTTP/1.1 500 Error\r\n\r\n".to_vec()).is_none());
+        assert!(serve(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nno".to_vec()).is_none());
+        assert!(serve(b"HTTP/1.1 200 OK\r\nContent-Length: 2097153\r\n\r\n".to_vec()).is_none());
+        let mut oversized_body = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        oversized_body.resize(oversized_body.len() + 2 * 1024 * 1024 + 1, b'x');
+        assert!(serve(oversized_body).is_none());
+
+        let mut oversized_head = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for _ in 0..8 {
+            oversized_head.extend_from_slice(b"X-Fill: ");
+            oversized_head.extend(std::iter::repeat_n(b'x', 9000));
+            oversized_head.extend_from_slice(b"\r\n");
+        }
+        oversized_head.extend_from_slice(b"\r\n");
+        assert!(serve(oversized_head).is_none());
+
+        let mut eof = &b""[..];
+        assert!(read_http_line(&mut eof).is_none());
+        assert!(fetch_response("not-a-url", b"x", Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn fresh_and_stapled_responses_cover_failure_and_cache_paths() {
+        fn responder(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+            });
+            (format!("http://{addr}/ocsp"), handle)
+        }
+
+        let cert = minimal_cert(None);
+        let chain = [
+            CertificateDer::from(cert.clone()),
+            CertificateDer::from(cert),
+        ];
+        let (bad_url, bad_thread) = responder(der(0x30, &der(0x0a, &[1])));
+        assert!(fetch_fresh(&chain, Some(&bad_url), Duration::from_secs(2)).is_none());
+        bad_thread.join().unwrap();
+
+        let (bad_staple_url, bad_staple_thread) = responder(der(0x30, &der(0x0a, &[1])));
+        assert!(staple_response(&chain, Some(&bad_staple_url), Duration::from_secs(2)).is_none());
+        bad_staple_thread.join().unwrap();
+
+        let good = der(0x30, &der(0x0a, &[0]));
+        let (fresh_url, fresh_thread) = responder(good.clone());
+        assert_eq!(
+            fetch_fresh(&chain, Some(&fresh_url), Duration::from_secs(2)),
+            Some(good.clone())
+        );
+        fresh_thread.join().unwrap();
+        let (good_url, good_thread) = responder(good.clone());
+        assert_eq!(
+            staple_response(&chain, Some(&good_url), Duration::from_secs(2)),
+            Some(good.clone())
+        );
+        good_thread.join().unwrap();
+        // No responder is listening now: success proves the cache-return arm.
+        assert_eq!(
+            staple_response(&chain, Some(&good_url), Duration::from_millis(10)),
+            Some(good)
+        );
     }
 }

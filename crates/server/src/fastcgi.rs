@@ -588,7 +588,8 @@ fn secure_temp_file_at(dir: &Path, seed: u64, start: u64) -> io::Result<File> {
             Err(e) => return Err(e),
         }
     }
-    Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "spool name collision")))
+    Err(last
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "spool name collision")))
 }
 
 fn secure_temp_file(dir: &Path, seed: u64) -> io::Result<File> {
@@ -786,18 +787,13 @@ mod tests {
     #[test]
     fn spool_temp_file_never_follows_a_preexisting_symlink() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-fcgi-spool-safe-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vapache-fcgi-spool-safe-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let target = dir.join("overwrite-target");
         fs::write(&target, b"ORIGINAL TARGET CONTENT\n").unwrap();
-        let predicted = dir.join(format!(
-            "vapache-fastcgi-{}-0.body",
-            std::process::id()
-        ));
+        let predicted = dir.join(format!("vapache-fastcgi-{}-0.body", std::process::id()));
         std::os::unix::fs::symlink(&target, &predicted).unwrap();
         let mut file = secure_temp_file_at(&dir, 0, 0).expect("collision-safe spool");
         file.write_all(b"ATTACKER BODY").unwrap();
@@ -820,17 +816,13 @@ mod tests {
 
     #[test]
     fn spool_temp_file_reports_open_errors_and_collision_exhaustion() {
-        let missing = std::env::temp_dir().join(format!(
-            "vapache-fcgi-spool-missing-{}",
-            std::process::id()
-        ));
+        let missing =
+            std::env::temp_dir().join(format!("vapache-fcgi-spool-missing-{}", std::process::id()));
         let _ = fs::remove_dir_all(&missing);
         assert!(secure_temp_file_at(&missing, 1, 0).is_err());
 
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-fcgi-spool-full-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vapache-fcgi-spool-full-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let pid = std::process::id();
@@ -849,10 +841,8 @@ mod tests {
     #[test]
     fn spool_temp_file_is_private_and_unlinked() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-fcgi-spool-mode-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vapache-fcgi-spool-mode-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let file = secure_temp_file_at(&dir, 7, 0).unwrap();

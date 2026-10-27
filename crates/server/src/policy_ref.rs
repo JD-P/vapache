@@ -383,6 +383,7 @@ mod tests {
                 "</Directory>\n",
             ),
         );
+        compare("baseline", "Listen 127.0.0.1:0\n");
     }
 
     #[test]
@@ -391,12 +392,10 @@ mod tests {
         let plan = crate::verified::access_plan_exec(&present);
         assert_eq!(plan.len(), present.len() + 6);
         for (i, step) in plan.iter().take(present.len()).enumerate() {
-            match step {
-                crate::verified::AccessStep::Walk { access } => {
-                    assert_eq!(*access, present[i]);
-                }
-                other => panic!("expected Walk at {i}, got {other:?}"),
-            }
+            assert_eq!(
+                step,
+                &crate::verified::AccessStep::Walk { access: present[i] }
+            );
         }
         assert_eq!(
             &plan[present.len()..],

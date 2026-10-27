@@ -1836,6 +1836,14 @@ mod tests {
             worker_ids_for(1000, 1001, "ignored", "ignored").unwrap(),
             (1000, 1001)
         );
+        assert_eq!(worker_ids_for(0, 0, "123", "456").unwrap(), (123, 456));
+        assert!(worker_ids_for(0, 0, "bad\0user", "0").is_err());
+        assert!(worker_ids_for(0, 0, "no-such-vapache-user-xyz", "0").is_err());
+        let root_ids = worker_ids_for(0, 0, "root", "root").unwrap();
+        assert_eq!(root_ids.0, 0);
+        assert_eq!(root_ids.1, 0);
+        assert!(worker_ids_for(0, 0, "0", "bad\0group").is_err());
+        assert!(worker_ids_for(0, 0, "0", "no-such-vapache-group-xyz").is_err());
         init_worker_groups("bad\0user", 0);
         init_worker_groups("no-such-vapache-user-xyz", 0);
 
@@ -2179,6 +2187,43 @@ mod tests {
             let dropped = drop_worker_privileges(euid, egid, "root");
             let rejected = drop_worker_privileges(u32::MAX, u32::MAX, "no-such-user");
             std::process::exit(if setup && dropped && !rejected { 0 } else { 1 });
+        }
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        // Exercise the root-mode privilege-drop branch in disposable
+        // children.  The first keeps the child's real ids; the second uses an
+        // impossible gid so the syscall failure is observed without changing
+        // the test runner's credentials.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+            std::process::exit(if drop_worker_privileges_for(0, 0, uid, gid, "root") {
+                0
+            } else {
+                1
+            });
+        }
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let uid = unsafe { libc::geteuid() };
+            std::process::exit(if drop_worker_privileges_for(0, 0, uid, u32::MAX, "root") {
+                1
+            } else {
+                0
+            });
         }
         let mut status = 0;
         unsafe {

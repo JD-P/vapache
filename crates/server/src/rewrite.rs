@@ -264,7 +264,9 @@ fn build_cookie(raw: &str) -> Result<String, String> {
         out.push_str(same_site);
     }
     if out.chars().any(|c| c.is_control()) {
-        return Err("control character in RewriteRule [CO] cookie".into());
+        // Every interpolated field is validated as a cookie octet or parsed as
+        // an integer above; retain this final invariant check as defense in depth.
+        return Err("control character in RewriteRule [CO] cookie".into()); // coverage:ignore-line
     }
     Ok(out)
 }
@@ -390,7 +392,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
     let mut vary: Vec<String> = Vec::new();
     let mut idx = 0usize;
     let mut skip_next = 0usize;
-    let mut loops = 0usize;
+    let mut loops = 0u64;
 
     while idx < scope.rewrite_policy.rewrite_rules.len() {
         let rule = &scope.rewrite_policy.rewrite_rules[idx];
@@ -503,10 +505,10 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                 idx = idx.saturating_add(n);
             }
             if rule.flags.next {
-                loops += 1;
-                if loops > 10 {
+                if !vapache_verified::rewrite_restart_admit(loops, 10) {
                     return Outcome::Error("rewrite [N] loop limit exceeded".into());
                 }
+                loops += 1;
                 idx = 0;
                 continue;
             }
@@ -571,18 +573,26 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         } else {
             format!("/{new_path}")
         };
-        if has_target_query {
-            if rule.flags.qsa && !rule.flags.qsd && !query.is_empty() {
+        match vapache_verified::rewrite_query_action(
+            has_target_query,
+            rule.flags.qsa,
+            rule.flags.qsd,
+            !query.is_empty(),
+        ) {
+            vapache_verified::RewriteQueryAction::Append => {
                 new_query = if new_query.is_empty() {
                     String::from_utf8_lossy(&query).into_owned()
                 } else {
                     format!("{}&{}", new_query, String::from_utf8_lossy(&query))
                 };
             }
-        } else if !rule.flags.qsd {
-            // Apache copies the original query string when the substitution
-            // does not contain a replacement query string.
-            new_query = String::from_utf8_lossy(&query).into_owned();
+            vapache_verified::RewriteQueryAction::Preserve => {
+                // Apache copies the original query string when the
+                // substitution does not contain a replacement query string.
+                new_query = String::from_utf8_lossy(&query).into_owned();
+            }
+            vapache_verified::RewriteQueryAction::Replace
+            | vapache_verified::RewriteQueryAction::Discard => {}
         }
         if new_query.chars().any(|c| c.is_control()) {
             return Outcome::Error("control character in rewrite query".into());
@@ -591,8 +601,12 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         // A [PT] substitution maps back through URL space (it is re-resolved
         // by the dispatcher next round), so it must never be promoted to a
         // filesystem target (F67). The flag stays accepted and inert-legal.
-        let filesystem = if !external && !rule.flags.passthrough && Path::new(&joined).is_absolute()
-        {
+        let absolute = Path::new(&joined).is_absolute();
+        let filesystem = if vapache_verified::rewrite_filesystem_shape_admit(
+            external,
+            rule.flags.passthrough,
+            absolute,
+        ) {
             let candidate = fs::canonicalize(&joined).ok();
             let docroot = fs::canonicalize(ctx.docroot).ok();
             match (candidate, docroot) {
@@ -601,7 +615,10 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                     // stat, but it must never relax the base used to authorize
                     // and serve the result.  A rewrite names one file inside
                     // the current root, not a new root.
-                    if vapache_verified::rewrite_filesystem_admit(
+                    if vapache_verified::rewrite_filesystem_candidate_admit(
+                        external,
+                        rule.flags.passthrough,
+                        absolute,
                         candidate.is_file(),
                         vapache_verified::path_under_base(
                             candidate.as_os_str().as_encoded_bytes(),
@@ -625,29 +642,36 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         // clear an override either.
         filesystem_override = filesystem;
 
-        if rule.flags.proxy {
-            let mut url = joined;
-            if !new_query.is_empty() {
-                url.push(if url.contains('?') { '&' } else { '?' });
-                url.push_str(&new_query);
+        match vapache_verified::rewrite_sink(
+            rule.flags.proxy,
+            external,
+            rule.flags.redirect.is_some(),
+        ) {
+            vapache_verified::RewriteSink::Proxy => {
+                let mut url = joined;
+                if !new_query.is_empty() {
+                    url.push(if url.contains('?') { '&' } else { '?' });
+                    url.push_str(&new_query);
+                }
+                return Outcome::Proxy { url, effects };
             }
-            return Outcome::Proxy { url, effects };
-        }
-        if external || rule.flags.redirect.is_some() {
-            let status = rule.flags.redirect.unwrap_or(302);
-            let mut location = joined;
-            if !new_query.is_empty() {
-                location.push(if location.contains('?') { '&' } else { '?' });
-                location.push_str(&new_query);
+            vapache_verified::RewriteSink::Redirect => {
+                let status = rule.flags.redirect.unwrap_or(302);
+                let mut location = joined;
+                if !new_query.is_empty() {
+                    location.push(if location.contains('?') { '&' } else { '?' });
+                    location.push_str(&new_query);
+                }
+                if !rule.flags.noescape {
+                    location = escape_redirect_location(&location);
+                }
+                return Outcome::Redirect {
+                    status,
+                    location,
+                    effects,
+                };
             }
-            if !rule.flags.noescape {
-                location = escape_redirect_location(&location);
-            }
-            return Outcome::Redirect {
-                status,
-                location,
-                effects,
-            };
+            vapache_verified::RewriteSink::Internal => {}
         }
 
         path = new_path_from_joined(&joined);
@@ -657,10 +681,10 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             idx = idx.saturating_add(n);
         }
         if rule.flags.next {
-            loops += 1;
-            if loops > 10 {
+            if !vapache_verified::rewrite_restart_admit(loops, 10) {
                 return Outcome::Error("rewrite [N] loop limit exceeded".into());
             }
+            loops += 1;
             idx = 0;
             continue;
         }
@@ -1474,6 +1498,86 @@ mod tests {
             &[true, true, false]
         ));
         assert!(vapache_verified::cond_chain_eval(&[], &[]));
+    }
+
+    #[test]
+    fn verified_rewrite_decisions_cover_flag_truth_tables() {
+        use vapache_verified::{RewriteQueryAction, RewriteSink};
+
+        for proxy in [false, true] {
+            for external in [false, true] {
+                for redirect in [false, true] {
+                    let expected = if proxy {
+                        RewriteSink::Proxy
+                    } else if external || redirect {
+                        RewriteSink::Redirect
+                    } else {
+                        RewriteSink::Internal
+                    };
+                    assert_eq!(
+                        vapache_verified::rewrite_sink(proxy, external, redirect),
+                        expected
+                    );
+                }
+            }
+        }
+
+        for has_target_query in [false, true] {
+            for append in [false, true] {
+                for discard in [false, true] {
+                    for original_present in [false, true] {
+                        let expected = if has_target_query {
+                            if append && !discard && original_present {
+                                RewriteQueryAction::Append
+                            } else {
+                                RewriteQueryAction::Replace
+                            }
+                        } else if discard {
+                            RewriteQueryAction::Discard
+                        } else {
+                            RewriteQueryAction::Preserve
+                        };
+                        assert_eq!(
+                            vapache_verified::rewrite_query_action(
+                                has_target_query,
+                                append,
+                                discard,
+                                original_present,
+                            ),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+
+        for external in [false, true] {
+            for passthrough in [false, true] {
+                for absolute in [false, true] {
+                    for is_file in [false, true] {
+                        for under_base in [false, true] {
+                            assert_eq!(
+                                vapache_verified::rewrite_filesystem_candidate_admit(
+                                    external,
+                                    passthrough,
+                                    absolute,
+                                    is_file,
+                                    under_base,
+                                ),
+                                !external && !passthrough && absolute && is_file && under_base
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for completed in 0..=11 {
+            assert_eq!(
+                vapache_verified::rewrite_restart_admit(completed, 10),
+                completed < 10
+            );
+        }
     }
 
     #[test]
@@ -2362,6 +2466,22 @@ mod tests {
             process(&scope, &r, &ctx("/old", &root.join("old"), root)),
             Outcome::Gone
         );
+
+        let mut per_dir_scope = Scope::default();
+        per_dir_scope.rewrite_policy.rewrite_engine = Some(true);
+        let mut per_dir_rule =
+            parse_rewrite_rule(&["^old$".into(), "-".into(), "[G]".into()], "/", true).unwrap();
+        per_dir_rule
+            .conditions
+            .push(parse_rewrite_cond(&["expr".into(), "true".into()]).unwrap());
+        per_dir_scope
+            .rewrite_policy
+            .rewrite_rules
+            .push(per_dir_rule);
+        assert_eq!(
+            process(&per_dir_scope, &r, &ctx("/old", &root.join("old"), root)),
+            Outcome::Gone
+        );
     }
 
     #[test]
@@ -2551,6 +2671,7 @@ mod tests {
         assert!(build_cookie("name:value:\"injected\"").is_err());
         assert!(build_cookie("name:value:ev;il.test").is_err());
         assert!(build_cookie("name:value:example.test:10:/:pa;th").is_err());
+        assert!(build_cookie("name:value:example.test:10:/bad,path").is_err());
         assert!(build_cookie("name:value:example.test:10:/:yes").is_err());
         assert!(build_cookie("name:value:example.test:10:/:secure:yes").is_err());
         assert!(build_cookie("name:value:example.test:10:/:secure:httponly:foo").is_err());

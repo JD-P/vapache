@@ -1070,11 +1070,7 @@ mod tests {
             b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: nope\r\n\r\n",
             b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
         ] {
-            assert!(
-                parse_head(raw, &limits()).is_err(),
-                "{:?}",
-                String::from_utf8_lossy(raw)
-            );
+            assert!(parse_head(raw, &limits()).is_err());
         }
     }
 
@@ -1130,11 +1126,7 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n",
         ];
         for c in cases {
-            assert!(
-                parse_head(c, &limits()).is_err(),
-                "{:?}",
-                String::from_utf8_lossy(c)
-            );
+            assert!(parse_head(c, &limits()).is_err());
         }
     }
 
@@ -1166,7 +1158,11 @@ mod tests {
         .unwrap();
         assert!(!req.keep_alive);
         // `close` is sticky regardless of token order.
-        for header in ["close, keep-alive", "keep-alive, close", "keep-alive, close, keep-alive"] {
+        for header in [
+            "close, keep-alive",
+            "keep-alive, close",
+            "keep-alive, close, keep-alive",
+        ] {
             let raw = format!("GET / HTTP/1.1\r\nHost: x\r\nConnection: {header}\r\n\r\n");
             let req = parse_head(raw.as_bytes(), &limits()).unwrap();
             assert!(!req.keep_alive, "{header}");
@@ -1917,6 +1913,22 @@ mod tests {
             self.pos += n;
             Ok(n)
         }
+    }
+
+    #[test]
+    fn test_readers_report_eof_after_their_input() {
+        let mut slow = SlowReader {
+            delay: Duration::ZERO,
+            data: Vec::new(),
+            pos: 0,
+        };
+        assert_eq!(slow.read(&mut [0; 1]).unwrap(), 0);
+        let mut short = ShortReads {
+            data: Vec::new(),
+            pos: 0,
+            max: 1,
+        };
+        assert_eq!(short.read(&mut [0; 1]).unwrap(), 0);
     }
 
     #[test]

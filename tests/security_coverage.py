@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Track production-line coverage for unproven security-critical modules.
+"""Track production-line coverage for every server production module.
 
 `tests/coverage.sh` produces whole-program coverage, including `#[cfg(test)]`
-test modules.  For attack-surface tracking we care about the production lines
+test modules.  For release tracking we care about the production lines
 before the file's test module.  This script reads the same coverage artifacts
 and reports those numbers, and fails when an enforced module drops below 100%.
 
@@ -24,28 +24,37 @@ ROOT = Path(__file__).resolve().parent.parent
 PROFILE = Path(os.environ.get("SECURITY_COVERAGE_PROFILE", "/tmp/vapcov/all.profdata"))
 COV_TARGET = ROOT / "target" / "cov"
 
-# (name, source path, required percentage).  Start with the modules whose
-# protocol/process boundaries are hardest to prove, and promote them one at a
-# time as their production-line coverage reaches 100%.
+# (name, source path, required percentage).
 MODULES = [
     ("access", "crates/server/src/access.rs", 100.0),
-    ("fastcgi", "crates/server/src/fastcgi.rs", 100.0),
+    ("auth", "crates/server/src/auth.rs", 100.0),
+    ("cache", "crates/server/src/cache.rs", 100.0),
     ("cgi", "crates/server/src/cgi.rs", 100.0),
-    ("http", "crates/server/src/http.rs", 100.0),
+    ("compression", "crates/server/src/compression.rs", 100.0),
+    ("config", "crates/server/src/config.rs", 100.0),
+    ("config_frontend", "crates/server/src/config_frontend.rs", 100.0),
+    ("expires", "crates/server/src/expires.rs", 100.0),
+    ("expr", "crates/server/src/expr.rs", 100.0),
+    ("fastcgi", "crates/server/src/fastcgi.rs", 100.0),
+    ("files", "crates/server/src/files.rs", 100.0),
     ("h2", "crates/server/src/h2.rs", 100.0),
+    ("htaccess", "crates/server/src/htaccess.rs", 100.0),
+    ("http", "crates/server/src/http.rs", 100.0),
+    ("log", "crates/server/src/log.rs", 100.0),
+    ("main", "crates/server/src/main.rs", 100.0),
+    ("ocsp", "crates/server/src/ocsp.rs", 100.0),
+    ("policy_ref", "crates/server/src/policy_ref.rs", 100.0),
     ("proxy", "crates/server/src/proxy.rs", 100.0),
     ("request_plan", "crates/server/src/request_plan.rs", 100.0),
-    ("tls", "crates/server/src/tls.rs", 100.0),
-    ("server", "crates/server/src/server.rs", 100.0),
-    ("htaccess", "crates/server/src/htaccess.rs", 100.0),
-    ("config", "crates/server/src/config.rs", 100.0),
-    ("expr", "crates/server/src/expr.rs", 100.0),
     ("rewrite", "crates/server/src/rewrite.rs", 100.0),
+    ("scope_policy", "crates/server/src/scope_policy.rs", 100.0),
+    ("server", "crates/server/src/server.rs", 100.0),
+    ("status", "crates/server/src/status.rs", 100.0),
+    ("tls", "crates/server/src/tls.rs", 100.0),
+    ("util", "crates/server/src/util.rs", 100.0),
 ]
 
-# Enforced modules are at 100% production-line coverage.  The rest are reported
-# so the next module can be promoted without changing the measurement method.
-ENFORCED = {"access", "cgi", "config", "expr", "fastcgi", "htaccess", "http", "proxy", "request_plan", "rewrite", "server", "tls"}
+ENFORCED = {name for name, _, _ in MODULES}
 
 
 def llvm_bin() -> Path:
@@ -57,6 +66,9 @@ def llvm_bin() -> Path:
 
 def coverage_objects() -> list[str]:
     objects = [str(COV_TARGET / "release" / "vapached")]
+    debug_daemon = COV_TARGET / "debug" / "vapached"
+    if debug_daemon.is_file() and os.access(debug_daemon, os.X_OK):
+        objects.extend(["-object", str(debug_daemon)])
     for path in sorted((COV_TARGET / "debug" / "deps").glob("vapache*")):
         if path.is_file() and os.access(path, os.X_OK):
             objects.extend(["-object", str(path)])
@@ -137,7 +149,7 @@ def main() -> int:
             number, count = line[3:].split(",", 2)[:2]
             data[current][int(number)] = int(count)
 
-    print("production-line coverage for unproven security-critical modules")
+    print("production-line coverage for server modules")
     print(f"{'module':12} {'lines':>7} {'missed':>7} {'cover':>8}   status")
     failed = False
     by_name = {name: path for name, path, _ in MODULES}

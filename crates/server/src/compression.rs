@@ -217,10 +217,10 @@ fn alter_etag(resp: &mut Response, kind: CompressionKind, scope: &Scope) {
     }
 }
 
-fn read_body(body: Body) -> Result<(Vec<u8>, Option<Body>), Body> {
+fn read_body(body: Body) -> Result<Vec<u8>, Body> {
     match body {
-        Body::Empty => Ok((Vec::new(), None)),
-        Body::Bytes(bytes) => Ok((bytes, None)),
+        Body::Empty => Ok(Vec::new()),
+        Body::Bytes(bytes) => Ok(bytes),
         Body::Stream { reader, len } => Err(Body::Stream { reader, len }),
         Body::File {
             mut file,
@@ -237,27 +237,35 @@ fn read_body(body: Body) -> Result<(Vec<u8>, Option<Body>), Body> {
             if file.read_exact(&mut bytes).is_err() {
                 return Err(Body::File { file, offset, len });
             }
-            Ok((bytes, None))
+            Ok(bytes)
         }
     }
 }
 
-fn gzip(data: &[u8], level: u32) -> std::io::Result<Vec<u8>> {
+fn gzip(data: &[u8], level: u32) -> Vec<u8> {
     let mut encoder =
         flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level.min(9)));
-    encoder.write_all(data)?;
-    encoder.finish()
+    encoder
+        .write_all(data)
+        .expect("writing compressed bytes to Vec is infallible");
+    encoder
+        .finish()
+        .expect("finishing compressed bytes in Vec is infallible")
 }
 
-fn brotli(data: &[u8], quality: u32) -> std::io::Result<Vec<u8>> {
+fn brotli(data: &[u8], quality: u32) -> Vec<u8> {
     let mut out = Vec::new();
     {
         let mut encoder = brotli::CompressorWriter::new(&mut out, 4096, quality.min(11), 22);
-        encoder.write_all(data)?;
-        encoder.flush()?;
+        encoder
+            .write_all(data)
+            .expect("writing compressed bytes to Vec is infallible");
+        encoder
+            .flush()
+            .expect("flushing compressed bytes to Vec is infallible");
         encoder.into_inner();
     }
-    Ok(out)
+    out
 }
 
 /// Apply the configured output filter to a response.
@@ -327,7 +335,7 @@ pub fn finalize(scope: &Scope, req: &Request, resp: &mut Response, path: &[u8]) 
     }
 
     let body = std::mem::replace(&mut resp.body, Body::Empty);
-    let (raw, restore) = match read_body(body) {
+    let raw = match read_body(body) {
         Ok(v) => v,
         Err(body) => {
             resp.body = body;
@@ -353,13 +361,6 @@ pub fn finalize(scope: &Scope, req: &Request, resp: &mut Response, path: &[u8]) 
                 .brotli_quality
                 .unwrap_or(DEFAULT_BROTLI_QUALITY),
         ),
-    };
-    let encoded = match encoded {
-        Ok(v) => v,
-        Err(_) => {
-            resp.body = restore.unwrap_or(Body::Bytes(raw));
-            return;
-        }
     };
     let len = encoded.len();
     resp.body = Body::Bytes(encoded);
@@ -504,5 +505,163 @@ mod tests {
         let mut r = response(b"body", "application/octet-stream");
         finalize(&scope, &request("gzip"), &mut r, b"/x.bin");
         assert_eq!(header_str(&r, "content-encoding").as_deref(), Some("gzip"));
+    }
+
+    #[test]
+    fn vary_quality_and_etag_helpers_cover_all_settings() {
+        let mut fresh = Response::new(200);
+        add_vary_value(&mut fresh, "Origin");
+        assert_eq!(header_str(&fresh, "vary").as_deref(), Some("Origin"));
+
+        let mut r = Response::new(200);
+        r.headers.push((Cow::Borrowed("Vary"), Vec::new()));
+        add_vary_value(&mut r, "Origin");
+        add_vary_value(&mut r, "Accept-Language");
+        add_vary_value(&mut r, "origin");
+        assert_eq!(
+            header_str(&r, "vary").as_deref(),
+            Some("Origin, Accept-Language")
+        );
+        r.headers[0].1 = b"*".to_vec();
+        add_vary_value(&mut r, "Anything");
+        assert_eq!(header_str(&r, "vary").as_deref(), Some("*"));
+
+        add_vary_accept_encoding(&mut r);
+        assert_eq!(header_str(&r, "vary").as_deref(), Some("*"));
+        r.headers[0].1 = b"Origin".to_vec();
+        add_vary_accept_encoding(&mut r);
+        assert_eq!(
+            header_str(&r, "vary").as_deref(),
+            Some("Origin, Accept-Encoding")
+        );
+        add_vary_accept_encoding(&mut r);
+
+        assert_eq!(q_value("Q=0.5"), 0.5);
+        assert_eq!(q_value("quality=1"), 0.0);
+        assert_eq!(q_value("q=invalid"), 0.0);
+        let no_encoding = request("");
+        let mut no_encoding = no_encoding;
+        no_encoding.headers.remove("accept-encoding");
+        assert!(!accepts_encoding(&no_encoding, CompressionKind::Gzip));
+        assert!(accepts_encoding(
+            &request("*;q=.4"),
+            CompressionKind::Brotli
+        ));
+        assert!(accepts_encoding(&request("x-gzip"), CompressionKind::Gzip));
+        assert!(accepts_encoding(
+            &request("gzip; level=9; q=1"),
+            CompressionKind::Gzip
+        ));
+
+        let mut scope = Scope::default();
+        let mut r = response(b"x", "text/plain");
+        scope.compression_policy.deflate_alter_etag = Some(AlterEtag::NoChange);
+        alter_etag(&mut r, CompressionKind::Gzip, &scope);
+        assert_eq!(header_str(&r, "etag").as_deref(), Some("\"abc\""));
+        scope.compression_policy.deflate_alter_etag = Some(AlterEtag::Remove);
+        alter_etag(&mut r, CompressionKind::Gzip, &scope);
+        assert!(header(&r, "etag").is_none());
+
+        let mut r = Response::new(200);
+        r.headers.push((Cow::Borrowed("ETag"), b"plain".to_vec()));
+        scope.compression_policy.deflate_alter_etag = Some(AlterEtag::AddSuffix);
+        alter_etag(&mut r, CompressionKind::Gzip, &scope);
+        alter_etag(&mut r, CompressionKind::Gzip, &scope);
+        assert_eq!(header_str(&r, "etag").as_deref(), Some("plain-gzip"));
+    }
+
+    #[test]
+    fn body_reader_and_finalize_bypass_edges() {
+        assert!(matches!(read_body(Body::Empty), Ok(bytes) if bytes.is_empty()));
+        assert!(matches!(
+            read_body(Body::Stream {
+                reader: Box::new(std::io::Cursor::new(b"stream".to_vec())),
+                len: 6,
+            }),
+            Err(Body::Stream { len: 6, .. })
+        ));
+
+        let path = std::env::temp_dir().join(format!("vapache-compress-{}", std::process::id()));
+        std::fs::write(&path, b"short").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert!(matches!(
+            read_body(Body::File {
+                file,
+                offset: 0,
+                len: MAX_COMPRESS_BODY + 1,
+            }),
+            Err(Body::File { .. })
+        ));
+        let file = std::fs::File::open(&path).unwrap();
+        assert!(matches!(
+            read_body(Body::File {
+                file,
+                offset: 0,
+                len: 20,
+            }),
+            Err(Body::File { .. })
+        ));
+        let file = std::fs::File::open(&path).unwrap();
+        assert!(matches!(
+            read_body(Body::File {
+                file,
+                offset: 0,
+                len: 5,
+            }),
+            Ok(bytes) if bytes == b"short"
+        ));
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let file = std::fs::File::from(std::os::fd::OwnedFd::from(stream));
+        assert!(matches!(
+            read_body(Body::File {
+                file,
+                offset: 1,
+                len: 1,
+            }),
+            Err(Body::File { .. })
+        ));
+        std::fs::remove_file(path).unwrap();
+
+        let mut scope = Scope::default();
+        scope
+            .compression_policy
+            .compression_rules
+            .push(CompressionRule::Set(vec![CompressionKind::Gzip]));
+        scope.header_policy.vary.push("Origin".into());
+        scope.header_policy.cookies.push("a=b".into());
+        scope.header_policy.cookies.push("a=b".into());
+
+        let mut r = response(b"body", "text/plain");
+        r.headers
+            .push((Cow::Borrowed("Content-Encoding"), b"identity".to_vec()));
+        finalize(&scope, &request("gzip"), &mut r, b"/x");
+        assert_eq!(
+            header_str(&r, "content-encoding").as_deref(),
+            Some("identity")
+        );
+
+        let mut head = request("gzip");
+        head.method = "HEAD".into();
+        let mut r = response(b"body", "text/plain");
+        finalize(&scope, &head, &mut r, b"/x");
+        assert!(header(&r, "content-encoding").is_none());
+
+        let mut r = response(b"", "text/plain");
+        finalize(&scope, &request("gzip"), &mut r, b"/x");
+        assert!(header(&r, "content-encoding").is_none());
+
+        let mut r = Response::new(304);
+        r.headers
+            .push((Cow::Borrowed("ETag"), b"\"cached\"".to_vec()));
+        finalize(&scope, &request("gzip"), &mut r, b"/x");
+        assert_eq!(header_str(&r, "content-encoding").as_deref(), Some("gzip"));
+
+        let mut r = response(b"ignored", "text/plain");
+        r.body = Body::Stream {
+            reader: Box::new(std::io::Cursor::new(b"stream".to_vec())),
+            len: 6,
+        };
+        finalize(&scope, &request("gzip"), &mut r, b"/x");
+        assert!(matches!(r.body, Body::Stream { .. }));
     }
 }

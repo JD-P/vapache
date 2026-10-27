@@ -143,6 +143,15 @@ mod tests {
         assert_eq!(duration("A3600"), Some(3600));
         assert_eq!(duration("M60"), Some(60));
         assert!(duration("bogus").is_none());
+        assert_eq!(
+            duration("modification plus 2 weeks"),
+            Some((1 << 62) | 1_209_600)
+        );
+        assert_eq!(duration("now 1 month"), Some(2_592_000));
+        assert_eq!(duration("access 1 year"), Some(31_536_000));
+        assert!(duration("access 1 fortnight").is_none());
+        assert!(duration("access nope seconds").is_none());
+        assert!(duration("access 9223372036854775807 years").is_none());
     }
 
     #[test]
@@ -170,5 +179,68 @@ mod tests {
             .unwrap();
         assert!(cc.contains("max-age=86400"));
         let _ = http_date_now();
+    }
+
+    fn active_scope(spec: Option<&str>) -> Scope {
+        let mut scope = Scope::default();
+        scope.header_policy.expires_active = Some(true);
+        scope.header_policy.expires_default = spec.map(str::to_string);
+        scope
+    }
+
+    #[test]
+    fn apply_covers_inactive_status_invalid_and_cache_control_edges() {
+        let mut response = Response::new(200);
+        apply(&Scope::default(), &mut response);
+        assert!(header(&response, "Expires").is_none());
+
+        for status in [101, 204] {
+            let mut response = Response::new(status);
+            apply(&active_scope(Some("A60")), &mut response);
+            assert!(header(&response, "Expires").is_none());
+        }
+
+        let mut response = Response::new(200);
+        apply(&active_scope(None), &mut response);
+        assert!(header(&response, "Expires").is_none());
+        apply(&active_scope(Some("invalid")), &mut response);
+        assert!(header(&response, "Expires").is_none());
+
+        let mut response = Response::new(200);
+        response.headers.push((
+            std::borrow::Cow::Borrowed("Last-Modified"),
+            http_date_now().into_bytes(),
+        ));
+        response.headers.push((
+            std::borrow::Cow::Borrowed("Cache-Control"),
+            b"public".to_vec(),
+        ));
+        apply(
+            &active_scope(Some("modification plus 1 second")),
+            &mut response,
+        );
+        assert!(
+            String::from_utf8_lossy(header(&response, "Cache-Control").unwrap())
+                .contains("max-age=1")
+        );
+
+        let mut response = Response::new(200);
+        response.headers.push((
+            std::borrow::Cow::Borrowed("Cache-Control"),
+            b"private, no-store".to_vec(),
+        ));
+        apply(&active_scope(Some("A60")), &mut response);
+        assert_eq!(
+            header(&response, "Cache-Control"),
+            Some(&b"private, no-store"[..])
+        );
+
+        let mut response = Response::new(200);
+        response.headers.push((
+            std::borrow::Cow::Borrowed("Cache-Control"),
+            b"max-age=7".to_vec(),
+        ));
+        apply(&active_scope(Some("A60")), &mut response);
+        assert_eq!(header(&response, "Cache-Control"), Some(&b"max-age=7"[..]));
     }
 }

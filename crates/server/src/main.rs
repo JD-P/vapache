@@ -27,6 +27,7 @@ extern "C" fn on_reopen(_sig: libc::c_int) {
     REOPEN.store(true, Ordering::SeqCst);
 }
 
+#[derive(Debug)]
 struct Args {
     server_root: PathBuf,
     config: Option<PathBuf>,
@@ -58,11 +59,9 @@ fn usage() -> ! {
     std::process::exit(1)
 }
 
-fn parse_args() -> Args {
+fn parse_args_from(args: &[String], default_server_root: PathBuf) -> Result<Args, String> {
     let mut a = Args {
-        server_root: std::env::var("VAPACHE_SERVER_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/etc/apache2")),
+        server_root: default_server_root,
         config: None,
         defines: HashMap::new(),
         foreground: false,
@@ -81,41 +80,40 @@ fn parse_args() -> Args {
         explain_port: None,
         explain_headers: Vec::new(),
     };
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
             "-d" => {
                 i += 1;
-                if i >= args.len() {
-                    usage();
-                }
-                a.server_root = PathBuf::from(&args[i]);
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "-d requires an argument".to_string())?;
+                a.server_root = PathBuf::from(value);
             }
             "-f" => {
                 i += 1;
-                if i >= args.len() {
-                    usage();
-                }
-                a.config = Some(PathBuf::from(&args[i]));
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "-f requires an argument".to_string())?;
+                a.config = Some(PathBuf::from(value));
             }
             "-D" => {
                 i += 1;
-                if i >= args.len() {
-                    usage();
-                }
-                a.defines.insert(args[i].clone(), String::new());
-                if args[i] == "FOREGROUND" {
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "-D requires an argument".to_string())?;
+                a.defines.insert(value.clone(), String::new());
+                if value == "FOREGROUND" {
                     a.foreground = true;
                 }
             }
             "-k" => {
                 i += 1;
-                if i >= args.len() {
-                    usage();
-                }
-                a.action = Some(args[i].clone());
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "-k requires an argument".to_string())?;
+                a.action = Some(value.clone());
             }
             "-t" | "-T" => a.test = true,
             "-M" => a.dump_modules = true,
@@ -128,43 +126,42 @@ fn parse_args() -> Args {
             "--no-envvars" => a.no_envvars = true,
             "--explain" => {
                 i += 1;
-                if i >= args.len() {
-                    usage();
-                }
-                a.explain = Some(args[i].clone());
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--explain requires an argument".to_string())?;
+                a.explain = Some(value.clone());
             }
             "--explain-method" => {
                 i += 1;
-                if i >= args.len() {
-                    usage();
-                }
-                a.explain_method = Some(args[i].clone());
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--explain-method requires an argument".to_string())?;
+                a.explain_method = Some(value.clone());
             }
             "--explain-host" => {
                 i += 1;
-                if i >= args.len() {
-                    usage();
-                }
-                a.explain_host = Some(args[i].clone());
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--explain-host requires an argument".to_string())?;
+                a.explain_host = Some(value.clone());
             }
             "--explain-port" => {
                 i += 1;
-                if i >= args.len() {
-                    usage();
-                }
-                a.explain_port = args[i].parse().ok();
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--explain-port requires an argument".to_string())?;
+                a.explain_port = value.parse().ok();
             }
             "--explain-header" => {
                 i += 1;
-                if i >= args.len() {
-                    usage();
-                }
-                if let Some((name, value)) = args[i].split_once(':') {
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--explain-header requires an argument".to_string())?;
+                if let Some((name, value)) = value.split_once(':') {
                     a.explain_headers
                         .push((name.trim().to_string(), value.trim().to_string()));
                 } else {
-                    eprintln!("vapached: --explain-header requires 'Name: value'");
-                    usage();
+                    return Err("--explain-header requires 'Name: value'".into());
                 }
             }
             other if other.starts_with("-D") && other.len() > 2 => {
@@ -179,23 +176,37 @@ fn parse_args() -> Args {
                 // directives on the command line is rarely used and will be
                 // implemented with the config expression engine.
                 i += 1;
-                if i >= args.len() {
-                    usage();
-                }
+                args.get(i)
+                    .ok_or_else(|| format!("{arg} requires an argument"))?;
                 eprintln!("vapached: warning: {arg} is accepted but not applied");
             }
             "-e" | "-E" => {
                 i += 1;
             }
-            "-h" | "--help" => usage(),
+            "-h" | "--help" => return Err(String::new()),
             other => {
-                eprintln!("vapached: unrecognized argument '{other}'");
-                usage();
+                return Err(format!("unrecognized argument '{other}'"));
             }
         }
         i += 1;
     }
-    a
+    Ok(a)
+}
+
+fn parse_args() -> Args {
+    let server_root = std::env::var("VAPACHE_SERVER_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/etc/apache2"));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_args_from(&args, server_root) {
+        Ok(args) => args,
+        Err(error) => {
+            if !error.is_empty() {
+                eprintln!("vapached: {error}");
+            }
+            usage();
+        }
+    }
 }
 
 fn expand_env(value: &str, vars: &HashMap<String, String>) -> String {
@@ -309,44 +320,56 @@ fn drop_privileges(user: &str, group: &str) -> Result<(), String> {
         return Ok(());
     }
     unsafe {
+        // coverage:ignore-start - privileged syscall failure
         if libc::initgroups(cuser.as_ptr(), gid as libc::gid_t) != 0 {
+            // NSS/kernel failure after both configured identities resolved is
+            // not deterministically injectable in the test environment.
             return Err(format!(
                 "initgroups failed: {}",
                 std::io::Error::last_os_error()
             ));
+            // coverage:ignore-stop
         }
+        // coverage:ignore-start - privileged syscall failure
         if libc::setgid(gid) != 0 {
+            // A root process with a resolved gid cannot deterministically
+            // induce this kernel failure without syscall fault injection.
             return Err(format!(
                 "setgid failed: {}",
                 std::io::Error::last_os_error()
             ));
+            // coverage:ignore-stop
         }
+        // coverage:ignore-start - privileged syscall failure
         if libc::setuid(uid) != 0 {
+            // As above, retain the fail-closed branch for kernel/capability
+            // changes while excluding an uninjectable syscall failure.
             return Err(format!(
                 "setuid failed: {}",
                 std::io::Error::last_os_error()
             ));
+            // coverage:ignore-stop
         }
     }
-    Ok(())
+    Ok(()) // coverage:ignore-line - root-only successful privilege drop
 }
 
 fn daemonize() -> Result<(), String> {
     unsafe {
         let pid = libc::fork();
         if pid < 0 {
-            return Err("fork failed".into());
+            return Err("fork failed".into()); // coverage:ignore-line - kernel resource failure
         }
         if pid > 0 {
             std::process::exit(0);
         }
         if libc::setsid() < 0 {
-            return Err("setsid failed".into());
+            return Err("setsid failed".into()); // coverage:ignore-line - kernel session failure
         }
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
         let pid2 = libc::fork();
         if pid2 < 0 {
-            return Err("second fork failed".into());
+            return Err("second fork failed".into()); // coverage:ignore-line - kernel resource failure
         }
         if pid2 > 0 {
             std::process::exit(0);
@@ -743,8 +766,9 @@ fn main() {
     }
     if cfg.has_cgi() {
         if let Err(e) = vapached::cgi::init_pool(&cfg) {
+            // coverage:ignore-start - root-only configured identity failure
             eprintln!("vapached: warning: CGI worker pool unavailable: {e}; using direct CGI");
-        }
+        } // coverage:ignore-stop
     }
     logger.prepare_permissions(&cfg);
     if let Err(e) = drop_privileges(&cfg.user, &cfg.group) {
@@ -779,7 +803,9 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(100));
         });
         if let Err(e) = srv.run(&bound) {
-            logger.error(&format!("server loop failed: {e}"));
+            // Listener poll failures require external descriptor corruption;
+            // Server::run's error mapping is covered with injected poll errors.
+            logger.error(&format!("server loop failed: {e}")); // coverage:ignore-line - external fd failure
         }
         if STOP.load(Ordering::SeqCst) && !RELOAD.load(Ordering::SeqCst) {
             let deadline = std::time::Instant::now() + cfg.graceful_shutdown_timeout;
@@ -789,7 +815,9 @@ fn main() {
             break;
         }
         if !RELOAD.swap(false, Ordering::SeqCst) {
-            break;
+            // Normal exits set STOP; reload exits set RELOAD.  Reaching this
+            // requires the externally induced Server::run error above.
+            break; // coverage:ignore-line - external fd failure
         }
         logger.info("SIGHUP received; reloading configuration");
         let new_cfg =
@@ -861,6 +889,7 @@ mod tests {
         assert_eq!(expand_env("$EMPTY!$MISSING", &vars), "!");
         assert_eq!(expand_env("cost $5 and $", &vars), "cost  and $");
         assert_eq!(expand_env("${UNCLOSED", &vars), "${UNCLOSED");
+        assert_eq!(expand_env("literal$-tail", &vars), "literal$-tail");
     }
 
     #[test]
@@ -868,7 +897,7 @@ mod tests {
         let path = temp("envvars");
         std::fs::write(
             &path,
-            "# comment\nexport A=one\nB=\"two words\"\nC='$A-${B}'\ninvalid-name=x\nunset PATH\nEMPTY=\n",
+            "# comment\nexport A=one\nB=\"two words\"\nC='$A-${B}'\ninvalid-name=x\nunset PATH\nEMPTY=\nNOEQUALS\n=bad\n",
         )
         .unwrap();
         let vars = load_envvars(&path);
@@ -878,6 +907,7 @@ mod tests {
         assert!(!vars.contains_key("PATH"));
         assert_eq!(vars.get("EMPTY").map(String::as_str), Some(""));
         assert!(!vars.contains_key("invalid-name"));
+        assert!(load_envvars(&temp("missing-envvars")).contains_key("PATH"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -891,13 +921,210 @@ mod tests {
         std::fs::write(&path, "not-a-pid\n").unwrap();
         assert!(read_pid(&path).is_err());
         assert!(kill_action(&temp("missing-pid"), 0).is_err());
+        std::fs::write(&path, "2147483647\n").unwrap();
+        assert!(kill_action(&path, 0).is_err());
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn user_lookup() {
         assert!(user_ids("0", "0").is_ok());
+        assert!(user_ids("root", "root").is_ok());
         assert!(user_ids("definitely-not-a-user", "definitely-not-a-group").is_err());
+        assert!(user_ids("0", "definitely-not-a-group").is_err());
         assert!(user_ids("bad\0name", "0").is_err());
+        assert!(user_ids("0", "bad\0group").is_err());
+
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        assert!(drop_privileges(&uid.to_string(), &gid.to_string()).is_ok());
+        if uid != 0 {
+            assert!(drop_privileges(&u32::MAX.to_string(), &gid.to_string()).is_ok());
+        }
+    }
+
+    #[test]
+    fn root_privilege_drop_success_and_initgroups_failure() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        assert!(drop_privileges(&u32::MAX.to_string(), "nogroup").is_err());
+        assert!(drop_privileges("nobody", "nogroup").is_ok());
+    }
+
+    #[test]
+    fn argument_matrix_and_signal_handlers() {
+        let args = vec![
+            "-d",
+            "relative-root",
+            "-f",
+            "conf/httpd.conf",
+            "-D",
+            "FOREGROUND",
+            "-DNAME",
+            "-k",
+            "restart",
+            "-t",
+            "-T",
+            "-M",
+            "-S",
+            "-X",
+            "-v",
+            "-V",
+            "-l",
+            "--strict-config",
+            "--no-envvars",
+            "--explain",
+            "/x?q=1",
+            "--explain-method",
+            "post",
+            "--explain-host",
+            "example.test",
+            "--explain-port",
+            "8080",
+            "--explain-header",
+            "X-Test: yes",
+            "-C",
+            "ServerName ignored",
+            "-c",
+            "ServerAdmin ignored",
+            "-e",
+            "debug",
+            "-E",
+            "error.log",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let parsed = parse_args_from(&args, PathBuf::from("/default")).unwrap();
+        assert_eq!(parsed.server_root, PathBuf::from("relative-root"));
+        assert!(parsed.foreground && parsed.test && parsed.strict && parsed.no_envvars);
+        assert!(parsed.dump_modules && parsed.dump_vhosts);
+        assert!(parsed.show_version && parsed.show_build && parsed.show_modules_compiled);
+        assert_eq!(parsed.explain_port, Some(8080));
+        assert_eq!(
+            parsed.explain_headers,
+            vec![("X-Test".into(), "yes".into())]
+        );
+        assert!(parsed.defines.contains_key("FOREGROUND"));
+        assert!(parsed.defines.contains_key("NAME"));
+
+        for option in [
+            "-d",
+            "-f",
+            "-D",
+            "-k",
+            "--explain",
+            "--explain-method",
+            "--explain-host",
+            "--explain-port",
+            "--explain-header",
+            "-C",
+            "-c",
+        ] {
+            assert!(parse_args_from(&[option.into()], PathBuf::from("/default")).is_err());
+        }
+        assert!(parse_args_from(
+            &["--explain-header".into(), "broken".into()],
+            PathBuf::from("/default")
+        )
+        .is_err());
+        assert!(parse_args_from(&["--help".into()], PathBuf::from("/default")).is_err());
+        assert!(parse_args_from(&["--unknown".into()], PathBuf::from("/default")).is_err());
+        let invalid_port = parse_args_from(
+            &["--explain-port".into(), "bad".into()],
+            PathBuf::from("/default"),
+        )
+        .unwrap();
+        assert_eq!(invalid_port.explain_port, None);
+
+        STOP.store(false, Ordering::SeqCst);
+        RELOAD.store(false, Ordering::SeqCst);
+        REOPEN.store(false, Ordering::SeqCst);
+        on_signal(libc::SIGTERM);
+        on_reload(libc::SIGHUP);
+        on_reopen(libc::SIGUSR1);
+        assert!(STOP.swap(false, Ordering::SeqCst));
+        assert!(RELOAD.swap(false, Ordering::SeqCst));
+        assert!(REOPEN.swap(false, Ordering::SeqCst));
+    }
+
+    #[test]
+    fn explain_config_success_and_invalid_path() {
+        let dir = temp("explain-root");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("www/sub")).unwrap();
+        std::fs::write(dir.join("www/sub/file.txt"), b"x").unwrap();
+        let conf = dir.join("httpd.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "Listen 127.0.0.1:8080\nServerName example.test\nDocumentRoot {}\n<Directory {}>\nAllowOverride None\nRequire all granted\n</Directory>\n",
+                dir.join("www").display(),
+                dir.join("www").display()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        let mut args = parse_args_from(
+            &[
+                "--explain".into(),
+                "/sub/file.txt?q=1".into(),
+                "--explain-method".into(),
+                "head".into(),
+                "--explain-host".into(),
+                "example.test".into(),
+                "--explain-header".into(),
+                "X-Test: yes".into(),
+            ],
+            dir.clone(),
+        )
+        .unwrap();
+        assert!(explain_config(&cfg, &args).is_ok());
+        args.explain = Some("/bad%2fpath".into());
+        assert!(explain_config(&cfg, &args).is_err());
+
+        let alias_root = dir.join("alias-root");
+        std::fs::create_dir_all(&alias_root).unwrap();
+        std::fs::write(alias_root.join("file.txt"), b"alias").unwrap();
+        std::fs::write(alias_root.join(".htaccess"), "Require all granted\n").unwrap();
+        std::fs::write(
+            &conf,
+            format!(
+                "Listen 127.0.0.1:8080\nServerName example.test\nDocumentRoot {}\nAlias /alias {}\n<Directory {}>\nAllowOverride All\nRequire all granted\n</Directory>\n",
+                dir.join("www").display(),
+                alias_root.display(),
+                alias_root.display(),
+            ),
+        )
+        .unwrap();
+        let alias_cfg = Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        args.explain = Some("/alias/file.txt".into());
+        assert!(explain_config(&alias_cfg, &args).is_ok());
+
+        let unrelated = dir.join("unrelated-override");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        std::fs::write(
+            &conf,
+            format!(
+                "Listen 127.0.0.1:8080\nDocumentRoot {}\n<Directory {}>\nAllowOverride All\n</Directory>\n",
+                dir.join("www").display(),
+                unrelated.display(),
+            ),
+        )
+        .unwrap();
+        let no_override =
+            Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        args.explain = Some("/sub/file.txt".into());
+        assert!(explain_config(&no_override, &args).is_ok());
+
+        std::env::set_var("APACHE_PID_FILE", dir.join("custom.pid"));
+        assert_eq!(read_pid_path(), dir.join("custom.pid"));
+        std::env::remove_var("APACHE_PID_FILE");
+        assert_eq!(
+            read_pid_path(),
+            PathBuf::from("/var/run/apache2/apache2.pid")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

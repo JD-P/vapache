@@ -161,7 +161,7 @@ impl Logger {
             if unsafe { libc::geteuid() } != 0 {
                 return;
             }
-            let user = CString::new(cfg.user.as_str()).ok();
+            let user = CString::new(cfg.user.as_str()).ok(); // coverage:ignore-start - root-only ownership handoff
             let group = CString::new(cfg.group.as_str()).ok();
             let uid = user.as_ref().and_then(|u| {
                 let pw = unsafe { libc::getpwnam(u.as_ptr()) };
@@ -190,7 +190,7 @@ impl Logger {
                 let _ = std::os::unix::fs::chown(&path, Some(uid), gid);
                 let _ = std::fs::set_permissions(
                     &path,
-                    std::os::unix::fs::PermissionsExt::from_mode(0o640),
+                    std::os::unix::fs::PermissionsExt::from_mode(0o640), // coverage:ignore-stop
                 );
             }
         }
@@ -541,6 +541,7 @@ impl Logger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn escape_control() {
@@ -583,6 +584,11 @@ mod tests {
         assert_eq!(format_access("%{unclosed", &empty), "%");
         assert_eq!(format_access("%{Referer", &empty), "%");
         assert_eq!(format_access("%{Referer}i", &empty), "-");
+        assert_eq!(format_access("%{Anything}o %{Anything}e", &empty), "- -");
+        assert_eq!(format_access("%{Anything}Z", &empty), "");
+        assert_eq!(format_access("%{Referer}", &empty), "");
+        assert_eq!(format_access("%<s", &empty), "200");
+        assert!(format_access("%D %T %P", &empty).split_whitespace().count() == 3);
     }
 
     #[test]
@@ -642,5 +648,97 @@ mod tests {
         assert!(s.starts_with("127.0.0.1 - - ["));
         assert!(s.ends_with(" \"-\" \"test\""));
         assert!(s.contains("\"GET /a?b=1 HTTP/1.1\" 200 42"));
+    }
+
+    #[test]
+    fn logger_opens_writes_filters_and_reopens_configured_logs() {
+        for (name, expected) in [
+            ("emerg", Level::Emerg),
+            ("alert", Level::Alert),
+            ("crit", Level::Crit),
+            ("error", Level::Error),
+            ("warn", Level::Warn),
+            ("notice", Level::Notice),
+            ("info", Level::Info),
+            ("trace8", Level::Debug),
+            ("unknown", Level::Warn),
+        ] {
+            assert!(Level::parse(name) == expected);
+            assert!(!expected.name().is_empty());
+        }
+
+        let dir = std::env::temp_dir().join(format!("vapache-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("httpd.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "ServerRoot \"{}\"\n\
+                 Listen 127.0.0.1:0\n\
+                 ErrorLog logs/error.log\n\
+                 LogLevel info\n\
+                 LogFormat \"%h %>s %b\" common\n\
+                 CustomLog logs/access.log common\n\
+                 CustomLog /dev/null \"%h\"\n\
+                 <VirtualHost 127.0.0.1:0>\n\
+                 CustomLog logs/vhost.log common\n\
+                 </VirtualHost>\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let mut cfg = Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        cfg.custom_logs.push(CustomLog {
+            path: "logs/quoted.log".into(),
+            format: "\"%h %s\"".into(),
+            condition: None,
+        });
+        let logger = Logger::new(&cfg).unwrap();
+        assert_eq!(logger.access_log_count(), 4);
+        assert!(logger.wants_access_log());
+        logger.prepare_permissions(&cfg);
+        logger.log(Level::Debug, "test", "filtered");
+        logger.error("error\nline");
+        logger.warn("warning");
+        logger.info("information");
+
+        let entry = AccessEntry {
+            remote_ip: "192.0.2.1",
+            remote_port: 1234,
+            local_ip: "127.0.0.1",
+            local_port: 80,
+            server_name: "example.test",
+            method: "GET",
+            uri: "/",
+            protocol: "HTTP/1.1",
+            status: 200,
+            bytes_sent: 5,
+            bytes_in: 0,
+            referer: "",
+            user_agent: "",
+            host: "example.test",
+            vhost_index: None,
+            started: Instant::now(),
+        };
+        logger.access(&entry);
+        logger.access(&AccessEntry {
+            vhost_index: Some(0),
+            ..entry
+        });
+        logger.reopen().unwrap();
+        drop(logger);
+        assert!(std::fs::read_to_string(dir.join("logs/error.log"))
+            .unwrap()
+            .contains("error\\x0aline"));
+        assert!(std::fs::read_to_string(dir.join("logs/access.log"))
+            .unwrap()
+            .contains("192.0.2.1 200 5"));
+        assert!(std::fs::read_to_string(dir.join("logs/vhost.log"))
+            .unwrap()
+            .contains("192.0.2.1 200 5"));
+
+        assert!(open_log("syslog:local0", &dir).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

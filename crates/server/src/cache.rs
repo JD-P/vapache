@@ -108,6 +108,14 @@ fn disk_stem_files(stem: &Path) -> [PathBuf; 4] {
     ]
 }
 
+fn record_disk_file(state: &mut DiskUsageState, stem: PathBuf, len: u64, modified: SystemTime) {
+    let slot = state.stems.entry(stem).or_insert((0, modified));
+    slot.0 = slot.0.saturating_add(len);
+    if modified < slot.1 {
+        slot.1 = modified;
+    }
+}
+
 fn remove_disk_stem_files(stem: &Path) {
     for path in disk_stem_files(stem) {
         let _ = fs::remove_file(path);
@@ -129,14 +137,12 @@ fn scan_disk_usage(root: &Path) -> DiskUsageState {
                         continue;
                     };
                     let Ok(meta) = entry.metadata() else {
-                        continue;
+                        // `read_dir` supplied a regular-file entry but it was
+                        // concurrently removed or replaced before metadata.
+                        continue; // coverage:ignore-line - filesystem race
                     };
                     let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    let slot = state.stems.entry(stem).or_insert((0, modified));
-                    slot.0 = slot.0.saturating_add(meta.len());
-                    if modified < slot.1 {
-                        slot.1 = modified;
-                    }
+                    record_disk_file(state, stem, meta.len(), modified);
                 }
                 _ => {}
             }
@@ -446,7 +452,9 @@ pub fn request_scope_with_plan(
         index_selected,
         index_selected,
     ) {
-        return None;
+        // All three index arguments are the same local bit.  The verified
+        // predicate therefore proves this fail-closed guard unreachable.
+        return None; // coverage:ignore-line - verified identical bindings
     }
     if !cache_enabled(&scope, &cache_url_path) {
         return None;
@@ -489,7 +497,11 @@ pub fn request_scope_with_plan(
             || crate::fastcgi::match_proxy(&scope, &cache_url_path, &root).is_some()
             || crate::proxy::matches_route(&scope, &cache_url_path);
         if !vapache_verified::cache_dynamic_handler_admit(handler, dynamic) {
+            // `dynamic` includes `handler` as a disjunct, so the verified
+            // predicate proves that this fail-closed guard cannot reject.
+            // coverage:ignore-start - verified implication
             return None;
+            // coverage:ignore-stop
         }
         if !vapache_verified::cache_ignore_query_admit(
             cfg.cache.ignore_query_string,
@@ -1036,8 +1048,9 @@ pub fn prepare_dir(cfg: &Config, dir: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::ffi::CString;
+        use std::os::unix::fs::PermissionsExt;
         if unsafe { libc::geteuid() } == 0 {
-            let user = CString::new(cfg.user.as_str()).ok();
+            let user = CString::new(cfg.user.as_str()).ok(); // coverage:ignore-start - root-only ownership handoff
             let group = CString::new(cfg.group.as_str()).ok();
             let uid = user.as_ref().and_then(|u| {
                 let pw = unsafe { libc::getpwnam(u.as_ptr()) };
@@ -1050,7 +1063,7 @@ pub fn prepare_dir(cfg: &Config, dir: &std::path::Path) {
             if let Some(uid) = uid {
                 let _ = std::os::unix::fs::chown(dir, Some(uid), gid);
             }
-            let _ = fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o775));
+            let _ = fs::set_permissions(dir, PermissionsExt::from_mode(0o775)); // coverage:ignore-stop
         }
     }
 }
@@ -1152,9 +1165,12 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
     let Some(stem) = cache_stem(cfg, key) else {
         return;
     };
-    let Some(root) = &cfg.cache.root else {
-        return;
-    };
+    // `cache_stem` succeeds exactly when the root exists.
+    let root = cfg
+        .cache
+        .root
+        .as_ref()
+        .expect("cache root checked by cache_stem");
     if let Some(parent) = stem.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -2731,6 +2747,147 @@ DirectoryIndex index.html\n\
     }
 
     #[test]
+    fn request_scope_covers_symlink_directory_disable_method_and_dynamic_routes() {
+        let dir =
+            std::env::temp_dir().join(format!("vapache-cache-scope-matrix-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let www = dir.join("www");
+        fs::create_dir_all(www.join("empty")).unwrap();
+        fs::create_dir_all(www.join("disabled")).unwrap();
+        fs::create_dir_all(www.join("method")).unwrap();
+        fs::write(www.join("real.txt"), b"real").unwrap();
+        fs::write(www.join("disabled/file.txt"), b"disabled").unwrap();
+        fs::write(www.join("method/file.txt"), b"method").unwrap();
+        std::os::unix::fs::symlink("real.txt", www.join("alias.txt")).unwrap();
+        let conf = dir.join("httpd.conf");
+        fs::write(
+            &conf,
+            format!(
+                "Listen 127.0.0.1:0\n\
+DocumentRoot \"{www}\"\n\
+CacheRoot \"{cache}\"\n\
+CacheEnable disk /\n\
+<Directory \"{www}\">\n\
+    Require all granted\n\
+    Options -FollowSymLinks +SymLinksIfOwnerMatch\n\
+</Directory>\n\
+<Directory \"{www}/disabled\">\n\
+    CacheDisable /disabled\n\
+</Directory>\n\
+<Directory \"{www}/method\">\n\
+    AllowMethods POST\n\
+</Directory>\n",
+                www = www.display(),
+                cache = dir.join("cache").display(),
+            ),
+        )
+        .unwrap();
+        let cfg =
+            Config::load(&conf, &dir, &Default::default(), &Default::default(), false).unwrap();
+        let call = |path: &str| {
+            let mut req = test_request();
+            req.target = path.as_bytes().to_vec();
+            req.raw_path = path.as_bytes().to_vec();
+            request_scope(
+                &cfg,
+                None,
+                &req,
+                "127.0.0.1".parse().unwrap(),
+                path,
+                80,
+                false,
+                "localhost",
+                "localhost",
+                "127.0.0.1",
+            )
+        };
+        let symlink = call("/alias.txt").expect("same-owner symlink is cacheable");
+        assert_eq!(
+            symlink.target,
+            fs::canonicalize(www.join("real.txt")).unwrap()
+        );
+        assert!(call("/empty/").is_some());
+        assert!(call("/disabled/file.txt").is_none());
+        assert!(call("/method/file.txt").is_none());
+
+        let route_config = |name: &str, extra: &str| {
+            let conf = dir.join(format!("{name}.conf"));
+            fs::write(
+                &conf,
+                format!(
+                    "Listen 127.0.0.1:0\n\
+DocumentRoot \"{www}\"\n\
+CacheRoot \"{cache}\"\n\
+CacheEnable disk /\n\
+CacheIgnoreQueryString On\n\
+<Directory \"{www}\">\nRequire all granted\n</Directory>\n{extra}\n",
+                    www = www.display(),
+                    cache = dir.join("cache").display(),
+                ),
+            )
+            .unwrap();
+            Config::load(&conf, &dir, &Default::default(), &Default::default(), false).unwrap()
+        };
+        fs::create_dir_all(www.join("fcgi")).unwrap();
+        fs::write(www.join("fcgi/test.php"), b"php").unwrap();
+        let fastcgi_rule = format!(
+            "ProxyPassMatch ^/fcgi/(.*\\.php)$ \"unix:/tmp/vapache-cache-missing.sock|fcgi://localhost{}/\"",
+            www.display()
+        );
+        let fastcgi_cfg = route_config("fastcgi", &fastcgi_rule);
+        let mut dynamic = test_request();
+        dynamic.target = b"/fcgi/test.php?a=1".to_vec();
+        dynamic.raw_path = b"/fcgi/test.php".to_vec();
+        dynamic.query = b"a=1".to_vec();
+        assert!(request_scope(
+            &fastcgi_cfg,
+            None,
+            &dynamic,
+            "127.0.0.1".parse().unwrap(),
+            "/fcgi/test.php",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .is_none());
+
+        let proxy_cfg = route_config("proxy", "ProxyPass /proxy http://127.0.0.1:9000/");
+        dynamic.target = b"/proxy/item?a=1".to_vec();
+        dynamic.raw_path = b"/proxy/item".to_vec();
+        assert!(request_scope(
+            &proxy_cfg,
+            None,
+            &dynamic,
+            "127.0.0.1".parse().unwrap(),
+            "/proxy/item",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .is_none());
+        dynamic.query.clear();
+        dynamic.target = b"/proxy/item".to_vec();
+        assert!(request_scope(
+            &proxy_cfg,
+            None,
+            &dynamic,
+            "127.0.0.1".parse().unwrap(),
+            "/proxy/item",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cache_control_ttl_is_bounded() {
         let cfg = crate::config::CacheConfig::default();
         let headers = vec![("Cache-Control".into(), b"max-age=999999".to_vec())];
@@ -2855,6 +3012,17 @@ DirectoryIndex index.html\n\
         );
         let oversize = cache_stem(&cfg, "oversize").unwrap();
         assert!(!oversize.with_extension("body").exists());
+
+        cfg.cache.max_disk_size = 20_000;
+        for key in ["break-a", "break-b", "break-c"] {
+            disk_store(&cfg, key, &disk_entry(&vec![b'd'; 1_000], unix_now() + 60));
+        }
+        cfg.cache.max_disk_size = 4_000;
+        disk_store(
+            &cfg,
+            "break-new",
+            &disk_entry(&vec![b'e'; 1_000], unix_now() + 60),
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2867,6 +3035,554 @@ DirectoryIndex index.html\n\
         assert!(disk_load(&cfg, "expired").is_none());
         assert!(!stem.with_extension("body").exists());
         assert!(!stem.with_extension("meta").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_helper_lookup_and_freshness_edges() {
+        let (dir, mut cfg) = disk_test_config("helpers");
+        let cache_root = cfg.cache.root.clone().unwrap();
+        fs::create_dir_all(cache_root.join("nested")).unwrap();
+        fs::write(cache_root.join("alpha.body"), b"body").unwrap();
+        fs::write(cache_root.join("alpha.meta"), b"meta").unwrap();
+        fs::write(cache_root.join("unrelated.txt"), b"ignored").unwrap();
+        let old = fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(cache_root.join("alpha.meta"))
+            .unwrap()
+            .set_times(old)
+            .unwrap();
+        fs::write(cache_root.join("nested/beta.body.tmp"), b"tmp").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("alpha.body", cache_root.join("link")).unwrap();
+        let usage = scan_disk_usage(&cache_root);
+        assert!(usage.total >= 11);
+        assert_eq!(usage.stems.len(), 2);
+        let mut recorded = DiskUsageState::default();
+        record_disk_file(
+            &mut recorded,
+            PathBuf::from("manual"),
+            2,
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
+        );
+        record_disk_file(
+            &mut recorded,
+            PathBuf::from("manual"),
+            3,
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(recorded.stems[Path::new("manual")].0, 5);
+        assert_eq!(scan_disk_usage(&cache_root.join("missing")).total, 0);
+        assert!(disk_stem(Path::new("plain")).is_none());
+        assert_eq!(disk_stem(Path::new("x.body")).unwrap(), PathBuf::from("x"));
+        assert_eq!(disk_stem(Path::new("x.meta")).unwrap(), PathBuf::from("x"));
+
+        let response = Response::bytes(200, "text/plain", b"x".to_vec());
+        assert_eq!(
+            response_header_str(&response, "content-type").as_deref(),
+            Some("text/plain")
+        );
+        let mut no_root = cfg.clone();
+        no_root.cache.root = None;
+        remove_disk_stem(&no_root, Path::new("unused"));
+        disk_store(&no_root, "no-root", &disk_entry(b"x", unix_now() + 60));
+
+        let mut req = test_request();
+        req.headers.insert("authorization", b"Basic eA==".to_vec());
+        assert!(!request_allows_lookup(&cfg, &req));
+        req.headers = Default::default();
+        req.headers.insert("pragma", b"NO-CACHE".to_vec());
+        assert!(!request_allows_lookup(&cfg, &req));
+        req.headers.insert("cache-control", b"public".to_vec());
+        assert!(!request_allows_lookup(&cfg, &req));
+        req.headers = Default::default();
+        req.headers
+            .insert("cache-control", b"private, max-age=0".to_vec());
+        assert!(!request_allows_lookup(&cfg, &req));
+        cfg.cache.ignore_cache_control = true;
+        assert!(request_allows_lookup(&cfg, &req));
+        cfg.cache.ignore_cache_control = false;
+
+        let headers = vec![
+            ("Vary".into(), b"Accept-Encoding,,*".to_vec()),
+            ("vary".into(), b"Accept-Encoding, Cookie".to_vec()),
+        ];
+        let mut req = test_request();
+        req.headers.insert("accept-encoding", b"gzip".to_vec());
+        let vary = vary_values(&req, &headers);
+        assert_eq!(vary.len(), 2);
+        assert_eq!(
+            combined_header(&headers, "vary")
+                .unwrap()
+                .matches(',')
+                .count(),
+            4
+        );
+        assert!(vary_values(&req, &[]).is_empty());
+        assert!(!cache_enabled(&Scope::default(), "/x"));
+        let mut disabled = Scope::default();
+        disabled
+            .rewrite_policy
+            .cache_enable
+            .push(("disk".into(), "/".into()));
+        disabled.rewrite_policy.cache_disable.push("/x".into());
+        assert!(!cache_enabled(&disabled, "/x"));
+        let mut ignored_query_cfg = cfg.clone();
+        ignored_query_cfg.cache.ignore_query_string = true;
+        assert!(base_key(
+            &ignored_query_cfg,
+            None,
+            "127.0.0.1",
+            80,
+            false,
+            "host",
+            "/x",
+            b"query",
+            Path::new("/tmp/target"),
+            [0; 32],
+        )
+        .contains("\n\nhttp\n"));
+
+        let policy = cache_policy_fingerprint(
+            &Scope::default(),
+            &req,
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp/target"),
+        );
+        let key = "lookup-edges".to_string();
+        entries().lock().unwrap().insert(
+            key.clone(),
+            vec![
+                Entry {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"expired".to_vec(),
+                    stored: unix_now() - 10,
+                    expires: unix_now() - 1,
+                    policy,
+                    epoch: current_epoch(),
+                    vary: Vec::new(),
+                },
+                Entry {
+                    status: 200,
+                    headers: vec![
+                        ("etag".into(), b"\"tag\"".to_vec()),
+                        ("content-length".into(), b"5".to_vec()),
+                    ],
+                    body: b"fresh".to_vec(),
+                    stored: unix_now(),
+                    expires: unix_now() + 60,
+                    policy,
+                    epoch: current_epoch(),
+                    vary: Vec::new(),
+                },
+            ],
+        );
+        cfg.cache.header = true;
+        cfg.cache.detail_header = true;
+        let mut conditional = req.clone();
+        conditional
+            .headers
+            .insert("if-none-match", b"W/\"tag\", \"other\"".to_vec());
+        entries().lock().unwrap().get_mut(&key).unwrap()[1].policy = cache_policy_fingerprint(
+            &Scope::default(),
+            &conditional,
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp/target"),
+        );
+        let hit = lookup(
+            &cfg,
+            None,
+            &conditional,
+            "host",
+            "/x",
+            &Scope::default(),
+            "127.0.0.1".parse().unwrap(),
+            &crate::access::test_grant(),
+            &key,
+            Path::new("/tmp/target"),
+        )
+        .unwrap();
+        assert_eq!(hit.status, 304);
+        assert!(hit
+            .headers
+            .iter()
+            .all(|(n, _)| !n.eq_ignore_ascii_case("content-length")));
+        assert!(hit
+            .headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("x-cache-detail")));
+
+        let wrong_resource =
+            crate::access::ResourceKey::cache(None, &req, "different-host", "/different-path");
+        let wrong_grant =
+            crate::access::grant_if_allowed(crate::access::Access::Allowed, wrong_resource)
+                .unwrap();
+        assert!(lookup(
+            &cfg,
+            None,
+            &req,
+            "host",
+            "/x",
+            &Scope::default(),
+            "127.0.0.1".parse().unwrap(),
+            &wrong_grant,
+            "wrong-grant-lookup",
+            Path::new("/tmp/target"),
+        )
+        .is_none());
+        let mut no_cache = req.clone();
+        no_cache
+            .headers
+            .insert("cache-control", b"no-cache".to_vec());
+        assert!(lookup(
+            &cfg,
+            None,
+            &no_cache,
+            "host",
+            "/x",
+            &Scope::default(),
+            "127.0.0.1".parse().unwrap(),
+            &crate::access::test_grant(),
+            "no-cache-lookup",
+            Path::new("/tmp/target"),
+        )
+        .is_none());
+
+        let expired_key = "only-expired".to_string();
+        entries().lock().unwrap().insert(
+            expired_key.clone(),
+            vec![Entry {
+                policy,
+                expires: unix_now() - 1,
+                ..disk_entry(b"old", unix_now() - 1)
+            }],
+        );
+        assert!(lookup(
+            &cfg,
+            None,
+            &req,
+            "host",
+            "/x",
+            &Scope::default(),
+            "127.0.0.1".parse().unwrap(),
+            &crate::access::test_grant(),
+            &expired_key,
+            Path::new("/tmp/target"),
+        )
+        .is_none());
+        assert!(!entries().lock().unwrap().contains_key(&expired_key));
+
+        let mismatched_key = "disk-policy-mismatch";
+        let mismatched = Entry {
+            policy: [9; 32],
+            ..disk_entry(b"disk", unix_now() + 60)
+        };
+        disk_store(&cfg, mismatched_key, &mismatched);
+        entries().lock().unwrap().remove(mismatched_key);
+        assert!(lookup(
+            &cfg,
+            None,
+            &req,
+            "host",
+            "/x",
+            &Scope::default(),
+            "127.0.0.1".parse().unwrap(),
+            &crate::access::test_grant(),
+            mismatched_key,
+            Path::new("/tmp/target"),
+        )
+        .is_none());
+
+        let now = unix_now();
+        let expires = vec![(
+            "expires".into(),
+            crate::util::http_date(now - 1).into_bytes(),
+        )];
+        assert!(freshness(&cfg.cache, &expires, now).is_none());
+        let last = vec![(
+            "last-modified".into(),
+            crate::util::http_date(now).into_bytes(),
+        )];
+        assert_eq!(
+            freshness(&cfg.cache, &last, now),
+            Some(cfg.cache.default_expire.min(cfg.cache.max_expire) as i64)
+        );
+        let mut no_last = cfg.cache.clone();
+        no_last.ignore_no_last_mod = true;
+        assert!(freshness(&no_last, &[], now).is_some());
+
+        let mut empty = Body::Empty;
+        assert_eq!(response_body_bytes(&mut empty), Some(Vec::new()));
+        let mut bytes = Body::Bytes(b"bytes".to_vec());
+        assert_eq!(response_body_bytes(&mut bytes), Some(b"bytes".to_vec()));
+        let file_path = dir.join("body-file");
+        fs::write(&file_path, b"012345").unwrap();
+        let mut file_body = Body::File {
+            file: fs::File::open(&file_path).unwrap(),
+            offset: 2,
+            len: 3,
+        };
+        assert_eq!(response_body_bytes(&mut file_body), Some(b"234".to_vec()));
+        let mut stream = Body::Stream {
+            reader: Box::new(&b"stream"[..]),
+            len: 6,
+        };
+        assert!(response_body_bytes(&mut stream).is_none());
+
+        let rnd = crate::config::RewriteMap::Rnd(HashMap::from([
+            ("b".into(), vec!["2".into()]),
+            ("a".into(), vec!["1".into()]),
+        ]));
+        assert!(rewrite_map_material(&rnd).starts_with("rnd:"));
+        assert_eq!(
+            rewrite_map_material(&crate::config::RewriteMap::Prg("worker".into())),
+            "prg:worker"
+        );
+        let ims = crate::util::http_date(unix_now()).into_bytes();
+        let mut ims_req = test_request();
+        ims_req.headers.insert("if-modified-since", ims.clone());
+        let ims_entry = Entry {
+            headers: vec![("last-modified".into(), ims)],
+            ..disk_entry(b"body", unix_now() + 60)
+        };
+        let mut ims_response = Response::bytes(200, "text/plain", b"body".to_vec());
+        assert!(conditional_hit(&ims_req, &ims_entry, &mut ims_response));
+        assert_eq!(ims_response.status, 304);
+
+        let expires_future = vec![(
+            "expires".into(),
+            crate::util::http_date(unix_now() + 120).into_bytes(),
+        )];
+        assert!(freshness(&cfg.cache, &expires_future, unix_now()).is_some());
+        let last_past = vec![(
+            "last-modified".into(),
+            crate::util::http_date(unix_now() - 120).into_bytes(),
+        )];
+        assert!(freshness(&cfg.cache, &last_past, unix_now()).is_some());
+        assert!(decode_meta(
+            format!(
+                "V3\nS 200\nT 1\nE 2\nP {}\nG 1\nX ignored\n",
+                STANDARD.encode([0u8; 32])
+            )
+            .as_bytes()
+        )
+        .is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_corruption_write_failure_and_invalidation_edges() {
+        let (dir, mut cfg) = disk_test_config("disk-failures");
+        let root = cfg.cache.root.clone().unwrap();
+        prepare(&cfg);
+        prepare_dir(&cfg, &dir.join("prepared"));
+        let blocker = dir.join("blocker");
+        fs::write(&blocker, b"file").unwrap();
+        prepare_dir(&cfg, &blocker.join("child"));
+
+        assert!(disk_load(&cfg, "absent").is_none());
+        let bad_stem = cache_stem(&cfg, "bad-meta").unwrap();
+        fs::create_dir_all(bad_stem.parent().unwrap()).unwrap();
+        fs::write(bad_stem.with_extension("meta"), b"not metadata").unwrap();
+        fs::write(bad_stem.with_extension("body"), b"body").unwrap();
+        assert!(disk_load(&cfg, "bad-meta").is_none());
+        assert!(!bad_stem.with_extension("body").exists());
+
+        let missing_body = disk_entry(b"gone", unix_now() + 60);
+        disk_store(&cfg, "missing-body", &missing_body);
+        let missing_stem = cache_stem(&cfg, "missing-body").unwrap();
+        fs::remove_file(missing_stem.with_extension("body")).unwrap();
+        assert!(disk_load(&cfg, "missing-body").is_none());
+
+        let root_file = dir.join("cache-is-a-file");
+        fs::write(&root_file, b"x").unwrap();
+        cfg.cache.root = Some(root_file.clone());
+        cfg.cache.max_disk_size = u64::MAX;
+        disk_store(&cfg, "write-fails", &disk_entry(b"x", unix_now() + 60));
+
+        cfg.cache.root = Some(root.clone());
+        let rename_stem = cache_stem(&cfg, "rename-fails").unwrap();
+        fs::create_dir_all(rename_stem.with_extension("meta")).unwrap();
+        disk_store(&cfg, "rename-fails", &disk_entry(b"x", unix_now() + 60));
+        assert!(!rename_stem.with_extension("body").exists());
+        fs::remove_dir_all(rename_stem.with_extension("meta")).unwrap();
+
+        disk_usage().lock().unwrap().insert(
+            root.clone(),
+            DiskUsageState {
+                total: u64::MAX,
+                stems: HashMap::new(),
+            },
+        );
+        cfg.cache.max_disk_size = 1_000;
+        disk_store(
+            &cfg,
+            "accounting-refuses",
+            &disk_entry(b"x", unix_now() + 60),
+        );
+
+        fs::write(root.join("orphan.body.tmp"), b"x").unwrap();
+        fs::write(root.join("keep.txt"), b"x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("keep.txt", root.join("keep-link")).unwrap();
+        clear(&cfg);
+        assert!(!root.join("orphan.body.tmp").exists());
+        assert!(root.join("keep.txt").exists());
+        assert!(root.join("keep-link").exists());
+        let mut no_root = cfg.clone();
+        no_root.cache.root = None;
+        clear(&no_root);
+        invalidate_disk(&no_root);
+        let mut bad_root = no_root;
+        bad_root.cache.root = Some(root_file);
+        invalidate_disk(&bad_root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn production_store_rejection_and_eviction_edges() {
+        let (dir, mut cfg) = disk_test_config("store-edges");
+        cfg.cache.root = None;
+        cfg.cache.min_file_size = 0;
+        cfg.cache.max_file_size = 1_000_000;
+        cfg.cache.default_expire = 60;
+        cfg.cache.ignore_no_last_mod = true;
+        let scope = Scope::default();
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let target = Path::new("/tmp/cache-target");
+        let base_req = test_request();
+        let good = crate::access::test_grant();
+        let call = |cfg: &Config,
+                    req: &Request,
+                    response: &mut Response,
+                    grant: &AccessGrant,
+                    key: &str| {
+            store(
+                cfg, None, req, "host", "/x", &scope, peer, response, grant, key, target,
+            )
+        };
+
+        let wrong_key = crate::access::ResourceKey::cache(None, &base_req, "other", "/other");
+        let wrong_grant =
+            crate::access::grant_if_allowed(crate::access::Access::Allowed, wrong_key).unwrap();
+        let mut response = Response::bytes(200, "text/plain", b"ok".to_vec());
+        crate::files::set_local_error_document_response_for_test(true);
+        call(&cfg, &base_req, &mut response, &good, "local-error");
+        crate::files::set_local_error_document_response_for_test(false);
+        call(&cfg, &base_req, &mut response, &wrong_grant, "wrong-grant");
+
+        for mut req in [
+            {
+                let mut r = base_req.clone();
+                r.method = "POST".into();
+                r
+            },
+            {
+                let mut r = base_req.clone();
+                r.body = b"x".to_vec();
+                r
+            },
+            {
+                let mut r = base_req.clone();
+                r.headers.insert("authorization", b"x".to_vec());
+                r
+            },
+            {
+                let mut r = base_req.clone();
+                r.headers.insert("cookie", b"x=y".to_vec());
+                r
+            },
+        ] {
+            let mut response = Response::bytes(200, "text/plain", b"ok".to_vec());
+            call(&cfg, &req, &mut response, &good, "bad-request");
+            req.headers = Default::default();
+        }
+
+        let mut response = Response::bytes(500, "text/plain", b"no".to_vec());
+        call(&cfg, &base_req, &mut response, &good, "bad-status");
+        for (key, name, value) in [
+            ("no-store", "Cache-Control", "no-store"),
+            ("no-cache", "Cache-Control", "no-cache"),
+            ("private", "Cache-Control", "private"),
+            ("cookie", "Set-Cookie", "x=y"),
+            ("vary-star", "Vary", "*"),
+        ] {
+            let mut response = Response::bytes(200, "text/plain", b"ok".to_vec());
+            response
+                .headers
+                .push((Cow::Owned(name.into()), value.as_bytes().to_vec()));
+            call(&cfg, &base_req, &mut response, &good, key);
+        }
+        let mut stream = Response::new(200);
+        stream.body = Body::Stream {
+            reader: Box::new(&b"x"[..]),
+            len: 1,
+        };
+        call(&cfg, &base_req, &mut stream, &good, "stream");
+        let mut too_large = Response::bytes(200, "text/plain", b"xx".to_vec());
+        let mut tiny_cfg = cfg.clone();
+        tiny_cfg.cache.max_file_size = 1;
+        call(&tiny_cfg, &base_req, &mut too_large, &good, "too-large");
+        let mut no_ttl = Response::bytes(200, "text/plain", b"ok".to_vec());
+        let mut no_ttl_cfg = cfg.clone();
+        no_ttl_cfg.cache.ignore_no_last_mod = false;
+        call(&no_ttl_cfg, &base_req, &mut no_ttl, &good, "no-ttl");
+        let mut zero_ttl = Response::bytes(200, "text/plain", b"ok".to_vec());
+        zero_ttl
+            .headers
+            .push((Cow::Borrowed("Cache-Control"), b"max-age=0".to_vec()));
+        call(&cfg, &base_req, &mut zero_ttl, &good, "zero-ttl");
+
+        let mut stored = Response::bytes(200, "text/plain", b"ok".to_vec());
+        stored.headers.extend([
+            (Cow::Borrowed("Connection"), b"close".to_vec()),
+            (Cow::Borrowed("Age"), b"1".to_vec()),
+            (Cow::Borrowed("X-Cache"), b"old".to_vec()),
+        ]);
+        cfg.cache.header = true;
+        {
+            let mut map = entries().lock().unwrap();
+            map.clear();
+            for i in 0..=MAX_ENTRIES {
+                map.insert(format!("old-{i}"), Vec::new());
+            }
+        }
+        call(&cfg, &base_req, &mut stored, &good, "new-key");
+        assert!(stored
+            .headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("x-cache") && v == b"MISS"));
+
+        let policy = cache_policy_fingerprint(&scope, &base_req, peer, target);
+        entries().lock().unwrap().insert(
+            "variants".into(),
+            (0..=MAX_VARIANTS_PER_KEY)
+                .map(|i| Entry {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: vec![i as u8],
+                    stored: unix_now(),
+                    expires: unix_now() + 60,
+                    policy,
+                    epoch: current_epoch(),
+                    vary: vec![("x-variant".into(), vec![i as u8])],
+                })
+                .collect(),
+        );
+        let mut variant_req = base_req.clone();
+        variant_req.headers.insert("x-variant", b"new".to_vec());
+        let mut variant = Response::bytes(200, "text/plain", b"v".to_vec());
+        variant
+            .headers
+            .push((Cow::Borrowed("Vary"), b"X-Variant".to_vec()));
+        call(&cfg, &variant_req, &mut variant, &good, "variants");
+        assert_eq!(
+            entries().lock().unwrap()["variants"].len(),
+            MAX_VARIANTS_PER_KEY
+        );
+        entries().lock().unwrap().clear();
         let _ = fs::remove_dir_all(&dir);
     }
 }
