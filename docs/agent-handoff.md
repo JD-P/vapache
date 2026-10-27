@@ -125,7 +125,7 @@ divergence. Then move ledger obligation `expr_parser_totality` to partial.
 
 ## H2 (P0) — Rewrite flag/round state machine (F67 + F68 + dead flag)
 
-These are the two still-live findings from `findings_p10.md` (its own
+These are the two still-live findings from `adversarial/findings_p10.md` (its own
 remediation list); the F60 half already landed.
 
 ### H2a. `[PT]` is parsed but never read (F67)

@@ -6181,4 +6181,740 @@ pub proof fn prefilter_sound(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pass-11 remediation kernels: shell fnmatch for section patterns (F61/F62),
+// expression-variable admission (F63), SetHandler precedence and conjoin
+// (F64), ScriptAlias execution gating (F65) and lexical handler identity
+// (F69).
+// ---------------------------------------------------------------------------
+
+/// Byte membership in a sequence, stated recursively so the executable
+/// matcher and its specification share one definition.
+pub open spec fn bytes_contains_spec(bytes: Seq<u8>, byte: u8) -> bool
+    decreases bytes.len(),
+{
+    if bytes.len() == 0 {
+        false
+    } else {
+        bytes[0] == byte || bytes_contains_spec(bytes.skip(1), byte)
+    }
+}
+
+pub fn bytes_contains(bytes: &[u8], byte: u8) -> (out: bool)
+    ensures out == bytes_contains_spec(bytes@, byte),
+    decreases bytes.len(),
+{
+    if bytes.len() == 0 {
+        false
+    } else {
+        bytes[0] == byte || bytes_contains(&bytes[1..], byte)
+    }
+}
+
+/// A byte found at a position is a member by the recursive definition.
+pub proof fn bytes_contains_at(bytes: Seq<u8>, i: int, byte: u8)
+    requires 0 <= i < bytes.len(),
+    ensures
+        bytes[i] == byte ==> bytes_contains_spec(bytes, byte),
+    decreases i,
+{
+    if i == 0 {
+        assert(bytes[i] == byte ==> bytes_contains_spec(bytes, byte));
+    } else {
+        assert(bytes.skip(1).len() == bytes.len() - 1);
+        assert(bytes.skip(1)[i - 1] == bytes[i]);
+        bytes_contains_at(bytes.skip(1), i - 1, byte);
+        assert(bytes[i] == byte ==> bytes_contains_spec(bytes, byte));
+    }
+}
+
+/// Membership is witnessed at some index.
+pub proof fn bytes_contains_witness(bytes: Seq<u8>, byte: u8)
+    requires bytes_contains_spec(bytes, byte),
+    ensures exists|j: int| 0 <= j < bytes.len() && bytes[j] == byte,
+    decreases bytes.len(),
+{
+    if bytes.len() == 0 {
+        assert(!bytes_contains_spec(bytes, byte));
+    } else if bytes[0] == byte {
+        assert(bytes[0] == byte);
+    } else {
+        bytes_contains_witness(bytes.skip(1), byte);
+        assert(exists|j: int| 0 <= j < bytes.len() && bytes[j] == byte);
+    }
+}
+
+/// Membership survives embedding a subrange into its parent sequence.
+pub proof fn bytes_contains_subrange(bytes: Seq<u8>, lo: int, hi: int, byte: u8)
+    requires 0 <= lo <= hi <= bytes.len(),
+    ensures
+        bytes_contains_spec(bytes.subrange(lo, hi), byte)
+            ==> bytes_contains_spec(bytes, byte),
+    decreases hi - lo,
+{
+    if lo < hi {
+        let sub = bytes.subrange(lo, hi);
+        assert(sub.len() == hi - lo);
+        // The witness index `k` inside the subrange maps to `lo + k` in the
+        // parent.
+        assert forall|k: int| 0 <= k < sub.len() implies sub[k] == bytes[lo + k] by {
+            assert(sub[k] == bytes[lo + k]);
+        }
+        if bytes_contains_spec(sub, byte) {
+            bytes_contains_witness(sub, byte);
+            let witness = choose|j: int| 0 <= j < sub.len() && sub[j] == byte;
+            assert(0 <= lo + witness < bytes.len());
+            assert(bytes[lo + witness] == byte);
+            bytes_contains_at(bytes, lo + witness, byte);
+            assert(bytes_contains_spec(bytes, byte));
+        }
+    }
+}
+
+/// Position of the closing `]` of a bracket expression, scanning from `from`.
+/// `\x` escape pairs are transparent, so an escaped `]` never terminates the
+/// class.  An unterminated class reports `pattern.len()`; a terminated one
+/// reports the index of the closing bracket (never before `from`).
+pub open spec fn fnmatch_class_end_spec(pattern: Seq<u8>, from: int) -> int
+    decreases pattern.len() - from,
+{
+    if from < 0 || from >= pattern.len() {
+        pattern.len() as int
+    } else if pattern[from] == b']' {
+        from
+    } else if pattern[from] == b'\\' && from + 1 < pattern.len() {
+        fnmatch_class_end_spec(pattern, from + 2)
+    } else {
+        fnmatch_class_end_spec(pattern, from + 1)
+    }
+}
+
+pub fn fnmatch_class_end(pattern: &[u8], from: usize) -> (out: Option<usize>)
+    requires from <= pattern.len(),
+    ensures
+        match out {
+            None => fnmatch_class_end_spec(pattern@, from as int) == pattern@.len(),
+            Some(e) => {
+                &&& fnmatch_class_end_spec(pattern@, from as int) == e as int
+                &&& from <= e < pattern.len()
+                &&& pattern@[e as int] == b']'
+            }
+        },
+    decreases pattern.len() - from,
+{
+    if from >= pattern.len() {
+        None
+    } else if pattern[from] == b']' {
+        Some(from)
+    } else if pattern[from] == b'\\' && from + 1 < pattern.len() {
+        fnmatch_class_end(pattern, from + 2)
+    } else {
+        fnmatch_class_end(pattern, from + 1)
+    }
+}
+
+/// `fnmatch_class_end_spec` never escapes `[from, pattern.len()]`, which the
+/// path-mode boundedness proof needs before indexing past the closing `]`.
+pub proof fn fnmatch_class_end_bounds(pattern: Seq<u8>, from: int)
+    requires 0 <= from <= pattern.len(),
+    ensures
+        from <= fnmatch_class_end_spec(pattern, from) <= pattern.len(),
+    decreases pattern.len() - from,
+{
+    if from >= pattern.len() {
+        assert(fnmatch_class_end_spec(pattern, from) == pattern.len());
+    } else if pattern[from] == b']' {
+        assert(fnmatch_class_end_spec(pattern, from) == from);
+    } else if pattern[from] == b'\\' && from + 1 < pattern.len() {
+        assert(from + 2 <= pattern.len());
+        fnmatch_class_end_bounds(pattern, from + 2);
+    } else {
+        fnmatch_class_end_bounds(pattern, from + 1);
+    }
+}
+
+/// Both shell negation markers are honored inside a class: `!` and `^`
+/// (F62/F62b: `^` was previously read as a positive class member).
+pub open spec fn fnmatch_class_negated_spec(pattern: Seq<u8>, start: int) -> bool
+{
+    0 <= start + 1 < pattern.len()
+        && (pattern[start + 1] == b'!' || pattern[start + 1] == b'^')
+}
+
+pub fn fnmatch_class_negated(pattern: &[u8], start: usize) -> (neg: bool)
+    requires start < pattern.len(),
+    ensures neg == fnmatch_class_negated_spec(pattern@, start as int),
+{
+    start + 1 < pattern.len() && (pattern[start + 1] == b'!' || pattern[start + 1] == b'^')
+}
+
+/// Index of the first class member, past an optional negation marker and a
+/// literal leading `]`.
+pub open spec fn fnmatch_class_body_start_spec(pattern: Seq<u8>, start: int) -> int
+{
+    if start < 0 {
+        0int
+    } else {
+        let s = start
+            + 1
+            + (if start + 1 < pattern.len()
+                && (pattern[start + 1] == b'!' || pattern[start + 1] == b'^')
+            {
+                1int
+            } else {
+                0int
+            });
+        if s < pattern.len() && pattern[s] == b']' {
+            s + 1
+        } else {
+            s
+        }
+    }
+}
+
+pub fn fnmatch_class_body_start(pattern: &[u8], start: usize) -> (out: usize)
+    requires start < pattern.len(),
+    ensures out == fnmatch_class_body_start_spec(pattern@, start as int),
+{
+    let mut s = start + 1;
+    if s < pattern.len() && (pattern[s] == b'!' || pattern[s] == b'^') {
+        s += 1;
+    }
+    if s < pattern.len() && pattern[s] == b']' {
+        s + 1
+    } else {
+        s
+    }
+}
+
+/// Does byte `c` belong to the class body starting at `i` (the characters
+/// between the brackets, negation marker already excluded)?  `\x` pairs are
+/// literal members; `lo-hi` needs plain characters on both sides of the dash;
+/// a dash at an edge is a literal dash.  In path mode a class never matches
+/// `/` (POSIX pathname expansion).
+pub open spec fn fnmatch_class_body_spec(pattern: Seq<u8>, i: int, c: u8, path_mode: bool) -> bool
+    decreases pattern.len() - i,
+{
+    if i < 0 || i >= pattern.len() {
+        false
+    } else if pattern[i] == b'\\' && i + 1 < pattern.len() {
+        (c == pattern[i + 1] && (!path_mode || c != b'/'))
+            || fnmatch_class_body_spec(pattern, i + 2, c, path_mode)
+    } else if i + 2 < pattern.len() && pattern[i + 1] == b'-' {
+        ((!path_mode || c != b'/') && pattern[i] <= c && c <= pattern[i + 2])
+            || fnmatch_class_body_spec(pattern, i + 3, c, path_mode)
+    } else {
+        (c == pattern[i] && (!path_mode || c != b'/'))
+            || fnmatch_class_body_spec(pattern, i + 1, c, path_mode)
+    }
+}
+
+fn fnmatch_class_body(body: &[u8], i: usize, c: u8, path_mode: bool) -> (out: bool)
+    requires i <= body.len(),
+    ensures out == fnmatch_class_body_spec(body@, i as int, c, path_mode),
+    decreases body.len() - i,
+{
+    if i >= body.len() {
+        false
+    } else if body[i] == b'\\' && i + 1 < body.len() {
+        (c == body[i + 1] && (!path_mode || c != b'/'))
+            || fnmatch_class_body(body, i + 2, c, path_mode)
+    } else if i + 1 < body.len() && i + 2 < body.len() && body[i + 1] == b'-' {
+        ((!path_mode || c != b'/') && body[i] <= c && c <= body[i + 2])
+            || fnmatch_class_body(body, i + 3, c, path_mode)
+    } else {
+        (c == body[i] && (!path_mode || c != b'/'))
+            || fnmatch_class_body(body, i + 1, c, path_mode)
+    }
+}
+
+/// Shell-style fnmatch used by `<Location>` glob patterns, `<Files>` patterns
+/// and the component-wise `<Directory>` matcher.  In path mode `*` and `?`
+/// stop at `/` and a bracket expression never matches `/`, so a pattern can
+/// never reach past the URL component it belongs to (F61).  Outside path mode
+/// `*` crosses `/` (the `<Proxy>` wildcard form).  Both `!` and `^` negate a
+/// class (F62/F62b).  The match is anchored: the whole value must be consumed.
+pub open spec fn fnmatch_spec(pattern: Seq<u8>, value: Seq<u8>, path_mode: bool) -> bool
+    decreases pattern.len() + value.len(),
+{
+    if pattern.len() == 0 {
+        value.len() == 0
+    } else if pattern[0] == b'*' {
+        if fnmatch_spec(pattern.skip(1), value, path_mode) {
+            true
+        } else if value.len() == 0 || (path_mode && value[0] == b'/') {
+            false
+        } else {
+            fnmatch_spec(pattern, value.skip(1), path_mode)
+        }
+    } else if pattern[0] == b'?' {
+        if value.len() == 0 {
+            false
+        } else {
+            (!path_mode || value[0] != b'/')
+                && fnmatch_spec(pattern.skip(1), value.skip(1), path_mode)
+        }
+    } else if value.len() == 0 {
+        false
+    } else if pattern[0] == b'[' && pattern.len() > 1 {
+        let body_start = fnmatch_class_body_start_spec(pattern, 0);
+        let end = fnmatch_class_end_spec(pattern, body_start);
+        if end == pattern.len() {
+            // Unterminated class: `[` is an ordinary character.
+            value[0] == b'['
+                && fnmatch_spec(pattern.skip(1), value.skip(1), path_mode)
+        } else {
+            // Clamped so the well-formedness of the subrange does not depend
+            // on an inductive bound on `end` (real runs always satisfy
+            // body_start <= end < pattern.len(); see fnmatch_class_end_bounds).
+            let from2 = if end + 1 < 0 {
+                0int
+            } else if end + 1 > pattern.len() {
+                pattern.len() as int
+            } else {
+                end + 1
+            };
+            let hit = fnmatch_class_body_spec(pattern, body_start, value[0], path_mode);
+            (!path_mode || value[0] != b'/')
+                && hit != fnmatch_class_negated_spec(pattern, 0)
+                && fnmatch_spec(
+                    pattern.subrange(from2, pattern.len() as int),
+                    value.skip(1),
+                    path_mode,
+                )
+        }
+    } else if pattern[0] == b'\\' && pattern.len() > 1 {
+        value[0] == pattern[1]
+            && fnmatch_spec(pattern.subrange(2, pattern.len() as int), value.skip(1), path_mode)
+    } else {
+        pattern[0] == value[0] && fnmatch_spec(pattern.skip(1), value.skip(1), path_mode)
+    }
+}
+
+pub fn fnmatch_match(pattern: &[u8], value: &[u8], path_mode: bool) -> (out: bool)
+    ensures out == fnmatch_spec(pattern@, value@, path_mode),
+    decreases pattern.len() + value.len(),
+{
+    if pattern.len() == 0 {
+        return value.len() == 0;
+    }
+    if pattern[0] == b'*' {
+        if fnmatch_match(&pattern[1..], value, path_mode) {
+            return true;
+        }
+        if value.len() == 0 || (path_mode && value[0] == b'/') {
+            return false;
+        }
+        return fnmatch_match(pattern, &value[1..], path_mode);
+    }
+    if pattern[0] == b'?' {
+        if value.len() == 0 {
+            return false;
+        }
+        return (!path_mode || value[0] != b'/')
+            && fnmatch_match(&pattern[1..], &value[1..], path_mode);
+    }
+    if value.len() == 0 {
+        return false;
+    }
+    if pattern[0] == b'[' && pattern.len() > 1 {
+        let body_start = fnmatch_class_body_start(pattern, 0);
+        let end = fnmatch_class_end(pattern, body_start);
+        if let Some(end) = end {
+            let hit = fnmatch_class_body(pattern, body_start, value[0], path_mode);
+            let negated = fnmatch_class_negated(pattern, 0);
+            return (!path_mode || value[0] != b'/')
+                && hit != negated
+                && fnmatch_match(&pattern[end + 1..], &value[1..], path_mode);
+        }
+        return value[0] == b'[' && fnmatch_match(&pattern[1..], &value[1..], path_mode);
+    }
+    if pattern[0] == b'\\' && pattern.len() > 1 {
+        return value[0] == pattern[1] && fnmatch_match(&pattern[2..], &value[1..], path_mode);
+    }
+    pattern[0] == value[0] && fnmatch_match(&pattern[1..], &value[1..], path_mode)
+}
+
+/// In path mode no wildcard can consume a `/`: only literal characters and
+/// escapes can, so a matching pattern must itself contain a `/` whenever the
+/// value does.  This is the property that keeps `<Location "/admin/*">` from
+/// reaching past the URL component it belongs to.
+pub proof fn fnmatch_path_mode_slash_bounded(pattern: Seq<u8>, value: Seq<u8>)
+    requires fnmatch_spec(pattern, value, true),
+    ensures
+        bytes_contains_spec(value, b'/') ==> bytes_contains_spec(pattern, b'/'),
+    decreases pattern.len() + value.len(),
+{
+    if pattern.len() == 0 {
+        assert(value.len() == 0);
+        assert(!bytes_contains_spec(value, b'/'));
+    } else if pattern[0] == b'*' {
+        if fnmatch_spec(pattern.skip(1), value, true) {
+            fnmatch_path_mode_slash_bounded(pattern.skip(1), value);
+            bytes_contains_subrange(pattern, 1, pattern.len() as int, b'/');
+        } else {
+            assert(value.len() > 0);
+            assert(value[0] != b'/');
+            fnmatch_path_mode_slash_bounded(pattern, value.skip(1));
+        }
+    } else if pattern[0] == b'?' {
+        assert(value.len() > 0);
+        assert(value[0] != b'/');
+        fnmatch_path_mode_slash_bounded(pattern.skip(1), value.skip(1));
+        bytes_contains_subrange(pattern, 1, pattern.len() as int, b'/');
+    } else if value.len() == 0 {
+        assert(!bytes_contains_spec(value, b'/'));
+    } else if pattern[0] == b'[' && pattern.len() > 1 {
+        let body_start = fnmatch_class_body_start_spec(pattern, 0);
+        let end = fnmatch_class_end_spec(pattern, body_start);
+        fnmatch_class_end_bounds(pattern, body_start);
+        if end == pattern.len() {
+            assert(value[0] == b'[');
+            fnmatch_path_mode_slash_bounded(pattern.skip(1), value.skip(1));
+            bytes_contains_subrange(pattern, 1, pattern.len() as int, b'/');
+        } else {
+            // The class matched `value[0]`; in path mode that byte is not `/`.
+            assert(value[0] != b'/');
+            fnmatch_path_mode_slash_bounded(
+                pattern.subrange(end + 1, pattern.len() as int),
+                value.skip(1),
+            );
+            bytes_contains_subrange(pattern, end + 1, pattern.len() as int, b'/');
+        }
+    } else if pattern[0] == b'\\' && pattern.len() > 1 {
+        if value[0] == b'/' {
+            assert(pattern[1] == b'/');
+            bytes_contains_at(pattern, 1, b'/');
+            assert(bytes_contains_spec(pattern, b'/'));
+        } else {
+            fnmatch_path_mode_slash_bounded(pattern.subrange(2, pattern.len() as int), value.skip(1));
+            bytes_contains_subrange(pattern, 2, pattern.len() as int, b'/');
+        }
+    } else {
+        if value[0] == b'/' {
+            assert(pattern[0] == value[0]);
+            bytes_contains_at(pattern, 0, b'/');
+            assert(bytes_contains_spec(pattern, b'/'));
+        } else {
+            fnmatch_path_mode_slash_bounded(pattern.skip(1), value.skip(1));
+        }
+    }
+}
+
+/// Oracle lemmas for the Apache `<Location>` glob verdicts pinned on 2.4.69:
+/// the wildcard is component-bounded, classes and `?` are honored, and the
+/// match is anchored over the whole URL path.
+pub proof fn fnmatch_location_glob_oracle()
+    ensures
+        // <Location "/admin/*"> denies a sibling script and its directory...
+        fnmatch_spec(
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'/', b'*'],
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'/', b'r', b'u', b'n', b'.', b'c', b'g', b'i'],
+            true,
+        ),
+        // ...but never reaches a deeper component or past the prefix.
+        !fnmatch_spec(
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'/', b'*'],
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'/', b'a', b'/', b'b', b'.', b'c', b'g', b'i'],
+            true,
+        ),
+        !fnmatch_spec(
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'/', b'*'],
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'i', b's', b't', b'r', b'y'],
+            true,
+        ),
+        // <Location "/admin*"> keeps the star inside its own component.
+        fnmatch_spec(
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'*'],
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'i', b's', b't', b'r', b'y'],
+            true,
+        ),
+        !fnmatch_spec(
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'*'],
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'/', b'r', b'u', b'n', b'.', b'c', b'g', b'i'],
+            true,
+        ),
+        // ? matches exactly one character.
+        fnmatch_spec(
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'/', b'?', b'.', b'c', b'g', b'i'],
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'/', b'x', b'.', b'c', b'g', b'i'],
+            true,
+        ),
+        !fnmatch_spec(
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'/', b'?', b'.', b'c', b'g', b'i'],
+            seq![b'/', b'a', b'd', b'm', b'i', b'n', b'/', b'x', b'y', b'.', b'c', b'g', b'i'],
+            true,
+        ),
+{
+    reveal_with_fuel(fnmatch_spec, 40);
+    reveal_with_fuel(fnmatch_class_end_spec, 20);
+    reveal_with_fuel(fnmatch_class_body_spec, 20);
+}
+
+/// F62/F62b: both negation markers negate a bracket expression, and ranges
+/// still match within the class.
+pub proof fn fnmatch_class_negation_oracle()
+    ensures
+        !fnmatch_spec(seq![b'[', b'^', b'a', b']'], seq![b'a'], false),
+        fnmatch_spec(seq![b'[', b'^', b'a', b']'], seq![b'z'], false),
+        !fnmatch_spec(seq![b'[', b'!', b'a', b']'], seq![b'a'], false),
+        fnmatch_spec(seq![b'[', b'!', b'a', b']'], seq![b'z'], false),
+        fnmatch_spec(seq![b'[', b'a', b'-', b'c', b']'], seq![b'b'], false),
+        !fnmatch_spec(seq![b'[', b'a', b'-', b'c', b']'], seq![b'x'], false),
+{
+    reveal_with_fuel(fnmatch_spec, 20);
+    reveal_with_fuel(fnmatch_class_end_spec, 10);
+    reveal_with_fuel(fnmatch_class_body_spec, 10);
+}
+
+/// F61: a `<Location>` argument containing a shell wildcard must be compiled
+/// to the verified fnmatch kernel at parse time; it may never degrade into an
+/// inert literal pattern (which silently disables the guard inside it).
+pub fn location_wildcard_compiled_admit(has_wildcard: bool, compiled: bool) -> (ok: bool)
+    ensures ok == (!has_wildcard || compiled),
+{
+    !has_wildcard || compiled
+}
+
+/// F63: the complete set of `ap_expr` variables the evaluator implements.
+/// The evaluator and the load-time validator both consult this kernel, so a
+/// variable can never evaluate differently from what was validated: an
+/// unknown variable is a configuration error at load time and never an empty
+/// string substituted at evaluation time.
+pub open spec fn expr_var_fixed_spec(name: Seq<u8>) -> bool {
+    eq_ignore_ascii_case_spec(name, b"time"@)
+        || eq_ignore_ascii_case_spec(name, b"time_year"@)
+        || eq_ignore_ascii_case_spec(name, b"time_mon"@)
+        || eq_ignore_ascii_case_spec(name, b"time_day"@)
+        || eq_ignore_ascii_case_spec(name, b"time_hour"@)
+        || eq_ignore_ascii_case_spec(name, b"time_min"@)
+        || eq_ignore_ascii_case_spec(name, b"time_sec"@)
+        || eq_ignore_ascii_case_spec(name, b"request_method"@)
+        || eq_ignore_ascii_case_spec(name, b"query_string"@)
+        || eq_ignore_ascii_case_spec(name, b"request_uri"@)
+        || eq_ignore_ascii_case_spec(name, b"request_scheme"@)
+        || eq_ignore_ascii_case_spec(name, b"https"@)
+        || eq_ignore_ascii_case_spec(name, b"remote_addr"@)
+        || eq_ignore_ascii_case_spec(name, b"server_name"@)
+        || eq_ignore_ascii_case_spec(name, b"server_port"@)
+        || eq_ignore_ascii_case_spec(name, b"document_root"@)
+        || eq_ignore_ascii_case_spec(name, b"api_version"@)
+        // F63: the filesystem variables the access-control idioms rely on.
+        || eq_ignore_ascii_case_spec(name, b"request_filename"@)
+        || eq_ignore_ascii_case_spec(name, b"script_filename"@)
+}
+
+/// `%{FUNC:arg}` transform forms.  The argument part is validated separately,
+/// because the evaluator expands nested `%{...}` inside it.
+pub open spec fn expr_transform_var_spec(name: Seq<u8>) -> bool {
+    (name.len() >= 8
+        && name[7] == b':'
+        && eq_ignore_ascii_case_spec(name.subrange(0, 7), b"toupper"@))
+        || (name.len() >= 7
+            && name[6] == b':'
+            && eq_ignore_ascii_case_spec(name.subrange(0, 6), b"tolower"@))
+        || (name.len() >= 7
+            && name[6] == b':'
+            && eq_ignore_ascii_case_spec(name.subrange(0, 6), b"escape"@))
+        || (name.len() >= 9
+            && name[8] == b':'
+            && eq_ignore_ascii_case_spec(name.subrange(0, 8), b"unescape"@))
+}
+
+pub open spec fn expr_var_known_spec(name: Seq<u8>) -> bool {
+    expr_transform_var_spec(name)
+        || starts_with_ignore_ascii_case_spec(name, b"req:"@)
+        || starts_with_ignore_ascii_case_spec(name, b"http:"@)
+        || starts_with_ignore_ascii_case_spec(name, b"env:"@)
+        || starts_with_ignore_ascii_case_spec(name, b"http_"@)
+        || starts_with_ignore_ascii_case_spec(name, b"http"@)
+        || expr_var_fixed_spec(name)
+}
+
+pub fn expr_transform_var_known(name: &[u8]) -> (known: bool)
+    ensures known == expr_transform_var_spec(name@),
+{
+    (name.len() >= 8 && name[7] == b':' && eq_ignore_ascii_case(&name[..7], b"toupper"))
+        || (name.len() >= 7 && name[6] == b':' && eq_ignore_ascii_case(&name[..6], b"tolower"))
+        || (name.len() >= 7 && name[6] == b':' && eq_ignore_ascii_case(&name[..6], b"escape"))
+        || (name.len() >= 9 && name[8] == b':' && eq_ignore_ascii_case(&name[..8], b"unescape"))
+}
+
+pub fn expr_var_known(name: &[u8]) -> (known: bool)
+    ensures known == expr_var_known_spec(name@),
+{
+    expr_transform_var_known(name)
+        || starts_with_ignore_ascii_case(name, b"req:")
+        || starts_with_ignore_ascii_case(name, b"http:")
+        || starts_with_ignore_ascii_case(name, b"env:")
+        || starts_with_ignore_ascii_case(name, b"http_")
+        || starts_with_ignore_ascii_case(name, b"http")
+        || eq_ignore_ascii_case(name, b"time")
+        || eq_ignore_ascii_case(name, b"time_year")
+        || eq_ignore_ascii_case(name, b"time_mon")
+        || eq_ignore_ascii_case(name, b"time_day")
+        || eq_ignore_ascii_case(name, b"time_hour")
+        || eq_ignore_ascii_case(name, b"time_min")
+        || eq_ignore_ascii_case(name, b"time_sec")
+        || eq_ignore_ascii_case(name, b"request_method")
+        || eq_ignore_ascii_case(name, b"query_string")
+        || eq_ignore_ascii_case(name, b"request_uri")
+        || eq_ignore_ascii_case(name, b"request_scheme")
+        || eq_ignore_ascii_case(name, b"https")
+        || eq_ignore_ascii_case(name, b"remote_addr")
+        || eq_ignore_ascii_case(name, b"server_name")
+        || eq_ignore_ascii_case(name, b"server_port")
+        || eq_ignore_ascii_case(name, b"document_root")
+        || eq_ignore_ascii_case(name, b"api_version")
+        || eq_ignore_ascii_case(name, b"request_filename")
+        || eq_ignore_ascii_case(name, b"script_filename")
+}
+
+/// F63: a filesystem variable (`REQUEST_FILENAME`/`SCRIPT_FILENAME`) evaluated
+/// without a filesystem binding fails closed: the evaluator returns an error
+/// rather than substituting an empty string.  A guard that depends on the
+/// variable can then only take the Apache direction through a bound value.
+pub fn expr_fs_var_bound_admit(bound: bool) -> (ok: bool)
+    ensures ok == bound,
+{
+    bound
+}
+
+/// F64: the conjoined scope keeps a `SetHandler` force only when at least one
+/// conjoined scope forced it and the two scopes do not force conflicting
+/// names.  A conflict degrades to "no forced handler" (fail closed: no
+/// execution), never to one scope's force.
+/// F64/I61: conjoin of `SetHandler` forces across the URL identity and the
+/// resolved canonical target.  `url_denied` records an explicit
+/// `SetHandler none` on the URL identity: a handler denial that survives the
+/// conjoin as a static force — the resolved target may not re-arm an
+/// extension handler the lexical identity unforced (pass-10 F60 contract).
+/// Otherwise a name forced by both identities must agree; a disagreement
+/// degrades to "no forced handler" (the conjoined extension table still
+/// governs), and a force from one identity alone is kept.
+pub open spec fn set_handler_conjoin_spec(url_denied: bool, url_force: bool, target_force: bool, same_name: bool) -> u8 {
+    if url_denied {
+        1u8
+    } else if url_force {
+        if target_force && !same_name {
+            0u8
+        } else {
+            1u8
+        }
+    } else if target_force {
+        1u8
+    } else {
+        0u8
+    }
+}
+
+pub fn set_handler_conjoin_admit(url_denied: bool, url_force: bool, target_force: bool, same_name: bool) -> (out: u8)
+    ensures out == set_handler_conjoin_spec(url_denied, url_force, target_force, same_name),
+{
+    if url_denied {
+        1u8
+    } else if url_force {
+        if target_force && !same_name {
+            0u8
+        } else {
+            1u8
+        }
+    } else if target_force {
+        1u8
+    } else {
+        0u8
+    }
+}
+
+pub proof fn set_handler_conjoin_preserves_force(url_denied: bool, url_force: bool, target_force: bool, same_name: bool)
+    ensures
+        set_handler_conjoin_spec(url_denied, url_force, target_force, same_name) == 1
+            ==> (url_denied
+                || (url_force && (!target_force || same_name))
+                || (target_force && !url_force)),
+{
+}
+
+/// F64: when a scope forces a handler, the CGI decision is that of the forced
+/// name; the extension table (`AddHandler`/`RemoveHandler`, in any parse
+/// order or inherited layer) can neither add nor remove execution.
+pub fn set_handler_precedence_admit(forced: bool, forced_name_is_cgi: bool) -> (ok: bool)
+    ensures ok == (!forced || forced_name_is_cgi),
+{
+    !forced || forced_name_is_cgi
+}
+
+/// F65/I71: CGI execution requires BOTH the handler classification and the
+/// filesystem grant (`Options ExecCGI` or a script alias).  A
+/// `default-handler` (or any other non-CGI handler) assignment suppresses
+/// execution even inside a ScriptAlias tree.
+pub open spec fn cgi_exec_spec(
+    handler_bound: bool,
+    handler_is_cgi: bool,
+    script_alias: bool,
+    options_exec: bool,
+) -> bool {
+    let classified = if handler_bound {
+        handler_is_cgi
+    } else {
+        script_alias
+    };
+    let exec_allowed = script_alias || options_exec;
+    classified && exec_allowed
+}
+
+pub fn cgi_exec_admit(
+    handler_bound: bool,
+    handler_is_cgi: bool,
+    script_alias: bool,
+    options_exec: bool,
+) -> (ok: bool)
+    ensures ok == cgi_exec_spec(handler_bound, handler_is_cgi, script_alias, options_exec),
+{
+    let classified = if handler_bound {
+        handler_is_cgi
+    } else {
+        script_alias
+    };
+    let exec_allowed = script_alias || options_exec;
+    classified && exec_allowed
+}
+
+pub proof fn cgi_exec_requires_cgi_handler(
+    handler_bound: bool,
+    handler_is_cgi: bool,
+    script_alias: bool,
+    options_exec: bool,
+)
+    ensures
+        cgi_exec_spec(handler_bound, handler_is_cgi, script_alias, options_exec)
+            ==> (!handler_bound || handler_is_cgi),
+{
+}
+
+pub proof fn cgi_exec_requires_exec_allowed(
+    handler_bound: bool,
+    handler_is_cgi: bool,
+    script_alias: bool,
+    options_exec: bool,
+)
+    ensures
+        cgi_exec_spec(handler_bound, handler_is_cgi, script_alias, options_exec)
+            ==> (script_alias || options_exec),
+{
+}
+
+/// F69/I70: handler and MIME classification bind to the lexical request-mapped
+/// filename's basename.  When the opened target differs from the lexical path
+/// (an in-root symlink), the canonical target's basename must not classify the
+/// request.
+pub fn handler_identity_lexical_admit(
+    resolved_differs: bool,
+    name_is_lexical_basename: bool,
+) -> (ok: bool)
+    ensures ok == (!resolved_differs || name_is_lexical_basename),
+{
+    !resolved_differs || name_is_lexical_basename
+}
+
 } // verus!

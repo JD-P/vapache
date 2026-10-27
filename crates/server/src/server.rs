@@ -679,6 +679,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                     &scope,
                     &req,
                     &url_path,
+                    &fs_path,
                     local_port,
                     &server_name_for_public(&cfg, &req, &local_ip, local_port),
                     peer.ip(),
@@ -1023,13 +1024,16 @@ fn helper_access_response(
     scope: &Scope,
     req: &Request,
     url_path: &str,
+    fs_path: &Path,
     local_port: u16,
     server_name: &str,
     peer: std::net::IpAddr,
     local_ip: &str,
     resource: &mut access::ResourceKey,
 ) -> Result<access::AccessGrant, Response> {
-    let mut access = access::check(scope, req, peer, None, url_path);
+    // F63/I63: the mapped filesystem path binds `%{REQUEST_FILENAME}` in
+    // `Require expr`.
+    let mut access = access::check(scope, req, peer, None, url_path, Some(fs_path));
     if access == Access::AuthRequired {
         if let Some(identity) = crate::auth::authenticate(scope, req) {
             resource.identity = Some(identity.user.clone());
@@ -1039,6 +1043,7 @@ fn helper_access_response(
                 peer,
                 Some(&identity),
                 url_path,
+                Some(fs_path),
             ));
         }
     }
@@ -1471,6 +1476,7 @@ fn bind_target_grant(
         &target_scope,
         req,
         url_path,
+        &actual_path,
         local_port,
         server_name,
         peer,
@@ -1589,6 +1595,7 @@ fn authorize_resolved_target(
         &target_scope,
         req,
         target_url,
+        &target_fs,
         local_port,
         server_name,
         peer,
@@ -1683,6 +1690,7 @@ fn authorize_original_request(
         &original_scope,
         req,
         url_path,
+        fs_path,
         local_port,
         server_name,
         peer.ip(),
@@ -1971,6 +1979,7 @@ fn dispatch_inner(
                     &scope,
                     current_req,
                     &url_path,
+                    &original_fs_path,
                     local_port,
                     &server_name,
                     peer.ip(),
@@ -2346,6 +2355,7 @@ fn dispatch_inner(
         &scope,
         req,
         &url_path,
+        &fs_path,
         local_port,
         &server_name,
         peer.ip(),
@@ -2356,11 +2366,24 @@ fn dispatch_inner(
         Err(r) => return r,
     };
 
-    if scope
-        .mapping_policy
-        .handlers
-        .iter()
-        .any(|h| h.handler.eq_ignore_ascii_case("server-status"))
+    // F64/I62: `SetHandler server-status` lives in the precedence field, not
+    // in the extension table.  Consult the effective handler as well; either
+    // source may select the status page.
+    // F64/I62: `SetHandler server-status` lives in the precedence field, not
+    // in the extension table.  Consult the effective handler as well; either
+    // source may select the status page.
+    let status_name: Vec<u8> = fs_path
+        .file_name()
+        .map(|n| n.as_encoded_bytes().to_vec())
+        .unwrap_or_default();
+    let status_forced = crate::config::effective_handler(&scope, &status_name)
+        .is_some_and(|h| h.eq_ignore_ascii_case("server-status"));
+    if status_forced
+        || scope
+            .mapping_policy
+            .handlers
+            .iter()
+            .any(|h| h.handler.eq_ignore_ascii_case("server-status"))
     {
         let auto = req.query.eq_ignore_ascii_case(b"auto");
         return crate::status::response(auto);
@@ -2457,14 +2480,25 @@ fn dispatch_inner(
             let scope = &target_scope;
             let grant = &target_grant;
             let resource = &target_resource;
-            // Handler, MIME and dispatch decisions use the resolved target
-            // basename, never the URL remainder (F39/I37).
-            let name = actual_path
+            // Handler, MIME and dispatch decisions bind to the lexical
+            // request-mapped filename (F69/I70): an in-root symlink whose
+            // canonical target has a different basename (for example
+            // `link.txt -> secret.cgi`) must keep the lexical extension for
+            // handler and MIME classification.  Authorization and
+            // containment still bind to the resolved target below.
+            let name = fs_path
                 .file_name()
-                .or_else(|| fs_path.file_name())
+                .or_else(|| actual_path.file_name())
                 .or_else(|| rel.file_name())
                 .map(|n| n.as_encoded_bytes())
                 .unwrap_or(b"");
+            debug_assert!(vapache_verified::handler_identity_lexical_admit(
+                actual_path != fs_path,
+                name == fs_path
+                    .file_name()
+                    .map(|n| n.as_encoded_bytes())
+                    .unwrap_or(b""),
+            ));
             let script_root = actual_path.parent().unwrap_or(root.as_path()).to_path_buf();
             let script_rel = actual_path
                 .file_name()
@@ -3267,17 +3301,10 @@ fn apply_rewrite_effects(scope: &mut crate::config::Scope, effects: &crate::rewr
         }
     }
     if let Some(handler) = &effects.handler {
-        if !scope
-            .mapping_policy
-            .handlers
-            .iter()
-            .any(|h| h.ext == "*" && h.handler == *handler)
-        {
-            scope
-                .mapping_policy
-                .handlers
-                .push(crate::config::Handler::add("*".into(), handler.clone()));
-        }
+        // F64: a rewrite `[H=...]` sets the same precedence field a
+        // `SetHandler` directive would — a forced handler beats the
+        // extension table regardless of parse order.
+        scope.mapping_policy.set_handler = Some(crate::config::SetHandler::Name(handler.clone()));
     }
     if let Some(content_type) = &effects.content_type {
         scope.content_policy.force_type = Some(content_type.clone());
@@ -3928,7 +3955,13 @@ mod tests {
             .mapping_policy
             .handlers
             .iter()
-            .any(|h| h.handler == "new"));
+            .any(|h| h.handler == "old"));
+        // F64: a rewrite `[H=...]` forces the same precedence field a
+        // `SetHandler` directive would.
+        assert_eq!(
+            scope.mapping_policy.set_handler,
+            Some(crate::config::SetHandler::Name("new".into()))
+        );
         assert_eq!(
             scope.content_policy.force_type.as_deref(),
             Some("text/plain")
@@ -4298,7 +4331,7 @@ mod tests {
         let meta = std::fs::metadata(&fs_path).unwrap();
         let scope = Scope::default();
         let other = access::ResourceKey::request(None, &req, "/other", None, None);
-        let grant = access::check_grant(&scope, &req, peer, None, "/x", other).unwrap();
+        let grant = access::check_grant(&scope, &req, peer, None, "/x", None, other).unwrap();
         let effects = crate::rewrite::Effects::default();
         let (_, _, _) = (grant.key(), &scope, &effects);
         let err = bind_target_grant(
@@ -4402,6 +4435,7 @@ mod tests {
             peer,
             None,
             "/script.cgi",
+            None,
             script_resource.clone(),
         )
         .unwrap();
@@ -4437,6 +4471,7 @@ mod tests {
             peer,
             None,
             "/script.cgi",
+            None,
             script_resource.clone(),
         )
         .unwrap();
@@ -4472,6 +4507,7 @@ mod tests {
             peer,
             None,
             "/script.cgi",
+            None,
             auth_resource.clone(),
         )
         .unwrap();

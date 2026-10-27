@@ -1,0 +1,5 @@
+[Tue Oct 27 04:08:53.693102 2026] [core:warn] [pid 1292355:tid 1292355] AH00098: pid file /tmp/opencode/p11/case01-F61-A/logs/httpd.pid overwritten -- Unclean shutdown of previous Apache run?
+[Tue Oct 27 04:08:53.694073 2026] [mpm_event:notice] [pid 1292355:tid 1292355] AH00489: Apache/2.4.69 (Debian) configured -- resuming normal operations
+[Tue Oct 27 04:08:53.694086 2026] [core:notice] [pid 1292355:tid 1292355] AH00094: Command line: '/usr/sbin/apache2 -f /tmp/opencode/p11/case01-F61-A/apache.conf -D FOREGROUND'
+[Tue Oct 27 04:08:55.208840 2026] [authz_core:error] [pid 1292358:tid 1292370] [client 127.0.0.1:34832] AH01630: client denied by server configuration: /tmp/opencode/p11/case01-F61-A/www/admin/run.cgi
+[Tue Oct 27 04:08:55.226363 2026] [mpm_event:notice] [pid 1292355:tid 1292355] AH00491: caught SIGTERM, shutting down

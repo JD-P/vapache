@@ -223,12 +223,12 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus   # include the Verus gate
 ```
 
-Current ledger: **51.0% weighted obligations**, **6/6 proof debt**,
+Current ledger: **50.8% weighted obligations**, **6/6 proof debt**,
 **8/8 grant-required sinks**, **8/8 path-target-bound sinks**, **4/8
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
-failures**, **71 adversarial replay cases** covering the findings classes,
-and **277 Verus functions with 0 errors** (including the I3 fast-path
+failures**, **89 adversarial replay cases** covering the findings classes,
+and **322 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -237,14 +237,17 @@ dynamic-handler kernels, the pass-8 I57/I58 canonical-REQUEST_URI and
 access-file rewrite-subject kernels, the pass-9 I60 explicit-target
 access-layer binding kernels, the pass-10 I61 resolved-target/rewrite
 scope-conjunction kernels (`options_conjoin`, `handler_conjoin_admit`,
-`override_categories_conjoin`, `rewrite_scope_retained_admit`), and the
-strengthened cache-key
+`override_categories_conjoin`, `rewrite_scope_retained_admit`), the pass-11
+F61–F69 kernels (the class-capable `fnmatch_match` glob kernel,
+`expr_var_known`, `set_handler_precedence_admit`/`set_handler_conjoin_admit`,
+`cgi_exec_admit`, `handler_identity_lexical_admit`), and the strengthened
+cache-key
 injectivity, lookup, store-admission, freshness, disk-accounting and SHA-256
 policy-binding proofs for I51/I54).
 
 The ledger lives in `docs/verification-status.json`. It records:
 
-- weighted progress on the forty-six proof obligations,
+- weighted progress on the sixty-five proof obligations,
 - named unverified security components,
 - sinks that need stronger resource binding,
 - explicit assumptions and unmodeled directive classes,
@@ -260,19 +263,23 @@ requiring a grant. Raising a budget is a deliberate, reviewable change.
 ```sh
 cargo test --workspace          # Rust unit tests
 python3 tests/conformance.py    # 165 Apache differential/conformance tests
-python3 tests/adversarial_regressions.py  # F23-F60 end-to-end replay suite
+python3 tests/adversarial_regressions.py  # F23-F69 end-to-end replay suite
 ```
 
 The conformance suite starts a real Apache `httpd` and `vapached` with
 equivalent configurations, so it exercises both servers end to end. It covers
 HTTP/1.1, HTTPS, HTTP/2, CGI, conditional requests, ranges, access control and
 Basic auth. Use `--differential` to write `tests/differential_report.md`, which
-compares status codes, selected headers and bodies.
+compares status codes, selected headers and bodies.  The `adversarial/`
+folder holds the numbered findings write-ups (passes 3–11) and the
+pass-11 exploit harness (`adversarial/p11/exploit_p11.py`) with its
+Apache-versus-vapached case dossiers, so the exact exploit shapes are
+documented rather than re-derived.
 
 Security-sensitive configuration semantics are checked separately:
 
 ```sh
-python3 tests/config_semantics.py  # 205 generated differential cases
+python3 tests/config_semantics.py  # 206 generated differential cases
 python3 tests/config_semantics.py --random 300 --seed 7  # deterministic randomized matrix
 python3 tests/config_validity.py  # context acceptance matrix (Apache -t vs vapached -t)
 python3 tests/config_grammar.py   # finite valid/invalid grammar matrix
@@ -348,8 +355,8 @@ time.
 
 Latest snapshot: **94.1% regions**, **90.1% of functions** and **94.9% of
 lines** across the Rust, conformance and adversarial replay suites. The current
-suite is 373 Rust library tests, 4 CLI tests, 165 conformance tests, 205
-generated configuration cases and 71 adversarial replay tests. Authentication
+suite is 398 Rust library tests, 4 CLI tests, 165 conformance tests, 206
+generated configuration cases and 89 adversarial replay tests. Authentication
 is at 91.8% line coverage, TLS/HTTP/2 at 97.9%/81.6%, access logging at 84.7%,
 the verified security kernels at 88.3%, compression at 90.0%, FastCGI at 98.9%,
 the HTTP proxy at 97.8%, rewrite execution at 98.6%, cache at 91.4%, OCSP at

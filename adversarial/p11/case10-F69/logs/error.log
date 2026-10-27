@@ -1,0 +1,4 @@
+[Tue Oct 27 04:13:46.783147 2026] [core:warn] [pid 1294349:tid 1294349] AH00098: pid file /tmp/opencode/p11/case10-F69/logs/httpd.pid overwritten -- Unclean shutdown of previous Apache run?
+[Tue Oct 27 04:13:46.784071 2026] [mpm_event:notice] [pid 1294349:tid 1294349] AH00489: Apache/2.4.69 (Debian) configured -- resuming normal operations
+[Tue Oct 27 04:13:46.784081 2026] [core:notice] [pid 1294349:tid 1294349] AH00094: Command line: '/usr/sbin/apache2 -f /tmp/opencode/p11/case10-F69/apache.conf -D FOREGROUND'
+[Tue Oct 27 04:13:48.319866 2026] [mpm_event:notice] [pid 1294349:tid 1294349] AH00491: caught SIGTERM, shutting down

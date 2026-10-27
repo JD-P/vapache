@@ -57,8 +57,8 @@ Let:
 - `Rule` be `(kind, delta, order, condition, branch, chain, nested)`.
 - `Phase` be one of `Directory < Files < Location < Condition`.
 - `Match` be one of `Always`, `Directory(pattern)`, `DirectoryMatch(regex)`,
-  `Files(pattern)`, `FilesMatch(regex)`, `Location(prefix)`,
-  `LocationMatch(regex)`.
+  `Files(pattern)`, `FilesGlob(pattern)`, `FilesMatch(regex)`,
+  `Location(prefix)`, `LocationGlob(pattern)`, `LocationMatch(regex)`.
 
 The implementation's `RulePhase` and `ScopeRule::phase` are the code-level
 counterparts of `Phase`.
@@ -68,19 +68,28 @@ counterparts of `Phase`.
 For a request `(url, fs_path, fname)`:
 
 - `Directory(pattern)` matches a directory ancestor of `fs_path`, or
-  `fs_path` itself if it is a directory, using Apache shell-glob semantics
-  with `*`, `?`, `[]`, `[!...]`.  Wildcards do not cross `/`.
+  `fs_path` itself (including the file's own path when the pattern's
+  component count equals the mapped path's, F61-C), using Apache shell-glob
+  semantics with `*`, `?`, `[]`, `[!...]` and `[^...]`.  Wildcards do not
+  cross `/`.
 - `DirectoryMatch(regex)` matches the **full filesystem filename string**
   (observed Apache 2.4 behavior).  A pattern anchored at a directory name
   without allowing for the final filename does not match a file inside it.
 - `Files(pattern)` and `FilesMatch(regex)` match the basename `fname`.
-  `<Files>` patterns support `*`, `?`, `[]`, `[!...]`; `~ regex` is regex.
+  `<Files>` patterns support `*`, `?`, `[]`, `[!...]`, `[^...]` (F62/F62b:
+  both markers negate a class); `~ regex` is regex.
 - `Location(prefix)`:
   - `/` or empty matches everything.
   - a prefix **not** ending in `/` matches exactly the prefix or a
     slash-boundary child;
   - a prefix ending in `/` matches only strings that begin with that exact
     prefix.  Thus `/admin/` does not match `/admin`.
+- `LocationGlob(pattern)` is a `<Location>` argument containing shell
+  wildcards (`*`, `?`, `[...]`): the verified fnmatch kernel evaluates it in
+  path mode — component-bounded, anchored, and `*` never crosses `/`
+  (F61-A/A2/B).  A `~` first argument compiles the rest as a regex
+  (`LocationMatch`); `<Location ~>` with no expression is a configuration
+  error (fail closed).
 - `LocationMatch(regex)` matches the canonical URL path.
 
 ## 4. Merge order
@@ -420,13 +429,16 @@ winner:
 Alias | ScriptAlias | AliasMatch | ScriptAliasMatch   : first match wins
 Redirect | RedirectMatch | RedirectPermanent/Temp     : first match wins
 ProxyPass | ProxyPassMatch                            : first match wins
-AddHandler | SetHandler | RemoveHandler               : last matching op wins
+AddHandler | RemoveHandler                            : last matching op wins
+SetHandler                                            : precedence force
 ```
 
 A later, more-specific mapping does not override an earlier overlapping one;
 Apache also treats such overlapping aliases as unreachable.  For handler
 operations, `RemoveHandler` must be able to cancel an inherited `AddHandler`
-regardless of section depth.  `ProxyPass`/`ProxyPassMatch` exclusion syntax
+regardless of section depth, while `SetHandler` is a precedence force that
+overrides every handler assignment in its scope regardless of order (I62,
+F64).  `ProxyPass`/`ProxyPassMatch` exclusion syntax
 (`!`) is not implemented and is rejected at startup rather than silently
 ignored.  This closes the “multiple competing request-to-resource mappings”
 class from the findings.
@@ -1207,7 +1219,10 @@ identities.  Replacing `scope(L)` with `scope(T)` dropped child
 bypassed (F60).  `Scope::restrict_with()` now computes the meet:
 `options_conjoin`, `handler_conjoin_admit` and
 `override_categories_conjoin` are the verified kernels; handler maps are
-projected to explicit per-extension grants only when both identities agree.
+projected to explicit per-extension grants only when both identities agree,
+and an explicit lexical `SetHandler none` materializes as a static
+`none` force across the meet (F64b: the resolved target cannot re-arm an
+extension handler the lexical identity unforced).
 The `AllowOverride` walk consumes `OverridePolicy::conjoined_with()` so an
 explicit `None` on either path identity denies the canonical access file,
 while an unconfigured canonical directory does not erase an enabled lexical
@@ -1216,6 +1231,74 @@ use the same meet; the post-rewrite original-URL gate uses
 `restrict_policy_with()` so it retains the original `Options`/headers without
 forcing the old filename's handler extension onto a legitimately rewritten
 target.
+
+### I62 — SetHandler precedence
+
+```text
+SetHandler in scope S forces handler H for every request S governs
+effective_handler == forced-name            when S forces a name
+effective_handler == ext-table resolution   when S forces none
+merging/inheritance never re-parses the force into the extension table
+the extension table can neither add nor remove execution past a force
+```
+
+`SetHandler` is a precedence field (`MappingPolicy.set_handler`), not an
+extension-table entry, so directive order and inheritance cannot re-prioritize
+it (F64).  `effective_handler` consults the force first; a child `SetHandler
+none` clears the parent force and the extension table applies again (the
+Apache 2.4.69 probes).  The conjoin across the resolved-target meet keeps
+`set_handler_conjoin_admit` and materializes a lexical denial as a static
+force, so the attacker `.htaccess` `AddHandler` upload chain (F64b) is dead.
+`[H=...]` rewrites write the same field.  `set_handler_precedence_admit` is
+the kernel; `set_handler_conjoin_preserves_force` proves the conjoin never
+grants.
+
+### I63 — Expression filesystem variables fail closed
+
+```text
+%{REQUEST_FILENAME}/%{SCRIPT_FILENAME} == mapped fs_path  when bound
+unbound reference -> Err (fail closed), never an empty string
+unknown variable -> configuration error at load time
+```
+
+The `<If>`/`Require expr`/`RewriteCond expr` idioms that key on the mapped
+filesystem path must evaluate against the dispatcher's canonical mapping
+(F63/F63b).  `expr::Context::fs_path` is the only binding; without one the
+variables fail closed instead of substituting an empty string that would
+make a guard silently take the attacker's direction.  `expr_var_known` is the
+single source of truth shared by evaluation and the load-time `validate_vars`
+walker (which also scans `%{...}` inside `Expr::Str` and transform arguments),
+so an unknown variable is a configuration error, never an inert string.
+
+### I66 — CGI execution admission
+
+```text
+execute(script) <=> classified && exec_allowed
+classified   == handler-bound ? (handler == cgi-script) : script_alias
+exec_allowed == script_alias || Options ExecCGI
+```
+
+CGI execution requires both a CGI classification and a filesystem grant
+(F65/I66).  `cgi::is_cgi` reduces to the single verified kernel
+`cgi_exec_admit`, so a `SetHandler default-handler` force inside a
+`ScriptAlias` tree serves static source (Apache behavior), while the ScriptAlias
+mapping keeps executing scripts with `Options` disabled — the Apache 2.4.69
+matrix.  `cgi_exec_requires_cgi_handler` and `cgi_exec_requires_exec_allowed`
+prove the fail-closed direction.
+
+### I70 — Lexical handler identity
+
+```text
+handler/MIME classification binds to the request-mapped basename
+L != T  ==>  the canonical target's basename must not classify the request
+```
+
+The handler for a request is derived from the lexical URL-mapped filename,
+not from the canonicalized target (F69/I70): an in-root symlink
+`link.txt -> secret.cgi` under a global `AddHandler cgi-script .cgi` must
+serve static source, exactly as Apache does.  Authorization and containment
+still bind to the resolved target.  `handler_identity_lexical_admit` is the
+kernel guard at the dispatch binding.
 
 ### I51 — Cache key byte identity
 

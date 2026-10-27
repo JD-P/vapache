@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "updated": "2026-10-26",
+  "updated": "2026-10-27",
   "verus": {
-    "verified_functions": 293,
+    "verified_functions": 322,
     "errors": 0
   },
   "obligations": [
@@ -207,7 +207,7 @@
       "title": "CGI/FastCGI reauthorize and bind the actual target",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "the dispatcher binds the opened target before handler selection; PATH_INFO reauthorizes fd_path(file); FastCGI canonicalizes SCRIPT_FILENAME and reauthorizes the actual path before backend binding; cgi_actual_target_admit is mechanized and the F41 replay covers direct, PATH_INFO and FastCGI symlink targets"
+      "evidence": "the dispatcher binds the opened target before handler selection; PATH_INFO reauthorizes fd_path(file); FastCGI canonicalizes SCRIPT_FILENAME and reauthorizes the actual path before backend binding; cgi_actual_target_admit is mechanized and the F41 replay covers direct, PATH_INFO and FastCGI symlink targets Pass-11: classification (is_cgi) is a single cgi_exec_admit kernel call with fail-closed lemmas, evaluated on the lexical basename while containment stays on the resolved target."
     },
     {
       "id": "capture_only_alias_base",
@@ -305,7 +305,7 @@
       "title": "Resolved-target scope is a meet with the URL-mapped scope",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "options_conjoin computes the bitwise meet of URL and canonical target Options; handler_conjoin_admit permits an extension only when both identities resolve to the same handler, and conjoined_handlers projects disagreement to RemoveHandler; override_categories_conjoin plus OverridePolicy::conjoined_with make an explicit AllowOverride None on either path identity deny the canonical access file. Scope::restrict_with is consumed by symlink target binding, DirectorySlash/PATH_INFO/FastCGI target reauthorization, rewrite filesystem targets and cache script/index/canonical targets (F60/I61). The Options and AllowOverride-category meets are now aliases of one generalized bits_meet spec with no-broadening (bits_meet_never_grants), commutativity, associativity, idempotence and narrowing lemmas proved once for every policy bit-vector conjoin. Unit, htaccess policy and F60 end-to-end cases cover plain <Directory> policy, in-root symlinks, ancestor .htaccess, RemoveHandler, -Indexes and AllowOverride None"
+      "evidence": "options_conjoin computes the bitwise meet of URL and canonical target Options; handler_conjoin_admit permits an extension only when both identities resolve to the same handler, and conjoined_handlers projects disagreement to RemoveHandler; override_categories_conjoin plus OverridePolicy::conjoined_with make an explicit AllowOverride None on either path identity deny the canonical access file. Scope::restrict_with is consumed by symlink target binding, DirectorySlash/PATH_INFO/FastCGI target reauthorization, rewrite filesystem targets and cache script/index/canonical targets (F60/I61). The Options and AllowOverride-category meets are now aliases of one generalized bits_meet spec with no-broadening (bits_meet_never_grants), commutativity, associativity, idempotence and narrowing lemmas proved once for every policy bit-vector conjoin. Unit, htaccess policy and F60 end-to-end cases cover plain <Directory> policy, in-root symlinks, ancestor .htaccess, RemoveHandler, -Indexes and AllowOverride None Pass-11: the SetHandler force conjoins through set_handler_conjoin_admit; an explicit lexical `SetHandler none` materializes as a static none force so the resolved target cannot re-arm an extension handler the URL identity unforced."
     },
     {
       "id": "percent_encode_family",
@@ -418,6 +418,48 @@
       "status": "partial",
       "weight": 1.0,
       "evidence": "cache_store_request_admit, cache_store_status_admit, cache_store_control_admit, cache_store_shape_admit and cache_store_ttl_admit mechanize the runtime store gates for method/body/credentials, cacheable statuses, Cache-Control overrides, Set-Cookie/Vary:*/size and positive freshness; cache_ttl_clamp returns zero for reversed CacheMinExpire/CacheMaxExpire instead of panicking. Unit matrix plus conformance cache cases exercise each branch"
+    },
+    {
+      "id": "location_glob_parse_binding",
+      "title": "Location shell-glob compiles at parse time (F61)",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "compile_location_pattern builds MatchKind::LocationGlob/LocationMatch/Location at load time; an unhandleable pattern (a bare `~` with no expression, a malformed regex) is a configuration error and the section is skipped, never an inert literal string. fnmatch_match evaluates the glob with path_mode=true; fnmatch_path_mode_slash_bounded plus the fnmatch_class_end_bounds lemma prove the kernel match stays component-bounded and anchored, and fnmatch_location_glob_oracle pins the 2.4.69 probe verdicts (wildcard covers nested below the prefix, never bridges a sibling prefix, matches the trailing-slash form and not the bare directory). location_wildcard_compiled_admit is debug-asserted at the parse site. F61-A/A2/B/C Python replays cover directive forms and both match-phase placements."
+    },
+    {
+      "id": "glob_class_negation",
+      "title": "fnmatch class negation honors both markers (F62/F62b)",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "the verified fnmatch kernel treats `[^a]` and `[!a]` identically (fnmatch_class_negated, fnmatch_class_body); fnmatch_class_negation_oracle pins the Apache verdicts for member/non-member basenames in Files globs, Locations and Directory wildcards, and fnmatch_match is the single matcher used by glob_match, Files slots and Location slots (the old hand-rolled matcher and the files_glob_to_regex regex translation are gone, so the `^`-as-literal bug cannot recur). Files-class Python replays and the kernel unit matrix cover negated members, `?` cardinality and basename containment."
+    },
+    {
+      "id": "expr_var_single_source",
+      "title": "expr variables known-set and fail-closed fs vars (F63/F63b)",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "expr_var_known is the single source of truth shared by expr::var evaluation and the load-time validate_vars walker (Expr::Var nodes plus %{...} inside Str with transform-arg recursion). REQUEST_FILENAME/SCRIPT_FILENAME are known only when the context binds fs_path (with_fs_path), so an unbound reference evaluates to Err (fail closed) instead of an empty string; expr_fs_var_bound_admit guards the bound case. Wired at <If>/<ElseIf>, Require expr (unsupported -> fail closed) and RewriteCond expr, in both per-server and per-dir layers. Python replays cover the guard fail-closed and the bound-value forms; the F63b load-time refusal is a config_validity divergence."
+    },
+    {
+      "id": "set_handler_precedence",
+      "title": "SetHandler is a separate precedence field (F64/F64b)",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "SetHandler is parsed into MappingPolicy.set_handler instead of the ordered extension table, so directive order and inheritance cannot reorder it. effective_handler consults the force first (None unforces to the ext table). restrict_with conjoins URL/target forces through set_handler_conjoin_admit with set_handler_conjoin_preserves_force proving a surviving force always comes from one side, and set_handler_precedence_admit is debug-asserted in is_cgi so a force always binds and the ext table can neither remove it nor add execution past it (the attacker .htaccess AddHandler upload chain is dead). [H=...] rewrites write the same field. Python replays cover both directive orders, .htaccess over a SetHandler'ed directory, and the [H] override."
+    },
+    {
+      "id": "cgi_exec_admission",
+      "title": "CGI execution needs handler or ScriptAlias plus grant (F65)",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "is_cgi reduces to a single verified kernel call cgi_exec_admit(handler_bound, handler_is_cgi, script_alias, exec_allowed) with cgi_exec_requires_cgi_handler proving no execution without a cgi-script handler bound or a ScriptAlias mapping, and cgi_exec_requires_exec_allowed proving no execution without the Options ExecCGI grant or the alias. A SetHandler default-handler force suppresses a ScriptAlias script; SetHandler None unforces to the ext table. The kernel unit matrix and the F65 replay (source served for a ScriptAlias script under default-handler) pin the behavior."
+    },
+    {
+      "id": "handler_identity_lexical",
+      "title": "handler classification uses the lexical basename (F69)",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "the dispatch binds the classification name to fs_path.file_name() first (then actual_path, then rel); handler_identity_lexical_admit is debug-asserted at the bind site so a resolved target that differs from the lexical path cannot contribute its basename. Authorization and containment still bind to the resolved canonical target. The F69 replay serves link.txt as static source under a global AddHandler cgi-script with the symlink target secret.cgi."
     }
   ],
   "minimum_weighted_score": 3.5,

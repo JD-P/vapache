@@ -734,7 +734,17 @@ fn conditions_match(
     let mut matched_headers: Vec<String> = Vec::new();
     for cond in &rule.conditions {
         if let Some(expr) = &cond.expr {
-            let mut ectx = crate::expr::Context::new(req, env, ctx.peer, ctx.docroot, path);
+            // F63/I63: bind the filesystem path for `%{REQUEST_FILENAME}`/
+            // `%{SCRIPT_FILENAME}`.  A per-directory layer binds the real
+            // filesystem path of the request; a server-context rule runs
+            // during URL translation, where the mapped path is the rewrite
+            // subject itself.
+            let mut ectx = crate::expr::Context::new(req, env, ctx.peer, ctx.docroot, path)
+                .with_fs_path(if rule.per_dir {
+                    Some(ctx.fs_path)
+                } else {
+                    Some(Path::new(path))
+                });
             let r = expr.eval(&mut ectx).map(|v| v.truthy()).unwrap_or(false);
             matches.push(r);
             ors.push(cond.flags.or);

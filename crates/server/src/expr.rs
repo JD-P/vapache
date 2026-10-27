@@ -154,6 +154,12 @@ pub struct Context<'a> {
     /// query-free and free of dot segments.  `%{REQUEST_URI}` must be bound to
     /// this value, never to `Request::target` (F57/I57).
     pub url_path: &'a str,
+    /// The filesystem path mapped for the request, when one exists.
+    /// `%{REQUEST_FILENAME}` and `%{SCRIPT_FILENAME}` evaluate against it
+    /// (F63/I63); without a binding they fail closed instead of substituting
+    /// an empty string that would make a guard silently pass or fail in the
+    /// attacker's favor.
+    pub fs_path: Option<&'a Path>,
     pub captures: Vec<String>,
 }
 
@@ -177,8 +183,16 @@ impl<'a> Context<'a> {
             peer,
             docroot,
             url_path,
+            fs_path: None,
             captures: Vec::new(),
         }
+    }
+
+    /// Bind the filesystem path backing the request.  Required for the
+    /// `REQUEST_FILENAME`/`SCRIPT_FILENAME` variables (F63/I63).
+    pub fn with_fs_path(mut self, fs_path: Option<&'a Path>) -> Self {
+        self.fs_path = fs_path;
+        self
     }
 }
 
@@ -300,6 +314,27 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
         "server_port" => request_port().to_string(),
         "document_root" => ctx.docroot.to_string_lossy().into_owned(),
         "api_version" => "20120211".into(),
+        // F63/I63: the filesystem variables bind to the mapped filesystem
+        // path.  Without a binding they fail closed: an unbound filesystem
+        // variable must not read as the empty string (which would satisfy
+        // `-z`-style guards or make comparisons vacuous in the attacker's
+        // favor).
+        "request_filename" => match ctx.fs_path {
+            Some(p) => p.to_string_lossy().into_owned(),
+            None => {
+                return Err(format!(
+                    "variable '%{{{name}}}' is not available in this context"
+                ))
+            }
+        },
+        "script_filename" => match ctx.fs_path {
+            Some(p) => p.to_string_lossy().into_owned(),
+            None => {
+                return Err(format!(
+                    "variable '%{{{name}}}' is not available in this context"
+                ))
+            }
+        },
         other => {
             if other.starts_with("http") {
                 empty
@@ -308,6 +343,134 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
             }
         }
     }))
+}
+
+/// Load-time validation of every variable reference inside an `ap_expr`
+/// tree (F63/I63).  `Expr::Str` literals expand `%{...}` at evaluation time,
+/// so string contents are scanned as well as `Var` nodes.  A variable the
+/// evaluator does not implement is a configuration error: it must never
+/// evaluate to an empty string, which could make a guard silently take
+/// either direction.
+pub fn validate_vars(expr: &Expr) -> Result<(), String> {
+    fn var_reference_known(name: &str) -> Result<(), String> {
+        if vapache_verified::expr_var_known(name.as_bytes()) {
+            Ok(())
+        } else {
+            Err(format!("unknown expression variable '%{{{name}}}'"))
+        }
+    }
+
+    /// The argument of a `%{func:arg}` transform is a variable reference when
+    /// the evaluator would treat it as one (same rule as `function_arg`).
+    fn is_var_reference(arg: &str) -> bool {
+        arg.contains("%{")
+            || arg.starts_with("req:")
+            || arg.starts_with("http:")
+            || arg.starts_with("env:")
+            || arg.starts_with("HTTP_")
+            || matches!(
+                arg.to_ascii_uppercase().as_str(),
+                "TIME"
+                    | "TIME_YEAR"
+                    | "TIME_MON"
+                    | "TIME_DAY"
+                    | "TIME_HOUR"
+                    | "TIME_MIN"
+                    | "TIME_SEC"
+                    | "REQUEST_METHOD"
+                    | "QUERY_STRING"
+                    | "REQUEST_URI"
+                    | "REQUEST_SCHEME"
+                    | "HTTPS"
+                    | "REMOTE_ADDR"
+                    | "SERVER_NAME"
+                    | "SERVER_PORT"
+                    | "DOCUMENT_ROOT"
+                    | "API_VERSION"
+            )
+    }
+
+    fn scan_text(text: &str) -> Result<(), String> {
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'%' && bytes[i + 1] == b'{' {
+                let mut depth = 1;
+                let mut j = i + 2;
+                while j < bytes.len() && depth > 0 {
+                    if bytes[j] == b'{' {
+                        depth += 1;
+                    } else if bytes[j] == b'}' {
+                        depth -= 1;
+                    }
+                    j += 1;
+                }
+                if depth != 0 {
+                    return Err("unterminated %{...} expression".into());
+                }
+                let inner = &text[i + 2..j - 1];
+                if let Some((func, arg)) = inner.split_once(':') {
+                    if matches!(
+                        func.to_ascii_lowercase().as_str(),
+                        "toupper" | "tolower" | "escape" | "unescape"
+                    ) {
+                        // The argument is expanded recursively.
+                        if arg.contains("%{") {
+                            scan_text(arg)?;
+                        } else if is_var_reference(arg) {
+                            var_reference_known(arg)?;
+                        }
+                        i = j;
+                        continue;
+                    }
+                }
+                var_reference_known(inner)?;
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn walk(expr: &Expr) -> Result<(), String> {
+        match expr {
+            Expr::Bool(_) | Expr::Int(_) | Expr::Capture(_) | Expr::IfFile(_) => Ok(()),
+            Expr::Str(s) => scan_text(s),
+            Expr::Var(v) => var_reference_known(v),
+            Expr::Func(_, args) | Expr::Concat(args) | Expr::And(args) | Expr::Or(args) => {
+                for arg in args {
+                    walk(arg)?;
+                }
+                Ok(())
+            }
+            Expr::Not(e) | Expr::Neg(e) => walk(e),
+            Expr::Compare(l, _, r) => {
+                walk(l)?;
+                walk(r)
+            }
+            Expr::Regex(l, _, _, _) => walk(l),
+            Expr::In(l, list) => {
+                walk(l)?;
+                for item in list {
+                    walk(item)?;
+                }
+                Ok(())
+            }
+            Expr::FileTest(_, e) => walk(e),
+            Expr::StrTest(e, _) => walk(e),
+            Expr::IpMatch(l, r, _) => {
+                walk(l)?;
+                walk(r)
+            }
+            Expr::StrMatch(l, r, _, _) => {
+                walk(l)?;
+                walk(r)
+            }
+        }
+    }
+
+    walk(expr)
 }
 
 fn expand(text: &str, ctx: &Context<'_>) -> Result<String, String> {
@@ -1515,5 +1678,95 @@ mod tests {
         // Mixed operator nesting is also bounded and erroring.
         let deep_neg = format!("{}1", "-".repeat(MAX_EXPR_DEPTH + 1));
         assert!(parse(&deep_neg).is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass-11 regression kernels (F63): filesystem variables fail closed and are
+// validated at load time.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod pass11_kernel_tests {
+    use super::*;
+    use crate::http::{Headers, Request, Version};
+
+    fn req() -> Request {
+        Request {
+            method: "GET".into(),
+            target: b"/x.cgi".to_vec(),
+            raw_path: b"/x.cgi".to_vec(),
+            query: Vec::new(),
+            version: Version::Http11,
+            headers: Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        }
+    }
+
+    fn context(fs_path: Option<&'static Path>) -> Context<'static> {
+        // The request is leaked for the test only: the borrow lives for the
+        // whole case.
+        let r: &'static Request = Box::leak(Box::new(req()));
+        let docroot: &'static Path = Path::new("/srv");
+        let url: &'static str = "/x.cgi";
+        Context::new(r, &[], "127.0.0.1".parse().unwrap(), docroot, url).with_fs_path(fs_path)
+    }
+
+    #[test]
+    fn request_filename_fails_closed_without_a_binding() {
+        let e = parse("%{REQUEST_FILENAME} != ''").unwrap();
+        let mut c = context(None);
+        assert!(
+            e.eval(&mut c).is_err(),
+            "an unbound filesystem variable must not evaluate (fail closed)"
+        );
+        let e = parse("%{SCRIPT_FILENAME} == ''").unwrap();
+        let mut c = context(None);
+        assert!(e.eval(&mut c).is_err());
+    }
+
+    #[test]
+    fn request_filename_binds_to_the_mapped_filesystem_path() {
+        let e = parse("%{REQUEST_FILENAME} == '/srv/www/x.cgi'").unwrap();
+        let mut c = context(Some(Path::new("/srv/www/x.cgi")));
+        assert!(e.eval(&mut c).unwrap().truthy());
+        let e = parse("%{SCRIPT_FILENAME} == '/srv/www/x.cgi'").unwrap();
+        let mut c = context(Some(Path::new("/srv/www/x.cgi")));
+        assert!(e.eval(&mut c).unwrap().truthy());
+    }
+
+    #[test]
+    fn validate_vars_rejects_unknown_variables_in_every_position() {
+        // A plain Var node.
+        assert!(validate_vars(&parse("%{NOSUCHVAR} == 'x'").unwrap()).is_err());
+        // A %{...} reference inside a string literal.
+        assert!(validate_vars(&parse("'%{NOSUCHVAR}' != ''").unwrap()).is_err());
+        // Inside a transform argument (recursed).
+        assert!(validate_vars(&parse("tolower(%{NOSUCHVAR}) == 'x'").unwrap()).is_err());
+        // Known variables validate cleanly.
+        assert!(validate_vars(&parse("%{REQUEST_FILENAME} != ''").unwrap()).is_ok());
+        assert!(validate_vars(&parse("%{SCRIPT_FILENAME} != ''").unwrap()).is_ok());
+        assert!(validate_vars(&parse("'%{REQUEST_URI}' != ''").unwrap()).is_ok());
+        // The evaluator and the validator share one source of truth: a name
+        // that validates must also evaluate when bound, and vice versa.
+        for name in ["REQUEST_FILENAME", "SCRIPT_FILENAME", "NOSUCHVAR"] {
+            let known = vapache_verified::expr_var_known(name.as_bytes());
+            let expr = parse(&format!("%{{{name}}} != ''")).unwrap();
+            assert_eq!(
+                validate_vars(&expr).is_ok(),
+                known,
+                "validator and kernel disagree on {name}"
+            );
+            let mut c = context(Some(Path::new("/srv/www/x.cgi")));
+            assert_eq!(
+                expr.eval(&mut c).is_ok(),
+                known,
+                "evaluator disagrees on {name}"
+            );
+        }
     }
 }

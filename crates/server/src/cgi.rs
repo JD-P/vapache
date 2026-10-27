@@ -1207,19 +1207,31 @@ fn split_cgi_head(data: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 /// Decide whether a filename should be handled by CGI given the scopes and
-/// handler map.  ScriptAlias directories always execute.
+/// handler map (F65/I66).  Execution requires BOTH the CGI classification
+/// and the filesystem grant: a `ScriptAlias` only supplies classification
+/// (and an unconditional filesystem grant) — a `SetHandler default-handler`
+/// (or any other non-`cgi-script` force, regardless of parse order or
+/// inheritance, F64) suppresses execution, and without a forced handler a
+/// scope without `Options ExecCGI` never executes either.
 pub fn is_cgi(cfg: &Config, scope: &crate::config::Scope, name: &[u8], script_alias: bool) -> bool {
-    if script_alias {
-        return true;
-    }
-    let options = scope.effective_options();
-    if !options.contains(crate::config::Options::EXEC_CGI) {
-        return false;
-    }
     let _ = cfg;
-    crate::config::effective_handler(scope, name)
-        .map(|handler| handler.eq_ignore_ascii_case("cgi-script"))
-        .unwrap_or(false)
+    let options = scope.effective_options();
+    let exec_allowed = script_alias || options.contains(crate::config::Options::EXEC_CGI);
+    let (handler_bound, handler_is_cgi) = match crate::config::effective_handler(scope, name) {
+        Some(handler) => (true, handler.eq_ignore_ascii_case("cgi-script")),
+        None => (false, false),
+    };
+    // F64/I62: when the scope forces a handler the force always binds — the
+    // extension table can neither remove it nor add execution past it.
+    let forced = matches!(
+        scope.mapping_policy.set_handler,
+        Some(crate::config::SetHandler::Name(_))
+    );
+    debug_assert!(vapache_verified::set_handler_precedence_admit(
+        forced,
+        handler_bound
+    ));
+    vapache_verified::cgi_exec_admit(handler_bound, handler_is_cgi, script_alias, exec_allowed)
 }
 #[cfg(test)]
 mod tests {
@@ -2247,5 +2259,117 @@ mod tests {
             libc::waitpid(pid, &mut status, 0);
         }
         assert_eq!(libc::WEXITSTATUS(status), 1);
+    }
+}
+
+#[cfg(test)]
+mod pass11_kernel_tests {
+    use super::*;
+    use crate::config::{Options, Scope, SetHandler};
+
+    fn tempdir(name: &str) -> PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("vapache-cgi-matrix-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn config(root: &Path) -> Config {
+        let path = root.join("httpd.conf");
+        std::fs::write(&path, "Listen 127.0.0.1:0\n").unwrap();
+        Config::load(
+            &path,
+            root,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            false,
+        )
+        .unwrap()
+    }
+
+    fn cgi_scope(options: Options, text: &str) -> Scope {
+        let cfg_text = format!("Listen 127.0.0.1:0\n{text}");
+        let dir = std::env::temp_dir().join(format!("vapache-cgi-matrix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("httpd.conf");
+        std::fs::write(&path, cfg_text).unwrap();
+        let cfg = Config::load(
+            &path,
+            &dir,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            false,
+        )
+        .unwrap();
+        // Layer the parsed scope onto a default one the same way dispatch
+        // does, so `SetHandler`/`AddHandler` land in the merged mapping.
+        // The ExecCGI bits go in AFTER the merge: `merge_child` lets the
+        // child's options policy win, which would otherwise drop them.
+        let mut merged = cfg.effective_scope(None, Path::new("/srv/www/x.cgi"), "/x.cgi");
+        merged.options.push_add(options.0);
+        merged
+    }
+
+    #[test]
+    fn cgi_classification_matrix() {
+        let dir = tempdir("matrix");
+        let cfg = config(&dir);
+        // Baseline: Options ExecCGI + AddHandler classifies and executes.
+        let s = cgi_scope(
+            Options(Options::EXEC_CGI),
+            "<Directory /srv>\nAddHandler cgi-script .cgi\n</Directory>\n",
+        );
+        assert!(is_cgi(&cfg, &s, b"x.cgi", false));
+        assert!(!is_cgi(&cfg, &s, b"x.txt", false));
+        // No ExecCGI: never, even with the handler present.
+        let s = cgi_scope(
+            Options::empty(),
+            "<Directory /srv>\nAddHandler cgi-script .cgi\n</Directory>\n",
+        );
+        assert!(!is_cgi(&cfg, &s, b"x.cgi", false));
+        // F65: ScriptAlias executes without Options ExecCGI...
+        let s = cgi_scope(Options::empty(), "<Directory /srv>\n</Directory>\n");
+        assert!(is_cgi(&cfg, &s, b"x.cgi", true));
+        // ...but a SetHandler force suppresses it regardless: default-handler
+        // serves the source of a script inside a ScriptAlias directory.
+        let s = cgi_scope(
+            Options::empty(),
+            "<Directory /srv>\nSetHandler default-handler\n</Directory>\n",
+        );
+        assert!(!is_cgi(&cfg, &s, b"x.cgi", true));
+        // A non-CGI force in a plain ExecCGI directory also suppresses.
+        let s = cgi_scope(
+            Options(Options::EXEC_CGI),
+            "<Directory /srv>\nAddHandler cgi-script .cgi\nSetHandler default-handler\n</Directory>\n",
+        );
+        assert!(!is_cgi(&cfg, &s, b"x.cgi", false));
+        // SetHandler None unforces: the extension table applies again (the
+        // ExecCGI option still has to be present for execution).
+        let s = cgi_scope(
+            Options(Options::EXEC_CGI),
+            "<Directory /srv>\nSetHandler None\nAddHandler cgi-script .cgi\n</Directory>\n",
+        );
+        assert!(is_cgi(&cfg, &s, b"x.cgi", false));
+        // ExecCGI alone (no handler, no ScriptAlias) still never executes:
+        // classification needs a handler or a ScriptAlias.
+        let s = cgi_scope(
+            Options(Options::EXEC_CGI),
+            "<Directory /srv>\n</Directory>\n",
+        );
+        assert!(!is_cgi(&cfg, &s, b"x.cgi", false));
+        // ScriptAlias + an AddHandler'ed non-cgi extension does not execute.
+        let s = cgi_scope(
+            Options::empty(),
+            "<Directory /srv>\nAddHandler cgi-script .cgi\n</Directory>\n",
+        );
+        // ScriptAlias classifies every file in the directory as a script,
+        // handler or not (Apache semantics): even an unknown extension runs.
+        assert!(is_cgi(&cfg, &s, b"x.txt", true));
+        // The classification still needs SOME binding: ScriptAlias absent,
+        // ExecCGI present, no handler → static.
+        assert!(!is_cgi(&cfg, &s, b"x.txt", false));
+        let _ = SetHandler::parse("None");
     }
 }

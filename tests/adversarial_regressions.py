@@ -2,7 +2,7 @@
 """End-to-end regressions for the pass-2 through pass-10 findings (F23-F60).
 
 The suite starts fresh vapached instances in temporary trees and exercises
-the exploit shapes from findings.md: terminal rewrite/proxy authorization,
+the exploit shapes from adversarial/findings.md: terminal rewrite/proxy authorization,
 cache generations and CGI PATH_INFO, relative and capture-only regex aliases,
 autoindex links, negated/environment Require providers, IndexIgnore,
 DirectorySlash Off, UnsafePrefixStat re-rooting, header-selected cache
@@ -2596,6 +2596,243 @@ RewriteRule "^/unsafe/(.*)$" "{cls.base}/$1" [L,UnsafePrefixStat]
         output = self.proc.stdout.read().decode(errors="replace")
         self.assertIn("[UnsafePrefixStat]", output)
         self.assertIn("has no effect", output)
+
+
+class F61ToF69Pass11Tests(unittest.TestCase):
+    """Pass-11 replays: one live server carrying every guard idiom of the
+    findings table, each over its own URL space.
+
+    Rows and expected verdicts (Apache 2.4.69 oracle):
+      F61-A   <Location "/admin/*"> Require all denied      -> 403
+      F61-A2  <Location "/admopt/*"> Options -ExecCGI       -> 403
+      F61-B   <Location ~ "^/regex/"> Require all denied    -> 403
+      F61-C   control tree, no guard                        -> 200 executed
+      F62     <Directory ".../f62/[^a]*"> Require all denied -> 403 (zdir,
+              hello.html), 200 (adir)
+      F62b    <Files "[^a]*.cgi"> Require all denied        -> 403 (run.cgi),
+              200 (awake.cgi)
+      F63     <If "%{REQUEST_FILENAME} =~ /private/"> deny  -> 403
+      F63b    RewriteCond expr %{REQUEST_FILENAME} + [F]    -> 403
+      F64     <Directory uploads> SetHandler default-handler -> 200 source
+      F64b    F64 + attacker-written .htaccess AddHandler   -> 200 source
+      F65     ScriptAlias tree + SetHandler default-handler -> 200 source
+      F69     symlink link.txt -> secret.cgi                -> 200 source
+      F66     <DirectoryMatch ".../privatematch/$"> guard    -> 403 (stays fixed)
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-pass11-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.logs = cls.base / "logs"
+        for directory in (
+            cls.www / "admin",
+            cls.www / "admopt",
+            cls.www / "regex",
+            cls.www / "control",
+            cls.www / "negcgi",
+            cls.www / "private",
+            cls.www / "privatematch",
+            cls.www / "secret",
+            cls.www / "public",
+            cls.www / "uploads" / "attacker",
+            cls.www / "cgibin",
+            cls.base / "f62" / "adir",
+            cls.base / "f62" / "zdir",
+            cls.logs,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+
+        def script(directory: Path, marker: str):
+            path = directory / "run.cgi"
+            path.write_text(
+                "#!/bin/sh\n"
+                "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+                f"printf 'EXEC-{marker} uid=%s\\n' \"$(id -u)\"\n"
+            )
+            path.chmod(0o755)
+
+        script(cls.www / "admin", "ADMIN")
+        script(cls.www / "admopt", "ADMOPT")
+        script(cls.www / "regex", "REGEX")
+        script(cls.www / "control", "CONTROL")
+        script(cls.www / "negcgi", "NEGCgi")
+        # A basename inside the [^a] class must stay positive: rename one copy
+        # to awake.cgi (excluded from the class), keep run.cgi as the denied one.
+        (cls.www / "negcgi" / "run.cgi").rename(cls.www / "negcgi" / "awake.cgi")
+        script(cls.www / "negcgi", "NEGCgi")
+        script(cls.www / "private", "PRIVATE")
+        script(cls.www / "secret", "SECRET")
+        script(cls.www / "uploads", "UPLOADS")
+        script(cls.www / "uploads" / "attacker", "UPLOADSATT")
+        script(cls.www / "cgibin", "CGIBIN")
+        script(cls.base / "f62" / "adir", "ADIR")
+        script(cls.base / "f62" / "zdir", "ZDIR")
+        (cls.base / "f62" / "hello.html").write_text("f62\n")
+        (cls.www / "hello.txt").write_text("hello\n")
+        (cls.www / "administry").mkdir(parents=True, exist_ok=True)
+        (cls.www / "administry" / "wallet.txt").write_text("WALLET-ADMINISTRY\n")
+        (cls.www / "administry").chmod(0o755)
+        (cls.www / "secret" / "index.html").write_text("WALLET-F63B-LEAK\n")
+        # F69: the symlink target itself (direct requests hit the rewrite
+        # guard; the symlink path classifies by the request basename).
+        (cls.www / "secret" / "secret.cgi").write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'EXEC-SECRET uid=%s\\n' \"$(id -u)\"\n"
+        )
+        (cls.www / "secret" / "secret.cgi").chmod(0o755)
+        (cls.www / "privatematch" / "index.html").write_text("WALLET-F66\n")
+        # F69: a public symlink whose target basename would classify as CGI.
+        (cls.www / "public" / "link.txt").symlink_to("../secret/secret.cgi")
+        (cls.www / "public").chmod(0o755)
+        # F64b: the whole attacker contribution is one writable file.
+        (cls.www / "uploads" / "attacker" / ".htaccess").write_text(
+            "AddHandler cgi-script .cgi\n"
+        )
+
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+AddHandler cgi-script .cgi
+<Directory "{cls.www}">
+    AllowOverride All
+    Options +ExecCGI +FollowSymLinks
+    Require all granted
+    <If "%{{REQUEST_FILENAME}} =~ /private/">
+        Require all denied
+    </If>
+</Directory>
+<Location "/admin/*">
+    Require all denied
+</Location>
+<Location "/admopt/*">
+    Options -ExecCGI
+</Location>
+<Location ~ "^/regex/">
+    Require all denied
+</Location>
+<Directory "{cls.base}/f62/[^a]*">
+    Require all denied
+</Directory>
+<Directory "{cls.www}/negcgi">
+    <Files "[^a]*.cgi">
+        Require all denied
+    </Files>
+</Directory>
+<Directory "{cls.www}/uploads">
+    SetHandler default-handler
+    AllowOverride FileInfo
+</Directory>
+<Directory "{cls.www}/cgibin">
+    SetHandler default-handler
+</Directory>
+<DirectoryMatch "{cls.www}/privatematch/$">
+    Require all denied
+</DirectoryMatch>
+ScriptAlias /cgibin/ "{cls.www}/cgibin/"
+Alias /f62 "{cls.base}/f62/"
+<Directory "{cls.base}/f62">
+    Options +ExecCGI
+    Require all granted
+</Directory>
+<Directory "{cls.base}/f62/[^a]*">
+    Require all denied
+</Directory>
+RewriteEngine On
+RewriteCond expr "%{{REQUEST_FILENAME}} =~ /secret/"
+RewriteRule "^" "-" [F]
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def assert_executed(self, path: str, marker: bytes):
+        status, _, body = request(self.port, path)
+        self.assertEqual(status, 200, f"{path}: {body[:200]}")
+        self.assertIn(marker, body, f"{path}: {body[:200]}")
+        self.assertFalse(
+            body.startswith(b"#!/bin/sh"), f"{path} served as source: {body[:120]}"
+        )
+
+    def assert_denied(self, path: str):
+        status, _, body = request(self.port, path)
+        self.assertEqual(status, 403, f"{path}: {body[:200]}")
+        self.assertNotIn(b"uid=", body, f"{path}: {body[:200]}")
+
+    def assert_source(self, path: str):
+        status, _, body = request(self.port, path)
+        self.assertEqual(status, 200, f"{path}: {body[:200]}")
+        self.assertTrue(body.startswith(b"#!/bin/sh"), f"{path}: {body[:200]}")
+
+    def test_f61_a_location_glob_deny_executes_nothing(self):
+        # The shell-wildcard Location compiles at parse time and binds: the
+        # script inside /admin is denied, a sibling prefix is not matched.
+        self.assert_denied("/admin/run.cgi")
+        status, _, body = request(self.port, "/administry/wallet.txt")
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"WALLET-ADMINISTRY", body)
+
+    def test_f61_a2_location_glob_options_execcgi_off(self):
+        self.assert_denied("/admopt/run.cgi")
+
+    def test_f61_b_location_regex_form_binds(self):
+        self.assert_denied("/regex/run.cgi")
+
+    def test_f61_c_control_tree_executes(self):
+        # The fixture itself is viable: without a guard the CGI runs.
+        self.assert_executed("/control/run.cgi", b"EXEC-CONTROL uid=")
+
+    def test_f62_directory_class_negation_honors_caret(self):
+        self.assert_denied("/f62/zdir/run.cgi")
+        # The file's own path participates when the components line up.
+        self.assert_denied("/f62/hello.html")
+        # A name inside the class is NOT negated: the allow side stays live.
+        self.assert_executed("/f62/adir/run.cgi", b"EXEC-ADIR uid=")
+
+    def test_f62b_files_class_negation_honors_caret(self):
+        self.assert_denied("/negcgi/run.cgi")
+        self.assert_executed("/negcgi/awake.cgi", b"EXEC-NEGCgi uid=")
+
+    def test_f63_if_request_filename_is_bound_and_deny_guards(self):
+        self.assert_denied("/private/run.cgi")
+        # The guard is keyed on the mapped path, not the URL string: a URL
+        # outside the private tree is untouched.
+        self.assert_executed("/control/run.cgi", b"EXEC-CONTROL uid=")
+
+    def test_f63b_rewrite_cond_request_filename_fails_the_request(self):
+        self.assert_denied("/secret/index.html")
+        self.assert_denied("/secret/run.cgi")
+
+    def test_f64_set_handler_beats_the_floor_add_handler(self):
+        self.assert_source("/uploads/run.cgi")
+
+    def test_f64b_attacker_htaccess_addhandler_cannot_rearm_execution(self):
+        self.assert_source("/uploads/attacker/run.cgi")
+
+    def test_f65_script_alias_honors_set_handler_default_handler(self):
+        self.assert_source("/cgibin/run.cgi")
+
+    def test_f69_symlink_classifies_by_request_basename(self):
+        # Apache serves the canonical target as static source because the
+        # request-mapped basename is link.txt, not secret.cgi.
+        self.assert_source("/public/link.txt")
+
+    def test_f66_directory_match_guard_stays_fixed(self):
+        self.assert_denied("/privatematch/")
 
 
 if __name__ == "__main__":

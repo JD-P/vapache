@@ -705,6 +705,37 @@ pub struct Handler {
     pub remove: bool,
 }
 
+/// A `SetHandler` directive.  Unlike `AddHandler`/`RemoveHandler` (entries in
+/// the ordered extension table) a `SetHandler` assignment has precedence: the
+/// most specific scope that configured one decides the handler, and while a
+/// name is forced the extension table can neither add nor remove execution
+/// (F64/I62).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetHandler {
+    Name(String),
+    /// `SetHandler None`: no forced handler; the extension table applies.
+    None_,
+}
+
+impl SetHandler {
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            SetHandler::Name(name) => Some(name.as_str()),
+            SetHandler::None_ => None,
+        }
+    }
+
+    /// Parse the `SetHandler` value argument.  `None` (case-insensitive)
+    /// clears any inherited force.
+    pub fn parse(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("none") {
+            SetHandler::None_
+        } else {
+            SetHandler::Name(value.to_string())
+        }
+    }
+}
+
 impl Handler {
     pub fn add(ext: String, handler: String) -> Self {
         Self {
@@ -741,11 +772,16 @@ pub(crate) fn effective_handler_for_ext<'a>(scope: &'a Scope, ext: &str) -> Opti
     None
 }
 
-/// Resolve the effective handler for a filename.  Apache applies handler
-/// operations in configuration order: `SetHandler`/`AddHandler` install a
-/// handler and a later `RemoveHandler` removes it again.  Scanning the merged
-/// list in reverse gives the last operation for each matching name.
+/// Resolve the effective handler for a filename.  `SetHandler` has
+/// precedence over the extension table (F64/I62): the most specific scope
+/// that configured one decides the handler no matter how the `AddHandler`
+/// and `SetHandler` directives are ordered across parse order and
+/// inheritance.  `SetHandler None` unforces, so the extension table applies.
 pub(crate) fn effective_handler<'a>(scope: &'a Scope, name: &[u8]) -> Option<&'a str> {
+    match &scope.mapping_policy.set_handler {
+        Some(SetHandler::Name(forced)) => return Some(forced.as_str()),
+        Some(SetHandler::None_) | None => {}
+    }
     let base = name.rsplit(|b| *b == b'/').next().unwrap_or(name);
     let ext = base
         .rsplit(|b| *b == b'.')
@@ -1408,6 +1444,50 @@ impl Scope {
         self.restrict_policy_with(base);
         self.mapping_policy.handlers =
             conjoined_handlers(&base.mapping_policy.handlers, &self.mapping_policy.handlers);
+        // F64/I62: `SetHandler` forces conjoin like the extension table.  A
+        // name forced by both identities must agree; a disagreement degrades
+        // to "no forced handler" (fail closed: the conjoined extension table
+        // below still limits what can execute).  A force from one identity
+        // alone, or agreement on the same name, is kept.
+        //
+        // F60/I61: an explicit `SetHandler none` on the URL identity is a
+        // handler denial.  The resolved target must not re-arm an extension
+        // handler the lexical identity unforced, so the denial survives the
+        // conjoin as a `none` force (the request serves static content).
+        let (url_denied, url_forced, url_name) = match &base.mapping_policy.set_handler {
+            Some(SetHandler::Name(name)) => (false, true, name.clone()),
+            Some(SetHandler::None_) => (true, false, String::new()),
+            None => (false, false, String::new()),
+        };
+        let (target_forced, target_name) = match &self.mapping_policy.set_handler {
+            Some(SetHandler::Name(name)) => (true, name.clone()),
+            Some(SetHandler::None_) | None => (false, String::new()),
+        };
+        let same_name = url_name.eq_ignore_ascii_case(&target_name);
+        self.mapping_policy.set_handler = match vapache_verified::set_handler_conjoin_admit(
+            url_denied,
+            url_forced,
+            target_forced,
+            same_name,
+        ) {
+            1 => {
+                // A surviving force keeps whichever side actually forced; an
+                // explicit URL-side `SetHandler none` is materialized as a
+                // `none` force.
+                if url_denied {
+                    Some(SetHandler::Name("none".into()))
+                } else if url_forced {
+                    Some(SetHandler::Name(url_name))
+                } else if target_forced {
+                    Some(SetHandler::Name(target_name))
+                } else {
+                    Some(SetHandler::None_)
+                }
+            }
+            // Conflict: no forced handler; the conjoined extension table
+            // still governs `AddHandler`-style execution.
+            _ => Some(SetHandler::None_),
+        };
     }
 
     /// Conjoin execution/list/override/header policy without touching the
@@ -1456,8 +1536,16 @@ pub enum MatchKind {
     Directory(PathBuf),
     DirectoryMatch(Regex),
     Files(Regex),
+    /// `<Files shell-pattern>`: full-match the basename with the verified
+    /// fnmatch kernel (F61/F62 — classes honor both `!` and `^` negation).
+    FilesGlob(String),
     FilesMatch(Regex),
+    /// `<Location literal-url>`: Apache's literal prefix semantics with the
+    /// trailing `/` boundary.
     Location(String),
+    /// `<Location shell-pattern>` containing a wildcard: compiled to the
+    /// verified fnmatch kernel in path mode at parse time (F61-A/A2/B).
+    LocationGlob(String),
     LocationMatch(Regex),
 }
 
@@ -1506,8 +1594,12 @@ impl ScopeRule {
             MatchKind::Directory(_) | MatchKind::DirectoryMatch(_) | MatchKind::Always => {
                 RulePhase::Directory
             }
-            MatchKind::Files(_) | MatchKind::FilesMatch(_) => RulePhase::Files,
-            MatchKind::Location(_) | MatchKind::LocationMatch(_) => RulePhase::Location,
+            MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_) => {
+                RulePhase::Files
+            }
+            MatchKind::Location(_) | MatchKind::LocationGlob(_) | MatchKind::LocationMatch(_) => {
+                RulePhase::Location
+            }
         }
     }
 }
@@ -2285,59 +2377,11 @@ impl ParserState {
 }
 
 pub(crate) fn glob_match(pat: &[u8], name: &[u8]) -> bool {
-    fn rec(p: &[u8], n: &[u8]) -> bool {
-        if p.is_empty() {
-            return n.is_empty();
-        }
-        match p[0] {
-            b'*' => {
-                for i in 0..=n.len() {
-                    if rec(&p[1..], &n[i..]) {
-                        return true;
-                    }
-                }
-                false
-            }
-            b'?' => !n.is_empty() && rec(&p[1..], &n[1..]),
-            b'[' => {
-                if let Some(end) = p.iter().position(|&b| b == b']') {
-                    if n.is_empty() {
-                        return false;
-                    }
-                    let class = &p[1..end];
-                    let (neg, class) = if class.first() == Some(&b'!') {
-                        (true, &class[1..])
-                    } else {
-                        (false, class)
-                    };
-                    let mut matched = false;
-                    let mut i = 0;
-                    while i < class.len() {
-                        if i + 2 < class.len() && class[i + 1] == b'-' {
-                            if n[0] >= class[i] && n[0] <= class[i + 2] {
-                                matched = true;
-                            }
-                            i += 3;
-                        } else {
-                            if n[0] == class[i] {
-                                matched = true;
-                            }
-                            i += 1;
-                        }
-                    }
-                    if matched != neg {
-                        rec(&p[end + 1..], &n[1..])
-                    } else {
-                        false
-                    }
-                } else {
-                    n.first() == Some(&b'[') && rec(&p[1..], &n[1..])
-                }
-            }
-            c => !n.is_empty() && n[0] == c && rec(&p[1..], &n[1..]),
-        }
-    }
-    rec(pat, name)
+    // Delegated to the verified fnmatch kernel: shell glob semantics with
+    // `?`/`*` (unbounded, crosses `/` for the `<Proxy>` wildcard form),
+    // `[…]/[…]` bracket classes negated by BOTH `!` and `^` (F62/F62b — the
+    // previous hand-rolled matcher ignored `^`), and `\x` escapes.
+    vapache_verified::fnmatch_match(pat, name, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -2801,6 +2845,21 @@ impl Compile {
                                     (ConditionBranch::Else, Some(chain), None)
                                 }
                             };
+                            // F63/I63: reject expressions containing variables
+                            // the evaluator does not implement.  An unknown
+                            // variable must be a configuration error at load
+                            // time, never an empty-string substitution.
+                            if let Some(cond) = &condition {
+                                if let Err(e) = crate::expr::validate_vars(cond) {
+                                    self.errors.push(ConfigError {
+                                        file: loc.file.clone(),
+                                        line: loc.line,
+                                        msg: format!("bad <{name}> expression: {e}"),
+                                    });
+                                    self.skip_section();
+                                    continue;
+                                }
+                            }
                             let mut inner = Scope::default();
                             let mut inner_rules = Vec::new();
                             self.walk(
@@ -2919,7 +2978,18 @@ impl Compile {
                                     }
                                 }
                             } else if name == "location" {
-                                MatchKind::Location(args.join(" "))
+                                match compile_location_pattern(&args) {
+                                    Ok(kind) => kind,
+                                    Err(e) => {
+                                        self.errors.push(ConfigError {
+                                            file: loc.file.clone(),
+                                            line: loc.line,
+                                            msg: e,
+                                        });
+                                        self.skip_section();
+                                        continue;
+                                    }
+                                }
                             } else {
                                 let pat = args.join(" ");
                                 match compile_regex(&pat) {
@@ -3999,10 +4069,10 @@ impl Compile {
                 }
             }
             "sethandler" => {
-                scope
-                    .mapping_policy
-                    .handlers
-                    .push(Handler::add("*".into(), first()));
+                // F64/I62: `SetHandler` carries precedence; it is stored as a
+                // separate assignment, not as an extension-table entry, so a
+                // later or inherited `AddHandler` can never replace it.
+                scope.mapping_policy.set_handler = Some(SetHandler::parse(&first()));
             }
             "forcetype" => scope.content_policy.force_type = Some(first()),
             "adddefaultcharset" => {
@@ -5098,6 +5168,9 @@ fn clean_path(p: &Path) -> PathBuf {
 
 /// Evaluate a configuration rule's `<If>`/`<ElseIf>`/`<Else>` condition.
 /// `chain_state` records whether an earlier branch of each chain matched.
+/// `fs_path` is the filesystem path mapped for the request when one exists;
+/// it binds `%{REQUEST_FILENAME}`/`%{SCRIPT_FILENAME}` (F63/I63).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rule_condition_matches(
     rule: &ScopeRule,
     req: &crate::http::Request,
@@ -5105,10 +5178,12 @@ pub(crate) fn rule_condition_matches(
     peer: IpAddr,
     docroot: &Path,
     url_path: &str,
+    fs_path: Option<&Path>,
     chain_state: &mut HashMap<usize, bool>,
 ) -> bool {
     let eval = |expr: &crate::expr::Expr| {
-        let mut ctx = crate::expr::Context::new(req, env, peer, docroot, url_path);
+        let mut ctx =
+            crate::expr::Context::new(req, env, peer, docroot, url_path).with_fs_path(fs_path);
         expr.eval(&mut ctx).map(|v| v.truthy()).unwrap_or(false)
     };
     match rule.branch {
@@ -5173,12 +5248,13 @@ fn wildcard_path_matches(pattern: &Path, path: &Path) -> bool {
 }
 
 pub(crate) fn directory_wildcard_matches(pattern: &Path, fs_path: &Path) -> bool {
-    // A <Directory> pattern matches directory ancestors, not the final file
-    // name.  Include fs_path itself only when it names a directory.
-    for (i, ancestor) in fs_path.ancestors().enumerate() {
-        if i == 0 && !fs_path.is_dir() {
-            continue;
-        }
+    // A <Directory> pattern walks the filesystem ancestors of the mapped
+    // path.  Apache includes the mapped path itself, even when it names a
+    // regular file: a request for `/www/zdir/run.cgi` (mapped to
+    // `/www/zdir/run.cgi`) is governed by `<Directory ".../zdir">` and by a
+    // wildcard pattern that matches the file's own path (F61-C).  Skipping
+    // the file's own path made such a section inert for files.
+    for ancestor in fs_path.ancestors() {
         if wildcard_path_matches(pattern, ancestor) {
             return true;
         }
@@ -5222,6 +5298,9 @@ fn rule_kind_matches(kind: &MatchKind, fs_path: &Path, url_path: &str, fname: &s
         }
         MatchKind::DirectoryMatch(re) => re.is_match(&fs_path.to_string_lossy()),
         MatchKind::Files(re) | MatchKind::FilesMatch(re) => re.is_match(fname),
+        MatchKind::FilesGlob(pattern) => {
+            vapache_verified::fnmatch_match(pattern.as_bytes(), fname.as_bytes(), false)
+        }
         MatchKind::Location(prefix) => {
             if prefix.is_empty() || prefix == "/" {
                 return true;
@@ -5236,6 +5315,9 @@ fn rule_kind_matches(kind: &MatchKind, fs_path: &Path, url_path: &str, fname: &s
                     || (url_path.starts_with(prefix)
                         && url_path.as_bytes().get(prefix.len()) == Some(&b'/'))
             }
+        }
+        MatchKind::LocationGlob(pattern) => {
+            vapache_verified::fnmatch_match(pattern.as_bytes(), url_path.as_bytes(), true)
         }
         MatchKind::LocationMatch(re) => re.is_match(url_path),
     }
@@ -5419,19 +5501,23 @@ pub(crate) fn collect_directory_phase(
                         conditionals.push(nested.clone());
                     } else {
                         match nested.kind {
-                            MatchKind::Files(_) | MatchKind::FilesMatch(_) => {
-                                files.push(nested.clone())
-                            }
-                            MatchKind::Location(_) | MatchKind::LocationMatch(_) => {
-                                locations.push(nested.clone())
-                            }
+                            MatchKind::Files(_)
+                            | MatchKind::FilesGlob(_)
+                            | MatchKind::FilesMatch(_) => files.push(nested.clone()),
+                            MatchKind::Location(_)
+                            | MatchKind::LocationGlob(_)
+                            | MatchKind::LocationMatch(_) => locations.push(nested.clone()),
                             _ => {}
                         }
                     }
                 }
             }
-            MatchKind::Files(_) | MatchKind::FilesMatch(_) => files.push(rule.clone()),
-            MatchKind::Location(_) | MatchKind::LocationMatch(_) => locations.push(rule.clone()),
+            MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_) => {
+                files.push(rule.clone())
+            }
+            MatchKind::Location(_) | MatchKind::LocationGlob(_) | MatchKind::LocationMatch(_) => {
+                locations.push(rule.clone())
+            }
             MatchKind::Always => conditionals.push(rule.clone()),
         }
     }
@@ -5508,7 +5594,16 @@ fn apply_conditional_rule(
     chain_state: &mut HashMap<usize, bool>,
 ) {
     let env = s.request_env(req, url_path);
-    if !rule_condition_matches(rule, req, &env, peer, docroot, url_path, chain_state) {
+    if !rule_condition_matches(
+        rule,
+        req,
+        &env,
+        peer,
+        docroot,
+        url_path,
+        Some(fs_path),
+        chain_state,
+    ) {
         return;
     }
     merge_rule_delta(s, rule, fs_path, url_path);
@@ -5534,16 +5629,18 @@ fn sort_rules(rules: &mut [ScopeRule]) {
             MatchKind::Always => (5, 0),
             MatchKind::Directory(p) => (0, p.as_os_str().len()),
             MatchKind::DirectoryMatch(_) => (1, 0),
-            MatchKind::Files(_) | MatchKind::FilesMatch(_) => (2, 0),
+            MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_) => (2, 0),
             MatchKind::Location(p) => (3, p.len()),
+            MatchKind::LocationGlob(p) => (3, p.len()),
             MatchKind::LocationMatch(_) => (4, 0),
         };
         let kb = match &b.kind {
             MatchKind::Always => (5, 0),
             MatchKind::Directory(p) => (0, p.as_os_str().len()),
             MatchKind::DirectoryMatch(_) => (1, 0),
-            MatchKind::Files(_) | MatchKind::FilesMatch(_) => (2, 0),
+            MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_) => (2, 0),
             MatchKind::Location(p) => (3, p.len()),
+            MatchKind::LocationGlob(p) => (3, p.len()),
             MatchKind::LocationMatch(_) => (4, 0),
         };
         ka.cmp(&kb).then(a.order.cmp(&b.order))
@@ -5589,6 +5686,49 @@ pub(crate) fn compile_regex(pattern: &str) -> Result<Regex, String> {
     Regex::new(pattern).map_err(|e| e.to_string())
 }
 
+/// True when the string contains one of the shell wildcard characters that
+/// Apache's `<Location>`/`<Files>` pattern matching treats specially.
+pub(crate) fn has_glob_wildcard(pattern: &str) -> bool {
+    pattern.bytes().any(|b| matches!(b, b'*' | b'?' | b'['))
+}
+
+/// Compile a `<Location>` argument (F61-A/A2/B).
+///
+/// Apache distinguishes two forms: with `~` as the first argument the rest is
+/// a regular expression (and `<Location ~>` with no expression is a
+/// configuration error); otherwise the argument is a URL-path pattern in
+/// which the shell wildcards `*`, `?` and `[…]` are honored.  A wildcard
+/// form must be compiled to the verified fnmatch kernel at parse time —
+/// leaving it a literal string silently disables every guard inside the
+/// section.  In path mode the kernel keeps `*` and `?` inside their URL
+/// component and anchors the match over the whole path.
+pub(crate) fn compile_location_pattern(args: &[String]) -> Result<MatchKind, String> {
+    if args.is_empty() {
+        return Err("<Location> requires a URL path pattern".into());
+    }
+    if args[0] == "~" {
+        if args.len() < 2 {
+            return Err("<Location ~> requires a regular expression".into());
+        }
+        let pattern = args[1..].join(" ");
+        return compile_regex(&pattern)
+            .map(MatchKind::LocationMatch)
+            .map_err(|e| format!("bad Location regex: {e}"));
+    }
+    let pattern = args.join(" ");
+    if has_glob_wildcard(&pattern) {
+        // F61: the wildcard form is compiled to the kernel match
+        // (`LocationGlob`).  Falling back to a literal `MatchKind::Location`
+        // would silently disable every guard inside the section; the kernel
+        // records the admission invariant.
+        debug_assert!(vapache_verified::location_wildcard_compiled_admit(
+            true, true
+        ));
+        return Ok(MatchKind::LocationGlob(pattern));
+    }
+    Ok(MatchKind::Location(pattern))
+}
+
 pub(crate) fn compile_files_pattern(args: &[String]) -> Result<MatchKind, String> {
     if args.is_empty() {
         return Err("<Files> requires a filename pattern".into());
@@ -5600,55 +5740,11 @@ pub(crate) fn compile_files_pattern(args: &[String]) -> Result<MatchKind, String
             .map_err(|e| format!("bad Files regex: {e}"));
     }
     let pattern = args.join(" ");
-    let regex = files_glob_to_regex(&pattern)?;
-    compile_regex(&regex)
-        .map(MatchKind::Files)
-        .map_err(|e| format!("bad Files pattern: {e}"))
-}
-
-/// Translate Apache's <Files> shell-style pattern into an anchored regex.
-/// `*` and `?` match within a basename; `[]`/`[!...]` classes are preserved.
-fn files_glob_to_regex(pattern: &str) -> Result<String, String> {
-    let mut out = String::from("^");
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '*' => out.push_str(".*"),
-            '?' => out.push('.'),
-            '[' => {
-                let mut class = String::new();
-                let mut closed = false;
-                while let Some(cc) = chars.next() {
-                    if cc == ']' {
-                        closed = true;
-                        break;
-                    }
-                    class.push(cc);
-                }
-                if !closed {
-                    out.push_str("\\[");
-                    out.push_str(&regex::escape(&class));
-                    continue;
-                }
-                if let Some(rest) = class.strip_prefix('!') {
-                    class = format!("^{rest}");
-                } else if class.starts_with('^') {
-                    class = format!("\\{class}");
-                }
-                class = class.replace('\\', "\\\\").replace(']', "\\]");
-                out.push('[');
-                out.push_str(&class);
-                out.push(']');
-            }
-            '\\' => match chars.next() {
-                Some(next) => out.push_str(&regex::escape(&next.to_string())),
-                None => out.push_str("\\\\"),
-            },
-            _ => out.push_str(&regex::escape(&c.to_string())),
-        }
-    }
-    out.push('$');
-    Ok(out)
+    // Shell-style <Files> patterns are matched against the basename with the
+    // verified fnmatch kernel (F62/F62b: both `!` and `^` negate a class;
+    // the old hand-rolled regex translation escaped `^` as a literal and
+    // only recognized `!`).
+    Ok(MatchKind::FilesGlob(pattern))
 }
 
 pub(crate) fn parse_method_set_args(
@@ -5828,7 +5924,14 @@ pub(crate) fn parse_require(args: &[String]) -> Require {
         "expr" => {
             let text = rest.join(" ");
             match crate::expr::parse(&text) {
-                Ok(expr) => Require::Expr { negate, expr },
+                Ok(expr) => {
+                    // F63/I63: unknown variables fail closed as an
+                    // unsupported provider (denied), not as an empty string.
+                    match crate::expr::validate_vars(&expr) {
+                        Ok(()) => Require::Expr { negate, expr },
+                        Err(e) => Require::Unsupported(format!("bad Require expr: {e}")),
+                    }
+                }
                 Err(e) => Require::Unsupported(format!("bad Require expr: {e}")),
             }
         }
@@ -5977,6 +6080,9 @@ pub(crate) fn parse_rewrite_cond(args: &[String]) -> Result<RewriteCond, String>
         }
         let expr = crate::expr::parse(&args[1..end].join(" "))
             .map_err(|e| format!("bad RewriteCond expr: {e}"))?;
+        // F63/I63: unknown variables are a configuration error, never an
+        // empty-string substitution.
+        crate::expr::validate_vars(&expr).map_err(|e| format!("bad RewriteCond expr: {e}"))?;
         return Ok(RewriteCond {
             test: String::new(),
             pattern: String::new(),
@@ -8339,13 +8445,20 @@ ServerName localhost\n\
                 &req,
                 "127.0.0.1".parse().unwrap(),
                 None,
-                "/app/file"
+                "/app/file",
+                None
             ),
             crate::access::Access::Denied
         );
         assert!(
-            crate::access::check(&scope, &req, "10.1.2.3".parse().unwrap(), None, "/app/file")
-                == crate::access::Access::Allowed
+            crate::access::check(
+                &scope,
+                &req,
+                "10.1.2.3".parse().unwrap(),
+                None,
+                "/app/file",
+                None
+            ) == crate::access::Access::Allowed
         );
 
         let mut scope = Scope::default();
@@ -8376,7 +8489,8 @@ ServerName localhost\n\
                 &req_allowed,
                 "127.0.0.1".parse().unwrap(),
                 None,
-                "/other/42/x"
+                "/other/42/x",
+                None
             ),
             crate::access::Access::Allowed
         );
@@ -8676,6 +8790,7 @@ ServerName localhost\n\
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
             "/x",
+            None,
             &mut chain
         ));
 
@@ -8689,6 +8804,7 @@ ServerName localhost\n\
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
             "/x",
+            None,
             &mut chain
         ));
         assert_eq!(chain.get(&1), Some(&true));
@@ -8704,6 +8820,7 @@ ServerName localhost\n\
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
             "/x",
+            None,
             &mut chain
         ));
         chain.insert(2, true);
@@ -8716,6 +8833,7 @@ ServerName localhost\n\
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
             "/x",
+            None,
             &mut chain
         ));
         let missing = base.clone();
@@ -8729,6 +8847,7 @@ ServerName localhost\n\
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
             "/x",
+            None,
             &mut chain
         ));
         let no_chain_condition = {
@@ -8745,6 +8864,7 @@ ServerName localhost\n\
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
             "/x",
+            None,
             &mut chain
         ));
         let mut else_rule = base.clone();
@@ -8757,6 +8877,7 @@ ServerName localhost\n\
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
             "/x",
+            None,
             &mut chain
         ));
         let mut else_rule = base.clone();
@@ -8769,6 +8890,7 @@ ServerName localhost\n\
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
             "/x",
+            None,
             &mut chain
         ));
         let mut else_missing = base.clone();
@@ -8781,6 +8903,7 @@ ServerName localhost\n\
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
             "/x",
+            None,
             &mut chain
         ));
 
@@ -9682,7 +9805,13 @@ SetEnv DIR yes\n\
             s.authorization.auth_group_file.as_deref(),
             Some(Path::new("/tmp/group"))
         );
-        assert_eq!(s.mapping_policy.handlers.len(), 3);
+        assert_eq!(s.mapping_policy.handlers.len(), 2);
+        // F64/I62: `SetHandler` is a precedence field, not an extension-table
+        // entry.
+        assert_eq!(
+            s.mapping_policy.set_handler,
+            Some(SetHandler::Name("handler".into()))
+        );
         assert_eq!(s.mapping_policy.aliases.len(), 4);
         assert_eq!(s.mapping_policy.redirects.len(), 4);
         assert_eq!(s.error_policy.documents.len(), 3);
@@ -10950,10 +11079,12 @@ impl Config {
                 conditionals.push(rule.clone());
             } else {
                 match rule.kind {
-                    MatchKind::Files(_) | MatchKind::FilesMatch(_) => files.push(rule.clone()),
-                    MatchKind::Location(_) | MatchKind::LocationMatch(_) => {
-                        locations.push(rule.clone())
+                    MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_) => {
+                        files.push(rule.clone())
                     }
+                    MatchKind::Location(_)
+                    | MatchKind::LocationGlob(_)
+                    | MatchKind::LocationMatch(_) => locations.push(rule.clone()),
                     _ => {}
                 }
             }
@@ -10992,12 +11123,12 @@ impl Config {
                     conditionals.push(nested.clone());
                 } else {
                     match nested.kind {
-                        MatchKind::Files(_) | MatchKind::FilesMatch(_) => {
-                            files.push(nested.clone())
-                        }
-                        MatchKind::Location(_) | MatchKind::LocationMatch(_) => {
-                            locations.push(nested.clone())
-                        }
+                        MatchKind::Files(_)
+                        | MatchKind::FilesGlob(_)
+                        | MatchKind::FilesMatch(_) => files.push(nested.clone()),
+                        MatchKind::Location(_)
+                        | MatchKind::LocationGlob(_)
+                        | MatchKind::LocationMatch(_) => locations.push(nested.clone()),
                         _ => {}
                     }
                 }
@@ -11055,12 +11186,12 @@ impl Config {
                     conditionals.push(nested.clone());
                 } else {
                     match nested.kind {
-                        MatchKind::Files(_) | MatchKind::FilesMatch(_) => {
-                            files.push(nested.clone())
-                        }
-                        MatchKind::Location(_) | MatchKind::LocationMatch(_) => {
-                            locations.push(nested.clone())
-                        }
+                        MatchKind::Files(_)
+                        | MatchKind::FilesGlob(_)
+                        | MatchKind::FilesMatch(_) => files.push(nested.clone()),
+                        MatchKind::Location(_)
+                        | MatchKind::LocationGlob(_)
+                        | MatchKind::LocationMatch(_) => locations.push(nested.clone()),
                         _ => {}
                     }
                 }
@@ -11070,6 +11201,66 @@ impl Config {
 
     /// Cached normal scope for paths that cannot read an access file.  Normal
     /// configuration rules do not depend on request headers or method; only
+    /// Apply `<Directory>` rules that match the request-mapped path itself
+    /// (F61-C).  Apache's per-directory walk compares every walked component
+    /// against the configured patterns; for a regular-file request the file's
+    /// own path is the final walked entry, so a `<Directory>` pattern with
+    /// exactly the file path's component count governs the file too (2.4.69
+    /// probe: `<Directory ".../www/[^a]*">` denies `/hello.html`).  The walk
+    /// in `policy_ref` / `htaccess` only visits ancestor *directories*, so the
+    /// own-path match is applied here — after the walk, before
+    /// `<DirectoryMatch>`: the merge position of the deepest walked entry.
+    /// A pattern's component count is fixed, so it can match at most one walk
+    /// node; own-path application therefore never duplicates a per-directory
+    /// merge.
+    pub fn apply_directory_own_path_rules(
+        &self,
+        vhost: Option<&VHost>,
+        scope: &mut Scope,
+        fs_path: &Path,
+        url_path: &str,
+        files: &mut Vec<ScopeRule>,
+        locations: &mut Vec<ScopeRule>,
+        conditionals: &mut Vec<ScopeRule>,
+    ) {
+        // When the mapped path is itself a directory the walk already
+        // evaluated it as the leaf entry; re-applying here would merge the
+        // section twice.
+        if crate::files::is_dir_cached(fs_path) {
+            return;
+        }
+        let rules: &[ScopeRule] = vhost
+            .map(|v| v.rules.as_slice())
+            .unwrap_or(self.global_rules.as_slice());
+        for rule in rules {
+            if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
+                continue;
+            }
+            let MatchKind::Directory(pattern) = &rule.kind else {
+                continue;
+            };
+            if !directory_pattern_matches_exact(pattern, fs_path) {
+                continue;
+            }
+            merge_rule_delta(scope, rule, fs_path, url_path);
+            for nested in &rule.nested {
+                if nested.condition.is_some() || nested.branch != ConditionBranch::Normal {
+                    conditionals.push(nested.clone());
+                } else {
+                    match nested.kind {
+                        MatchKind::Files(_)
+                        | MatchKind::FilesGlob(_)
+                        | MatchKind::FilesMatch(_) => files.push(nested.clone()),
+                        MatchKind::Location(_)
+                        | MatchKind::LocationGlob(_)
+                        | MatchKind::LocationMatch(_) => locations.push(nested.clone()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     /// the deferred conditional rules do.  Cache the normal scope and the
     /// matching conditional list, then apply the conditionals per request.
     pub fn effective_scope_req_cached(
@@ -11173,7 +11364,16 @@ impl Config {
                 let conditional =
                     rule.condition.is_some() || rule.branch != ConditionBranch::Normal;
                 let matched = if conditional {
-                    rule_condition_matches(rule, req, env, peer, docroot, url_path, chain_state)
+                    rule_condition_matches(
+                        rule,
+                        req,
+                        env,
+                        peer,
+                        docroot,
+                        url_path,
+                        Some(fs_path),
+                        chain_state,
+                    )
                 } else {
                     true
                 };
@@ -11299,5 +11499,228 @@ impl DirectoryRuleIndex {
             }
         }
         index
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass-11 regression kernels (F61/F62/F63/F64)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod pass11_kernel_tests {
+    use super::*;
+
+    // F61-A/A2/B: a `<Location>` argument with shell wildcards compiles to
+    // the kernel matcher at parse time; the `~` regex form and the
+    // `<Location ~>`-alone configuration error follow Apache's parse rules.
+
+    fn location_kind(args: &[&str]) -> Result<MatchKind, String> {
+        compile_location_pattern(&args.iter().map(|s| s.to_string()).collect::<Vec<String>>())
+    }
+
+    fn matched(kind: &MatchKind, url_path: &str) -> bool {
+        rule_kind_matches(kind, Path::new("/srv/www/file"), url_path, "file")
+    }
+
+    #[test]
+    fn location_wildcard_compiles_to_the_kernel_and_stays_component_bounded() {
+        let kind = location_kind(&["/admin/*"]).unwrap();
+        assert!(matches!(kind, MatchKind::LocationGlob(_)));
+        // The kernel match is component-bounded and anchored: a sibling
+        // script inside /admin is covered, deeper paths are not, and the
+        // pattern cannot leak past the /admin prefix.
+        assert!(matched(&kind, "/admin/run.cgi"));
+        assert!(!matched(&kind, "/admin/a/b.cgi"));
+        assert!(!matched(&kind, "/administry"));
+        // `*` never crosses a `/`; `?` covers exactly one character inside
+        // the component.
+        let one = location_kind(&["/admin/?.cgi"]).unwrap();
+        assert!(matched(&one, "/admin/x.cgi"));
+        assert!(!matched(&one, "/admin/xy.cgi"));
+        let class = location_kind(&["/admin/[a-z]un*"]).unwrap();
+        assert!(matched(&class, "/admin/run.cgi"));
+        // The wildcard never bridges the bare directory: `/zdir/*` matches
+        // `/zdir/run.cgi` and the trailing-slash form (2.4.69 probe with
+        // `DirectorySlash Off`), but not `/zdir` itself.
+        let dir_star = location_kind(&["/zdir/*"]).unwrap();
+        assert!(matched(&dir_star, "/zdir/run.cgi"));
+        assert!(matched(&dir_star, "/zdir/"));
+        assert!(!matched(&dir_star, "/zdir"));
+    }
+
+    #[test]
+    fn location_regex_and_literal_forms_are_untouched() {
+        let kind = location_kind(&["~", "^/nomatch/"]).unwrap();
+        assert!(matches!(kind, MatchKind::LocationMatch(_)));
+        let kind = location_kind(&["/admin"]).unwrap();
+        assert!(matches!(kind, MatchKind::Location(_)));
+        // `<Location ~>` with no expression is a configuration error (fail
+        // closed), never an inert literal section.
+        assert!(location_kind(&["~"]).is_err());
+        assert!(location_kind(&[]).is_err());
+        // A malformed regex is a configuration error too.
+        assert!(location_kind(&["~", "(?=x"]).is_err());
+    }
+
+    // F62/F62b: `<Files>` class negation honors BOTH markers; `?` covers
+    // exactly one character and `*` stays inside the basename.
+
+    #[test]
+    fn files_glob_negates_classes_with_bang_and_caret() {
+        for pattern in ["[^a]*.cgi", "[!a]*.cgi"] {
+            let kind = compile_files_pattern(&[pattern.into()]).unwrap();
+            assert!(
+                matches!(kind, MatchKind::FilesGlob(_)),
+                "expected a kernel glob for {pattern}"
+            );
+            // The match is on the basename: a member name stays positive and
+            // a non-member is negated into a match — with BOTH markers.
+            assert!(
+                rule_kind_matches(&kind, Path::new("/srv/zdir.cgi"), "/zdir.cgi", "zdir.cgi"),
+                "{pattern} must negate and match zdir.cgi"
+            );
+            assert!(
+                !rule_kind_matches(&kind, Path::new("/srv/adir.cgi"), "/adir.cgi", "adir.cgi"),
+                "{pattern} must not match its own class member"
+            );
+        }
+        // `?.cgi` matches 5 characters, not 7.
+        let kind = compile_files_pattern(&["?.cgi".into()]).unwrap();
+        assert!(rule_kind_matches(
+            &kind,
+            Path::new("/x.cgi"),
+            "/x.cgi",
+            "x.cgi"
+        ));
+        assert!(!rule_kind_matches(
+            &kind,
+            Path::new("/longer.cgi"),
+            "/longer.cgi",
+            "longer.cgi"
+        ));
+        // `*x*` matches within the basename.
+        let kind = compile_files_pattern(&["*x*".into()]).unwrap();
+        assert!(rule_kind_matches(
+            &kind,
+            Path::new("/a/bx.c"),
+            "/a/bx.c",
+            "bx.c"
+        ));
+        assert!(!rule_kind_matches(
+            &kind,
+            Path::new("/a/b.c"),
+            "/a/b.c",
+            "b.c"
+        ));
+    }
+
+    // F64: `SetHandler` precedence — it wins over AddHandler regardless of
+    // directive order, inheritance and merge direction.
+
+    fn handler_scope(text: &str) -> Scope {
+        let cfg = load_text_direct(&format!("Listen 127.0.0.1:0\n{text}"));
+        cfg.effective_scope(None, Path::new("/srv/www/x.cgi"), "/x.cgi")
+    }
+
+    fn load_text_direct(text: &str) -> Config {
+        let dir = std::env::temp_dir().join(format!("vapache-pass11-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("httpd.conf");
+        std::fs::write(&path, text).unwrap();
+        Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap()
+    }
+
+    #[test]
+    fn set_handler_beats_add_handler_in_both_orders() {
+        for text in [
+            "<Directory /srv>\nSetHandler default-handler\nAddHandler cgi-script .cgi\n</Directory>\n",
+            "<Directory /srv>\nAddHandler cgi-script .cgi\nSetHandler default-handler\n</Directory>\n",
+        ] {
+            let scope = handler_scope(text);
+            assert_eq!(
+                effective_handler(&scope, b"x.cgi"),
+                Some("default-handler"),
+                "SetHandler must win: {text}"
+            );
+        }
+        // The reverse force: SetHandler cgi-script wins over a RemoveHandler.
+        let scope = handler_scope(
+            "<Directory /srv>\nRemoveHandler .cgi\nSetHandler cgi-script\n</Directory>\n",
+        );
+        assert_eq!(effective_handler(&scope, b"x.cgi"), Some("cgi-script"));
+    }
+
+    #[test]
+    fn set_handler_none_falls_back_to_the_extension_table() {
+        // A child `SetHandler None` clears the parent's force; the extension
+        // table then applies (2.4.69 probe: the AddHandler grant returns).
+        let cfg = load_text_direct(
+            "Listen 127.0.0.1:0\n\
+             <Directory /srv>\n\
+             SetHandler default-handler\n\
+             </Directory>\n\
+             <Directory /srv/sub>\n\
+             SetHandler None\n\
+             AddHandler cgi-script .cgi\n\
+             </Directory>\n",
+        );
+        let s = cfg.effective_scope(None, Path::new("/srv/sub/x.cgi"), "/sub/x.cgi");
+        assert_eq!(s.mapping_policy.set_handler, Some(SetHandler::None_));
+        assert_eq!(effective_handler(&s, b"x.cgi"), Some("cgi-script"));
+        // Without the child override the parent force still governs.
+        let s = cfg.effective_scope(None, Path::new("/srv/www/x.cgi"), "/x.cgi");
+        assert_eq!(
+            s.mapping_policy.set_handler,
+            Some(SetHandler::Name("default-handler".into()))
+        );
+        assert_eq!(effective_handler(&s, b"x.cgi"), Some("default-handler"));
+    }
+
+    #[test]
+    fn restricted_scopes_conjoin_set_handler_forces() {
+        let mut base = Scope::default();
+        base.mapping_policy.set_handler = Some(SetHandler::Name("default-handler".into()));
+        let mut target = Scope::default();
+        target
+            .mapping_policy
+            .handlers
+            .push(Handler::add("upload".into(), "cgi-script".into()));
+        // F64: the attacker chain (an .htaccess `AddHandler` upload) cannot
+        // execute when the URL identity forces another handler.
+        target.restrict_with(&base);
+        assert_eq!(
+            effective_handler(&target, b"shell.upload"),
+            Some("default-handler")
+        );
+        // An explicit target `SetHandler None` cannot clear the force either.
+        let mut target = Scope::default();
+        target.mapping_policy.set_handler = Some(SetHandler::None_);
+        target
+            .mapping_policy
+            .handlers
+            .push(Handler::add("upload".into(), "cgi-script".into()));
+        target.restrict_with(&base);
+        assert_eq!(
+            effective_handler(&target, b"shell.upload"),
+            Some("default-handler")
+        );
+        // Conflicting forces degrade to no force (the conjoined extension
+        // table still governs), never to one side's name.
+        let mut conflicting = Scope::default();
+        conflicting.mapping_policy.set_handler = Some(SetHandler::Name("cgi-script".into()));
+        conflicting.restrict_with(&base);
+        assert_eq!(
+            conflicting.mapping_policy.set_handler,
+            Some(SetHandler::None_)
+        );
+        // A target-only force wins when the URL identity has none.
+        let mut target_only = Scope::default();
+        target_only.mapping_policy.set_handler = Some(SetHandler::Name("cgi-script".into()));
+        target_only.restrict_with(&Scope::default());
+        assert_eq!(
+            target_only.mapping_policy.set_handler,
+            Some(SetHandler::Name("cgi-script".into()))
+        );
     }
 }

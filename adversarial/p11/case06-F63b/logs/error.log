@@ -1,0 +1,3 @@
+[Tue Oct 27 04:10:14.920271 2026] [mpm_event:notice] [pid 1293046:tid 1293046] AH00489: Apache/2.4.69 (Debian) configured -- resuming normal operations
+[Tue Oct 27 04:10:14.920341 2026] [core:notice] [pid 1293046:tid 1293046] AH00094: Command line: '/usr/sbin/apache2 -f /tmp/opencode/p11/case06-F63b/apache.conf -D FOREGROUND'
+[Tue Oct 27 04:10:16.452844 2026] [mpm_event:notice] [pid 1293046:tid 1293046] AH00491: caught SIGTERM, shutting down

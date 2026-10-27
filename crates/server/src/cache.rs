@@ -504,8 +504,15 @@ pub fn request_scope_with_plan(
     let fingerprint = cache_policy_fingerprint(&scope, req, peer, &fs_path);
     let resource =
         crate::access::ResourceKey::cache_policy(vhost, req, host, &cache_url_path, fingerprint);
-    let grant = match crate::access::check_grant(&scope, req, peer, None, &cache_url_path, resource)
-    {
+    let grant = match crate::access::check_grant(
+        &scope,
+        req,
+        peer,
+        None,
+        &cache_url_path,
+        Some(&fs_path),
+        resource,
+    ) {
         Ok(grant) => grant,
         Err(_) => return None,
     };

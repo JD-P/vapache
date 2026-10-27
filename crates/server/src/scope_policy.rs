@@ -218,7 +218,7 @@ impl OverridePolicy {
 #[cfg(test)]
 mod override_tests {
     use super::*;
-    use crate::config::{NonfatalMode, OverrideCategories, OverrideMode, OverrideCategory};
+    use crate::config::{NonfatalMode, OverrideCategories, OverrideCategory, OverrideMode};
 
     #[test]
     fn child_presence_wins_for_override_fields() {
@@ -654,6 +654,11 @@ pub struct MappingPolicy {
     pub aliases: Vec<crate::config::Alias>,
     pub redirects: Vec<crate::config::Redirect>,
     pub handlers: Vec<crate::config::Handler>,
+    /// `SetHandler` carries handler precedence, unlike `AddHandler`, which is
+    /// only an extension-table entry (F64).  Keeping it out of the ordered
+    /// `handlers` list makes the forced handler win regardless of parse order,
+    /// merge order or inheritance.
+    pub set_handler: Option<crate::config::SetHandler>,
     pub unsupported_filters: Vec<String>,
 }
 
@@ -662,6 +667,11 @@ impl MappingPolicy {
         crate::verified::append_vec(&mut self.aliases, &child.aliases);
         crate::verified::append_vec(&mut self.redirects, &child.redirects);
         crate::verified::append_vec(&mut self.handlers, &child.handlers);
+        // A child that configured `SetHandler` (including `SetHandler None`)
+        // wins; a child with no directive keeps the inherited force.
+        if child.set_handler.is_some() {
+            self.set_handler = child.set_handler.clone();
+        }
         crate::verified::append_vec(&mut self.unsupported_filters, &child.unsupported_filters);
     }
 }

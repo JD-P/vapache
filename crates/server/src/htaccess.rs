@@ -239,7 +239,10 @@ pub fn apply_req_deferred_with_root(
                 for rule in &delta.rules {
                     if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
                         deferred.push(rule.clone());
-                    } else if matches!(rule.kind, MatchKind::Files(_) | MatchKind::FilesMatch(_)) {
+                    } else if matches!(
+                        rule.kind,
+                        MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_)
+                    ) {
                         files.push(rule.clone());
                     }
                 }
@@ -249,6 +252,18 @@ pub fn apply_req_deferred_with_root(
         }
     }
     if apply_config_dirs {
+        // F61-C: the file's own path is the final walked entry of the
+        // Directory phase; apply wildcard `<Directory>` sections that match
+        // it before the `<DirectoryMatch>` step.
+        cfg.apply_directory_own_path_rules(
+            vhost,
+            scope,
+            fs_path,
+            url_path,
+            config_files,
+            &mut ignored_locations,
+            deferred,
+        );
         cfg.apply_directory_match_rules(
             vhost,
             scope,
@@ -474,7 +489,10 @@ fn add_layer_rule(layer: &mut crate::policy_ref::AccessLayer, rule: &ScopeRule) 
     let slot = crate::verified::access_layer_slot(
         rule.condition.is_some(),
         rule.branch == ConditionBranch::Normal,
-        matches!(rule.kind, MatchKind::Files(_) | MatchKind::FilesMatch(_)),
+        matches!(
+            rule.kind,
+            MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_)
+        ),
     );
     match slot {
         crate::verified::AccessLayerSlot::Conditional => layer.conditionals.push(rule.clone()),
@@ -581,12 +599,18 @@ fn rule_matches(kind: &MatchKind, fname: &str, url_path: &str) -> bool {
     match kind {
         MatchKind::Always => true,
         MatchKind::Files(re) | MatchKind::FilesMatch(re) => re.is_match(fname),
+        MatchKind::FilesGlob(pattern) => {
+            vapache_verified::fnmatch_match(pattern.as_bytes(), fname.as_bytes(), false)
+        }
         MatchKind::Location(prefix) => {
             let base = prefix.trim_end_matches('/');
             base.is_empty()
                 || url_path == base
                 || (url_path.starts_with(base)
                     && url_path.as_bytes().get(base.len()) == Some(&b'/'))
+        }
+        MatchKind::LocationGlob(pattern) => {
+            vapache_verified::fnmatch_match(pattern.as_bytes(), url_path.as_bytes(), true)
         }
         MatchKind::LocationMatch(re) => re.is_match(url_path),
         MatchKind::Directory(p) => Path::new(url_path).starts_with(p),
@@ -792,8 +816,12 @@ fn parse_block(
                         }
                         let (branch, chain, condition) = if name == "if" || name == "iffile" {
                             let expression = if name == "if" {
-                                crate::expr::parse(&args.join(" "))
-                                    .map_err(|e| format!("line {}: {e}", *i))?
+                                let parsed = crate::expr::parse(&args.join(" "))
+                                    .map_err(|e| format!("line {}: {e}", *i))?;
+                                // F63/I63: unknown variables fail closed.
+                                crate::expr::validate_vars(&parsed)
+                                    .map_err(|e| format!("line {}: {e}", *i))?;
+                                parsed
                             } else {
                                 // SectionStart.args excludes the <IfFile> tag
                                 // itself, so the operator path is the first
@@ -816,6 +844,9 @@ fn parse_block(
                             };
                             if name == "elseif" {
                                 let expression = crate::expr::parse(&args.join(" "))
+                                    .map_err(|e| format!("line {}: {e}", *i))?;
+                                // F63/I63: unknown variables fail closed.
+                                crate::expr::validate_vars(&expression)
                                     .map_err(|e| format!("line {}: {e}", *i))?;
                                 (ConditionBranch::ElseIf, Some(chain), Some(expression))
                             } else {
@@ -1748,10 +1779,9 @@ fn apply_directive(
                     ));
             }
         }
-        "sethandler" => scope
-            .mapping_policy
-            .handlers
-            .push(crate::config::Handler::add("*".into(), first.to_string())),
+        "sethandler" => {
+            scope.mapping_policy.set_handler = Some(crate::config::SetHandler::parse(first));
+        }
         "forcetype" => scope.content_policy.force_type = Some(first.to_string()),
         "adddefaultcharset" => {
             if !first.eq_ignore_ascii_case("off") {

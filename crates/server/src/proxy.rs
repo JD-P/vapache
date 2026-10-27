@@ -1617,11 +1617,29 @@ fn authorize_failover(
         url_path,
     );
     let mut identity = None;
-    let mut access = crate::access::check(&next_scope, req, peer.ip(), None, url_path);
+    // F63/I63: a proxied request has no filesystem target of its own; the
+    // resource key's fs_path (the URL-mapped source path) is bound when the
+    // dispatcher had one, and absent otherwise — unbound filesystem
+    // variables then fail closed in the evaluator.
+    let mut access = crate::access::check(
+        &next_scope,
+        req,
+        peer.ip(),
+        None,
+        url_path,
+        resource.fs_path.as_deref(),
+    );
     if access == crate::access::Access::AuthRequired {
         if let Some(id) = crate::auth::authenticate(&next_scope, req) {
             identity = Some(id);
-            access = crate::access::check(&next_scope, req, peer.ip(), identity.as_ref(), url_path);
+            access = crate::access::check(
+                &next_scope,
+                req,
+                peer.ip(),
+                identity.as_ref(),
+                url_path,
+                resource.fs_path.as_deref(),
+            );
         }
     }
     if access != crate::access::Access::Allowed {
@@ -2833,7 +2851,7 @@ mod more_tests {
             "/bal/x",
         );
         assert_eq!(
-            crate::access::check(&matched, &req, peer.ip(), None, "/bal/x"),
+            crate::access::check(&matched, &req, peer.ip(), None, "/bal/x", None),
             crate::access::Access::Denied,
             "concrete balancer member identity must participate in <Proxy> matching"
         );

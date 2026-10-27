@@ -142,6 +142,18 @@ pub fn effective_scope_with_layers(
                 }
             }
             crate::verified::AccessStep::DirectoryMatch => {
+                // F61-C: the file's own path is the final walked entry of the
+                // Directory phase; apply wildcard `<Directory>` sections that
+                // match it before the `<DirectoryMatch>` step.
+                cfg.apply_directory_own_path_rules(
+                    vhost,
+                    &mut scope,
+                    fs_path,
+                    url_path,
+                    &mut config_files,
+                    &mut config_locations,
+                    &mut config_conditionals,
+                );
                 cfg.apply_directory_match_rules(
                     vhost,
                     &mut scope,
