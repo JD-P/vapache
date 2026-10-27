@@ -345,9 +345,24 @@ pub fn collect_layers(
     collect_layers_with_root(cfg, vhost, fs_path, url_path, None)
 }
 
+/// The lexical URL-mapped counterpart of a target directory when the mapping
+/// root itself contains a symlink.  This is used only to inherit the
+/// `AllowOverride` policy attached to the URL-mapped `<Directory>`; access
+/// files are still read from the explicit target's own canonical directories
+/// (F59/I60).
+fn mapped_policy_dir(root: &Path, canonical_root: Option<&Path>, dir: &Path) -> Option<PathBuf> {
+    if dir.starts_with(root) {
+        return Some(dir.to_path_buf());
+    }
+    let canonical_root = canonical_root?;
+    let rel = dir.strip_prefix(canonical_root).ok()?;
+    Some(root.join(rel))
+}
+
 /// Collect access-file layers using the actual alias/mapping root selected by
 /// `map_path()` for URL-base derivation.  The ancestor walk itself is not
-/// bounded by that root (F50/F51).
+/// bounded by that root (F50/F51) or by the lexical spelling of a symlinked
+/// root (F59): layer files are always read from `fs_path`'s ancestors.
 pub fn collect_layers_with_root(
     cfg: &Config,
     vhost: Option<&VHost>,
@@ -355,9 +370,6 @@ pub fn collect_layers_with_root(
     url_path: &str,
     mapping_root: Option<&Path>,
 ) -> Result<Vec<crate::policy_ref::AccessLayer>, String> {
-    if !cfg.htaccess_may_apply(fs_path) {
-        return Ok(Vec::new());
-    }
     let root = match mapping_root {
         Some(root) => {
             // Callers pass the root returned by `map_path()` for the URL that
@@ -367,20 +379,42 @@ pub fn collect_layers_with_root(
         }
         None => access_root_for(cfg, vhost, fs_path),
     };
+    let canonical_root = if fs_path.starts_with(&root) {
+        None
+    } else {
+        fs::canonicalize(&root).ok()
+    };
+    if !cfg.htaccess_may_apply(fs_path)
+        && !mapped_policy_dir(&root, canonical_root.as_deref(), fs_path)
+            .is_some_and(|mapped| cfg.htaccess_may_apply(&mapped))
+    {
+        return Ok(Vec::new());
+    }
     let start = walk_start(fs_path);
     let dirs = ancestor_dirs(start);
     let mut layers = Vec::new();
     for dir in dirs {
         // Ancestors above every override-enabled directory cannot contribute
         // an accessible layer (F50 still covers an enabled ancestor itself).
-        if !cfg.access_file_dir_applicable(&dir) {
+        let mapped_dir = mapped_policy_dir(&root, canonical_root.as_deref(), &dir);
+        let policy_applicable = cfg.access_file_dir_applicable(&dir)
+            || mapped_dir
+                .as_deref()
+                .is_some_and(|mapped| mapped != dir && cfg.access_file_dir_applicable(mapped));
+        if !policy_applicable {
             continue;
         }
         let is_dir = crate::files::is_dir_cached(&dir);
         if !is_dir {
             continue;
         }
-        let dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
+        let mut dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
+        if let Some(mapped) = mapped_dir.as_deref().filter(|mapped| *mapped != dir) {
+            let mapped_scope = cfg.effective_scope_cached(vhost, mapped, url_path);
+            if mapped_scope.override_policy.is_enabled() {
+                dir_scope = mapped_scope;
+            }
+        }
         let mode = dir_scope.override_policy.mode();
         let allow_list = dir_scope.override_policy.allow_list();
         let nonfatal = dir_scope.override_policy.nonfatal();
@@ -466,13 +500,21 @@ pub fn trace_access_files_with_root(
     mapping_root: Option<&Path>,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    if !cfg.htaccess_may_apply(fs_path) {
-        out.push("skipped (no override-enabled directory in path)".into());
-        return out;
-    }
     let root = mapping_root
         .map(Path::to_path_buf)
         .unwrap_or_else(|| access_root_for(cfg, vhost, fs_path));
+    let canonical_root = if fs_path.starts_with(&root) {
+        None
+    } else {
+        fs::canonicalize(&root).ok()
+    };
+    if !cfg.htaccess_may_apply(fs_path)
+        && !mapped_policy_dir(&root, canonical_root.as_deref(), fs_path)
+            .is_some_and(|mapped| cfg.htaccess_may_apply(&mapped))
+    {
+        out.push("skipped (no override-enabled directory in path)".into());
+        return out;
+    }
     let start = walk_start(fs_path);
     let dirs = ancestor_dirs(start);
     let mut found = false;
@@ -480,7 +522,21 @@ pub fn trace_access_files_with_root(
         if !dir.is_dir() {
             continue;
         }
-        let dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
+        let mapped_dir = mapped_policy_dir(&root, canonical_root.as_deref(), &dir);
+        let policy_applicable = cfg.access_file_dir_applicable(&dir)
+            || mapped_dir
+                .as_deref()
+                .is_some_and(|mapped| mapped != dir && cfg.access_file_dir_applicable(mapped));
+        if !policy_applicable {
+            continue;
+        }
+        let mut dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
+        if let Some(mapped) = mapped_dir.as_deref().filter(|mapped| *mapped != dir) {
+            let mapped_scope = cfg.effective_scope_cached(vhost, mapped, url_path);
+            if mapped_scope.override_policy.is_enabled() {
+                dir_scope = mapped_scope;
+            }
+        }
         let mode = dir_scope.override_policy.mode();
         let allow_list = dir_scope.override_policy.allow_list();
         let nonfatal = dir_scope.override_policy.nonfatal();
@@ -3378,6 +3434,39 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn symlinked_mapping_root_trace_uses_canonical_target_layers() {
+        let dir = tempdir("coverage-walk-symlink");
+        let real = dir.join("real/public");
+        let admin = real.join("admin");
+        fs::create_dir_all(&admin).unwrap();
+        fs::create_dir_all(dir.join("www")).unwrap();
+        let root = dir.join("www/html");
+        std::os::unix::fs::symlink(&real, &root).unwrap();
+        fs::write(admin.join(".htaccess"), "Options -ExecCGI\n").unwrap();
+        fs::write(admin.join("run.cgi"), "#!/bin/sh\n").unwrap();
+        let cfg = config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:0\nDocumentRoot \"{}\"\n<Directory \"{}\">\nAllowOverride All\n</Directory>\n",
+                root.display(),
+                root.display()
+            ),
+        );
+        let canonical = dir.join("real/public/admin/run.cgi");
+        let trace =
+            trace_access_files_with_root(&cfg, None, &canonical, "/admin/run.cgi", Some(&root))
+                .join("\n");
+        assert!(trace.contains(&admin.join(".htaccess").display().to_string()));
+        let layers =
+            collect_layers_with_root(&cfg, None, &canonical, "/admin/run.cgi", Some(&root))
+                .unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].identity.dir, admin);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

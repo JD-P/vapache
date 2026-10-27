@@ -1152,6 +1152,31 @@ rounds build a new plan from the rewritten canonical URL, and that plan is the
 input to the next scope evaluation.  `--explain` prints the plan’s canonical
 path, mapping, layer directories, URL mounts and filesystem subjects.
 
+### I60 — Explicit-target access-layer binding
+
+```text
+for every RequestPlan built from an explicit target T:
+  layer_walk_root == T
+  for every collected layer L: T == L.dir or T is beneath L.dir
+  mapping_root may differ from T only as a URL/RewriteBase label
+  nonempty RequestPlan.layers are always consumed by scope evaluation
+  mapping_root containing a symlink must not fabricate root.join(file_name)
+fail closed if the layer set does not belong to T
+```
+
+The initial URL-mapped plan and a later canonical-target plan have two path
+identities.  A plan built from an explicit target must derive its access-file
+walk, layer identities and scope evaluation from that same target; the
+mapping root is allowed to differ because it names the URL mount (and may be a
+symlink such as a release `current` link).  A failed `strip_prefix(root, T)`
+is not evidence that `T` has no access files: the walk uses `T`'s real
+ancestors, inheriting `AllowOverride` policy from the corresponding lexical
+mapping directory when the root itself is symlinked.  `from_fs_target`,
+`build_with_fs_path`, `evaluate_scope` and the `cache`/`DirectoryIndex`
+target paths consume `explicit_target_layer_admit` and
+`target_layer_consume_admit`; a nonempty layer set is never silently replaced
+by the configuration-only scope (F59).
+
 ### I51 — Cache key byte identity
 
 ```text
@@ -1305,7 +1330,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **266 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **268 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1396,6 +1421,14 @@ construction: there is no second production interleaver.
   round; dispatch, cache, rewrite contexts and `--explain` consume it (I59),
   and `LayerIdentity` plus the shared subject/URL-mount functions replace the
   duplicate layer arithmetic in `config.rs`, `htaccess.rs` and `rewrite.rs`.
+- `explicit_target_layer_admit` and `target_layer_consume_admit`.  These are
+  the pass-9 kernels for explicit-target access-layer binding (I60).
+  `RequestPlan::from_fs_target`/`build_with_fs_path` walk the supplied target
+  itself and fail closed if a collected layer is not its ancestor;
+  `RequestPlan::evaluate_scope` always consumes a nonempty layer set even
+  when the canonical target is outside the lexical `AllowOverride` prefix.
+  Unit plus F59 symlinked-document-root/alias, `DirectoryIndex` and autoindex
+  replays exercise both predicates.
 - `cache_key_hex_spec_injective`, `cache_lookup_hit_requires_binding`,
   `cache_lookup_rejects_stale`, `cache_store_request_admit`,
   `cache_store_status_admit`, `cache_store_control_admit`,

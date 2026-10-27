@@ -1038,6 +1038,34 @@ pub fn htaccess_rewrite_subject_admit(
     !filesystem_subject_required || filesystem_subject_available
 }
 
+/// F59/I60: an explicit-target plan must collect access-file layers by walking
+/// that same explicit target.  Every collected layer directory must be the
+/// target itself or one of its ancestors, so a lexical mapping root (which may
+/// contain a symlink) can never fabricate a different layer path.
+pub fn explicit_target_layer_admit(
+    explicit_target: bool,
+    layer_walk_uses_explicit_target: bool,
+    layers_match_target_ancestors: bool,
+) -> (ok: bool)
+    ensures
+        ok == (!explicit_target
+            || (layer_walk_uses_explicit_target && layers_match_target_ancestors)),
+{
+    !explicit_target || (layer_walk_uses_explicit_target && layers_match_target_ancestors)
+}
+
+/// F59/I60: a plan carrying access-file layers must consume them during scope
+/// evaluation.  The configuration-only path is admissible only when neither
+/// the target's lexical override prefix applies nor any layer was collected.
+pub fn target_layer_consume_admit(
+    override_may_apply: bool,
+    has_access_layers: bool,
+) -> (ok: bool)
+    ensures ok == (override_may_apply || has_access_layers),
+{
+    override_may_apply || has_access_layers
+}
+
 /// F54/I53: every non-default handler (`SetHandler proxy:`, `server-status`,
 /// CGI, FastCGI, future handlers) is dynamic for cache-query purposes.  When
 /// a dynamic handler is present, `CacheIgnoreQueryString` must bypass the

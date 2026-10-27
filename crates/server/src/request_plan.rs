@@ -224,7 +224,18 @@ impl RequestPlan {
         let rel = fs_path
             .strip_prefix(&root)
             .map(Path::to_path_buf)
-            .unwrap_or_else(|_| {
+            .ok()
+            .or_else(|| {
+                // A symlinked mapping root has a lexical spelling that does
+                // not prefix the canonical target.  Recover the URL-relative
+                // identity from the root's canonical form.
+                let canonical_root = std::fs::canonicalize(&root).ok()?;
+                fs_path
+                    .strip_prefix(canonical_root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .unwrap_or_else(|| {
                 PathBuf::from(
                     fs_path
                         .file_name()
@@ -232,9 +243,7 @@ impl RequestPlan {
                         .unwrap_or_default(),
                 )
             });
-        let mut plan = Self::build(cfg, vhost, target, root, rel, script_alias)?;
-        plan.fs_path = fs_path;
-        Ok(plan)
+        Self::build_with_fs_path(cfg, vhost, target, root, rel, fs_path, script_alias)
     }
 
     fn build(
@@ -246,18 +255,41 @@ impl RequestPlan {
         script_alias: bool,
     ) -> Result<Self, PlanError> {
         let fs_path = root.join(&rel);
-        let layers = if cfg.htaccess_may_apply(&fs_path) {
-            crate::htaccess::collect_layers_with_root(
-                cfg,
-                vhost,
-                &fs_path,
-                &target.url_path,
-                Some(&root),
-            )
-            .map_err(PlanError::AccessFiles)?
-        } else {
-            Vec::new()
-        };
+        Self::build_with_fs_path(cfg, vhost, target, root, rel, fs_path, script_alias)
+    }
+
+    /// Build a plan around one explicit filesystem target.  The target path,
+    /// the access-file walk and every layer identity must come from this same
+    /// path: the mapping root is only the URL/`RewriteBase` label and may be a
+    /// symlink whose canonical target is outside the lexical root (F59/I60).
+    fn build_with_fs_path(
+        cfg: &Config,
+        vhost: Option<&VHost>,
+        target: CanonicalTarget,
+        root: PathBuf,
+        rel: PathBuf,
+        fs_path: PathBuf,
+        script_alias: bool,
+    ) -> Result<Self, PlanError> {
+        let layers = crate::htaccess::collect_layers_with_root(
+            cfg,
+            vhost,
+            &fs_path,
+            &target.url_path,
+            Some(&root),
+        )
+        .map_err(PlanError::AccessFiles)?;
+        let layers_match_target = layers
+            .iter()
+            .all(|layer| fs_path.starts_with(&layer.identity.dir));
+        if !vapache_verified::explicit_target_layer_admit(true, true, layers_match_target) {
+            // coverage:ignore-start
+            return Err(PlanError::AccessFiles(format!(
+                "{}: access layers do not belong to the explicit target",
+                fs_path.display()
+            )));
+            // coverage:ignore-stop
+        }
         Ok(Self {
             target,
             root,
@@ -306,7 +338,14 @@ impl RequestPlan {
         req: &Request,
         peer: std::net::IpAddr,
     ) -> EvaluatedScope {
-        if cfg.htaccess_may_apply(&self.fs_path) {
+        // A nonempty layer set already proves that access files apply.  Never
+        // fall back to the configuration-only path merely because the target
+        // path is outside the lexical `AllowOverride` prefix (F59/I60).
+        let use_layers = vapache_verified::target_layer_consume_admit(
+            cfg.htaccess_may_apply(&self.fs_path),
+            !self.layers.is_empty(),
+        );
+        if use_layers {
             let (scope, config_conditionals, access_conditionals) =
                 crate::policy_ref::effective_scope_with_layers(
                     cfg,
@@ -522,24 +561,80 @@ mod tests {
     }
 
     #[test]
-    fn fs_target_outside_mapping_root_keeps_explicit_path() {
-        let cfg = load_config("Listen 127.0.0.1:0\n");
-        let target = CanonicalTarget::from_url_path("/x").unwrap();
-        let plan = RequestPlan::from_fs_target(
+    fn fs_target_outside_mapping_root_reads_explicit_target_layers() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("vapache-plan-f59-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real").join("public");
+        let admin = real.join("admin");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::create_dir_all(base.join("www")).unwrap();
+        let root = base.join("www").join("html");
+        symlink(&real, &root).unwrap();
+        std::fs::write(admin.join(".htaccess"), "Options -ExecCGI\n").unwrap();
+        std::fs::write(admin.join("sh.cgi"), "#!/bin/sh\n").unwrap();
+        let cfg = load_config(&format!(
+            "Listen 127.0.0.1:0\n\
+             Options +ExecCGI\n\
+             <Directory \"{}\">\n\
+                 AllowOverride All\n\
+                 Require all granted\n\
+             </Directory>\n",
+            root.display()
+        ));
+        let fs_path = std::fs::canonicalize(admin.join("sh.cgi")).unwrap();
+        let target = CanonicalTarget::from_url_path("/admin/sh.cgi").unwrap();
+        let plan =
+            RequestPlan::from_fs_target(&cfg, None, target, root.clone(), fs_path.clone(), false)
+                .unwrap();
+        assert_eq!(plan.fs_path(), fs_path);
+        assert_eq!(plan.rel(), Path::new("admin/sh.cgi"));
+        assert_eq!(
+            plan.layers()
+                .iter()
+                .map(|layer| layer.identity.dir.clone())
+                .collect::<Vec<_>>(),
+            vec![admin.clone()]
+        );
+        // The canonical target is outside the lexical <Directory> prefix, so
+        // the old fast path would have discarded the layer entirely.
+        assert!(!cfg.htaccess_may_apply(plan.fs_path()));
+        let req = crate::http::Request {
+            method: "GET".into(),
+            target: b"/admin/sh.cgi".to_vec(),
+            raw_path: b"/admin/sh.cgi".to_vec(),
+            query: Vec::new(),
+            version: crate::http::Version::Http11,
+            headers: crate::http::Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        };
+        let scope = plan.effective_scope(
             &cfg,
             None,
-            target,
-            PathBuf::from("/srv/www"),
-            PathBuf::from("/tmp/vapache-plan-outside/file.txt"),
+            &req,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        );
+        assert!(!scope
+            .effective_options()
+            .contains(crate::config::Options::EXEC_CGI));
+
+        // A target outside both the lexical and canonical root keeps the
+        // basename fallback instead of fabricating a relative path.
+        let basename_plan = RequestPlan::from_fs_target(
+            &cfg,
+            None,
+            CanonicalTarget::from_url_path("/admin/sh.cgi").unwrap(),
+            base.join("absent-root"),
+            fs_path.clone(),
             false,
         )
         .unwrap();
-        assert_eq!(
-            plan.fs_path(),
-            Path::new("/tmp/vapache-plan-outside/file.txt")
-        );
-        assert_eq!(plan.rel(), Path::new("file.txt"));
-        assert!(plan.layers().is_empty());
+        assert_eq!(basename_plan.rel(), Path::new("sh.cgi"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

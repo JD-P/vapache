@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-10-26",
   "verus": {
-    "verified_functions": 266,
+    "verified_functions": 268,
     "errors": 0
   },
   "obligations": [
@@ -298,7 +298,7 @@
       "title": "One immutable request plan for dispatch, cache, rewrite and explain",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "RequestPlan is built once per request or rewrite round from CanonicalTarget and map_path, collects the access-file layers once, and exposes canonical URL path, mapping root, relative/fs paths, script-alias state and layers. dispatch_inner_request passes the same plan to cache lookup/store and dispatch; cache no longer re-decodes raw_path or rebuilds mapping; rewrite::Context::for_plan consumes plan identity; --explain prints the plan's canonical path, mapping, layer directories, URL mounts and subjects. Integration coverage exercises cache hits, rewrite rounds, CGI PATH_INFO, DirectoryIndex and explain; the universal refinement theorem remains open"
+      "evidence": "RequestPlan is built once per request or rewrite round from CanonicalTarget and map_path, collects the access-file layers once, and exposes canonical URL path, mapping root, relative/fs paths, script-alias state and layers. dispatch_inner_request passes the same plan to cache lookup/store and dispatch; cache no longer re-decodes raw_path or rebuilds mapping; rewrite::Context::for_plan consumes plan identity; --explain prints the plan's canonical path, mapping, layer directories, URL mounts and subjects. Explicit-target plans walk the supplied fs_path itself (never root.join(file_name)), inherit AllowOverride policy from the lexically mapped directory when the root is a symlink, always consume a nonempty layer set, and fail closed when a layer does not belong to the target (explicit_target_layer_admit and target_layer_consume_admit, I60). Integration coverage exercises cache hits, rewrite rounds, CGI PATH_INFO, DirectoryIndex, explain and the F59 symlinked-root regressions; the universal refinement theorem remains open"
     },
     {
       "id": "htaccess_rewrite_subject_base",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end regressions for the pass-2 through pass-8 findings (F23-F58).
+"""End-to-end regressions for the pass-2 through pass-9 findings (F23-F59).
 
 The suite starts fresh vapached instances in temporary trees and exercises
 the exploit shapes from findings.md: terminal rewrite/proxy authorization,
@@ -11,8 +11,9 @@ entries, .htaccess RequestHeader, CGI REMOTE_USER/AUTH_TYPE, multi-provider
 IPv4-mapped peer canonicalization, ancestor access files above DocumentRoot,
 overlapping alias roots, DirectoryIndex-bound cache targets, alias per-directory
 rewrite bases, SetHandler/server-status cache classification, lossless cache
-key bytes, ErrorDocument cache scoping, canonical REQUEST_URI identity, and
-access-file rewrite subjects above the mapping root.
+key bytes, ErrorDocument cache scoping, canonical REQUEST_URI identity,
+access-file rewrite subjects above the mapping root, and explicit-target
+access-layer binding for symlinked mapping roots.
 
 Usage:
     cargo build --release -p vapached
@@ -1774,6 +1775,126 @@ Alias /storage "{cls.storage_app}"
             "/storage/private/wallet.dat",
         ):
             self.assert_not_served(path)
+
+
+class F59ExplicitTargetAccessLayerTests(unittest.TestCase):
+    """A symlinked mapping root must keep child .htaccess on target reauth."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f59-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.real = cls.base / "real" / "public"
+        cls.root = cls.base / "www" / "html"
+        cls.alias_real = cls.base / "alias-real" / "public"
+        cls.alias_link = cls.base / "alias-link"
+        cls.cache = cls.base / "cache"
+        cls.logs = cls.base / "logs"
+        for directory in (
+            cls.real / "admin",
+            cls.real / "list",
+            cls.real / "cached",
+            cls.alias_real / "admin",
+            cls.base / "www",
+            cls.cache,
+            cls.logs,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        cls.root.symlink_to(cls.real, target_is_directory=True)
+        cls.alias_link.symlink_to(cls.alias_real, target_is_directory=True)
+
+        script = (
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'WALLET-F59-%s\\n'\n"
+        )
+        # The hardening policy Apache enforces and the target scope used to
+        # discard when the mapping root contained a symlink.
+        (cls.real / "admin" / ".htaccess").write_text("Options -ExecCGI\n")
+        (cls.real / "admin" / "run.cgi").write_text(script % "CGI")
+        (cls.real / "admin" / "run.cgi").chmod(0o755)
+        (cls.real / "admin" / "index.cgi").write_text(script % "DIRINDEX")
+        (cls.real / "admin" / "index.cgi").chmod(0o755)
+        (cls.real / "list" / ".htaccess").write_text("Options -Indexes\n")
+        (cls.real / "list" / "wallet.dat").write_text("WALLET-F59-LIST-SECRET\n")
+        (cls.real / "cached" / ".htaccess").write_text("Options -ExecCGI\n")
+        (cls.real / "cached" / "index.cgi").write_text(script % "CACHE-INDEX")
+        (cls.real / "cached" / "index.cgi").chmod(0o755)
+        (cls.alias_real / "admin" / ".htaccess").write_text(
+            "Options -ExecCGI\n"
+        )
+        (cls.alias_real / "admin" / "run.cgi").write_text(script % "ALIAS-CGI")
+        (cls.alias_real / "admin" / "run.cgi").chmod(0o755)
+
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.root}"
+Options +ExecCGI +FollowSymLinks +Indexes
+CacheRoot "{cls.cache}"
+CacheEnable disk /
+CacheIgnoreNoLastMod On
+CacheHeader On
+CacheDefaultExpire 3600
+CacheMaxExpire 3600
+AddHandler cgi-script .cgi
+DirectoryIndex index.html index.cgi
+<Directory "{cls.root}">
+    AllowOverride All
+    Require all granted
+</Directory>
+<Directory "{cls.alias_link}">
+    AllowOverride All
+    Require all granted
+</Directory>
+Alias /aliased "{cls.alias_link}"
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def assert_not_executed(self, path: str, marker: bytes):
+        status, headers, body = request(self.port, path)
+        self.assertEqual(status, 403, f"{path}: {body[:200]}")
+        self.assertNotIn(marker, body, path)
+        self.assertNotEqual(headers.get("X-Cache"), "HIT", path)
+
+    def test_symlinked_document_root_honors_child_exec_cgi(self):
+        # Apache 2.4.69 returns 403 for this shape; the old target plan
+        # re-read layers from root.join(file_name) and lost the child policy.
+        self.assert_not_executed("/admin/run.cgi", b"WALLET-F59-CGI")
+
+    def test_directory_index_cgi_and_direct_index(self):
+        for path, marker in (
+            ("/admin/", b"WALLET-F59-DIRINDEX"),
+            ("/admin/index.cgi", b"WALLET-F59-DIRINDEX"),
+        ):
+            self.assert_not_executed(path, marker)
+
+    def test_symlinked_cache_index_keeps_child_policy(self):
+        status, headers, body = request(self.port, "/cached/")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"WALLET-F59-CACHE-INDEX", body)
+        self.assertNotEqual(headers.get("X-Cache"), "HIT")
+
+    def test_options_indexes_is_not_lost_for_symlinked_root(self):
+        status, _, body = request(self.port, "/list/")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"WALLET-F59-LIST-SECRET", body)
+
+    def test_symlinked_alias_root_keeps_child_policy(self):
+        self.assert_not_executed("/aliased/admin/run.cgi", b"WALLET-F59-ALIAS-CGI")
 
 
 class F54SetHandlerCacheTests(unittest.TestCase):
