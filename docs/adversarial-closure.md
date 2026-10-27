@@ -2,7 +2,7 @@
 
 This document records how the `findings.md` adversarial pass is reflected in
 the implementation and the security model.  The numbered findings are the
-source of the regression classes; the invariants (`I9`–`I53` in
+source of the regression classes; the invariants (`I9`–`I59` in
 `docs/config-semantics.md`) are the properties that prevent the class from
 returning through a different directive or dispatch path.
 
@@ -59,10 +59,12 @@ returning through a different directive or dispatch path.
 | F50 | The access-file walk stopped at `DocumentRoot`/the alias target and ignored an effective ancestor `.htaccess` | The walk covers every filesystem ancestor and asks the effective per-directory `AllowOverride` policy whether that layer participates; the mapping root is used only for URL/`RewriteBase` derivation (`access_walk_dir_admit`) | I47 |
 | F51 | Overlapping aliases selected the first alias target containing the path instead of the URL-selected alias | `map_path()` returns the actual URL-mapping root and dispatch/cache/explain pass it through to the access walk; alias-target containment is never used to reconstruct the root (`alias_mapping_root_admit`) | I48 |
 | F52 | Cache lookup/store used the directory URL instead of the selected `DirectoryIndex` target | `DirectoryIndex` is resolved before the cache decision; the cache key, target, grant and policy fingerprint bind that index. Dynamic index/script responses bypass `CacheIgnoreQueryString`, and a live `<Files>` change is visible in the recomputed index policy (`cache_directory_index_bind_admit`, `cache_ignore_query_admit`) | I49 |
-| F53 | `.htaccess` anchored rules under an `Alias`/`AliasMatch`/`ScriptAlias` used the alias target-relative path, not the URL mount, so `[F]`/`[G]` deny rules were skipped | `dir_url_base()` derives every layer's match base from the requested URL and the layer's depth below the requested target; prefix/regex aliases, nested access files, `RewriteBase`, static files, CGI and `[F]`/`[G]`/`[E]`/`[R]` effects share the same base (`htaccess_layer_url_base_admit`) | I50 |
+| F53 | `.htaccess` anchored rules under an `Alias`/`AliasMatch`/`ScriptAlias` used the alias target-relative path, not the URL mount, so `[F]`/`[G]` deny rules were skipped | `request_plan::layer_url_mount()` derives every layer's substitution base from the requested URL and the layer's depth below the requested target; prefix/regex aliases, nested access files, `RewriteBase`, static files, CGI and `[F]`/`[G]`/`[E]`/`[R]` effects share the same identity (`htaccess_layer_url_base_admit`) | I50 |
 | F54 | The `CacheIgnoreQueryString` dynamic-target classifier missed `SetHandler "proxy:…\|fcgi://…"` and other non-default handlers | The cache classifies the effective handler after `DirectoryIndex` resolution; any non-default handler (FastCGI proxy, `cgi-script`, `server-status`, future handlers) forces a cache bypass for query-bearing requests (`cache_dynamic_handler_admit`) | I49, I53 |
 | F55 | Lossy UTF-8 conversion in cache-key material merged invalid-byte queries/paths with the empty or replacement value | Server root, host, path, raw query and resolved target are hex encoded losslessly; non-UTF-8 URL paths bypass the shared cache, invalid index names are rejected, and invalidation uses the same encoding (`cache_key_hex`) | I51 |
 | F56 | A local `ErrorDocument` is an internal subrequest selected after the original URL's cache scope was built, so a query-dependent error document could be cached under the missing URL | A missing target whose scope can select a local `ErrorDocument` bypasses lookup, and an error-document response is never stored under the failing URL via a response-provenance marker; existing targets keep normal caching and the internal subrequest still runs normal authorization and handler dispatch (`cache_local_error_document_admit`) | I52 |
+| F57 | `%{REQUEST_URI}` used the raw request-line target, including the query, percent escapes and dot segments, so expression/rewrite/environment path policies authorized different bytes than dispatch served | Every `%{REQUEST_URI}` implementation receives the dispatcher's decoded, normalized, query-free URL path: expression variables/functions, `Require expr`, `<If>`, `SetEnvIf Request_URI`, `RewriteCond`/rule expansion and CGI environment. `expr::Context::new` consumes `request_uri_identity_admit`; no path appends the query string | I57 |
+| F58 | Access-file rewrite rules above the alias/document-root mapping root had an impossible URL match base, so anchored `[F]`/`[G]` deny rules were silently skipped | Every parsed access-file rule carries its layer directory; `request_plan::layer_subject()` matches the selected filesystem target relative to that directory, exactly Apache's per-directory subject. `htaccess_rewrite_subject_admit` requires a derivable subject or fails closed. `request_plan::layer_url_mount()` is used only for relative substitutions and uses the filesystem-directory form for ancestor layers instead of an unmatchable URL fallback | I58, I59 |
 | Additional | `Require not valid-user` dropped negation; non-HTTP control bytes passed header serialization; `close, keep-alive` re-enabled a connection; mmap allowed other-owner write races | Negation is carried into `Require::ValidUser`; header values admit only HTAB/SP/VCHAR/obs-text; `close` is sticky; mmap requires no owner/group/other write bits | I23, I33-adjacent |
 
 ## Additional hardening before the next pass
@@ -152,7 +154,7 @@ The closure is exercised by:
 - `tests/conformance.py`, `tests/config_semantics.py`,
   `tests/config_validity.py` and `tests/config_grammar.py`;
 - `tests/adversarial_regressions.py`, which starts fresh servers and replays
-  the F23–F52 exploit shapes (rewrite-to-proxy/redirect authorization, cache
+  the F23–F58 exploit shapes (rewrite-to-proxy/redirect authorization, cache
   reload plus PATH_INFO, relative and capture-only aliases, autoindex schemes,
   negated/env providers, `IndexIgnore`, `DirectorySlash Off`,
   `UnsafePrefixStat` re-rooting, header-selected cache entries,
@@ -161,14 +163,16 @@ The closure is exercised by:
   capture-only `AliasMatch`, expression file-test confinement,
   multi-provider `<RequireNone>`, regex alias file targets, address-bound
   vhosts, IPv4-mapped peers, ancestor `.htaccess` above `DocumentRoot`/an alias
-  target, overlapping `Alias`/`ScriptAlias`/`AliasMatch` roots, and
-  `DirectoryIndex` cache-target/query/live-policy changes);
+  target, overlapping `Alias`/`ScriptAlias`/`AliasMatch` roots,
+  `DirectoryIndex` cache-target/query/live-policy changes, canonical
+  `REQUEST_URI` query/encoding/dot-segment policies, and document-root/ancestor
+  rewrite subjects for alias and alias-match targets);
 - operator replay harnesses that reproduce the Apache-versus-vapached
   differentials in `findings.md`.
 
 Any new directive that changes a request-to-resource mapping, cache key,
 handler selection, authorization identity or inherited descriptor must state
-which of I9–I49 it preserves.  A directive that is recognized but not
+which of I9–I59 it preserves.  A directive that is recognized but not
 implemented is not allowed to pass as “inert” unless that inertness is
 explicit and local to the directive; request-mutating directives such as
 `RequestHeader` are never inert.

@@ -420,7 +420,9 @@ fn next_balancer_member(
                 && (!active || member_is_healthy(&balancer.name, &m.url))
                 && !is_dead(&balancer.name, &m.url)
                 && !is_excluded(m)
-        }) { return parse_http_url(&member.url); }
+        }) {
+            return parse_http_url(&member.url);
+        }
     }
     let mut viable: Vec<&BalancerMember> = balancer.members.iter().filter(available).collect();
     if viable.is_empty() {
@@ -528,13 +530,21 @@ pub fn balancer_unavailable(cfg: &Config, scope: &Scope, url_path: &str) -> bool
         if prefix_suffix(&rule.prefix, url_path).is_none() {
             continue;
         }
-        if rule.backend.trim_start().starts_with("balancer://") && resolve_backend(cfg, &rule.backend, "", None, None).is_none() { return true; }
+        if rule.backend.trim_start().starts_with("balancer://")
+            && resolve_backend(cfg, &rule.backend, "", None, None).is_none()
+        {
+            return true;
+        }
     }
     for rule in &scope.proxy_policy.proxy_rules {
         if !rule.pattern.is_match(url_path) {
             continue;
         }
-        if rule.backend.trim_start().starts_with("balancer://") && resolve_backend(cfg, &rule.backend, "", None, None).is_none() { return true; }
+        if rule.backend.trim_start().starts_with("balancer://")
+            && resolve_backend(cfg, &rule.backend, "", None, None).is_none()
+        {
+            return true;
+        }
     }
     false
 }
@@ -1527,7 +1537,12 @@ fn proxy_once(
             Read::by_ref(&mut reader)
                 .take(MAX_PROXY_BODY as u64 + 1)
                 .read_to_end(&mut body)?;
-            if body.len() > MAX_PROXY_BODY { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "proxy body too large")); }
+            if body.len() > MAX_PROXY_BODY {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "proxy body too large",
+                ));
+            }
         }
     }
     let mut response = Response::new(status);
@@ -1593,13 +1608,20 @@ fn authorize_failover(
     if let Some(logical) = target.logical_url.as_deref() {
         proxy_urls.push(logical);
     }
-    cfg.apply_proxy_access_urls(vhost, &mut next_scope, &proxy_urls, req, peer.ip());
+    cfg.apply_proxy_access_urls(
+        vhost,
+        &mut next_scope,
+        &proxy_urls,
+        req,
+        peer.ip(),
+        url_path,
+    );
     let mut identity = None;
-    let mut access = crate::access::check(&next_scope, req, peer.ip(), None);
+    let mut access = crate::access::check(&next_scope, req, peer.ip(), None, url_path);
     if access == crate::access::Access::AuthRequired {
         if let Some(id) = crate::auth::authenticate(&next_scope, req) {
             identity = Some(id);
-            access = crate::access::check(&next_scope, req, peer.ip(), identity.as_ref());
+            access = crate::access::check(&next_scope, req, peer.ip(), identity.as_ref(), url_path);
         }
     }
     if access != crate::access::Access::Allowed {
@@ -1618,7 +1640,10 @@ fn authorize_failover(
     let bound = grant.bind_backend(&next_resource, binding.clone())?;
     let mut expected = next_resource;
     expected.backend_target = Some(binding);
-    debug_assert!(bound.require(&expected), "failover grant does not cover bound backend");
+    debug_assert!(
+        bound.require(&expected),
+        "failover grant does not cover bound backend"
+    );
     Some((next_scope, bound, expected))
 }
 
@@ -1725,18 +1750,20 @@ pub fn execute(
                         resource,
                     ) {
                         Some(v) => v,
-                        None => return crate::files::error_response(
-                            cfg,
-                            vhost,
-                            &active_scope,
-                            403,
-                            req,
-                            url_path,
-                            local_port,
-                            host,
-                            peer.ip(),
-                            local_ip,
-                        ),
+                        None => {
+                            return crate::files::error_response(
+                                cfg,
+                                vhost,
+                                &active_scope,
+                                403,
+                                req,
+                                url_path,
+                                local_port,
+                                host,
+                                peer.ip(),
+                                local_ip,
+                            )
+                        }
                     };
                     active_scope = next_scope;
                     active_grant = next_grant;
@@ -1766,18 +1793,20 @@ pub fn execute(
                         resource,
                     ) {
                         Some(v) => v,
-                        None => return crate::files::error_response(
-                            cfg,
-                            vhost,
-                            &active_scope,
-                            403,
-                            req,
-                            url_path,
-                            local_port,
-                            host,
-                            peer.ip(),
-                            local_ip,
-                        ),
+                        None => {
+                            return crate::files::error_response(
+                                cfg,
+                                vhost,
+                                &active_scope,
+                                403,
+                                req,
+                                url_path,
+                                local_port,
+                                host,
+                                peer.ip(),
+                                local_ip,
+                            )
+                        }
                     };
                     active_scope = next_scope;
                     active_grant = next_grant;
@@ -2801,9 +2830,10 @@ mod more_tests {
             &[target.proxy_url.as_str(), logical.as_str()],
             &req,
             peer.ip(),
+            "/bal/x",
         );
         assert_eq!(
-            crate::access::check(&matched, &req, peer.ip(), None),
+            crate::access::check(&matched, &req, peer.ip(), None, "/bal/x"),
             crate::access::Access::Denied,
             "concrete balancer member identity must participate in <Proxy> matching"
         );
@@ -3131,10 +3161,7 @@ mod coverage_tests {
         assert_eq!(response_header(head, "missing"), None);
         assert_eq!(response_header(b"HTTP/1.1 101 \xff\r\n", "x"), None);
 
-        assert_eq!(
-            encode_proxy_path("/a b%\u{7f}?#"),
-            "/a%20b%25%7F%3F%23"
-        );
+        assert_eq!(encode_proxy_path("/a b%\u{7f}?#"), "/a%20b%25%7F%3F%23");
         assert!(hop_by_hop("Proxy-Authorization"));
         assert!(!hop_by_hop("x-test"));
         assert!(forwarded_header("Forwarded"));
@@ -3218,7 +3245,9 @@ mod coverage_tests {
         r.headers.push("Cookie", "route=node.2");
         assert!(next_balancer_member(&balancer, Some(&r), None, None).is_some());
         let mut tried = HashSet::new();
-        tried.insert(backend_key(&parse_http_url("http://127.0.0.1:9001").unwrap()));
+        tried.insert(backend_key(
+            &parse_http_url("http://127.0.0.1:9001").unwrap(),
+        ));
         assert!(next_balancer_member(&balancer, None, Some(&tried), None).is_none());
     }
 
@@ -3233,22 +3262,19 @@ mod coverage_tests {
             "Listen 127.0.0.1:0\n<Proxy balancer://empty>\n</Proxy>\n",
         )
         .unwrap();
-        let cfg = Config::load(
-            &config_path,
-            &dir,
-            &HashMap::new(),
-            &HashMap::new(),
-            false,
-        )
-        .unwrap();
+        let cfg =
+            Config::load(&config_path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
         let mut scope = Scope::default();
-        scope.proxy_policy.proxy_passes.push(crate::config::ProxyPassRule {
-            prefix: "/b".into(),
-            backend: "balancer://empty".into(),
-            sticky_cookie: None,
-            fail_on_status: Vec::new(),
-            route_order: 0,
-        });
+        scope
+            .proxy_policy
+            .proxy_passes
+            .push(crate::config::ProxyPassRule {
+                prefix: "/b".into(),
+                backend: "balancer://empty".into(),
+                sticky_cookie: None,
+                fail_on_status: Vec::new(),
+                route_order: 0,
+            });
         assert!(balancer_unavailable(&cfg, &scope, "/b/x"));
         assert!(!balancer_unavailable(&cfg, &scope, "/other"));
 
@@ -3266,19 +3292,25 @@ mod coverage_tests {
         assert!(!balancer_unavailable(&cfg, &plain, "/p/x"));
 
         let mut scope = Scope::default();
-        scope.proxy_policy.proxy_rules.push(crate::config::ProxyRule {
-            pattern: Arc::new(crate::config::compile_regex("^/r").unwrap()),
-            backend: "balancer://empty".into(),
-            route_order: 0,
-        });
+        scope
+            .proxy_policy
+            .proxy_rules
+            .push(crate::config::ProxyRule {
+                pattern: Arc::new(crate::config::compile_regex("^/r").unwrap()),
+                backend: "balancer://empty".into(),
+                route_order: 0,
+            });
         assert!(balancer_unavailable(&cfg, &scope, "/r/x"));
 
         let mut scope = Scope::default();
-        scope.proxy_policy.proxy_rules.push(crate::config::ProxyRule {
-            pattern: Arc::new(crate::config::compile_regex("^/r/(.*)$").unwrap()),
-            backend: "http://127.0.0.1:9000/base".into(),
-            route_order: 0,
-        });
+        scope
+            .proxy_policy
+            .proxy_rules
+            .push(crate::config::ProxyRule {
+                pattern: Arc::new(crate::config::compile_regex("^/r/(.*)$").unwrap()),
+                backend: "http://127.0.0.1:9000/base".into(),
+                route_order: 0,
+            });
         assert!(!balancer_unavailable(&cfg, &scope, "/r/x"));
         let t = match_target(&cfg, &scope, "/r/z").unwrap();
         assert_eq!(t.suffix, "z");
@@ -3376,10 +3408,9 @@ mod coverage_tests {
 
     #[test]
     fn proxy_response_success_and_streaming() {
-        let (resp, returned) = run(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok",
-        )
-        .unwrap();
+        let (resp, returned) =
+            run("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
         assert_eq!(resp.status, 200);
         assert!(returned.is_none());
         match resp.body {
@@ -3387,24 +3418,19 @@ mod coverage_tests {
             _ => panic!("expected bytes"),
         }
 
-        let (resp, _) =
-            run("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
+        let (resp, _) = run("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
         assert_eq!(resp.status, 204);
         assert!(matches!(resp.body, Body::Empty));
 
-        let (resp, _) = run(
-            "HTTP/1.1 200 OK\r\nContent-Length: 300000\r\n\r\n",
-        )
-        .unwrap();
+        let (resp, _) = run("HTTP/1.1 200 OK\r\nContent-Length: 300000\r\n\r\n").unwrap();
         match resp.body {
             Body::Stream { len, .. } => assert_eq!(len, 300_000),
             _ => panic!("expected stream"),
         }
 
-        let (resp, _) = run(
-            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n",
-        )
-        .unwrap();
+        let (resp, _) =
+            run("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n")
+                .unwrap();
         match resp.body {
             Body::Bytes(body) => assert_eq!(body, b"Wiki"),
             _ => panic!("expected bytes"),
@@ -3427,7 +3453,8 @@ mod coverage_tests {
         .unwrap();
         assert!(matches!(resp.body, Body::Empty));
 
-        let (resp, _) = run("HTTP/1.1 200 OK\r\nKeep-Alive: timeout=5\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let (resp, _) =
+            run("HTTP/1.1 200 OK\r\nKeep-Alive: timeout=5\r\nContent-Length: 0\r\n\r\n").unwrap();
         assert!(!resp
             .headers
             .iter()
@@ -3530,13 +3557,8 @@ mod coverage_tests {
         let t = target();
         let scope = Scope::default();
         let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-        let resource = crate::access::ResourceKey::request(
-            None,
-            &r,
-            "/x",
-            None,
-            Some(t.proxy_url.as_str()),
-        );
+        let resource =
+            crate::access::ResourceKey::request(None, &r, "/x", None, Some(t.proxy_url.as_str()));
         let wrong = crate::access::ResourceKey::request(
             None,
             &r,
@@ -3544,8 +3566,7 @@ mod coverage_tests {
             None,
             Some(t.proxy_url.as_str()),
         );
-        let grant =
-            crate::access::grant_if_allowed(crate::access::Access::Allowed, wrong).unwrap();
+        let grant = crate::access::grant_if_allowed(crate::access::Access::Allowed, wrong).unwrap();
         let resp = super::execute(
             &cfg,
             None,
@@ -3563,18 +3584,11 @@ mod coverage_tests {
         );
         assert_eq!(resp.status, 502);
 
-        let mismatched = crate::access::ResourceKey::request(
-            None,
-            &r,
-            "/x",
-            None,
-            Some("http://other/x"),
-        );
-        let grant = crate::access::grant_if_allowed(
-            crate::access::Access::Allowed,
-            mismatched.clone(),
-        )
-        .unwrap();
+        let mismatched =
+            crate::access::ResourceKey::request(None, &r, "/x", None, Some("http://other/x"));
+        let grant =
+            crate::access::grant_if_allowed(crate::access::Access::Allowed, mismatched.clone())
+                .unwrap();
         let resp = super::execute(
             &cfg,
             None,
@@ -3634,9 +3648,7 @@ mod coverage_tests {
             tls: false,
         };
         assert!(check_health_stream(
-            Box::new(MockStream::new(
-                "HTTP/1.1 204 No Content\r\n\r\n"
-            )),
+            Box::new(MockStream::new("HTTP/1.1 204 No Content\r\n\r\n")),
             &spec,
             &good
         ));
@@ -3706,7 +3718,8 @@ mod coverage_tests {
             base: "/".into(),
             tls: false,
         };
-        let err = match connect_async(&backend, &Scope::default(), Duration::from_millis(100)).await {
+        let err = match connect_async(&backend, &Scope::default(), Duration::from_millis(100)).await
+        {
             Ok(_) => panic!("expected connection failure"),
             Err(e) => e,
         };
@@ -3727,12 +3740,7 @@ mod coverage_tests {
             base: "/".into(),
             tls: true,
         };
-        let err = match connect_async(
-            &backend,
-            &Scope::default(),
-            Duration::from_millis(50),
-        )
-        .await
+        let err = match connect_async(&backend, &Scope::default(), Duration::from_millis(50)).await
         {
             Ok(_) => panic!("expected TLS timeout"),
             Err(e) => e,
@@ -3746,22 +3754,14 @@ mod coverage_tests {
     }
 
     fn resource(req: &Request, proxy_url: &str) -> crate::access::ResourceKey {
-        crate::access::ResourceKey::request(
-            None,
-            req,
-            "/ws",
-            None,
-            Some(proxy_url),
-        )
+        crate::access::ResourceKey::request(None, req, "/ws", None, Some(proxy_url))
     }
 
     async fn spawn_upstream(
         response: Vec<u8>,
         read_initial: bool,
     ) -> (u16, tokio::task::JoinHandle<Vec<u8>>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -3815,10 +3815,8 @@ mod coverage_tests {
         Arc<crate::access::AccessGrant>,
         Arc<crate::access::ResourceKey>,
     ) {
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-proxy-wsctx-{}-{port}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vapache-proxy-wsctx-{}-{port}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
@@ -4037,15 +4035,22 @@ mod coverage_tests {
         let (client, _server) = tokio::io::duplex(1024);
 
         let granted = resource(&r, "http://one.example/ws");
-        let grant = crate::access::grant_if_allowed(
-            crate::access::Access::Allowed,
-            granted.clone(),
-        )
-        .unwrap();
+        let grant =
+            crate::access::grant_if_allowed(crate::access::Access::Allowed, granted.clone())
+                .unwrap();
         let mismatched = resource(&r, "http://two.example/ws");
         let err = websocket_async(
-            &cfg, &scope, &r, &target, &grant, &mismatched, client, "127.0.0.1:1".parse().unwrap(),
-            false, "client.example", &[],
+            &cfg,
+            &scope,
+            &r,
+            &target,
+            &grant,
+            &mismatched,
+            client,
+            "127.0.0.1:1".parse().unwrap(),
+            false,
+            "client.example",
+            &[],
         )
         .await
         .unwrap_err();
@@ -4053,14 +4058,21 @@ mod coverage_tests {
 
         let (client, _server) = tokio::io::duplex(1024);
         let matching = resource(&r, "http://two.example/ws");
-        let grant = crate::access::grant_if_allowed(
-            crate::access::Access::Allowed,
-            matching.clone(),
-        )
-        .unwrap();
+        let grant =
+            crate::access::grant_if_allowed(crate::access::Access::Allowed, matching.clone())
+                .unwrap();
         let err = websocket_async(
-            &cfg, &scope, &r, &target, &grant, &matching, client, "127.0.0.1:1".parse().unwrap(),
-            false, "client.example", &[],
+            &cfg,
+            &scope,
+            &r,
+            &target,
+            &grant,
+            &matching,
+            client,
+            "127.0.0.1:1".parse().unwrap(),
+            false,
+            "client.example",
+            &[],
         )
         .await
         .unwrap_err();
@@ -4180,14 +4192,8 @@ mod coverage_tests {
             ),
         )
         .unwrap();
-        let cfg = Config::load(
-            &config_path,
-            &dir,
-            &HashMap::new(),
-            &HashMap::new(),
-            false,
-        )
-        .unwrap();
+        let cfg =
+            Config::load(&config_path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
         let backend = HttpBackend {
             host: "127.0.0.1".into(),
             port,
@@ -4217,8 +4223,9 @@ mod coverage_tests {
             None,
             Some(target.proxy_url.as_str()),
         );
-        assert!(authorize_failover(&cfg, None, &scope, &r, "/ws", &target, peer, &resource)
-            .is_none());
+        assert!(
+            authorize_failover(&cfg, None, &scope, &r, "/ws", &target, peer, &resource).is_none()
+        );
 
         let mut authed = req("/ws");
         authed.headers.push(
@@ -4232,8 +4239,10 @@ mod coverage_tests {
             None,
             Some(target.proxy_url.as_str()),
         );
-        assert!(authorize_failover(&cfg, None, &scope, &authed, "/ws", &target, peer, &resource)
-            .is_some());
+        assert!(
+            authorize_failover(&cfg, None, &scope, &authed, "/ws", &target, peer, &resource)
+                .is_some()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4264,14 +4273,8 @@ mod coverage_tests {
             ),
         )
         .unwrap();
-        let cfg = Config::load(
-            &config_path,
-            &dir,
-            &HashMap::new(),
-            &HashMap::new(),
-            false,
-        )
-        .unwrap();
+        let cfg =
+            Config::load(&config_path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
         let mut scope = Scope::default();
         scope
             .proxy_policy
@@ -4339,14 +4342,8 @@ mod coverage_tests {
             ),
         )
         .unwrap();
-        let cfg = Config::load(
-            &config_path,
-            &dir,
-            &HashMap::new(),
-            &HashMap::new(),
-            false,
-        )
-        .unwrap();
+        let cfg =
+            Config::load(&config_path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
         let mut scope = Scope::default();
         scope
             .proxy_policy
@@ -4396,17 +4393,14 @@ mod coverage_tests {
         let (port, upstream) = spawn_upstream(ws_101("x"), false).await;
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let r = ws_request(key);
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-proxy-wsbad-{}-{port}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vapache-proxy-wsbad-{}-{port}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
         std::fs::write(&path, "Listen 127.0.0.1:0\n").unwrap();
-        let cfg = Arc::new(
-            Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap(),
-        );
+        let cfg =
+            Arc::new(Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap());
         let backend = HttpBackend {
             host: "127.0.0.1".into(),
             port,

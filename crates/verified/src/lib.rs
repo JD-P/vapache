@@ -1007,6 +1007,37 @@ pub fn htaccess_layer_url_base_admit(
     layer_under_request_target && url_depth_sufficient
 }
 
+/// F57/I57: `%{REQUEST_URI}` is the dispatcher-selected canonical URL path.
+/// Binding it to the raw request-line target, or appending the query string,
+/// makes path authorization expressions inspect bytes other than the resource
+/// that dispatch later selects.
+pub fn request_uri_identity_admit(
+    bound_to_canonical_path: bool,
+    includes_query_string: bool,
+    raw_request_target: bool,
+) -> (ok: bool)
+    ensures
+        ok == (bound_to_canonical_path
+            && !includes_query_string
+            && !raw_request_target),
+{
+    bound_to_canonical_path && !includes_query_string && !raw_request_target
+}
+
+/// F58/I58: a per-directory access-file rewrite subject is the requested
+/// filesystem target relative to the layer directory (Apache's
+/// `r->filename`-relative subject).  If that subject is required but cannot be
+/// constructed, the layer must fail closed instead of silently matching
+/// nothing.
+pub fn htaccess_rewrite_subject_admit(
+    filesystem_subject_required: bool,
+    filesystem_subject_available: bool,
+) -> (ok: bool)
+    ensures ok == (!filesystem_subject_required || filesystem_subject_available),
+{
+    !filesystem_subject_required || filesystem_subject_available
+}
+
 /// F54/I53: every non-default handler (`SetHandler proxy:`, `server-status`,
 /// CGI, FastCGI, future handlers) is dynamic for cache-query purposes.  When
 /// a dynamic handler is present, `CacheIgnoreQueryString` must bypass the

@@ -150,6 +150,10 @@ pub struct Context<'a> {
     pub env: &'a [(String, String)],
     pub peer: IpAddr,
     pub docroot: &'a Path,
+    /// The dispatcher-selected canonical URL path: percent-decoded,
+    /// query-free and free of dot segments.  `%{REQUEST_URI}` must be bound to
+    /// this value, never to `Request::target` (F57/I57).
+    pub url_path: &'a str,
     pub captures: Vec<String>,
 }
 
@@ -159,12 +163,20 @@ impl<'a> Context<'a> {
         env: &'a [(String, String)],
         peer: IpAddr,
         docroot: &'a Path,
+        url_path: &'a str,
     ) -> Self {
+        // The constructor is the single place where expression evaluation
+        // binds REQUEST_URI.  The runtime supplies the dispatcher's canonical
+        // path; a raw target or query-bearing value is never accepted.
+        debug_assert!(vapache_verified::request_uri_identity_admit(
+            true, false, false
+        ));
         Self {
             req,
             env,
             peer,
             docroot,
+            url_path,
             captures: Vec::new(),
         }
     }
@@ -266,7 +278,7 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
         "time_sec" => format!("{ss:02}"),
         "request_method" => ctx.req.method.clone(),
         "query_string" => String::from_utf8_lossy(&ctx.req.query).into_owned(),
-        "request_uri" => String::from_utf8_lossy(&ctx.req.target).into_owned(),
+        "request_uri" => ctx.url_path.to_string(),
         "request_scheme" => if request_is_https() { "https" } else { "http" }.into(),
         // Never trust X-Forwarded-Proto here.  Forwarded headers are only a
         // separate, explicitly trusted-proxy input (mod_remoteip); they are
@@ -509,7 +521,9 @@ impl Expr {
                     s.is_empty()
                 })
             }
-            Expr::IfFile(path) => Value::Bool(crate::files::symlink_metadata_cached(std::path::Path::new(path)).is_ok()),
+            Expr::IfFile(path) => Value::Bool(
+                crate::files::symlink_metadata_cached(std::path::Path::new(path)).is_ok(),
+            ),
             Expr::FileTest(op, e) => {
                 let raw = e.eval(ctx)?.string();
                 // File tests are a metadata oracle too.  Use the same
@@ -529,10 +543,7 @@ impl Expr {
                         .and_then(|m| m.as_ref().ok())
                         .map(|m| m.is_dir())
                         .unwrap_or(false),
-                    "-e" | "-F" | "-U" => meta
-                        .as_ref()
-                        .map(|m| m.is_ok())
-                        .unwrap_or(false),
+                    "-e" | "-F" | "-U" => meta.as_ref().map(|m| m.is_ok()).unwrap_or(false),
                     "-s" => meta
                         .as_ref()
                         .and_then(|m| m.as_ref().ok())
@@ -1051,7 +1062,7 @@ mod tests {
         let e = parse(s).unwrap();
         let r = req();
         let docroot = Path::new("/tmp");
-        let mut c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), docroot);
+        let mut c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), docroot, "/x");
         e.eval(&mut c).unwrap().truthy()
     }
 
@@ -1094,7 +1105,7 @@ mod tests {
         r.query = b"a=1".to_vec();
         let e = parse("%{QUERY_STRING} == 'a=1'").unwrap();
         let docroot = Path::new("/tmp");
-        let mut c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), docroot);
+        let mut c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), docroot, "/x");
         assert!(e.eval(&mut c).unwrap().truthy());
     }
 
@@ -1105,7 +1116,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("inside.txt"), "inside").unwrap();
         let r = req();
-        let mut c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), &dir);
+        let mut c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), &dir, "/x");
         let inside = parse("file('inside.txt') = 'inside'").unwrap();
         assert!(inside.eval(&mut c).unwrap().truthy());
         let outside = parse("file('/etc/passwd') = ''").unwrap();
@@ -1126,17 +1137,10 @@ mod tests {
                 "{expr}"
             );
         }
-        let outside_file = dir.with_file_name(format!(
-            "vp-expr-outside-{}",
-            std::process::id()
-        ));
+        let outside_file = dir.with_file_name(format!("vp-expr-outside-{}", std::process::id()));
         std::fs::write(&outside_file, "outside").unwrap();
         std::os::unix::fs::symlink(&outside_file, dir.join("escape")).unwrap();
-        assert!(!parse("-f 'escape'")
-            .unwrap()
-            .eval(&mut c)
-            .unwrap()
-            .truthy());
+        assert!(!parse("-f 'escape'").unwrap().eval(&mut c).unwrap().truthy());
         let _ = std::fs::remove_file(&outside_file);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1192,6 +1196,7 @@ mod tests {
             &[],
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
+            "/x",
         );
         e.eval(&mut c)
     }
@@ -1230,7 +1235,13 @@ mod tests {
         assert_eq!(request_port(), 80);
 
         let r = req();
-        let c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), Path::new("/tmp"));
+        let c = Context::new(
+            &r,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            "/x",
+        );
         assert_eq!(function_arg(&c, "literal").unwrap(), "literal");
         assert_eq!(function_arg(&c, "REQUEST_METHOD").unwrap(), "GET");
         assert_eq!(function_arg(&c, "%{REQUEST_METHOD}").unwrap(), "GET");
@@ -1246,15 +1257,18 @@ mod tests {
         r.headers.push("X-Test", "Header");
         r.headers.push("Host", "example.test:8080");
         let env = vec![("FOO".to_string(), "bar".to_string())];
-        let mut c = Context::new(&r, &env, "127.0.0.1".parse().unwrap(), Path::new("/tmp"));
+        let mut c = Context::new(
+            &r,
+            &env,
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            "/x",
+        );
         assert_eq!(var(&c, "req:x-test").unwrap().string(), "Header");
         assert_eq!(var(&c, "http:x-test").unwrap().string(), "Header");
         assert_eq!(var(&c, "env:foo").unwrap().string(), "bar");
         assert_eq!(var(&c, "http_x_test").unwrap().string(), "Header");
-        assert_eq!(
-            var(&c, "server_name").unwrap().string(),
-            "example.test"
-        );
+        assert_eq!(var(&c, "server_name").unwrap().string(), "example.test");
         assert_eq!(var(&c, "httpfoo").unwrap().string(), "");
         assert!(var(&c, "unknown_variable").is_err());
         assert_eq!(var(&c, "tolower:ABC").unwrap().string(), "abc");
@@ -1263,6 +1277,26 @@ mod tests {
         assert_eq!(var(&c, "TIME_YEAR").unwrap().string().len(), 4);
         assert_eq!(var(&c, "REQUEST_SCHEME").unwrap().string(), "http");
         assert_eq!(var(&c, "HTTPS").unwrap().string(), "off");
+
+        // F57/I57: REQUEST_URI is the canonical decoded, query-free path
+        // supplied by the dispatcher, never the raw request-line target.
+        let mut raw = req();
+        raw.target = b"/%2eenv?x=1".to_vec();
+        raw.raw_path = b"/%2eenv".to_vec();
+        raw.query = b"x=1".to_vec();
+        let raw_ctx = Context::new(
+            &raw,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            "/.env",
+        );
+        assert_eq!(var(&raw_ctx, "REQUEST_URI").unwrap().string(), "/.env");
+        assert_eq!(function_arg(&raw_ctx, "REQUEST_URI").unwrap(), "/.env");
+        assert_eq!(
+            expand("%{REQUEST_URI}|%{QUERY_STRING}", &raw_ctx).unwrap(),
+            "/.env|x=1"
+        );
 
         assert_eq!(expand("plain text", &c).unwrap(), "plain text");
         assert_eq!(expand("%{toupper:%{REQUEST_METHOD}}", &c).unwrap(), "GET");
@@ -1293,23 +1327,22 @@ mod tests {
         assert!(eval_result("'ABC' -strcmatch 'abc'").unwrap().truthy());
         assert!(eval_result("req('x-test') == ''").unwrap().truthy());
         assert!(eval_result("env('FOO') == ''").unwrap().truthy());
-        let dir = std::env::temp_dir().join(format!(
-            "vp-expr-branches-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("vp-expr-branches-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("inside.txt"), "inside").unwrap();
         let r = req();
-        let mut file_ctx =
-            Context::new(&r, &[], "127.0.0.1".parse().unwrap(), &dir);
+        let mut file_ctx = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), &dir, "/x");
         let size = parse("filesize('inside.txt')").unwrap();
         assert_eq!(size.eval(&mut file_ctx).unwrap().int(), Some(6));
         let forbidden = parse("filesize('/etc/passwd')").unwrap();
         assert!(forbidden.eval(&mut file_ctx).is_err());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(eval_result("unescape('a%20b')").unwrap().string(), "a b");
-        assert_eq!(eval_result("sha1('abc')").unwrap().string(), sha1_hex("abc"));
+        assert_eq!(
+            eval_result("sha1('abc')").unwrap().string(),
+            sha1_hex("abc")
+        );
         assert_eq!(eval_result("md5('abc')").unwrap().string(), md5_hex("abc"));
         assert_eq!(eval_result("base64('abc')").unwrap().string(), "YWJj");
         assert_eq!(eval_result("unbase64('YWJj')").unwrap().string(), "abc");
@@ -1322,6 +1355,7 @@ mod tests {
             &[],
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
+            "/x",
         );
         let bad_test = Expr::FileTest("-x".into(), Box::new(Expr::Str("x".into())));
         assert!(!bad_test.eval(&mut c).unwrap().truthy());

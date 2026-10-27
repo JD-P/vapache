@@ -209,9 +209,10 @@ pub(crate) fn check_grant(
     req: &Request,
     peer: IpAddr,
     identity: Option<&Identity>,
+    url_path: &str,
     key: ResourceKey,
 ) -> Result<AccessGrant, Access> {
-    match check(scope, req, peer, identity) {
+    match check(scope, req, peer, identity, url_path) {
         Access::Allowed => Ok(AccessGrant {
             key,
             wildcard: false,
@@ -220,7 +221,13 @@ pub(crate) fn check_grant(
     }
 }
 
-pub fn check(scope: &Scope, req: &Request, peer: IpAddr, identity: Option<&Identity>) -> Access {
+pub fn check(
+    scope: &Scope,
+    req: &Request,
+    peer: IpAddr,
+    identity: Option<&Identity>,
+    url_path: &str,
+) -> Access {
     let host = scope
         .authorization
         .legacy
@@ -231,7 +238,7 @@ pub fn check(scope: &Scope, req: &Request, peer: IpAddr, identity: Option<&Ident
         .document_root
         .as_deref()
         .unwrap_or(Path::new("/"));
-    let auth = check_requires(scope, req, peer, identity, docroot);
+    let auth = check_requires(scope, req, peer, identity, docroot, url_path);
     let satisfy = scope
         .authorization
         .legacy
@@ -270,12 +277,13 @@ fn check_requires(
     peer: IpAddr,
     identity: Option<&Identity>,
     docroot: &Path,
+    url_path: &str,
 ) -> Access {
     let Some(policy) = &scope.authorization.requires else {
         return Access::Allowed;
     };
-    let env = scope.request_env(req);
-    match eval_policy(policy, req, peer, identity, &env, true, docroot) {
+    let env = scope.request_env(req, url_path);
+    match eval_policy(policy, req, peer, identity, &env, true, docroot, url_path) {
         PolicyResult::Granted => Access::Allowed,
         // At the root, Apache treats a neutral authorization result as a
         // failure (403), never as an implicit grant.
@@ -295,6 +303,7 @@ fn eval_policy(
     env: &[(String, String)],
     parent_and: bool,
     docroot: &Path,
+    url_path: &str,
 ) -> PolicyResult {
     match policy {
         AuthPolicy::List(entries) => {
@@ -305,7 +314,7 @@ fn eval_policy(
                     continue;
                 }
                 matched = true;
-                match eval_node(&entry.node, req, peer, identity, env, docroot) {
+                match eval_node(&entry.node, req, peer, identity, env, docroot, url_path) {
                     PolicyResult::Granted => return PolicyResult::Granted,
                     PolicyResult::Denied => {}
                     PolicyResult::AuthRequired => auth_required = true,
@@ -326,12 +335,12 @@ fn eval_policy(
             }
         }
         AuthPolicy::And(a, b) => combine_and(
-            eval_policy(a, req, peer, identity, env, true, docroot),
-            eval_policy(b, req, peer, identity, env, true, docroot),
+            eval_policy(a, req, peer, identity, env, true, docroot, url_path),
+            eval_policy(b, req, peer, identity, env, true, docroot, url_path),
         ),
         AuthPolicy::Or(a, b) => combine_or(
-            eval_policy(a, req, peer, identity, env, false, docroot),
-            eval_policy(b, req, peer, identity, env, false, docroot),
+            eval_policy(a, req, peer, identity, env, false, docroot, url_path),
+            eval_policy(b, req, peer, identity, env, false, docroot, url_path),
         ),
     }
 }
@@ -377,14 +386,18 @@ fn eval_node(
     identity: Option<&Identity>,
     env: &[(String, String)],
     docroot: &Path,
+    url_path: &str,
 ) -> PolicyResult {
     match node {
-        RequireNode::Provider(r) => eval_require(r, req, peer, identity, env, docroot),
+        RequireNode::Provider(r) => eval_require(r, req, peer, identity, env, docroot, url_path),
         RequireNode::All(items) => {
             // RequireAll: all children must pass, and at least one must grant.
             let mut result = PolicyResult::Neutral;
             for item in items {
-                result = combine_and(result, eval_node(item, req, peer, identity, env, docroot));
+                result = combine_and(
+                    result,
+                    eval_node(item, req, peer, identity, env, docroot, url_path),
+                );
                 if result == PolicyResult::Denied {
                     return PolicyResult::Denied;
                 }
@@ -394,7 +407,10 @@ fn eval_node(
         RequireNode::Any(items) => {
             let mut result = PolicyResult::Neutral;
             for item in items {
-                result = combine_or(result, eval_node(item, req, peer, identity, env, docroot));
+                result = combine_or(
+                    result,
+                    eval_node(item, req, peer, identity, env, docroot, url_path),
+                );
                 if result == PolicyResult::Granted {
                     return PolicyResult::Granted;
                 }
@@ -408,7 +424,7 @@ fn eval_node(
             // granted child and turned the group into an allow (F46/I43).
             let results: Vec<PolicyResult> = items
                 .iter()
-                .map(|item| eval_node(item, req, peer, identity, env, docroot))
+                .map(|item| eval_node(item, req, peer, identity, env, docroot, url_path))
                 .collect();
             require_none_multi(&results)
         }
@@ -422,6 +438,7 @@ fn eval_require(
     identity: Option<&Identity>,
     env: &[(String, String)],
     docroot: &Path,
+    url_path: &str,
 ) -> PolicyResult {
     // Apache's negated providers can deny or stay neutral, but can never
     // independently grant access.
@@ -492,7 +509,7 @@ fn eval_require(
             decide(hit, *negate)
         }
         Require::Expr { negate, expr } => {
-            let mut ctx = crate::expr::Context::new(req, env, peer, docroot);
+            let mut ctx = crate::expr::Context::new(req, env, peer, docroot, url_path);
             let hit = expr.eval(&mut ctx).map(|v| v.truthy()).unwrap_or(false);
             decide(hit, *negate)
         }
@@ -702,11 +719,11 @@ mod tests {
             nets: vec![("10.0.0.0".parse().unwrap(), 8)],
         }]);
         assert_eq!(
-            check(&s, &req("GET"), "10.1.2.3".parse().unwrap(), None),
+            check(&s, &req("GET"), "10.1.2.3".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
         assert_eq!(
-            check(&s, &req("GET"), "11.1.2.3".parse().unwrap(), None),
+            check(&s, &req("GET"), "11.1.2.3".parse().unwrap(), None, "/x"),
             Access::Denied
         );
 
@@ -718,11 +735,11 @@ mod tests {
             }),
         ])]);
         assert_eq!(
-            check(&s, &req("GET"), "10.1.2.3".parse().unwrap(), None),
+            check(&s, &req("GET"), "10.1.2.3".parse().unwrap(), None, "/x"),
             Access::Denied
         );
         assert_eq!(
-            check(&s, &req("GET"), "11.1.2.3".parse().unwrap(), None),
+            check(&s, &req("GET"), "11.1.2.3".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
     }
@@ -733,8 +750,15 @@ mod tests {
         let scope = Scope::default();
         let allowed = ResourceKey::request(None, &req, "/a", None, None);
         let other = ResourceKey::request(None, &req, "/b", None, None);
-        let grant = check_grant(&scope, &req, "127.0.0.1".parse().unwrap(), None, allowed)
-            .expect("allowed");
+        let grant = check_grant(
+            &scope,
+            &req,
+            "127.0.0.1".parse().unwrap(),
+            None,
+            "/x",
+            allowed,
+        )
+        .expect("allowed");
         let meta = std::fs::metadata("/proc/self/exe").expect("self metadata");
         assert!(grant.bind_file(&other, &meta).is_none());
     }
@@ -756,12 +780,12 @@ mod tests {
         });
         s.authorization.requires = reqs(vec![Require::AllGranted]);
         assert_eq!(
-            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
         s.authorization.requires = reqs(vec![Require::AllDenied]);
         assert_eq!(
-            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None, "/x"),
             Access::Denied
         );
     }
@@ -783,7 +807,7 @@ mod tests {
             Box::new(post(RequireNode::Provider(Require::AllGranted))),
         );
         assert_eq!(
-            eval_policy(&policy, &r, peer, None, &[], false, docroot),
+            eval_policy(&policy, &r, peer, None, &[], false, docroot, "/x"),
             PolicyResult::Neutral
         );
         assert_eq!(
@@ -797,6 +821,7 @@ mod tests {
                 None,
                 &[],
                 docroot,
+                "/x",
             ),
             PolicyResult::Denied
         );
@@ -842,7 +867,7 @@ mod tests {
             negate: false,
             names: vec!["localhost".into()],
         }]);
-        let result = check(&s, &req("GET"), ip, None);
+        let result = check(&s, &req("GET"), ip, None, "/x");
         assert!(matches!(result, Access::Allowed | Access::Denied));
     }
 
@@ -864,13 +889,13 @@ mod tests {
                 }),
             ]),
         ])]);
-        assert_eq!(check(&s, &req("GET"), inside, None), Access::Denied);
+        assert_eq!(check(&s, &req("GET"), inside, None, "/x"), Access::Denied);
         assert_eq!(
-            check(&s, &req("GET"), "10.1.2.3".parse().unwrap(), None),
+            check(&s, &req("GET"), "10.1.2.3".parse().unwrap(), None, "/x"),
             Access::Denied
         );
         assert_eq!(
-            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
 
@@ -892,21 +917,21 @@ mod tests {
                 }),
             ]),
         ])]);
-        assert_eq!(check(&s, &req("GET"), inside, None), Access::Denied);
+        assert_eq!(check(&s, &req("GET"), inside, None, "/x"), Access::Denied);
 
         // A granted child is not neutralized by a denied sibling.
         s.authorization.requires = nodes(vec![RequireNode::None(vec![
             RequireNode::Provider(Require::AllGranted),
             RequireNode::Provider(Require::AllDenied),
         ])]);
-        assert_eq!(check(&s, &req("GET"), inside, None), Access::Denied);
+        assert_eq!(check(&s, &req("GET"), inside, None, "/x"), Access::Denied);
 
         // No child satisfied means the negated group cannot grant by itself.
         s.authorization.requires = nodes(vec![RequireNode::None(vec![
             RequireNode::Provider(Require::AllDenied),
             RequireNode::Provider(Require::AllDenied),
         ])]);
-        assert_eq!(check(&s, &req("GET"), inside, None), Access::Denied);
+        assert_eq!(check(&s, &req("GET"), inside, None, "/x"), Access::Denied);
     }
 
     #[test]
@@ -926,14 +951,20 @@ mod tests {
 
         let mut s = Scope::default();
         s.authorization.requires = reqs(vec![Require::Local { negate: false }]);
-        assert_eq!(check(&s, &req("GET"), mapped, None), Access::Allowed);
+        assert_eq!(check(&s, &req("GET"), mapped, None, "/x"), Access::Allowed);
         s.authorization.requires = nodes(vec![RequireNode::All(vec![
             RequireNode::Provider(Require::AllGranted),
             RequireNode::Provider(Require::Local { negate: true }),
         ])]);
-        assert_eq!(check(&s, &req("GET"), mapped, None), Access::Denied);
+        assert_eq!(check(&s, &req("GET"), mapped, None, "/x"), Access::Denied);
         assert_eq!(
-            check(&s, &req("GET"), "::ffff:192.0.2.1".parse().unwrap(), None),
+            check(
+                &s,
+                &req("GET"),
+                "::ffff:192.0.2.1".parse().unwrap(),
+                None,
+                "/x"
+            ),
             Access::Allowed
         );
     }
@@ -964,7 +995,7 @@ mod tests {
         let scope = Scope::default();
         let a = ResourceKey::request(None, &req, "/public/a", None, None);
         let b = ResourceKey::request(None, &req, "/private/b", None, None);
-        let grant = check_grant(&scope, &req, peer, None, a.clone()).expect("allowed");
+        let grant = check_grant(&scope, &req, peer, None, "/x", a.clone()).expect("allowed");
         assert!(grant.require(&a));
         assert!(!grant.require(&b));
     }
@@ -975,7 +1006,7 @@ mod tests {
         let peer = "127.0.0.1".parse().unwrap();
         let scope = Scope::default();
         let key = ResourceKey::request(None, &req, "/file", None, None);
-        let grant = check_grant(&scope, &req, peer, None, key.clone()).expect("allowed");
+        let grant = check_grant(&scope, &req, peer, None, "/x", key.clone()).expect("allowed");
         let meta = std::fs::metadata("/proc/self/exe").expect("self metadata");
         let bound = grant.bind_file(&key, &meta).expect("file bound");
         assert_eq!(bound.key().file_dev, Some(meta.dev()));
@@ -1000,6 +1031,7 @@ mod tests {
                 Some(&identity),
                 &[],
                 docroot,
+                "/x",
             ),
             PolicyResult::Granted
         );
@@ -1011,6 +1043,7 @@ mod tests {
                 Some(&identity),
                 &[],
                 docroot,
+                "/x",
             ),
             PolicyResult::Denied
         );
@@ -1022,6 +1055,7 @@ mod tests {
                 None,
                 &[],
                 docroot,
+                "/x",
             ),
             PolicyResult::Neutral
         );
@@ -1032,11 +1066,11 @@ mod tests {
         let mut s = Scope::default();
         s.authorization.requires = reqs(vec![Require::Local { negate: false }]);
         assert_eq!(
-            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
         assert_eq!(
-            check(&s, &req("GET"), "10.0.0.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "10.0.0.1".parse().unwrap(), None, "/x"),
             Access::Denied
         );
         s.authorization.requires = nodes(vec![RequireNode::All(vec![
@@ -1044,11 +1078,11 @@ mod tests {
             RequireNode::Provider(Require::Local { negate: true }),
         ])]);
         assert_eq!(
-            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Denied
         );
         assert_eq!(
-            check(&s, &req("GET"), "10.0.0.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "10.0.0.1".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
     }
@@ -1065,17 +1099,17 @@ mod tests {
         ]);
         // Localhost is not in 10/8, but the second provider is enough.
         assert_eq!(
-            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
         assert_eq!(
-            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None, "/x"),
             Access::Denied
         );
         // A single matching provider among deny-all siblings still wins.
         s.authorization.requires = reqs(vec![Require::AllDenied, Require::AllGranted]);
         assert_eq!(
-            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
     }
@@ -1100,11 +1134,11 @@ mod tests {
             ..LegacyAccess::default()
         });
         assert_eq!(
-            check(&s, &req("GET"), "10.1.2.3".parse().unwrap(), None),
+            check(&s, &req("GET"), "10.1.2.3".parse().unwrap(), None, "/x"),
             Access::Denied
         );
         assert_eq!(
-            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
     }
@@ -1129,11 +1163,11 @@ mod tests {
             ..LegacyAccess::default()
         });
         assert_eq!(
-            check(&s, &req("GET"), "10.1.2.3".parse().unwrap(), None),
+            check(&s, &req("GET"), "10.1.2.3".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
         assert_eq!(
-            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None, "/x"),
             Access::Denied
         );
     }
@@ -1142,7 +1176,7 @@ mod tests {
     fn empty_scope_allows() {
         let s = Scope::default();
         assert_eq!(
-            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
     }
@@ -1152,12 +1186,12 @@ mod tests {
         let mut s = Scope::default();
         s.authorization.requires = reqs(vec![Require::AllGranted]);
         assert_eq!(
-            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
         s.authorization.requires = reqs(vec![Require::AllDenied]);
         assert_eq!(
-            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Denied
         );
     }
@@ -1167,7 +1201,7 @@ mod tests {
         let mut s = Scope::default();
         s.authorization.requires = reqs(vec![Require::Unsupported("x".into())]);
         assert_eq!(
-            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Denied
         );
     }
@@ -1180,28 +1214,28 @@ mod tests {
             RequireNode::Provider(Require::AllGranted),
             RequireNode::Provider(Require::Local { negate: false }),
         ])]);
-        assert_eq!(check(&s, &req("GET"), peer, None), Access::Allowed);
+        assert_eq!(check(&s, &req("GET"), peer, None, "/x"), Access::Allowed);
         s.authorization.requires = nodes(vec![RequireNode::All(vec![
             RequireNode::Provider(Require::AllGranted),
             RequireNode::Provider(Require::AllDenied),
         ])]);
-        assert_eq!(check(&s, &req("GET"), peer, None), Access::Denied);
+        assert_eq!(check(&s, &req("GET"), peer, None, "/x"), Access::Denied);
 
         s.authorization.requires = nodes(vec![RequireNode::Any(vec![
             RequireNode::Provider(Require::AllDenied),
             RequireNode::Provider(Require::Local { negate: false }),
         ])]);
-        assert_eq!(check(&s, &req("GET"), peer, None), Access::Allowed);
+        assert_eq!(check(&s, &req("GET"), peer, None, "/x"), Access::Allowed);
 
         s.authorization.requires = nodes(vec![RequireNode::None(vec![RequireNode::Provider(
             Require::AllGranted,
         )])]);
-        assert_eq!(check(&s, &req("GET"), peer, None), Access::Denied);
+        assert_eq!(check(&s, &req("GET"), peer, None, "/x"), Access::Denied);
         s.authorization.requires = nodes(vec![RequireNode::None(vec![RequireNode::Provider(
             Require::AllDenied,
         )])]);
         // A negated-only group is neutral; at the root Apache denies.
-        assert_eq!(check(&s, &req("GET"), peer, None), Access::Denied);
+        assert_eq!(check(&s, &req("GET"), peer, None, "/x"), Access::Denied);
     }
 
     #[test]
@@ -1212,15 +1246,15 @@ mod tests {
             methods: vec!["POST".into()],
         }]);
         assert_eq!(
-            check(&s, &req("POST"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("POST"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
         assert_eq!(
-            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Denied
         );
         assert_eq!(
-            check(&s, &req("HEAD"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("HEAD"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Denied
         );
 
@@ -1229,7 +1263,7 @@ mod tests {
             methods: vec!["GET".into()],
         }]);
         assert_eq!(
-            check(&s, &req("HEAD"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("HEAD"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
     }
@@ -1244,11 +1278,11 @@ mod tests {
         }]));
         // Only POST has an applicable authorization rule.
         assert_eq!(
-            check(&s, &req("POST"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("POST"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Denied
         );
         assert_eq!(
-            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("GET"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
         // GET and HEAD share a method number, matching Apache.
@@ -1257,11 +1291,11 @@ mod tests {
             limit: Some(MethodSet::Only(vec!["GET".into()])),
         }]));
         assert_eq!(
-            check(&s, &req("HEAD"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("HEAD"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Denied
         );
         assert_eq!(
-            check(&s, &req("POST"), "127.0.0.1".parse().unwrap(), None),
+            check(&s, &req("POST"), "127.0.0.1".parse().unwrap(), None, "/x"),
             Access::Allowed
         );
     }
@@ -1291,15 +1325,15 @@ mod tests {
         let mut merged = parent.clone();
         merged.merge(&child);
         assert_eq!(
-            check(&merged, &req, peer_inside, Some(&alice)),
+            check(&merged, &req, peer_inside, Some(&alice), "/x"),
             Access::Allowed
         );
         assert_eq!(
-            check(&merged, &req, peer_outside, Some(&alice)),
+            check(&merged, &req, peer_outside, Some(&alice), "/x"),
             Access::Denied
         );
         assert_eq!(
-            check(&merged, &req, peer_inside, None),
+            check(&merged, &req, peer_inside, None, "/x"),
             Access::AuthRequired
         );
 
@@ -1312,12 +1346,15 @@ mod tests {
         let mut merged = parent.clone();
         merged.merge(&child);
         assert_eq!(
-            check(&merged, &req, peer_outside, Some(&alice)),
+            check(&merged, &req, peer_outside, Some(&alice), "/x"),
             Access::Allowed
         );
-        assert_eq!(check(&merged, &req, peer_inside, None), Access::Allowed);
         assert_eq!(
-            check(&merged, &req, peer_outside, None),
+            check(&merged, &req, peer_inside, None, "/x"),
+            Access::Allowed
+        );
+        assert_eq!(
+            check(&merged, &req, peer_outside, None, "/x"),
             Access::AuthRequired
         );
 
@@ -1330,7 +1367,7 @@ mod tests {
         }]);
         merged.merge(&child);
         assert_eq!(
-            check(&merged, &req, peer_inside, None),
+            check(&merged, &req, peer_inside, None, "/x"),
             Access::AuthRequired
         );
     }
@@ -1353,16 +1390,16 @@ mod tests {
             ..LegacyAccess::default()
         });
         // Host access grants access, so the failing Require is bypassed.
-        assert_eq!(check(&s, &req("GET"), peer, None), Access::Allowed);
+        assert_eq!(check(&s, &req("GET"), peer, None, "/x"), Access::Allowed);
 
         s.authorization.legacy.as_mut().unwrap().satisfy[0].value = Satisfy::All;
         s.authorization.legacy.as_mut().unwrap().allow.clear();
         // Default Order Deny,Allow allows the host; Satisfy All still needs
         // the authorization provider to pass.
-        assert_eq!(check(&s, &req("GET"), peer, None), Access::Denied);
+        assert_eq!(check(&s, &req("GET"), peer, None, "/x"), Access::Denied);
 
         s.authorization.requires = reqs(vec![Require::AllGranted]);
-        assert_eq!(check(&s, &req("GET"), peer, None), Access::Allowed);
+        assert_eq!(check(&s, &req("GET"), peer, None, "/x"), Access::Allowed);
 
         // A host denial wins under Satisfy All even when Require passes.
         s.authorization
@@ -1374,6 +1411,6 @@ mod tests {
                 limit: None,
                 value: HostSpec::All,
             });
-        assert_eq!(check(&s, &req("GET"), peer, None), Access::Denied);
+        assert_eq!(check(&s, &req("GET"), peer, None, "/x"), Access::Denied);
     }
 }

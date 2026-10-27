@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-10-26",
   "verus": {
-    "verified_functions": 264,
+    "verified_functions": 266,
     "errors": 0
   },
   "obligations": [
@@ -287,11 +287,25 @@
       "evidence": "cache_directory_index_bind_admit requires an index-selected directory cache entry to bind both key and policy to the index; cache_ignore_query_admit forbids merging dynamic index/script representations across queries; request_scope resolves DirectoryIndex, re-evaluates the index scope and binds the opened index target before lookup/store; unit plus F52 replays cover cross-query CGI indexes and live <Files> denies for directory and direct index URLs"
     },
     {
-      "id": "htaccess_rewrite_subject_base",
-      "title": "Per-directory rewrite base follows the URL mount",
+      "id": "request_uri_identity",
+      "title": "Canonical REQUEST_URI for expressions, rewrites and environment rules",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "htaccess_layer_url_base_admit requires every access-file layer to derive its match base from the requested URL and its depth below the requested target; collect_layers, apply_req_deferred and --explain no longer use an alias-target-relative base. Unit plus F53 replays cover prefix Alias, AliasMatch, ScriptAlias, nested .htaccess, explicit RewriteBase and [F]/[G]/[E]/[R] effects"
+      "evidence": "request_uri_identity_admit requires REQUEST_URI to be bound to the dispatcher's canonical URL path, query-free and never the raw request-line target. RequestPlan supplies that target to dispatch, cache and --explain; expr::Context::new, Scope::request_env, access::check, rewrite::Context::for_plan and CGI build_env consume the canonical URL path. Require expr/<If>, SetEnvIf Request_URI, RewriteCond and substitution expansion no longer read req.target or append the query string. Unit plus F57 raw-socket replays cover query suffixes, percent-encoded names, dot segments, allow-list and deny-list shapes"
+    },
+    {
+      "id": "request_plan_identity",
+      "title": "One immutable request plan for dispatch, cache, rewrite and explain",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "RequestPlan is built once per request or rewrite round from CanonicalTarget and map_path, collects the access-file layers once, and exposes canonical URL path, mapping root, relative/fs paths, script-alias state and layers. dispatch_inner_request passes the same plan to cache lookup/store and dispatch; cache no longer re-decodes raw_path or rebuilds mapping; rewrite::Context::for_plan consumes plan identity; --explain prints the plan's canonical path, mapping, layer directories, URL mounts and subjects. Integration coverage exercises cache hits, rewrite rounds, CGI PATH_INFO, DirectoryIndex and explain; the universal refinement theorem remains open"
+    },
+    {
+      "id": "htaccess_rewrite_subject_base",
+      "title": "Per-directory rewrite URL base, filesystem subject and plan identity",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "request_plan::layer_url_mount is the single URL-mount derivation for access files and main-config <Directory> rewrites; request_plan::layer_subject is the single filesystem-relative RewriteRule subject derivation used by rewrite::subject_for. Every parsed access-file rule carries its layer directory, and htaccess_rewrite_subject_admit requires a derivable subject or fails closed instead of silently skipping a layer. RequestPlan now carries the canonical target, mapping root, relative path, filesystem target and collected access layers for dispatch, cache, rewrite contexts and --explain (I59). Unit plus F53/F58 replays cover prefix Alias, AliasMatch, ScriptAlias, nested .htaccess, explicit RewriteBase, document-root/ancestor layers above the mapping root, and [F]/[G]/[E]/[R] effects"
     },
     {
       "id": "dynamic_handler_cache_classification",
@@ -421,6 +435,8 @@
     "Multi-provider RequireNone OR-of-hits aggregation and non-granting negation",
     "Regex alias file-target split and parent access root",
     "Destination-address virtual-host eligibility and exact-address precedence",
-    "IPv4-mapped IPv6 peer canonicalization for authorization and identity"
+    "IPv4-mapped IPv6 peer canonicalization for authorization and identity",
+    "Canonical decoded, query-free REQUEST_URI identity for expressions, rewrite conditions/substitutions, environment rules and CGI",
+    "Filesystem-relative access-file rewrite subjects for layers at, below and above the URL mapping root"
   ]
 }

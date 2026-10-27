@@ -16,7 +16,7 @@ use crate::config::{apply_deferred_req, apply_normal_rule_list, Config, Scope, S
 use crate::http::Request;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Evaluate configuration rules in canonical order without touching the
 /// filesystem.  Conditional rules are collected and returned so a caller can
@@ -38,9 +38,9 @@ pub fn effective_scope_req(
 }
 
 /// A parsed per-directory access file, separated from filesystem I/O.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AccessLayer {
-    pub dir: PathBuf,
+    pub identity: crate::request_plan::LayerIdentity,
     pub scope: std::sync::Arc<Scope>,
     pub files: Vec<ScopeRule>,
     pub conditionals: Vec<ScopeRule>,
@@ -111,7 +111,7 @@ pub fn effective_scope_with_layers(
     // deferred Files/Location/conditional suffix.
     let mut present = Vec::with_capacity(dirs.len());
     for dir in &dirs {
-        present.push(layers.iter().any(|layer| layer.dir == *dir));
+        present.push(layers.iter().any(|layer| layer.identity.dir == *dir));
     }
     let mut htaccess_files = Vec::new();
     let mut htaccess_conditionals = Vec::new();
@@ -134,7 +134,7 @@ pub fn effective_scope_with_layers(
                     &mut config_conditionals,
                 );
                 if access {
-                    if let Some(layer) = layers.iter().find(|layer| layer.dir == *dir) {
+                    if let Some(layer) = layers.iter().find(|layer| layer.identity.dir == *dir) {
                         scope.merge(&layer.scope);
                         htaccess_files.extend(layer.files.iter().cloned());
                         htaccess_conditionals.extend(layer.conditionals.iter().cloned());

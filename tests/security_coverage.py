@@ -34,6 +34,7 @@ MODULES = [
     ("http", "crates/server/src/http.rs", 100.0),
     ("h2", "crates/server/src/h2.rs", 100.0),
     ("proxy", "crates/server/src/proxy.rs", 100.0),
+    ("request_plan", "crates/server/src/request_plan.rs", 100.0),
     ("tls", "crates/server/src/tls.rs", 100.0),
     ("server", "crates/server/src/server.rs", 100.0),
     ("htaccess", "crates/server/src/htaccess.rs", 100.0),
@@ -44,7 +45,7 @@ MODULES = [
 
 # Enforced modules are at 100% production-line coverage.  The rest are reported
 # so the next module can be promoted without changing the measurement method.
-ENFORCED = {"access", "cgi", "config", "expr", "fastcgi", "htaccess", "http", "proxy", "rewrite", "server", "tls"}
+ENFORCED = {"access", "cgi", "config", "expr", "fastcgi", "htaccess", "http", "proxy", "request_plan", "rewrite", "server", "tls"}
 
 
 def llvm_bin() -> Path:

@@ -30,6 +30,32 @@ pub struct Context<'a> {
     pub server_name: &'a str,
 }
 
+impl<'a> Context<'a> {
+    /// Build the rewrite context from the same immutable plan dispatch used
+    /// for mapping and access-file collection.
+    pub fn for_plan(
+        plan: &'a crate::request_plan::RequestPlan,
+        server_root: &'a Path,
+        query: &'a [u8],
+        peer: IpAddr,
+        port: u16,
+        https: bool,
+        server_name: &'a str,
+    ) -> Self {
+        Self {
+            url_path: plan.url_path(),
+            fs_path: plan.fs_path(),
+            docroot: plan.root(),
+            server_root,
+            query,
+            peer,
+            port,
+            https,
+            server_name,
+        }
+    }
+}
+
 /// Side effects of the rewrite rules that matched during a pass.  These are
 /// deliberately kept separate from the URL rewrite itself: the caller applies
 /// them to the effective scope of the *final* target after all rewrite rounds.
@@ -293,7 +319,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
     let mut cond_caps: Vec<String> = Vec::new();
     let mut effects = Effects::default();
     let mut filesystem_override: Option<PathBuf> = None;
-    let mut env: Vec<(String, String)> = scope.request_env(req);
+    let mut env: Vec<(String, String)> = scope.request_env(req, ctx.url_path);
     let mut vary: Vec<String> = Vec::new();
     let mut idx = 0usize;
     let mut skip_next = 0usize;
@@ -307,7 +333,18 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             continue;
         }
         vary.clear();
-        let Some(subject) = subject_for(rule, &path) else {
+        let subject = subject_for(rule, &path, ctx.fs_path);
+        if !vapache_verified::htaccess_rewrite_subject_admit(
+            rule.per_dir && rule.subject_dir.is_some(),
+            subject.is_some(),
+        ) {
+            // An access-file layer whose filesystem subject cannot be derived
+            // must not silently skip its rewrite deny rules (F58/I58).
+            return Outcome::Error(
+                "cannot derive per-directory rewrite subject for access layer".into(),
+            );
+        }
+        let Some(subject) = subject else {
             if rule.flags.chain {
                 skip_next = 1;
             }
@@ -333,7 +370,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             }
             continue;
         }
-        let caps = rule.pattern.captures(subject);
+        let caps = rule.pattern.captures(subject.as_ref());
         let cap_strings: Vec<String> = if rule.negated {
             if caps.is_some() {
                 if rule.flags.chain {
@@ -579,12 +616,24 @@ fn new_path_from_joined(joined: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn subject_for<'a>(rule: &RewriteRule, path: &'a str) -> Option<&'a str> {
+fn subject_for<'a>(
+    rule: &RewriteRule,
+    path: &'a str,
+    fs_path: &'a Path,
+) -> Option<std::borrow::Cow<'a, str>> {
     if rule.per_dir {
+        // Access-file layers carry the directory whose filesystem-relative
+        // path is Apache's per-directory rewrite subject.  This remains
+        // sound when the target is deeper than the URL mount or when the
+        // layer is above the alias/document-root mapping root (F58/I58).
+        if let Some(dir) = rule.subject_dir.as_deref() {
+            return crate::request_plan::layer_subject(dir, fs_path, path)
+                .map(std::borrow::Cow::Owned);
+        }
         let rel = path.strip_prefix(&rule.match_base)?;
-        Some(rel.trim_start_matches('/'))
+        Some(std::borrow::Cow::Borrowed(rel.trim_start_matches('/')))
     } else {
-        Some(path)
+        Some(std::borrow::Cow::Borrowed(path))
     }
 }
 
@@ -611,7 +660,7 @@ fn conditions_match(
     let mut matched_headers: Vec<String> = Vec::new();
     for cond in &rule.conditions {
         if let Some(expr) = &cond.expr {
-            let mut ectx = crate::expr::Context::new(req, env, ctx.peer, ctx.docroot);
+            let mut ectx = crate::expr::Context::new(req, env, ctx.peer, ctx.docroot, path);
             let r = expr.eval(&mut ectx).map(|v| v.truthy()).unwrap_or(false);
             matches.push(r);
             ors.push(cond.flags.or);
@@ -860,9 +909,7 @@ fn map_value(map: Option<&RewriteMap>, key: &str) -> String {
         Some(RewriteMap::Rnd(m)) => m
             .get(key)
             .and_then(|choices| {
-                choices.get(
-                    key.bytes().map(|b| b as usize).sum::<usize>() % choices.len().max(1),
-                )
+                choices.get(key.bytes().map(|b| b as usize).sum::<usize>() % choices.len().max(1))
             })
             .cloned()
             .unwrap_or_default(),
@@ -888,14 +935,10 @@ fn variable_value(
             .find(|(k, _)| k.eq_ignore_ascii_case(&n[4..]))
             .map(|(_, v)| v.clone())
             .unwrap_or_default(),
-        "REQUEST_URI" => {
-            let mut s = path.to_string();
-            if !query.is_empty() {
-                s.push('?');
-                s.push_str(&String::from_utf8_lossy(query));
-            }
-            s
-        }
+        // Apache's REQUEST_URI is the canonical URL path (r->uri).  The query
+        // string is a separate variable and must never be appended here;
+        // `path` is the dispatcher's decoded, normalized rewrite path (F57).
+        "REQUEST_URI" => path.to_string(),
         "REQUEST_FILENAME" | "SCRIPT_FILENAME" => ctx.fs_path.to_string_lossy().into_owned(),
         "DOCUMENT_ROOT" => ctx.docroot.to_string_lossy().into_owned(),
         "QUERY_STRING" => String::from_utf8_lossy(query).into_owned(),
@@ -2151,13 +2194,73 @@ mod tests {
         assert!(rule.negated);
     }
 
-    fn parsed_rule(pattern: &str, sub: &str, flags: &str, base: &str, per_dir: bool) -> RewriteRule {
-        parse_rewrite_rule(
-            &[pattern.into(), sub.into(), flags.into()],
-            base,
-            per_dir,
+    #[test]
+    fn access_layer_subject_is_filesystem_relative_and_keeps_directory_slash() {
+        let mut rule = parse_rewrite_rule(
+            &["^wallet/public/private/$".into(), "-".into(), "[F]".into()],
+            "/",
+            true,
         )
-        .unwrap()
+        .unwrap();
+        rule.subject_dir = Some(PathBuf::from("/srv/www"));
+        assert_eq!(
+            subject_for(
+                &rule,
+                "/wallet/private/",
+                Path::new("/srv/www/wallet/public/private")
+            )
+            .as_deref(),
+            Some("wallet/public/private/")
+        );
+        assert_eq!(
+            subject_for(
+                &rule,
+                "/wallet/private",
+                Path::new("/srv/www/wallet/public/private")
+            )
+            .as_deref(),
+            Some("wallet/public/private")
+        );
+        // A layer above the mapping root has the same subject shape.
+        rule.subject_dir = Some(PathBuf::from("/srv"));
+        assert_eq!(
+            subject_for(
+                &rule,
+                "/wallet/private/",
+                Path::new("/srv/www/wallet/public/private")
+            )
+            .as_deref(),
+            Some("www/wallet/public/private/")
+        );
+        assert!(subject_for(
+            &rule,
+            "/wallet/private/",
+            Path::new("/other/wallet/public/private")
+        )
+        .is_none());
+
+        // A malformed layer must fail closed rather than skip its rules.
+        let r = req();
+        let c = ctx(
+            "/wallet/private/",
+            Path::new("/other/wallet/public/private"),
+            Path::new("/srv"),
+        );
+        let scope = scope_with(vec![rule]);
+        assert!(matches!(
+            process(&scope, &r, &c),
+            Outcome::Error(message) if message.contains("rewrite subject")
+        ));
+    }
+
+    fn parsed_rule(
+        pattern: &str,
+        sub: &str,
+        flags: &str,
+        base: &str,
+        per_dir: bool,
+    ) -> RewriteRule {
+        parse_rewrite_rule(&[pattern.into(), sub.into(), flags.into()], base, per_dir).unwrap()
     }
 
     fn scope_with(rules: Vec<RewriteRule>) -> Scope {
@@ -2260,10 +2363,7 @@ mod tests {
 
     #[test]
     fn condition_evaluation_and_header_extraction() {
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-rewrite-cond-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("vapache-rewrite-cond-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("sub")).unwrap();
         fs::write(dir.join("file.txt"), "content").unwrap();
@@ -2348,20 +2448,15 @@ mod tests {
         assert!(!eval_cond(&regex, "zz", &c, &mut caps).unwrap());
         assert!(caps.is_empty());
 
-        assert_eq!(
-            compare_cond("10", "9", false),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(
-            compare_cond("ABC", "abc", true),
-            std::cmp::Ordering::Equal
-        );
-        assert_eq!(
-            compare_cond("ABC", "abc", false),
-            std::cmp::Ordering::Less
-        );
+        assert_eq!(compare_cond("10", "9", false), std::cmp::Ordering::Greater);
+        assert_eq!(compare_cond("ABC", "abc", true), std::cmp::Ordering::Equal);
+        assert_eq!(compare_cond("ABC", "abc", false), std::cmp::Ordering::Less);
         assert!(file_test("file.txt", &c, |p| p.is_file()));
-        assert!(file_test(&dir.join("file.txt").to_string_lossy(), &c, |p| p.is_file()));
+        assert!(file_test(
+            &dir.join("file.txt").to_string_lossy(),
+            &c,
+            |p| p.is_file()
+        ));
         assert!(!file_test("../etc/passwd", &c, |_| true));
         assert!(!file_test("/etc/passwd", &c, |_| true));
         let outside = std::env::temp_dir().join(format!(
@@ -2386,19 +2481,16 @@ mod tests {
             condition_header("x %{HTTP_X_TEST} y").as_deref(),
             Some("X-Test")
         );
-        assert_eq!(
-            condition_header("%{HTTP:host}").as_deref(),
-            Some("Host")
-        );
+        assert_eq!(condition_header("%{HTTP:host}").as_deref(), Some("Host"));
         assert_eq!(
             condition_header("%{HTTP:}%{ENV:X}%{HTTP:X-A}").as_deref(),
             Some("X-A")
         );
-        assert_eq!(condition_header("%{HTTPX}%{HTTP_X_TEST}").as_deref(), Some("X-Test"));
         assert_eq!(
-            condition_header("%{HTTP_X__Y}").as_deref(),
-            Some("X--Y")
+            condition_header("%{HTTPX}%{HTTP_X_TEST}").as_deref(),
+            Some("X-Test")
         );
+        assert_eq!(condition_header("%{HTTP_X__Y}").as_deref(), Some("X--Y"));
         assert_eq!(condition_header("plain"), None);
 
         assert_eq!(
@@ -2413,19 +2505,9 @@ mod tests {
                 &[],
             )
             .unwrap(),
-            "/path?q=1-/path?q=1-cap-é"
+            "/path-/path-cap-é"
         );
-        assert!(expand_vars(
-            "%{NOPE}",
-            &r,
-            &c,
-            "/path",
-            b"",
-            &[],
-            &[],
-            &[]
-        )
-        .is_err());
+        assert!(expand_vars("%{NOPE}", &r, &c, "/path", b"", &[], &[], &[]).is_err());
         assert_eq!(
             expand_vars("${unterminated", &r, &c, "/", b"", &[], &[], &[]).unwrap(),
             "${unterminated"
@@ -2455,13 +2537,21 @@ mod tests {
             ("int".into(), RewriteMap::Int("toupper".into())),
         ];
         assert_eq!(
-            variable_value("ENV:FOO", &r, &c, "/old", b"", &[], &[("FOO".into(), "bar".into())])
-                .unwrap(),
+            variable_value(
+                "ENV:FOO",
+                &r,
+                &c,
+                "/old",
+                b"",
+                &[],
+                &[("FOO".into(), "bar".into())]
+            )
+            .unwrap(),
             "bar"
         );
         assert_eq!(
             variable_value("REQUEST_URI", &r, &c, "/old", b"q=1", &[], &[]).unwrap(),
-            "/old?q=1"
+            "/old"
         );
         assert_eq!(
             variable_value("REQUEST_FILENAME", &r, &c, "/old", b"", &[], &[]).unwrap(),
@@ -2574,7 +2664,7 @@ mod tests {
                 None,
             )
             .unwrap(),
-            "/old%3fq=1-/old%3fq=1-one-cond-one"
+            "/old-/old-one-cond-one"
         );
         let spec = EscapeSpec {
             custom: None,
@@ -2735,17 +2825,8 @@ mod tests {
             assert!(matches!(process(&next, &r, &c), Outcome::Error(_)));
         }
 
-        let bad_expand = scope_with(vec![parsed_rule(
-            "^/x$",
-            "${UNKNOWN}",
-            "[L]",
-            "/",
-            false,
-        )]);
-        assert!(matches!(
-            process(&bad_expand, &r, &c),
-            Outcome::Error(_)
-        ));
+        let bad_expand = scope_with(vec![parsed_rule("^/x$", "${UNKNOWN}", "[L]", "/", false)]);
+        assert!(matches!(process(&bad_expand, &r, &c), Outcome::Error(_)));
 
         let mut bad_effect = parsed_rule("^/x$", "/y", "[L]", "/", false);
         bad_effect.flags.env.push((String::new(), Some("x".into())));

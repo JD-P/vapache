@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end regressions for the pass-2 through pass-7 findings (F23-F55).
+"""End-to-end regressions for the pass-2 through pass-8 findings (F23-F58).
 
 The suite starts fresh vapached instances in temporary trees and exercises
 the exploit shapes from findings.md: terminal rewrite/proxy authorization,
@@ -11,7 +11,8 @@ entries, .htaccess RequestHeader, CGI REMOTE_USER/AUTH_TYPE, multi-provider
 IPv4-mapped peer canonicalization, ancestor access files above DocumentRoot,
 overlapping alias roots, DirectoryIndex-bound cache targets, alias per-directory
 rewrite bases, SetHandler/server-status cache classification, lossless cache
-key bytes and ErrorDocument cache scoping.
+key bytes, ErrorDocument cache scoping, canonical REQUEST_URI identity, and
+access-file rewrite subjects above the mapping root.
 
 Usage:
     cargo build --release -p vapached
@@ -1498,6 +1499,281 @@ ScriptAlias /cgi "{cls.site}/cgi"
             headers.get("Location", "").endswith("/site/moved/file.txt"),
             headers.get("Location"),
         )
+
+
+class F57RequestUriIdentityTests(unittest.TestCase):
+    """%{REQUEST_URI} is the dispatcher's canonical path, never the raw target."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f57-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.logs = cls.base / "logs"
+        for directory in (
+            cls.www / "expr",
+            cls.www / "if-api",
+            cls.www / "if-private",
+            cls.www / "rewrite",
+            cls.www / "envif",
+            cls.logs,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        (cls.www / "expr" / ".env").write_text("WALLET-F57-ENV\n")
+        (cls.www / "expr" / "wallet.dat").write_text("WALLET-F57-DB\n")
+        (cls.www / "if-api" / "public.json").write_text("WALLET-F57-PUBLIC\n")
+        (cls.www / "if-private" / "secret.json").write_text("WALLET-F57-SECRET\n")
+        (cls.www / "rewrite" / ".env").write_text("WALLET-F57-RC-ENV\n")
+        (cls.www / "envif" / ".env").write_text("WALLET-F57-ENVIF-ENV\n")
+        (cls.www / "rewrite" / ".htaccess").write_text(
+            "RewriteEngine On\n"
+            "RewriteCond %{REQUEST_URI} \\.env$\n"
+            "RewriteRule ^ - [F,L]\n"
+        )
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+<Directory "{cls.www}">
+    AllowOverride All
+    Require all granted
+</Directory>
+SetEnvIf Request_URI "\\.env$" F57_BLOCKED=1
+<Location "/expr">
+    Require expr "%{{REQUEST_URI}} !~ /\\.env$/ && %{{REQUEST_URI}} !~ /wallet\\.dat$/"
+</Location>
+<Location "/envif">
+    Require expr "%{{ENV:F57_BLOCKED}} != '1'"
+</Location>
+<Directory "{cls.www}/if-private">
+    Require all denied
+</Directory>
+<If "%{{REQUEST_URI}} =~ /^\\/if-api\\//">
+    Require all granted
+</If>
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def assert_denied(self, target: bytes):
+        status, _, body = raw_request("127.0.0.1", self.port, target)
+        self.assertEqual(status, 403, f"{target!r}: {body[:200]}")
+        for marker in (
+            b"WALLET-F57-ENV",
+            b"WALLET-F57-DB",
+            b"WALLET-F57-SECRET",
+            b"WALLET-F57-RC-ENV",
+            b"WALLET-F57-ENVIF-ENV",
+        ):
+            self.assertNotIn(marker, body)
+
+    def test_require_expr_uses_decoded_query_free_path(self):
+        for target in (
+            b"/expr/.env",
+            b"/expr/.env?x=1",
+            b"/expr/%2eenv",
+            b"/expr/wallet.dat?dl=1",
+            b"/expr/wallet%2edat",
+            b"/expr/api/../.env",
+            b"/expr/api/%2e%2e/wallet.dat",
+        ):
+            self.assert_denied(target)
+
+    def test_if_allow_list_cannot_match_pre_normalization_path(self):
+        status, _, body = request(self.port, "/if-api/public.json?x=1")
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"WALLET-F57-PUBLIC", body)
+
+        for target in (
+            b"/if-api/../if-private/secret.json",
+            b"/if-api/%2e%2e/if-private/secret.json",
+        ):
+            self.assert_denied(target)
+
+    def test_rewrite_cond_uses_decoded_query_free_path(self):
+        for target in (
+            b"/rewrite/.env",
+            b"/rewrite/.env?x=1",
+            b"/rewrite/%2eenv",
+            b"/rewrite/api/../.env",
+        ):
+            self.assert_denied(target)
+
+    def test_setenvif_request_uri_uses_decoded_query_free_path(self):
+        for target in (
+            b"/envif/.env",
+            b"/envif/.env?x=1",
+            b"/envif/%2eenv",
+            b"/envif/api/../.env",
+        ):
+            self.assert_denied(target)
+
+
+class F58ParentRewriteSubjectTests(unittest.TestCase):
+    """Access-file rewrite layers above the mapping root use Apache subjects."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f58-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.ancestor = cls.base / "ancestor"
+        cls.www = cls.ancestor / "public"
+        cls.app = cls.www / "wallet" / "public"
+        cls.storage = cls.base / "storage"
+        cls.storage_app = cls.storage / "current" / "public"
+        cls.logs = cls.base / "logs"
+        for directory in (
+            cls.app / "env",
+            cls.app / "cgi",
+            cls.app / "moved",
+            cls.app / "private",
+            cls.app / "ancestor",
+            cls.storage_app / "private",
+            cls.logs,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        (cls.app / ".env").write_text("WALLET-F58-ENV\n")
+        (cls.app / "wallet.dat").write_text("WALLET-F58-DB\n")
+        (cls.app / "gone.dat").write_text("WALLET-F58-GONE\n")
+        (cls.app / "ancestor" / "wallet.dat").write_text("WALLET-F58-ANCESTOR\n")
+        (cls.app / "private" / "index.html").write_text(
+            "WALLET-F58-INDEX\n"
+        )
+        (cls.app / "moved" / "file.txt").write_text("WALLET-F58-MOVED\n")
+        (cls.app / "env" / "show.cgi").write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'F58_ENV=%s\\n' \"${F58_ENV:-missing}\"\n"
+        )
+        (cls.app / "env" / "show.cgi").chmod(0o755)
+        (cls.app / "cgi" / "run.cgi").write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'WALLET-F58-CGI\\n'\n"
+        )
+        (cls.app / "cgi" / "run.cgi").chmod(0o755)
+        (cls.storage_app / "private" / "wallet.dat").write_text(
+            "WALLET-F58-STORAGE\n"
+        )
+        # Layer above DocumentRoot (ancestor/public) and above the alias target.
+        (cls.ancestor / ".htaccess").write_text(
+            "RewriteEngine On\n"
+            "RewriteRule ^public/wallet/public/ancestor/ - [F,L]\n"
+        )
+        # DocumentRoot access file, applied to Alias/AliasMatch/ScriptAlias URLs.
+        (cls.www / ".htaccess").write_text(
+            "RewriteEngine On\n"
+            "RewriteRule (^|/)\\.(env|git)(/|$) - [F,L]\n"
+            "RewriteRule (^|/)wallet\\.dat$ - [F,L]\n"
+            "RewriteRule (^|/)gone\\.dat$ - [G,L]\n"
+            "RewriteRule ^wallet/public/private/$ - [F,L]\n"
+            "RewriteRule (^|/)private(/|$) - [F,L]\n"
+            "RewriteRule ^wallet/public/cgi/run\\.cgi$ - [F,L]\n"
+            "RewriteRule ^wallet/public/env/show\\.cgi$ - [E=F58_ENV:yes,L]\n"
+            "RewriteRule ^wallet/public/moved/(.*)$ /wallet/moved/$1 [R=302,L]\n"
+            "Header set X-Htaccess-Read yes\n"
+        )
+        # Access file above a separate alias target, as in F58 reproduction B.
+        (cls.storage / ".htaccess").write_text(
+            "RewriteEngine On\n"
+            "RewriteRule ^current/public/private/ - [F,L]\n"
+        )
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+AddHandler cgi-script .cgi
+DirectoryIndex index.html
+<Directory "{cls.ancestor}">
+    AllowOverride All
+    Options +ExecCGI
+    Require all granted
+</Directory>
+<Directory "{cls.www}">
+    AllowOverride All
+    Options +ExecCGI
+    Require all granted
+</Directory>
+<Directory "{cls.storage}">
+    AllowOverride All
+    Require all granted
+</Directory>
+Alias /wallet "{cls.app}"
+AliasMatch "^/mwallet/(.*)$" "{cls.app}/$1"
+ScriptAlias /swallet "{cls.app}/cgi"
+Alias /storage "{cls.storage_app}"
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def assert_not_served(self, path: str, expected=(403,), marker=b"WALLET-F58"):
+        status, headers, body = request(self.port, path)
+        self.assertIn(status, expected, f"{path}: {body[:200]}")
+        self.assertNotIn(marker, body, path)
+        return status, headers, body
+
+    def test_document_root_denylist_covers_alias_and_alias_match(self):
+        for path in (
+            "/wallet/.env",
+            "/wallet/.env?x=1",
+            "/wallet/%2eenv",
+            "/wallet/wallet.dat?dl=1",
+            "/mwallet/.env",
+            "/mwallet/wallet%2edat",
+        ):
+            self.assert_not_served(path)
+
+        status, headers, _ = request(self.port, "/wallet/moved/file.txt")
+        self.assertEqual(status, 302)
+        self.assertTrue(
+            headers.get("Location", "").endswith("/wallet/moved/file.txt"),
+            headers.get("Location"),
+        )
+
+    def test_document_root_index_cgi_env_gone_and_script_alias(self):
+        self.assert_not_served("/wallet/private/")
+        self.assert_not_served("/swallet/run.cgi")
+        self.assert_not_served("/swallet/.env", expected=(403, 404))
+
+        status, _, body = request(self.port, "/wallet/gone.dat")
+        self.assertEqual(status, 410, body[:200])
+        self.assertNotIn(b"WALLET-F58-GONE", body)
+
+        status, headers, body = request(self.port, "/wallet/env/show.cgi")
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"F58_ENV=yes", body)
+        self.assertEqual(headers.get("X-Htaccess-Read"), "yes")
+
+    def test_ancestor_layers_above_docroot_and_alias_target(self):
+        for path in (
+            "/wallet/ancestor/wallet.dat",
+            "/storage/private/wallet.dat",
+        ):
+            self.assert_not_served(path)
 
 
 class F54SetHandlerCacheTests(unittest.TestCase):

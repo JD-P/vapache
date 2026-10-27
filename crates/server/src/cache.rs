@@ -8,10 +8,9 @@
 //! under `CacheRoot` when a `disk` cache is enabled.
 
 use crate::access::AccessGrant;
-use crate::config::{CacheConfig, Config, EncodedSlashes, Scope, VHost};
+use crate::config::{CacheConfig, Config, Scope, VHost};
 use crate::http::{Body, Request, Response};
 use crate::util::{parse_http_date, unix_now};
-use crate::verified::{normalize_uri_path, percent_decode_path};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use sha1::{Digest, Sha1};
@@ -133,10 +132,7 @@ fn scan_disk_usage(root: &Path) -> DiskUsageState {
                         continue;
                     };
                     let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    let slot = state
-                        .stems
-                        .entry(stem)
-                        .or_insert((0, modified));
+                    let slot = state.stems.entry(stem).or_insert((0, modified));
                     slot.0 = slot.0.saturating_add(meta.len());
                     if modified < slot.1 {
                         slot.1 = modified;
@@ -214,11 +210,47 @@ pub struct CacheContext {
 /// Return the cache type selected for this request, if caching is enabled and
 /// access control permits serving a cached representation.
 #[allow(clippy::too_many_arguments)]
+/// Compatibility entry point for callers that do not already hold a
+/// `RequestPlan`.  Production dispatch/cache integration uses
+/// `request_scope_with_plan` so the cache and dispatcher share one identity.
+#[allow(clippy::too_many_arguments)]
 pub fn request_scope(
     cfg: &Config,
     vhost: Option<&VHost>,
     req: &Request,
     peer: IpAddr,
+    path: &str,
+    local_port: u16,
+    https: bool,
+    server_name: &str,
+    host: &str,
+    local_ip: &str,
+) -> Option<CacheContext> {
+    let allow_encoded = cfg.encoded_slashes == crate::config::EncodedSlashes::On;
+    let plan =
+        crate::request_plan::RequestPlan::from_request(cfg, vhost, req, allow_encoded).ok()?;
+    request_scope_with_plan(
+        cfg,
+        vhost,
+        req,
+        peer,
+        &plan,
+        path,
+        local_port,
+        https,
+        server_name,
+        host,
+        local_ip,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn request_scope_with_plan(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
+    peer: IpAddr,
+    plan: &crate::request_plan::RequestPlan,
     path: &str,
     local_port: u16,
     https: bool,
@@ -236,26 +268,10 @@ pub fn request_scope(
     // Skip the request-scope walk entirely; this is the common case for static
     // document roots that have not opted into mod_cache.
     cfg.cache.root.as_ref()?;
-    let allow_encoded = cfg.encoded_slashes == EncodedSlashes::On;
-    let decoded = match percent_decode_path(&req.raw_path, allow_encoded) {
-        Some(d) => d,
-        None => return None,
-    };
-    let normalized = match normalize_uri_path(&decoded) {
-        Some(n) => n,
-        None => return None,
-    };
-    let trailing_slash = decoded.len() > 1 && decoded.ends_with(b"/");
     // F55/I51: a lossy URL conversion can collapse distinct byte paths into
-    // one cache identity.  A non-UTF-8 path is dispatched normally but is
-    // never admitted to the shared cache.
-    let mut url_path = match std::str::from_utf8(&normalized) {
-        Ok(path) => path.to_string(),
-        Err(_) => return None,
-    };
-    if trailing_slash && url_path != "/" {
-        url_path.push('/');
-    }
+    // one cache identity.  The plan already rejected a non-UTF-8 canonical
+    // path; keep the cache decision on that same identity.
+    let url_path = plan.url_path().to_string();
     // Most requests are outside every CacheEnable prefix.  Check the
     // inherited scope before resolving directory rules and .htaccess, since
     // that walk is far more expensive than the prefix test itself.
@@ -277,30 +293,26 @@ pub fn request_scope(
             return None;
         }
     }
-    // Use the same URL-to-filesystem mapping as dispatch.  Authorizing a
-    // document-root path that an Alias never serves would let a cached alias
-    // response bypass the alias target's Directory/access-file policy.
-    let Some((root, rel, script_alias)) = crate::server::map_path(cfg, vhost, &normalized) else {
-        // A failed alias mapping is not cacheable and must go through the
-        // dispatcher's failure path.
-        return None;
-    };
-    let mapped_fs_path = root.join(&rel);
-    let mut scope = evaluate_cache_scope(cfg, vhost, req, peer, &root, &mapped_fs_path, &url_path)?;
+    // Authorizing a document-root path that an Alias never serves would let
+    // a cached alias response bypass the alias target's Directory/access-file
+    // policy.  The plan already used dispatch's mapping and access layers.
+    let root = plan.root().to_path_buf();
+    let rel = plan.rel().to_path_buf();
+    let script_alias = plan.script_alias();
+    let mapped_fs_path = plan.fs_path().to_path_buf();
+    let mut scope = plan.effective_scope(cfg, vhost, req, peer);
     // Cache lookup must not bypass rewrite rules.  If any rule would produce
     // an outcome (including F/G/redirects or a target/file change), run the
     // normal dispatcher instead of serving a stale representation.
-    let rewrite_ctx = crate::rewrite::Context {
-        url_path: &url_path,
-        fs_path: &mapped_fs_path,
-        docroot: &root,
-        server_root: &cfg.server_root,
-        query: &req.query,
+    let rewrite_ctx = crate::rewrite::Context::for_plan(
+        plan,
+        &cfg.server_root,
+        &req.query,
         peer,
-        port: local_port,
+        local_port,
         https,
         server_name,
-    };
+    );
     if !matches!(
         crate::rewrite::process(&scope, req, &rewrite_ctx),
         crate::rewrite::Outcome::None
@@ -335,7 +347,17 @@ pub fn request_scope(
                     .to_string();
                 fs_path = root.join(&st.rel_script);
                 cache_url_path = script_url.clone();
-                scope = evaluate_cache_scope(cfg, vhost, req, peer, &root, &fs_path, &script_url)?;
+                let target = crate::request_plan::CanonicalTarget::from_url_path(&script_url)?;
+                let script_plan = crate::request_plan::RequestPlan::from_fs_target(
+                    cfg,
+                    vhost,
+                    target,
+                    root.clone(),
+                    fs_path.clone(),
+                    script_alias,
+                )
+                .ok()?;
+                scope = script_plan.effective_scope(cfg, vhost, req, peer);
             }
         }
     }
@@ -351,22 +373,26 @@ pub fn request_scope(
         crate::files::resolve_target_checked(&root, current_rel, follow, owner_match_only)
     {
         directory_target = true;
-        if let Some(index) = crate::files::directory_index_target(
-            cfg,
-            &scope,
-            req,
-            &file,
-            &url_path,
-            &req.raw_path,
-        ) {
+        if let Some(index) =
+            crate::files::directory_index_target(cfg, &scope, req, &file, &url_path, &req.raw_path)
+        {
             // The cache identity must preserve the exact index name bytes.
             // Reject a non-UTF-8 index name rather than sharing a lossy key.
             let index_name = std::str::from_utf8(&index.name).ok()?;
             let index_url = format!("{}/{}", url_path.trim_end_matches('/'), index_name);
-            let index_fs = crate::files::fd_path(&index.file).unwrap_or_else(|| {
-                fs_path.join(std::ffi::OsStr::from_bytes(&index.name))
-            });
-            scope = evaluate_cache_scope(cfg, vhost, req, peer, &root, &index_fs, &index_url)?;
+            let index_fs = crate::files::fd_path(&index.file)
+                .unwrap_or_else(|| fs_path.join(std::ffi::OsStr::from_bytes(&index.name)));
+            let target = crate::request_plan::CanonicalTarget::from_url_path(&index_url)?;
+            let index_plan = crate::request_plan::RequestPlan::from_fs_target(
+                cfg,
+                vhost,
+                target,
+                root.clone(),
+                index_fs.clone(),
+                script_alias,
+            )
+            .ok()?;
+            scope = index_plan.effective_scope(cfg, vhost, req, peer);
             fs_path = index_fs;
             cache_url_path = index_url;
             index_selected = true;
@@ -434,14 +460,10 @@ pub fn request_scope(
     // Never bypass per-directory access control or a rewrite-set environment
     // requirement by serving a cached object without running dispatch.
     let fingerprint = cache_policy_fingerprint(&scope, req, peer, &fs_path);
-    let resource = crate::access::ResourceKey::cache_policy(
-        vhost,
-        req,
-        host,
-        &cache_url_path,
-        fingerprint,
-    );
-    let grant = match crate::access::check_grant(&scope, req, peer, None, resource) {
+    let resource =
+        crate::access::ResourceKey::cache_policy(vhost, req, host, &cache_url_path, fingerprint);
+    let grant = match crate::access::check_grant(&scope, req, peer, None, &cache_url_path, resource)
+    {
         Ok(grant) => grant,
         Err(_) => return None,
     };
@@ -472,111 +494,6 @@ pub fn request_scope(
         target: fs_path,
         path: cache_url_path,
     })
-}
-
-/// Build the effective scope used for cache authorization at one resolved
-/// target.  This mirrors the dispatcher's directory/access-file/conditional
-/// interleaving, and is called again when PATH_INFO resolution changes the
-/// target from the URL-mapped path to the actual script.
-#[allow(clippy::too_many_arguments)]
-fn evaluate_cache_scope(
-    cfg: &Config,
-    vhost: Option<&VHost>,
-    req: &Request,
-    peer: IpAddr,
-    root: &std::path::Path,
-    fs_path: &std::path::Path,
-    url_path: &str,
-) -> Option<Scope> {
-    let mut config_files = Vec::new();
-    let mut config_locations = Vec::new();
-    let mut config_conditionals = Vec::new();
-    let mut htaccess_files = Vec::new();
-    let mut htaccess_conditionals = Vec::new();
-    let mut scope = if cfg.htaccess_may_apply(fs_path) {
-        let layers =
-            crate::htaccess::collect_layers_with_root(cfg, vhost, fs_path, url_path, Some(root))
-                .ok()?;
-        let (evaluated, conditionals, access_conditionals) =
-            crate::policy_ref::effective_scope_with_layers(
-                cfg, vhost, fs_path, url_path, req, peer, &layers,
-            );
-        config_conditionals = conditionals;
-        htaccess_conditionals = access_conditionals;
-        evaluated
-    } else {
-        cfg.effective_scope_req_deferred(
-            vhost,
-            fs_path,
-            url_path,
-            req,
-            peer,
-            &mut config_conditionals,
-        )
-    };
-    let cond_fname = fs_path
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_default();
-    crate::config::apply_normal_rule_list(
-        &config_files,
-        &mut scope,
-        req,
-        peer,
-        root,
-        fs_path,
-        url_path,
-        &cond_fname,
-        &mut config_conditionals,
-    );
-    crate::config::apply_normal_rule_list(
-        &htaccess_files,
-        &mut scope,
-        req,
-        peer,
-        root,
-        fs_path,
-        url_path,
-        &cond_fname,
-        &mut htaccess_conditionals,
-    );
-    crate::config::apply_normal_rule_list(
-        &config_locations,
-        &mut scope,
-        req,
-        peer,
-        root,
-        fs_path,
-        url_path,
-        &cond_fname,
-        &mut config_conditionals,
-    );
-    config_conditionals.sort_by_key(|rule| rule.order);
-    let mut cond_state = HashMap::new();
-    crate::config::apply_deferred_req(
-        &mut scope,
-        &config_conditionals,
-        req,
-        peer,
-        root,
-        fs_path,
-        url_path,
-        &cond_fname,
-        &mut cond_state,
-    );
-    let mut htaccess_state = HashMap::new();
-    crate::config::apply_deferred_req(
-        &mut scope,
-        &htaccess_conditionals,
-        req,
-        peer,
-        root,
-        fs_path,
-        url_path,
-        &cond_fname,
-        &mut htaccess_state,
-    );
-    Some(scope)
 }
 
 /// Conservative prefilter for `request_scope`: return true when any matching
@@ -1244,9 +1161,7 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
         let _ = fs::remove_file(&meta_tmp);
         return;
     }
-    if fs::rename(&body_tmp, &body_path).is_err()
-        || fs::rename(&meta_tmp, &meta_path).is_err()
-    {
+    if fs::rename(&body_tmp, &body_path).is_err() || fs::rename(&meta_tmp, &meta_path).is_err() {
         let _ = fs::remove_file(&body_tmp);
         let _ = fs::remove_file(&meta_tmp);
         let _ = fs::remove_file(&body_path);
@@ -1256,7 +1171,11 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
     let actual = fs::metadata(&body_path)
         .map(|m| m.len())
         .unwrap_or(entry.body.len() as u64)
-        .saturating_add(fs::metadata(&meta_path).map(|m| m.len()).unwrap_or(meta.len() as u64));
+        .saturating_add(
+            fs::metadata(&meta_path)
+                .map(|m| m.len())
+                .unwrap_or(meta.len() as u64),
+        );
     usage.total = vapache_verified::cache_disk_projected(usage.total, old_size, actual);
     usage.stems.insert(stem, (actual, SystemTime::now()));
 }
@@ -1326,8 +1245,7 @@ pub fn store(
     // Credentialed responses are never placed in the shared cache.  The
     // cache has no identity dimension, so storing one and hoping a later
     // policy check rejects a different identity is not sufficient.
-    let credential_free =
-        req.header("authorization").is_none() && req.header("cookie").is_none();
+    let credential_free = req.header("authorization").is_none() && req.header("cookie").is_none();
     if !vapache_verified::cache_store_request_admit(
         req.method == "GET",
         req.body_len() == 0,
@@ -2373,10 +2291,8 @@ AddHandler cgi-script .cgi\n\
 
     #[test]
     fn ignore_query_string_never_shares_dynamic_cgi_representations() {
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-cache-ignore-query-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vapache-cache-ignore-query-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let cgi = dir.join("www").join("cgi");
         fs::create_dir_all(&cgi).unwrap();
@@ -2440,10 +2356,8 @@ AddHandler cgi-script .cgi\n\
 
     #[test]
     fn cache_key_is_injective_over_raw_bytes() {
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-cache-key-bytes-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vapache-cache-key-bytes-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("httpd.conf");
@@ -2684,10 +2598,8 @@ ErrorDocument 404 /404.html\n\
 
     #[test]
     fn directory_index_binds_cache_target_and_live_policy() {
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-cache-dir-index-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vapache-cache-dir-index-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let www = dir.join("www");
         fs::create_dir_all(www.join("dir")).unwrap();
@@ -2781,10 +2693,7 @@ DirectoryIndex index.html\n\
         reversed.min_expire = 60;
         reversed.max_expire = 5;
         assert_eq!(freshness(&reversed, &headers, 100), Some(0));
-        assert_eq!(
-            vapache_verified::cache_expiry(i64::MAX - 1, 10),
-            i64::MAX
-        );
+        assert_eq!(vapache_verified::cache_expiry(i64::MAX - 1, 10), i64::MAX);
     }
 
     #[test]
@@ -2836,10 +2745,8 @@ DirectoryIndex index.html\n\
     }
 
     fn disk_test_config(name: &str) -> (std::path::PathBuf, Config) {
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-cache-quota-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vapache-cache-quota-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("httpd.conf");
@@ -2873,10 +2780,18 @@ DirectoryIndex index.html\n\
     fn disk_cache_enforces_total_quota_and_rejects_oversize_entries() {
         let (dir, mut cfg) = disk_test_config("evict");
         cfg.cache.max_disk_size = 6_000;
-        disk_store(&cfg, "first", &disk_entry(&vec![b'a'; 4_000], unix_now() + 60));
+        disk_store(
+            &cfg,
+            "first",
+            &disk_entry(&vec![b'a'; 4_000], unix_now() + 60),
+        );
         let first = cache_stem(&cfg, "first").unwrap();
         assert!(first.with_extension("body").is_file());
-        disk_store(&cfg, "second", &disk_entry(&vec![b'b'; 4_000], unix_now() + 60));
+        disk_store(
+            &cfg,
+            "second",
+            &disk_entry(&vec![b'b'; 4_000], unix_now() + 60),
+        );
         let second = cache_stem(&cfg, "second").unwrap();
         assert!(second.with_extension("body").is_file());
         assert!(!first.with_extension("body").exists());
@@ -2884,7 +2799,11 @@ DirectoryIndex index.html\n\
 
         // A single entry larger than the total budget is never persisted.
         cfg.cache.max_disk_size = 128;
-        disk_store(&cfg, "oversize", &disk_entry(&vec![b'c'; 1_024], unix_now() + 60));
+        disk_store(
+            &cfg,
+            "oversize",
+            &disk_entry(&vec![b'c'; 1_024], unix_now() + 60),
+        );
         let oversize = cache_stem(&cfg, "oversize").unwrap();
         assert!(!oversize.with_extension("body").exists());
         let _ = fs::remove_dir_all(&dir);

@@ -1048,9 +1048,10 @@ request.  `map_path()` returns the actual mapping root, and every caller passes
 that value to the access walk/cache; `alias_mapping_root_admit` states that a
 root inferred from alias-target containment is never admitted (F51).  The
 mapping root selects the alias for `ResourceKey` and containment, while
-per-directory rewrite/URL bases follow the URL mount (I50) rather than a path
-relative to the alias target.  Authorization still walks every ancestor per
-I47.
+per-directory URL bases follow the URL mount for layers at/below it (I50) and
+the rewrite matching subject is filesystem-relative for every layer (I58),
+never a path relative to the alias target alone.  Authorization still walks
+every ancestor per I47.
 
 ### I49 — DirectoryIndex cache target
 
@@ -1069,23 +1070,87 @@ change affecting the index must change the computed policy before a lookup
 (F52).  The runtime consumes `cache_directory_index_bind_admit` and
 `cache_ignore_query_admit` before lookup/store.
 
-### I50 — Per-directory rewrite subject base
+### I50 — Per-directory rewrite URL base
 
 ```text
-layer_dir <= target_dir
+layer_dir at/below mapping_root
 depth(layer_dir, target_dir) == number of filesystem components below layer_dir
 match_base(layer) == URL_path(target)[0 .. len - depth] with a trailing slash
 match_base(layer) != path(layer_dir) relative to an alias target
 ```
 
-Apache's per-directory rewrite subject is the request URL with the layer's URL
-prefix removed.  For an `Alias`/`AliasMatch`/`ScriptAlias` tree the layer's
+For a layer at or below the URL-mapping root, Apache's per-directory rewrite
 prefix is the URL mount, not the directory's position under the alias target.
 Using the target-relative path made `RewriteRule ^private/ - [F]` miss and
-served or executed protected files (F53).  `dir_url_base()` now derives the
-base from the requested URL and depth for every layer; `RewriteBase` remains
-the substitution base only.  The runtime consumes
-`htaccess_layer_url_base_admit`, and `subject_for()` strips that URL base.
+served or executed protected files (F53).  `request_plan::layer_url_mount()`
+is now the single derivation used by access files and main-configuration
+`<Directory>` rules; `RewriteBase` remains the substitution base only.  The
+runtime consumes `htaccess_layer_url_base_admit`.  Matching subject identity is
+separate and follows I58 for every layer, including layers above the mapping
+root.
+
+### I57 — REQUEST_URI identity
+
+```text
+every expression/rewrite/environment evaluation of %{REQUEST_URI}
+  == dispatcher.canonical_url_path
+canonical_url_path is percent-decoded, dot-segment-normalized, and query-free
+%{REQUEST_URI} != Request::target (raw request-line bytes)
+%{REQUEST_URI} does not include %{QUERY_STRING}
+```
+
+`Require expr`, `<If>`, `SetEnvIf Request_URI`, `RewriteCond` and rewrite
+substitution expansion all inspect the same canonical URL path that dispatch
+uses to select the filesystem target.  Binding any of them to the raw request
+target let a query suffix, percent encoding or dot segment make a deny
+expression miss or an allow expression match the wrong resource (F57).  The
+runtime passes the dispatcher path into `expr::Context`,
+`Scope::request_env`, `access::check` and `rewrite::Context`; the CGI
+`REQUEST_URI` is likewise the canonical script URL.  `expr::Context::new`
+consumes `request_uri_identity_admit`, and no implementation appends the query
+string.
+
+### I58 — Access-file rewrite subject above the mapping root
+
+```text
+for an access-file layer D:
+subject(rule, request) == target_path relative to D
+subject(rule, request) == requested filesystem target with D's prefix removed
+subject(rule, request) != URL_path with components stripped by filesystem depth
+layer above mapping_root -> subject is still filesystem-relative
+cannot construct subject -> layer fails closed, never silently non-matching
+```
+
+Apache's per-directory `RewriteRule` pattern sees `r->filename` relative to the
+access-file directory, not a URL prefix.  Layers above an alias/document-root
+mapping root can therefore have a subject such as `wallet/public/.env` even
+though the request URL is `/wallet/.env`; layers under a fixed `AliasMatch`
+suffix can be deeper than the URL.  The runtime attaches the layer directory to
+every parsed access-file rule, computes the subject with the single
+`request_plan::layer_subject()` implementation, and consumes
+`htaccess_rewrite_subject_admit` before matching.  If the subject cannot be
+derived, dispatch fails closed instead of skipping the layer's deny rules
+(F58).  `request_plan::layer_url_mount()` is only the relative-substitution
+base; for layers above the mapping root it uses Apache's filesystem-directory
+form rather than the old unmatchable URL fallback.
+
+### I59 — Single request-plan identity
+
+```text
+dispatch(cache lookup/store) and --explain consume one RequestPlan
+RequestPlan.canonical_url_path == CanonicalTarget.url_path
+RequestPlan.mapping_root/rel/fs_path == map_path(canonical target)
+RequestPlan.layers == access-file walk(cfg, fs_path, canonical_url_path)
+rewrite Context(plan) uses plan.url_path/fs_path/mapping_root
+```
+
+Cache and dispatch previously re-decoded `Request::raw_path` and rebuilt the
+mapping independently.  They now receive the same `RequestPlan`, so a cache
+decision cannot be based on a different URI spelling, mapping root or
+access-file layer set than the request that is eventually served.  Rewrite
+rounds build a new plan from the rewritten canonical URL, and that plan is the
+input to the next scope evaluation.  `--explain` prints the plan’s canonical
+path, mapping, layer directories, URL mounts and filesystem subjects.
 
 ### I51 — Cache key byte identity
 
@@ -1240,7 +1305,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **238 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **266 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1321,6 +1386,16 @@ construction: there is no second production interleaver.
   classification (I53).  The `.htaccess` walk, cache request scope and key
   builder consume them; unit plus F53–F56 fastcgi-mock/raw-socket replays
   exercise each branch.
+- `request_uri_identity_admit` and `htaccess_rewrite_subject_admit`.  These
+  are the pass-8 kernels for canonical `%{REQUEST_URI}` identity (I57) and
+  filesystem-relative access-file rewrite subjects (I58).  `expr::Context::new`
+  consumes the URI predicate, while `rewrite::subject_for` consumes the subject
+  predicate and fails closed when an access-file layer cannot produce its
+  subject; unit plus F57/F58 replays exercise both.  The `request_plan` module
+  now builds one canonical target/mapping/layer set per request or rewrite
+  round; dispatch, cache, rewrite contexts and `--explain` consume it (I59),
+  and `LayerIdentity` plus the shared subject/URL-mount functions replace the
+  duplicate layer arithmetic in `config.rs`, `htaccess.rs` and `rewrite.rs`.
 - `cache_key_hex_spec_injective`, `cache_lookup_hit_requires_binding`,
   `cache_lookup_rejects_stale`, `cache_store_request_admit`,
   `cache_store_status_admit`, `cache_store_control_admit`,

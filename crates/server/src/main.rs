@@ -10,7 +10,6 @@ use vapached::config::{Config, EncodedSlashes};
 use vapached::http::{BodyFraming, Headers, Request, Version};
 use vapached::log::Logger;
 use vapached::server::{self, Server};
-use vapached::verified::{normalize_uri_path, percent_decode_path};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
@@ -419,15 +418,6 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
     let vhost = cfg.select_vhost(None, port, Some(&host));
 
     let allow_encoded = cfg.encoded_slashes == EncodedSlashes::On;
-    let decoded = percent_decode_path(raw_path.as_bytes(), allow_encoded)
-        .ok_or_else(|| format!("invalid request path '{raw_path}'"))?;
-    let normalized = normalize_uri_path(&decoded)
-        .ok_or_else(|| format!("path canonicalization failed for '{raw_path}'"))?;
-    let trailing_slash = decoded.len() > 1 && decoded.ends_with(b"/");
-    let mut url_path = String::from_utf8_lossy(&normalized).into_owned();
-    if trailing_slash && url_path != "/" {
-        url_path.push('/');
-    }
 
     let mut headers = Headers::default();
     headers.insert("host", format!("{host}:{port}"));
@@ -448,58 +438,23 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
         framing: BodyFraming::None,
     };
     let peer = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-    let (root, rel, _) = vapached::server::map_path(cfg, vhost, &normalized)
-        .ok_or_else(|| format!("no mapping for '{path}'"))?;
-    let fs_path = root.join(rel);
-    let layers = if cfg.htaccess_may_apply(&fs_path) {
-        vapached::htaccess::collect_layers_with_root(
-            cfg,
-            vhost,
-            &fs_path,
-            &url_path,
-            Some(&root),
-        )
-        .map_err(|e| format!("htaccess: {e}"))?
-    } else {
-        Vec::new()
-    };
-    let (mut scope, config_conditionals, htaccess_conditionals) =
-        vapached::policy_ref::effective_scope_with_layers(
-            cfg, vhost, &fs_path, &url_path, &req, peer, &layers,
-        );
+    let target =
+        vapached::request_plan::CanonicalTarget::from_raw_path(raw_path.as_bytes(), allow_encoded)
+            .map_err(|e| format!("invalid request path '{raw_path}': {e:?}"))?;
+    let plan = vapached::request_plan::RequestPlan::resolve(cfg, vhost, target)
+        .map_err(|e| format!("mapping failed for '{path}': {e:?}"))?;
+    let root = plan.root();
+    let fs_path = plan.fs_path();
+    let url_path = plan.url_path();
+    let mut evaluated = plan.evaluate_scope(cfg, vhost, &req, peer);
+    evaluated.apply_conditionals(cfg, vhost, fs_path, url_path, &req, peer);
+    let scope = evaluated.scope;
     let override_enabled = cfg.override_enabled;
-    let override_prefilter = cfg.override_applicable(&fs_path);
+    let override_prefilter = cfg.override_applicable(fs_path);
     let access_files = cfg.access_file_names_for(&scope);
-    let cond_fname = fs_path
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let mut cond_state = std::collections::HashMap::new();
-    vapached::config::apply_deferred_req(
-        &mut scope,
-        &config_conditionals,
-        &req,
-        peer,
-        &root,
-        &fs_path,
-        &url_path,
-        &cond_fname,
-        &mut cond_state,
-    );
-    let mut htaccess_state = std::collections::HashMap::new();
-    vapached::config::apply_deferred_req(
-        &mut scope,
-        &htaccess_conditionals,
-        &req,
-        peer,
-        &root,
-        &fs_path,
-        &url_path,
-        &cond_fname,
-        &mut htaccess_state,
-    );
 
     println!("explain: {method} {path}");
+    println!("  canonical_url_path: {url_path}");
     println!(
         "  vhost: {}",
         vhost
@@ -508,6 +463,15 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
     );
     println!("  document_root: {}", root.display());
     println!("  fs_path: {}", fs_path.display());
+    println!("  access_layers:");
+    for layer in plan.layers() {
+        println!(
+            "    dir={} url_mount={} subject={:?}",
+            layer.identity.dir.display(),
+            layer.identity.url_mount,
+            layer.identity.subject(fs_path, url_path)
+        );
+    }
     println!("  override_policy: {:?}", scope.override_policy);
     println!("  override_enabled: {override_enabled}");
     println!("  override_prefilter: {override_prefilter}");
@@ -546,10 +510,10 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
     println!("  cache_disable: {:?}", scope.rewrite_policy.cache_disable);
     if !override_prefilter {
         println!("  htaccess: skipped (no override-enabled directory in path)");
-    } else if layers.is_empty() {
+    } else if plan.layers().is_empty() {
         println!("  htaccess: no access files present");
     } else {
-        println!("  htaccess: {} layer(s) applied", layers.len());
+        println!("  htaccess: {} layer(s) applied", plan.layers().len());
     }
     Ok(())
 }

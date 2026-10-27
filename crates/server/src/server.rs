@@ -14,6 +14,7 @@ use crate::http::{
 };
 use crate::log::{AccessEntry, Logger};
 use crate::proxy;
+use crate::request_plan::{CanonicalTarget, RequestPlan};
 use crate::util::is_canonical_path;
 use crate::verified::{normalize_uri_path, percent_decode_path};
 use std::ffi::OsStr;
@@ -127,13 +128,7 @@ fn bind_fd(
     storage: &libc::sockaddr_storage,
     len: libc::socklen_t,
 ) -> io::Result<()> {
-    let rc = unsafe {
-        libc::bind(
-            fd,
-            storage as *const _ as *const libc::sockaddr,
-            len,
-        )
-    };
+    let rc = unsafe { libc::bind(fd, storage as *const _ as *const libc::sockaddr, len) };
     if rc != 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -287,10 +282,7 @@ impl Server {
                 loop {
                     match b.listener.accept() {
                         Ok((stream, peer)) => {
-                            let local = stream
-                                .local_addr()
-                                .ok()
-                                .map(access::canonical_socket_addr);
+                            let local = stream.local_addr().ok().map(access::canonical_socket_addr);
                             let peer = access::canonical_socket_addr(peer);
                             let cfg = self.cfg.clone();
                             let logger = self.logger.clone();
@@ -652,7 +644,14 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 if let Some(logical) = target.logical_url.as_deref() {
                     proxy_urls.push(logical);
                 }
-                cfg.apply_proxy_access_urls(vhost, &mut scope, &proxy_urls, &req, peer.ip());
+                cfg.apply_proxy_access_urls(
+                    vhost,
+                    &mut scope,
+                    &proxy_urls,
+                    &req,
+                    peer.ip(),
+                    &url_path,
+                );
                 if let Some(mut resp) = helper_method_not_allowed(
                     &cfg,
                     vhost,
@@ -1030,7 +1029,7 @@ fn helper_access_response(
     local_ip: &str,
     resource: &mut access::ResourceKey,
 ) -> Result<access::AccessGrant, Response> {
-    let mut access = access::check(scope, req, peer, None);
+    let mut access = access::check(scope, req, peer, None, url_path);
     if access == Access::AuthRequired {
         if let Some(identity) = crate::auth::authenticate(scope, req) {
             resource.identity = Some(identity.user.clone());
@@ -1039,6 +1038,7 @@ fn helper_access_response(
                 req,
                 peer,
                 Some(&identity),
+                url_path,
             ));
         }
     }
@@ -1231,18 +1231,23 @@ fn dispatch_inner_request(
         || vhost.map(|v| v.ssl.engine).unwrap_or(cfg.ssl.engine);
     let server_name_for_cache = server_name_for(cfg, req, local_ip, local_port);
     let _server_name_guard = crate::expr::set_server_name(&server_name_for_cache);
-    let cache_scope = crate::cache::request_scope(
-        cfg,
-        vhost,
-        req,
-        peer.ip(),
-        &path,
-        local_port,
-        https_for_cache,
-        &server_name_for_cache,
-        host,
-        local_ip,
-    );
+    let allow_encoded = cfg.encoded_slashes == EncodedSlashes::On;
+    let initial_plan = RequestPlan::from_request(cfg, vhost, req, allow_encoded).ok();
+    let cache_scope = initial_plan.as_ref().and_then(|plan| {
+        crate::cache::request_scope_with_plan(
+            cfg,
+            vhost,
+            req,
+            peer.ip(),
+            plan,
+            &path,
+            local_port,
+            https_for_cache,
+            &server_name_for_cache,
+            host,
+            local_ip,
+        )
+    });
     if let Some(cache_ctx) = &cache_scope {
         if let Some(resp) = crate::cache::lookup(
             cfg,
@@ -1267,6 +1272,7 @@ fn dispatch_inner_request(
         local_port,
         vhost,
         &server_name_for_cache,
+        initial_plan,
     );
     if let Some(cache_ctx) = cache_scope {
         crate::cache::store(
@@ -1330,6 +1336,7 @@ pub(crate) fn internal_dispatch(
         local_port,
         vhost,
         &server_name,
+        None,
     )
 }
 
@@ -1352,22 +1359,28 @@ fn evaluate_scope_for_path(
     ),
     String,
 > {
-    if cfg.htaccess_may_apply(fs_path) {
-        let layers = crate::htaccess::collect_layers_with_root(
-            cfg,
-            vhost,
-            fs_path,
-            url_path,
-            Some(mapping_root),
-        )?;
-        Ok(crate::policy_ref::effective_scope_with_layers(
-            cfg, vhost, fs_path, url_path, req, peer, &layers,
-        ))
-    } else {
-        let (scope, conditionals) =
-            cfg.effective_scope_req_cached(vhost, fs_path, url_path, req, peer);
-        Ok((scope, conditionals.as_ref().clone(), Vec::new()))
-    }
+    let target = CanonicalTarget::from_url_path(url_path)
+        .ok_or_else(|| format!("invalid canonical URL path '{url_path}'"))?;
+    let plan = RequestPlan::from_fs_target(
+        cfg,
+        vhost,
+        target,
+        mapping_root.to_path_buf(),
+        fs_path.to_path_buf(),
+        false,
+    )
+    .map_err(|error| match error {
+        // from_fs_target() never performs URL mapping, so only AccessFiles
+        // can occur here.
+        crate::request_plan::PlanError::Unmapped => "target has no URL mapping".to_string(), // coverage:ignore-line
+        crate::request_plan::PlanError::AccessFiles(e) => e,
+    })?;
+    let evaluated = plan.evaluate_scope(cfg, vhost, req, peer);
+    Ok((
+        evaluated.scope,
+        (*evaluated.config_conditionals).clone(),
+        (*evaluated.access_conditionals).clone(),
+    ))
 }
 
 /// Re-authorize a resolved file/directory target and bind the grant to the
@@ -1415,15 +1428,7 @@ fn bind_target_grant(
     }
 
     let (mut target_scope, config_conditionals, htaccess_conditionals) =
-        match evaluate_scope_for_path(
-            cfg,
-            vhost,
-            actual_path,
-            url_path,
-            req,
-            peer,
-            mapping_root,
-        ) {
+        match evaluate_scope_for_path(cfg, vhost, actual_path, url_path, req, peer, mapping_root) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("vapached: target scope error: {e}");
@@ -1509,15 +1514,7 @@ fn authorize_resolved_target(
     local_ip: &str,
 ) -> Result<(access::AccessGrant, access::ResourceKey, Scope), Response> {
     let (mut target_scope, config_conditionals, htaccess_conditionals) =
-        match evaluate_scope_for_path(
-            cfg,
-            vhost,
-            target_fs,
-            target_url,
-            req,
-            peer,
-            mapping_root,
-        ) {
+        match evaluate_scope_for_path(cfg, vhost, target_fs, target_url, req, peer, mapping_root) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("vapached: target scope error: {e}");
@@ -1573,34 +1570,16 @@ fn apply_scope_conditionals(
     req: &Request,
     peer: IpAddr,
 ) {
-    let fname = fs_path
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let docroot = cfg.documentation_root_for(vhost);
-    let mut state = std::collections::HashMap::new();
-    crate::config::apply_deferred_req(
+    crate::request_plan::apply_conditionals(
+        cfg,
+        vhost,
         scope,
         config_conditionals,
-        req,
-        peer,
-        &docroot,
-        fs_path,
-        url_path,
-        &fname,
-        &mut state,
-    );
-    let mut state = std::collections::HashMap::new();
-    crate::config::apply_deferred_req(
-        scope,
         htaccess_conditionals,
-        req,
-        peer,
-        &docroot,
         fs_path,
         url_path,
-        &fname,
-        &mut state,
+        req,
+        peer,
     );
 }
 
@@ -1623,15 +1602,7 @@ fn authorize_original_request(
     rewrite_effects: &crate::rewrite::Effects,
 ) -> Result<(), Response> {
     let (mut original_scope, config_conditionals, htaccess_conditionals) =
-        match evaluate_scope_for_path(
-            cfg,
-            vhost,
-            fs_path,
-            url_path,
-            req,
-            peer.ip(),
-            mapping_root,
-        ) {
+        match evaluate_scope_for_path(cfg, vhost, fs_path, url_path, req, peer.ip(), mapping_root) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("vapached: original URL scope error after rewrite: {e}");
@@ -1690,6 +1661,7 @@ fn dispatch_inner(
     local_port: u16,
     vhost: Option<&VHost>,
     server_name: &str,
+    initial_plan: Option<RequestPlan>,
 ) -> Response {
     // Methods we do not implement at all are 501, matching Apache.  Known
     // methods that are invalid for a particular resource (for example POST
@@ -1750,79 +1722,76 @@ fn dispatch_inner(
         return options_response(cfg, None);
     }
 
-    // Decode and canonicalize the path.  Borrow the request bytes for the
-    // common case instead of cloning the raw path on every request.
-    let raw_path: &[u8] = if req.raw_path == b"*" {
-        b"/"
-    } else {
-        &req.raw_path
-    };
+    // Build one immutable request plan and reuse it for cache and dispatch.
+    // The initial plan was already built by `dispatch_inner_request` when the
+    // outer request was cacheable; internal subrequests build it here.
     let allow_encoded = cfg.encoded_slashes == EncodedSlashes::On;
-    let decoded = match percent_decode_path(raw_path, allow_encoded) {
-        Some(d) => d,
+    let plan = match initial_plan {
+        Some(plan) => plan,
         None => {
-            return error_response(
-                cfg,
-                vhost,
-                base_scope,
-                404,
-                req,
-                &String::from_utf8_lossy(raw_path),
-                local_port,
-                &server_name,
-                peer.ip(),
-                local_ip,
-            )
+            let target = match CanonicalTarget::from_request(req, allow_encoded) {
+                Ok(target) => target,
+                Err(error) => {
+                    return error_response(
+                        cfg,
+                        vhost,
+                        base_scope,
+                        error.status(),
+                        req,
+                        &String::from_utf8_lossy(&req.raw_path),
+                        local_port,
+                        &server_name,
+                        peer.ip(),
+                        local_ip,
+                    )
+                }
+            };
+            match RequestPlan::resolve(cfg, vhost, target) {
+                Ok(plan) => plan,
+                Err(crate::request_plan::PlanError::Unmapped) => {
+                    return error_response(
+                        cfg,
+                        vhost,
+                        base_scope,
+                        404,
+                        req,
+                        &String::from_utf8_lossy(&req.raw_path),
+                        local_port,
+                        &server_name,
+                        peer.ip(),
+                        local_ip,
+                    )
+                }
+                Err(crate::request_plan::PlanError::AccessFiles(e)) => {
+                    eprintln!("vapached: .htaccess error: {e}");
+                    return error_response(
+                        cfg,
+                        vhost,
+                        base_scope,
+                        500,
+                        req,
+                        &String::from_utf8_lossy(&req.raw_path),
+                        local_port,
+                        &server_name,
+                        peer.ip(),
+                        local_ip,
+                    );
+                }
+            }
         }
     };
-    let trailing_slash = decoded.len() > 1 && decoded.ends_with(b"/");
-    let norm = match normalize_uri_path(&decoded) {
-        Some(n) if is_canonical_path(&n) => n,
-        _ => {
-            return error_response(
-                cfg,
-                vhost,
-                base_scope,
-                400,
-                req,
-                &String::from_utf8_lossy(raw_path),
-                local_port,
-                &server_name,
-                peer.ip(),
-                local_ip,
-            )
-        }
-    };
-    let mut url_path = String::from_utf8_lossy(&norm).into_owned();
-    if trailing_slash && url_path != "/" {
-        url_path.push('/');
-    }
     let original_req = req;
-    let original_url_path = url_path.clone();
-    let original_norm = norm.clone();
-    let Some((original_root, original_rel, _)) = map_path(cfg, vhost, &original_norm) else {
-        // A regex alias expanded outside its configured base.  The mapping is
-        // invalid; do not fall back to a different root.
-        return error_response(
-            cfg,
-            vhost,
-            base_scope,
-            404,
-            req,
-            &original_url_path,
-            local_port,
-            &server_name,
-            peer.ip(),
-            local_ip,
-        );
-    };
-    let original_fs_path = original_root.join(original_rel);
+    let original_url_path = plan.url_path().to_string();
+    let original_root = plan.root().to_path_buf();
+    let original_fs_path = plan.fs_path().to_path_buf();
 
     // Rewrites may change the URL, so resolve the target and its override
     // scope first, then restart resolution with the rewritten path.  A hard
     // limit prevents pathological rewrite loops from consuming a worker.
     let mut owned_req: Option<Request> = None;
-    let mut norm = norm;
+    let mut plan = plan;
+    let mut norm = plan.target().norm.clone();
+    let mut url_path = original_url_path.clone();
     let mut rewrite_rounds = 0usize;
     let mut stop_rewriting = false;
     let mut rewrite_effects = crate::rewrite::Effects::default();
@@ -1832,159 +1801,31 @@ fn dispatch_inner(
     let mut fs_path;
     let mut scope;
     loop {
-        let Some(mapped) = map_path(cfg, vhost, &norm) else {
-            return error_response(
-                cfg,
-                vhost,
-                base_scope,
-                404,
-                owned_req.as_ref().unwrap_or(req),
-                &url_path,
-                local_port,
-                &server_name,
-                peer.ip(),
-                local_ip,
-            );
-        };
-        (root, rel, script_alias) = mapped;
-        fs_path = root.join(&rel);
+        root = plan.root().to_path_buf();
+        rel = plan.rel().to_path_buf();
+        script_alias = plan.script_alias();
+        fs_path = plan.fs_path().to_path_buf();
         // After a rewrite has changed the query, the target scope must be
         // evaluated with the rewritten request context.  The original URL is
         // still reauthorized separately with `original_req`.
         let current_req = owned_req.as_ref().unwrap_or(req);
-        let mut config_files = Vec::new();
-        let mut config_locations = Vec::new();
-        let mut config_conditionals = Vec::new();
-        let mut cached_conditionals = None;
-        let mut htaccess_files = Vec::new();
-        let mut htaccess_conditionals = Vec::new();
-        if cfg.htaccess_may_apply(&fs_path) {
-            let layers = match crate::htaccess::collect_layers_with_root(
-                cfg,
-                vhost,
-                &fs_path,
-                &url_path,
-                Some(&root),
-            ) {
-                Ok(layers) => layers,
-                Err(e) => {
-                    eprintln!("vapached: .htaccess error: {e}");
-                    return error_response(
-                        cfg,
-                        vhost,
-                        &vhost.map(|v| &v.scope).unwrap_or(&cfg.global),
-                        500,
-                        owned_req.as_ref().unwrap_or(req),
-                        &url_path,
-                        local_port,
-                        &server_name,
-                        peer.ip(),
-                        local_ip,
-                    );
-                }
-            };
-            let (evaluated, conditionals, access_conditionals) =
-                crate::policy_ref::effective_scope_with_layers(
-                    cfg,
-                    vhost,
-                    &fs_path,
-                    &url_path,
-                    current_req,
-                    peer.ip(),
-                    &layers,
-                );
-            scope = evaluated;
-            config_conditionals = conditionals;
-            htaccess_conditionals = access_conditionals;
-        } else {
-            let (cached_scope, conditionals) =
-                cfg.effective_scope_req_cached(vhost, &fs_path, &url_path, current_req, peer.ip());
-            scope = cached_scope;
-            cached_conditionals = Some(conditionals);
-        }
-        apply_rewrite_effects(&mut scope, &rewrite_effects);
-        let cond_fname = fs_path
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let cond_docroot = cfg.documentation_root_for(vhost);
-        crate::config::apply_normal_rule_list(
-            &config_files,
-            &mut scope,
-            current_req,
-            peer.ip(),
-            &cond_docroot,
-            &fs_path,
-            &url_path,
-            &cond_fname,
-            &mut config_conditionals,
-        );
-        crate::config::apply_normal_rule_list(
-            &htaccess_files,
-            &mut scope,
-            current_req,
-            peer.ip(),
-            &cond_docroot,
-            &fs_path,
-            &url_path,
-            &cond_fname,
-            &mut htaccess_conditionals,
-        );
-        crate::config::apply_normal_rule_list(
-            &config_locations,
-            &mut scope,
-            current_req,
-            peer.ip(),
-            &cond_docroot,
-            &fs_path,
-            &url_path,
-            &cond_fname,
-            &mut config_conditionals,
-        );
-        config_conditionals.sort_by_key(|rule| rule.order);
-        let config_conditionals: &[crate::config::ScopeRule] = match &cached_conditionals {
-            Some(conditionals) => conditionals.as_slice(),
-            None => config_conditionals.as_slice(),
-        };
-        let mut cond_state = std::collections::HashMap::new();
-        crate::config::apply_deferred_req(
-            &mut scope,
-            config_conditionals,
-            current_req,
-            peer.ip(),
-            &cond_docroot,
-            &fs_path,
-            &url_path,
-            &cond_fname,
-            &mut cond_state,
-        );
-        let mut htaccess_state = std::collections::HashMap::new();
-        crate::config::apply_deferred_req(
-            &mut scope,
-            &htaccess_conditionals,
-            current_req,
-            peer.ip(),
-            &cond_docroot,
-            &fs_path,
-            &url_path,
-            &cond_fname,
-            &mut htaccess_state,
-        );
+        let mut evaluated = plan.evaluate_scope(cfg, vhost, current_req, peer.ip());
+        apply_rewrite_effects(&mut evaluated.scope, &rewrite_effects);
+        evaluated.apply_conditionals(cfg, vhost, &fs_path, &url_path, current_req, peer.ip());
+        scope = evaluated.scope;
         if stop_rewriting {
             break;
         }
         let current_req = owned_req.as_ref().unwrap_or(req);
-        let rewrite_ctx = crate::rewrite::Context {
-            url_path: &url_path,
-            fs_path: &fs_path,
-            docroot: &root,
-            server_root: &cfg.server_root,
-            query: &current_req.query,
-            peer: peer.ip(),
-            port: local_port,
+        let rewrite_ctx = crate::rewrite::Context::for_plan(
+            &plan,
+            &cfg.server_root,
+            &current_req.query,
+            peer.ip(),
+            local_port,
             https,
-            server_name: &server_name,
-        };
+            &server_name,
+        );
         match crate::rewrite::process(&scope, current_req, &rewrite_ctx) {
             crate::rewrite::Outcome::None => break,
             crate::rewrite::Outcome::Forbidden => {
@@ -2055,7 +1896,14 @@ fn dispatch_inner(
                 if let Some(logical) = target.logical_url.as_deref() {
                     proxy_urls.push(logical);
                 }
-                cfg.apply_proxy_access_urls(vhost, &mut scope, &proxy_urls, current_req, peer.ip());
+                cfg.apply_proxy_access_urls(
+                    vhost,
+                    &mut scope,
+                    &proxy_urls,
+                    current_req,
+                    peer.ip(),
+                    &url_path,
+                );
                 if let Some(r) = helper_method_not_allowed(
                     cfg,
                     vhost,
@@ -2242,6 +2090,42 @@ fn dispatch_inner(
                 }
                 url_path = canonical;
                 norm = url_path.as_bytes().to_vec();
+                // Rebuild the immutable plan for the rewritten URL.  The next
+                // loop iteration must use the same mapping/layer identities
+                // that dispatch will authorize and serve.
+                let target = CanonicalTarget::from_normalized(norm.clone(), url_path.clone());
+                plan = match RequestPlan::resolve(cfg, vhost, target) {
+                    Ok(plan) => plan,
+                    Err(crate::request_plan::PlanError::Unmapped) => {
+                        return error_response(
+                            cfg,
+                            vhost,
+                            base_scope,
+                            404,
+                            owned_req.as_ref().unwrap_or(req),
+                            &url_path,
+                            local_port,
+                            &server_name,
+                            peer.ip(),
+                            local_ip,
+                        )
+                    }
+                    Err(crate::request_plan::PlanError::AccessFiles(e)) => {
+                        eprintln!("vapached: .htaccess error: {e}");
+                        return error_response(
+                            cfg,
+                            vhost,
+                            base_scope,
+                            500,
+                            owned_req.as_ref().unwrap_or(req),
+                            &url_path,
+                            local_port,
+                            &server_name,
+                            peer.ip(),
+                            local_ip,
+                        );
+                    }
+                };
                 stop_rewriting = final_pass;
             }
         }
@@ -2368,7 +2252,7 @@ fn dispatch_inner(
             .as_ref()
             .and_then(|target| target.logical_url.as_deref())
         {
-            cfg.apply_proxy_access_urls(vhost, &mut scope, &[logical], req, peer.ip());
+            cfg.apply_proxy_access_urls(vhost, &mut scope, &[logical], req, peer.ip(), &url_path);
         }
         if let Some(target) = &fastcgi_target {
             selected_proxy_url = target.logical_url.clone();
@@ -2378,7 +2262,7 @@ fn dispatch_inner(
         if let Some(logical) = target.logical_url.as_deref() {
             proxy_urls.push(logical);
         }
-        cfg.apply_proxy_access_urls(vhost, &mut scope, &proxy_urls, req, peer.ip());
+        cfg.apply_proxy_access_urls(vhost, &mut scope, &proxy_urls, req, peer.ip(), &url_path);
         selected_proxy_url = Some(target.proxy_url.clone());
     }
 
@@ -2785,8 +2669,8 @@ fn dispatch_inner(
             // CGI script.  Policy is then re-evaluated for the actual script
             // path before the script inode is executed.
             if let Some(st) = cgi::find_script_checked(&root, &rel, follow, owner_match_only) {
-                let actual_path = crate::files::fd_path(&st.file)
-                    .unwrap_or_else(|| root.join(&st.rel_script));
+                let actual_path =
+                    crate::files::fd_path(&st.file).unwrap_or_else(|| root.join(&st.rel_script));
                 let actual_name = actual_path
                     .file_name()
                     .or_else(|| st.rel_script.file_name())
@@ -3175,7 +3059,7 @@ fn run_fastcgi(
         server_name,
         host: server_name,
         follow_symlinks: true,
-        env: &scope.request_env(req),
+        env: &scope.request_env(req, url_path),
         remote_user,
         auth_type,
         script_file: None,
@@ -3192,7 +3076,7 @@ fn run_cgi(
     req: &Request,
     root: &Path,
     script_rel: &Path,
-    _url_path: &str,
+    url_path: &str,
     path_info: &str,
     script_name: &str,
     server_name: &str,
@@ -3287,7 +3171,7 @@ fn run_cgi(
         server_name,
         host: server_name,
         follow_symlinks: follow,
-        env: &scope.request_env(req),
+        env: &scope.request_env(req, url_path),
         remote_user,
         auth_type,
         script_file,
@@ -3413,10 +3297,8 @@ mod tests {
 
     #[test]
     fn single_file_prefix_aliases_split_parent_and_basename() {
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-server-file-alias-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vapache-server-file-alias-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("private")).unwrap();
         let file = dir.join("private").join("secret.cgi");
@@ -3536,10 +3418,8 @@ mod tests {
     }
 
     fn cov_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-server-cov-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vapache-server-cov-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("www")).unwrap();
         dir
@@ -3683,11 +3563,9 @@ mod tests {
     fn coverage_server_support_and_failure_helpers() {
         assert!(first_resolved_addr(std::iter::empty()).is_err());
         assert_eq!(
-            first_resolved_addr(
-                vec!["127.0.0.1:80".parse::<SocketAddr>().unwrap()].into_iter()
-            )
-            .unwrap()
-            .port(),
+            first_resolved_addr(vec!["127.0.0.1:80".parse::<SocketAddr>().unwrap()].into_iter())
+                .unwrap()
+                .port(),
             80
         );
         assert!(create_tcp_socket(-1).is_err());
@@ -3709,7 +3587,10 @@ mod tests {
             accept_error_action(&io::Error::from(io::ErrorKind::ConnectionReset)),
             AcceptAction::Break
         );
-        assert_eq!(timed_io::<u8>(None, "timeout").unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            timed_io::<u8>(None, "timeout").unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
         assert_eq!(timed_io(Some(Ok(7)), "timeout").unwrap(), 7);
         assert_eq!(
             authenticated_access_result(Access::AuthRequired),
@@ -3719,7 +3600,9 @@ mod tests {
             authenticated_access_result(Access::Allowed),
             Access::Allowed
         );
-        assert!(timed_io::<u8>(Some(Err(io::Error::from(io::ErrorKind::Other))), "timeout").is_err());
+        assert!(
+            timed_io::<u8>(Some(Err(io::Error::from(io::ErrorKind::Other))), "timeout").is_err()
+        );
 
         let dir = cov_dir("helpers");
         let cfg = cov_config(&dir, "");
@@ -3763,7 +3646,10 @@ mod tests {
         };
         let mut cfg_name = cfg.clone();
         cfg_name.vhosts = vec![vhost_name.clone()];
-        assert_eq!(server_name_for(&cfg_name, &no_host, "127.0.0.1", 80), "vhost.test");
+        assert_eq!(
+            server_name_for(&cfg_name, &no_host, "127.0.0.1", 80),
+            "vhost.test"
+        );
 
         let mut cfg_canonical = cfg.clone();
         cfg_canonical.use_canonical_name = true;
@@ -3811,7 +3697,15 @@ mod tests {
         cfg_abs.use_canonical_name = true;
         cfg_abs.server_name = Some("cfg.test".into());
         assert_eq!(
-            absolute_url_scheme(&cfg_abs, Some(&vhost_name), &req_abs, "/x", "server.test", 8080, true),
+            absolute_url_scheme(
+                &cfg_abs,
+                Some(&vhost_name),
+                &req_abs,
+                "/x",
+                "server.test",
+                8080,
+                true
+            ),
             "https://vhost.test:80/x"
         );
         cfg_abs.vhosts.clear();
@@ -3829,9 +3723,20 @@ mod tests {
             "http://server.test/x"
         );
         cfg_abs.server_name = Some("cfg.test".into());
-        cfg_abs.vhosts = vec![VHost { server_name: Some(" ".into()), ..vhost_name.clone() }];
+        cfg_abs.vhosts = vec![VHost {
+            server_name: Some(" ".into()),
+            ..vhost_name.clone()
+        }];
         assert_eq!(
-            absolute_url_scheme(&cfg_abs, cfg_abs.vhosts.first(), &req_abs, "/x", "server.test", 8443, true),
+            absolute_url_scheme(
+                &cfg_abs,
+                cfg_abs.vhosts.first(),
+                &req_abs,
+                "/x",
+                "server.test",
+                8443,
+                true
+            ),
             "https://server.test:8443/x"
         );
 
@@ -3846,62 +3751,89 @@ mod tests {
         assert_eq!(clean_alias_path(Path::new(".")), PathBuf::new());
 
         let cfg_dispatch = cfg.clone();
-        let resp = dispatch(&cfg_dispatch, &cov_req("GET", "/missing"), cov_peer(), "127.0.0.1", 80);
+        let resp = dispatch(
+            &cfg_dispatch,
+            &cov_req("GET", "/missing"),
+            cov_peer(),
+            "127.0.0.1",
+            80,
+        );
         assert_eq!(resp.status, 404);
 
         let mut scope = Scope::default();
-        scope.mapping_policy.redirects.push(crate::config::Redirect {
-            from: String::new(),
-            to: "/never".into(),
-            status: 301,
-            regex: Some(Arc::new(crate::config::compile_regex("^/nope$").unwrap())),
-        });
-        scope.mapping_policy.redirects.push(crate::config::Redirect {
-            from: "/plain".into(),
-            to: "/dest".into(),
-            status: 302,
-            regex: None,
-        });
+        scope
+            .mapping_policy
+            .redirects
+            .push(crate::config::Redirect {
+                from: String::new(),
+                to: "/never".into(),
+                status: 301,
+                regex: Some(Arc::new(crate::config::compile_regex("^/nope$").unwrap())),
+            });
+        scope
+            .mapping_policy
+            .redirects
+            .push(crate::config::Redirect {
+                from: "/plain".into(),
+                to: "/dest".into(),
+                status: 302,
+                regex: None,
+            });
         let (red, loc) = match_redirect(&scope, "/plain").unwrap();
         assert_eq!(red.status, 302);
         assert_eq!(loc, "/dest");
         scope.mapping_policy.redirects.clear();
-        scope.mapping_policy.redirects.push(crate::config::Redirect {
-            from: "/d/".into(),
-            to: "/to/".into(),
-            status: 301,
-            regex: None,
-        });
+        scope
+            .mapping_policy
+            .redirects
+            .push(crate::config::Redirect {
+                from: "/d/".into(),
+                to: "/to/".into(),
+                status: 301,
+                regex: None,
+            });
         let (_, loc) = match_redirect(&scope, "/d/x").unwrap();
         assert_eq!(loc, "/to/x");
         let (_, loc) = match_redirect(&scope, "/d/").unwrap();
         assert_eq!(loc, "/to/");
         scope.mapping_policy.redirects.clear();
-        scope.mapping_policy.redirects.push(crate::config::Redirect {
-            from: "/exact".into(),
-            to: "/to".into(),
-            status: 302,
-            regex: None,
-        });
+        scope
+            .mapping_policy
+            .redirects
+            .push(crate::config::Redirect {
+                from: "/exact".into(),
+                to: "/to".into(),
+                status: 302,
+                regex: None,
+            });
         let (_, loc) = match_redirect(&scope, "/exact").unwrap();
         assert_eq!(loc, "/to");
         assert!(match_redirect(&scope, "/nothing").is_none());
         scope.mapping_policy.redirects.clear();
-        scope.mapping_policy.redirects.push(crate::config::Redirect {
-            from: String::new(),
-            to: String::new(),
-            status: 404,
-            regex: Some(Arc::new(crate::config::compile_regex("^/empty$").unwrap())),
-        });
+        scope
+            .mapping_policy
+            .redirects
+            .push(crate::config::Redirect {
+                from: String::new(),
+                to: String::new(),
+                status: 404,
+                regex: Some(Arc::new(crate::config::compile_regex("^/empty$").unwrap())),
+            });
         let (_, loc) = match_redirect(&scope, "/empty").unwrap();
         assert!(loc.is_empty());
 
         let mut scope = Scope::default();
-        scope.environment_policy.set_env.push(("OLD".into(), "1".into()));
+        scope
+            .environment_policy
+            .set_env
+            .push(("OLD".into(), "1".into()));
         scope.environment_policy.unset_env.push("GONE".into());
         scope.header_policy.vary.push("Accept".into());
         scope.header_policy.cookies.push("a=1".into());
-        scope.mapping_policy.handlers.push(crate::config::Handler::add("*".into(), "old".into()));
+        scope
+            .mapping_policy
+            .handlers
+            .push(crate::config::Handler::add("*".into(), "old".into()));
         let effects = crate::rewrite::Effects {
             env: vec![
                 ("OLD".into(), Some("2".into())),
@@ -3914,13 +3846,36 @@ mod tests {
             vary: vec!["Accept".into(), "X-Test".into()],
         };
         apply_rewrite_effects(&mut scope, &effects);
-        assert_eq!(scope.environment_policy.set_env.iter().find(|(n, _)| n == "OLD").unwrap().1, "2");
-        assert!(scope.environment_policy.unset_env.contains(&"NEW".to_string()));
-        assert!(scope.environment_policy.set_env.iter().any(|(n, v)| n == "GONE" && v == "3"));
+        assert_eq!(
+            scope
+                .environment_policy
+                .set_env
+                .iter()
+                .find(|(n, _)| n == "OLD")
+                .unwrap()
+                .1,
+            "2"
+        );
+        assert!(scope
+            .environment_policy
+            .unset_env
+            .contains(&"NEW".to_string()));
+        assert!(scope
+            .environment_policy
+            .set_env
+            .iter()
+            .any(|(n, v)| n == "GONE" && v == "3"));
         assert_eq!(scope.header_policy.vary, vec!["Accept", "X-Test"]);
         assert_eq!(scope.header_policy.cookies, vec!["a=1", "b=2"]);
-        assert!(scope.mapping_policy.handlers.iter().any(|h| h.handler == "new"));
-        assert_eq!(scope.content_policy.force_type.as_deref(), Some("text/plain"));
+        assert!(scope
+            .mapping_policy
+            .handlers
+            .iter()
+            .any(|h| h.handler == "new"));
+        assert_eq!(
+            scope.content_policy.force_type.as_deref(),
+            Some("text/plain")
+        );
 
         let alias_cfg = cov_config(
             &dir,
@@ -3930,13 +3885,17 @@ mod tests {
         assert_eq!(root, dir.join("www"));
         assert_eq!(rel, PathBuf::from("other.txt"));
         let mut manual_cfg = cfg.clone();
-        manual_cfg.global.mapping_policy.aliases.push(crate::config::Alias {
-            virtual_path: String::new(),
-            fs_path: PathBuf::from("/srv/unused"),
-            script: false,
-            regex: Some(Arc::new(crate::config::compile_regex("^/other").unwrap())),
-            target_template: None,
-        });
+        manual_cfg
+            .global
+            .mapping_policy
+            .aliases
+            .push(crate::config::Alias {
+                virtual_path: String::new(),
+                fs_path: PathBuf::from("/srv/unused"),
+                script: false,
+                regex: Some(Arc::new(crate::config::compile_regex("^/other").unwrap())),
+                target_template: None,
+            });
         let (root, rel, _) = map_path(&manual_cfg, None, b"/other.txt").unwrap();
         assert_eq!(root, dir.join("www"));
         assert_eq!(rel, PathBuf::from("other.txt"));
@@ -4003,8 +3962,16 @@ mod tests {
             b"GET /file.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
         let logger = cov_logger(&cfg);
-        handle_connection(&cfg, &logger, &mut normal, cov_peer(), "127.0.0.1", 80, false)
-            .unwrap();
+        handle_connection(
+            &cfg,
+            &logger,
+            &mut normal,
+            cov_peer(),
+            "127.0.0.1",
+            80,
+            false,
+        )
+        .unwrap();
         assert_eq!(cov_status(&String::from_utf8_lossy(&normal.output)), 200);
 
         let mut failing = ScriptConn::new(
@@ -4028,10 +3995,7 @@ mod tests {
             assert_eq!(cov_status(&text), 400, "{path}: {text}");
         }
 
-        let map_cfg = cov_config(
-            &dir,
-            "AliasMatch \"^/escape(.*)$\" \"$1\"\n",
-        );
+        let map_cfg = cov_config(&dir, "AliasMatch \"^/escape(.*)$\" \"$1\"\n");
         let (text, result) = cov_run_conn(&map_cfg, &cov_ws_request("/escape/tmp/elsewhere"), 80);
         result.unwrap();
         assert_eq!(cov_status(&text), 404, "{text}");
@@ -4072,11 +4036,7 @@ mod tests {
             ("/wsproxy/", 501),
             ("/wsbadproxy", 502),
         ] {
-            let (text, result) = cov_run_conn(
-                &rewrite_cfg,
-                &cov_ws_request(path),
-                80,
-            );
+            let (text, result) = cov_run_conn(&rewrite_cfg, &cov_ws_request(path), 80);
             result.unwrap();
             assert_eq!(cov_status(&text), expected, "{path}: {text}");
         }
@@ -4103,7 +4063,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 
     fn cov_dispatch(cfg: &Config, method: &str, path: &str) -> Response {
         let req = cov_req(method, path);
@@ -4166,9 +4125,10 @@ mod tests {
         );
         let proto = cov_dispatch(&proto_cfg, "GET", "/proto");
         assert_eq!(proto.status, 302);
-        assert!(proto.headers.iter().any(|(n, v)| {
-            n.eq_ignore_ascii_case("location") && v == b"http://example.com/x"
-        }));
+        assert!(proto
+            .headers
+            .iter()
+            .any(|(n, v)| { n.eq_ignore_ascii_case("location") && v == b"http://example.com/x" }));
 
         let map_cfg = cov_config(
             &dir,
@@ -4179,7 +4139,10 @@ mod tests {
              RewriteRule ^/rmap$ /bad/tmp/elsewhere [L]\n",
         );
         assert_eq!(cov_dispatch(&map_cfg, "GET", "/file.txt").status, 200);
-        assert_eq!(cov_dispatch(&map_cfg, "GET", "/bad/tmp/elsewhere").status, 404);
+        assert_eq!(
+            cov_dispatch(&map_cfg, "GET", "/bad/tmp/elsewhere").status,
+            404
+        );
         assert_eq!(cov_dispatch(&map_cfg, "GET", "/rmap").status, 404);
 
         let end_cfg = cov_config(
@@ -4195,22 +4158,34 @@ mod tests {
     fn coverage_dispatch_rewrite_failures_and_proxy_gate() {
         let dir = cov_dir("dispatch-rewrites");
         std::fs::write(dir.join("www/file.txt"), "hello\n").unwrap();
+        std::fs::create_dir_all(dir.join("www/bad")).unwrap();
+        std::fs::write(
+            dir.join("www/bad/.htaccess"),
+            "Header \"unterminated\n",
+        )
+        .unwrap();
         let cfg = cov_config(
             &dir,
-            "RewriteEngine On\n\
-             RewriteRule ^/forbid$ - [F]\n\
-             RewriteRule ^/gone$ - [G]\n\
-             RewriteRule ^/loop$ /loop [N]\n\
-             RewriteRule ^/redirect$ /file.txt [R=302]\n\
-             RewriteRule ^/internal$ /file.txt [L]\n\
-             RewriteRule ^/proxybad$ not-a-url [P]\n\
-             RewriteRule ^/proxy$ http://127.0.0.1:9/echo [P]\n",
+            &format!(
+                "RewriteEngine On\n\
+                 RewriteRule ^/forbid$ - [F]\n\
+                 RewriteRule ^/gone$ - [G]\n\
+                 RewriteRule ^/loop$ /loop [N]\n\
+                 RewriteRule ^/redirect$ /file.txt [R=302]\n\
+                 RewriteRule ^/internal$ /file.txt [L]\n\
+                 RewriteRule ^/badrewrite$ /bad/x [L]\n\
+                 RewriteRule ^/proxybad$ not-a-url [P]\n\
+                 RewriteRule ^/proxy$ http://127.0.0.1:9/echo [P]\n\
+                 <Directory \"{}/www/bad\">\nAllowOverride All\n</Directory>\n",
+                dir.display()
+            ),
         );
         assert_eq!(cov_dispatch(&cfg, "GET", "/forbid").status, 403);
         assert_eq!(cov_dispatch(&cfg, "GET", "/gone").status, 410);
         assert_eq!(cov_dispatch(&cfg, "GET", "/loop").status, 500);
         assert_eq!(cov_dispatch(&cfg, "GET", "/redirect").status, 302);
         assert_eq!(cov_dispatch(&cfg, "GET", "/internal").status, 200);
+        assert_eq!(cov_dispatch(&cfg, "GET", "/badrewrite").status, 500);
         assert_eq!(cov_dispatch(&cfg, "GET", "/proxybad").status, 502);
         assert!(matches!(
             cov_dispatch(&cfg, "GET", "/proxy").status,
@@ -4249,7 +4224,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn coverage_target_binding_and_script_error_paths() {
         let dir = cov_dir("target-errors");
@@ -4271,7 +4245,7 @@ mod tests {
         let meta = std::fs::metadata(&fs_path).unwrap();
         let scope = Scope::default();
         let other = access::ResourceKey::request(None, &req, "/other", None, None);
-        let grant = access::check_grant(&scope, &req, peer, None, other).unwrap();
+        let grant = access::check_grant(&scope, &req, peer, None, "/x", other).unwrap();
         let effects = crate::rewrite::Effects::default();
         let (_, _, _) = (grant.key(), &scope, &effects);
         let err = bind_target_grant(
@@ -4368,8 +4342,15 @@ mod tests {
         let script_req = cov_req("GET", "/script.cgi");
         let script_resource =
             access::ResourceKey::request(None, &script_req, "/script.cgi", Some(&script), None);
-        let script_grant =
-            access::check_grant(&scope, &script_req, peer, None, script_resource.clone()).unwrap();
+        let script_grant = access::check_grant(
+            &scope,
+            &script_req,
+            peer,
+            None,
+            "/script.cgi",
+            script_resource.clone(),
+        )
+        .unwrap();
         let err = run_cgi(
             &cfg,
             None,
@@ -4392,9 +4373,7 @@ mod tests {
         assert_eq!(err.status, 500);
 
         let mut symlink_scope = Scope::default();
-        symlink_scope
-            .options
-            .push_remove(Options::FOLLOW_SYMLINKS);
+        symlink_scope.options.push_remove(Options::FOLLOW_SYMLINKS);
         symlink_scope
             .options
             .push_add(Options::SYMLINKS_IF_OWNER_MATCH);
@@ -4403,6 +4382,7 @@ mod tests {
             &script_req,
             peer,
             None,
+            "/script.cgi",
             script_resource.clone(),
         )
         .unwrap();
@@ -4432,8 +4412,15 @@ mod tests {
         let mut auth_resource =
             access::ResourceKey::request(None, &script_req, "/script.cgi", Some(&script), None);
         auth_resource.identity = Some("alice".into());
-        let auth_grant =
-            access::check_grant(&auth_scope, &script_req, peer, None, auth_resource.clone()).unwrap();
+        let auth_grant = access::check_grant(
+            &auth_scope,
+            &script_req,
+            peer,
+            None,
+            "/script.cgi",
+            auth_resource.clone(),
+        )
+        .unwrap();
         let resp = run_cgi(
             &cfg,
             None,
@@ -4496,9 +4483,7 @@ mod tests {
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
         let err = server
-            .run_with_poll(&bound, |_| {
-                Err(io::Error::from_raw_os_error(libc::EFAULT))
-            })
+            .run_with_poll(&bound, |_| Err(io::Error::from_raw_os_error(libc::EFAULT)))
             .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EFAULT));
 
@@ -4506,9 +4491,7 @@ mod tests {
         let stop = server.stop_flag();
         let handle = std::thread::spawn(move || {
             server.run_with_poll(&bound, |pollfds| {
-                let rc = unsafe {
-                    libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, 20)
-                };
+                let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, 20) };
                 poll_result(
                     rc,
                     io::Error::last_os_error()
@@ -4623,7 +4606,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn coverage_dispatch_rewrite_redirect_and_pathinfo_edges() {
         let dir = cov_dir("dispatch-rewrite-edges");
@@ -4681,9 +4663,10 @@ mod tests {
         assert_eq!(cov_dispatch(&cfg, "HEAD", "/okredir").status, 302);
         let ext = cov_dispatch(&cfg, "GET", "/extredir");
         assert_eq!(ext.status, 302);
-        assert!(ext.headers.iter().any(|(n, v)| {
-            n.eq_ignore_ascii_case("location") && v == b"http://example.com/x"
-        }));
+        assert!(ext
+            .headers
+            .iter()
+            .any(|(n, v)| { n.eq_ignore_ascii_case("location") && v == b"http://example.com/x" }));
         assert_eq!(cov_dispatch(&cfg, "GET", "/relrewrite").status, 302);
         assert_eq!(cov_dispatch(&cfg, "GET", "/round0").status, 500);
         assert_eq!(cov_dispatch(&cfg, "GET", "/badcanon").status, 400);
@@ -4692,32 +4675,40 @@ mod tests {
         assert_eq!(cov_dispatch(&cfg, "GET", "/protected.sh/.cgi").status, 403);
 
         let mut manual = cov_config(&dir, "");
-        manual.global.mapping_policy.redirects.push(crate::config::Redirect {
-            from: "/directempty".into(),
-            to: String::new(),
-            status: 404,
-            regex: None,
-        });
-        manual.global.mapping_policy.redirects.push(crate::config::Redirect {
-            from: "/directrel".into(),
-            to: "relative-target".into(),
-            status: 302,
-            regex: None,
-        });
+        manual
+            .global
+            .mapping_policy
+            .redirects
+            .push(crate::config::Redirect {
+                from: "/directempty".into(),
+                to: String::new(),
+                status: 404,
+                regex: None,
+            });
+        manual
+            .global
+            .mapping_policy
+            .redirects
+            .push(crate::config::Redirect {
+                from: "/directrel".into(),
+                to: "relative-target".into(),
+                status: 302,
+                regex: None,
+            });
         let empty = cov_dispatch(&manual, "GET", "/directempty");
         assert_eq!(empty.status, 404);
         let rel = cov_dispatch(&manual, "GET", "/directrel");
         assert_eq!(rel.status, 302);
-        assert!(rel.headers.iter().any(|(n, v)| {
-            n.eq_ignore_ascii_case("location") && v == b"relative-target"
-        }));
+        assert!(rel
+            .headers
+            .iter()
+            .any(|(n, v)| { n.eq_ignore_ascii_case("location") && v == b"relative-target" }));
         let head = cov_dispatch(&manual, "HEAD", "/directrel");
         assert_eq!(head.status, 302);
         assert_eq!(head.body_len(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 
     #[test]
     fn coverage_run_fastcgi_pathinfo_and_auth() {
@@ -4799,7 +4790,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn coverage_directory_slash_reauthorization_error() {
         let dir = cov_dir("directory-slash");
@@ -4830,19 +4820,28 @@ mod tests {
             port: 0,
         });
         assert_eq!(
-            rebind(&cfg_many, &bound).err().expect("rebind error").kind(),
+            rebind(&cfg_many, &bound)
+                .err()
+                .expect("rebind error")
+                .kind(),
             io::ErrorKind::Unsupported
         );
         let mut cfg_mismatch = cfg.clone();
         cfg_mismatch.listeners[0].port = cfg.listeners[0].port.wrapping_add(1);
         assert_eq!(
-            rebind(&cfg_mismatch, &bound).err().expect("rebind error").kind(),
+            rebind(&cfg_mismatch, &bound)
+                .err()
+                .expect("rebind error")
+                .kind(),
             io::ErrorKind::Unsupported
         );
         let mut cfg_addr = cfg.clone();
         cfg_addr.listeners[0].addr = "127.0.0.2".into();
         assert_eq!(
-            rebind(&cfg_addr, &bound).err().expect("rebind error").kind(),
+            rebind(&cfg_addr, &bound)
+                .err()
+                .expect("rebind error")
+                .kind(),
             io::ErrorKind::Unsupported
         );
 
@@ -4881,7 +4880,9 @@ mod tests {
         let client = TcpStream::connect(addr).unwrap();
         let (server_stream, _) = listener.accept().unwrap();
         reject_busy_connection(server_stream, false, &cfg);
-        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut text = String::new();
         (&client).read_to_string(&mut text).unwrap();
         assert!(text.contains("503"));
@@ -4891,7 +4892,9 @@ mod tests {
         let mut client = TcpStream::connect(addr).unwrap();
         let (server_stream, _) = listener.accept().unwrap();
         reject_busy_connection(server_stream, true, &cfg);
-        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut buf = [0u8; 8];
         assert_eq!(client.read(&mut buf).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);

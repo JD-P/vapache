@@ -224,8 +224,9 @@ pub fn apply_req_deferred_with_root(
                     return Err(format!("{}: access file too large", path.display()))
                 }
                 Ok(meta) => {
-                    let base = dir_url_base(&root, &dir, fs_path, url_path);
-                    parse_cached(cfg, &path, mode, allow_list, nonfatal, &base, &meta)?
+                    let identity =
+                        crate::request_plan::LayerIdentity::new(&root, &dir, fs_path, url_path);
+                    parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, &meta)?
                 }
             };
             scope.merge(&delta.scope);
@@ -389,8 +390,9 @@ pub fn collect_layers_with_root(
         ) {
             continue;
         }
+        let identity = crate::request_plan::LayerIdentity::new(&root, &dir, fs_path, url_path);
         let mut layer = crate::policy_ref::AccessLayer {
-            dir: dir.clone(),
+            identity: identity.clone(),
             scope: Arc::new(Scope::default()),
             files: Vec::new(),
             conditionals: Vec::new(),
@@ -409,8 +411,7 @@ pub fn collect_layers_with_root(
                 }
                 Ok(m) => m,
             };
-            let base = dir_url_base(&root, &dir, fs_path, url_path);
-            let parsed = parse_cached(cfg, &path, mode, allow_list, nonfatal, &base, &meta)?;
+            let parsed = parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, &meta)?;
             if found {
                 Arc::make_mut(&mut layer.scope).merge(&parsed.scope);
             } else {
@@ -495,8 +496,8 @@ pub fn trace_access_files_with_root(
                 continue;
             }
             found = true;
-            let base = dir_url_base(&root, &dir, fs_path, url_path);
-            match parse_cached(cfg, &path, mode, allow_list, nonfatal, &base, &meta) {
+            let identity = crate::request_plan::LayerIdentity::new(&root, &dir, fs_path, url_path);
+            match parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, &meta) {
                 Ok(parsed) => out.push(format!(
                     "{} mode={:?} list={:?} nonfatal={:?} rules={}",
                     path.display(),
@@ -552,7 +553,7 @@ struct CacheKey {
     mode: u32,
     allow_list: Vec<String>,
     nonfatal: u8,
-    base_url: String,
+    identity: crate::request_plan::LayerIdentity,
 }
 
 fn mode_key(mode: OverrideMode) -> u32 {
@@ -574,7 +575,7 @@ fn parse_cached(
     mode: OverrideMode,
     allow_list: &[String],
     nonfatal: NonfatalMode,
-    base_url: &str,
+    identity: &crate::request_plan::LayerIdentity,
     meta: &fs::Metadata,
 ) -> Result<Arc<Parsed>, String> {
     let key = CacheKey {
@@ -595,7 +596,7 @@ fn parse_cached(
             NonfatalMode::Unknown => 2,
             NonfatalMode::All => 3,
         },
-        base_url: base_url.to_string(),
+        identity: identity.clone(),
     };
     {
         let guard = cache().lock().unwrap_or_else(|e| e.into_inner());
@@ -606,7 +607,7 @@ fn parse_cached(
     // Parse outside the lock: a slow filesystem read must not serialize
     // unrelated requests.  Duplicate parses on a race are harmless.
     let parsed = Arc::new(parse_file_with_list(
-        cfg, path, mode, allow_list, nonfatal, base_url,
+        cfg, path, mode, allow_list, nonfatal, identity,
     )?);
     let mut guard = cache().lock().unwrap_or_else(|e| e.into_inner());
     if guard.len() >= 512 {
@@ -623,7 +624,9 @@ fn parse_file(
     mode: OverrideMode,
     base_url: &str,
 ) -> Result<Parsed, String> {
-    parse_file_with_list(cfg, path, mode, &[], NonfatalMode::None, base_url)
+    let dir = path.parent().unwrap_or(path);
+    let identity = crate::request_plan::LayerIdentity::with_url_mount(dir, dir, base_url);
+    parse_file_with_list(cfg, path, mode, &[], NonfatalMode::None, &identity)
 }
 
 fn parse_file_with_list(
@@ -632,7 +635,7 @@ fn parse_file_with_list(
     mode: OverrideMode,
     allow_list: &[String],
     nonfatal: NonfatalMode,
-    base_url: &str,
+    identity: &crate::request_plan::LayerIdentity,
 ) -> Result<Parsed, String> {
     let data = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if data.len() as u64 > MAX_HTACCESS {
@@ -642,8 +645,8 @@ fn parse_file_with_list(
     let lines = logical_lines(&text);
     let mut scope = Scope::default();
     let mut rules = Vec::new();
-    scope.rewrite_policy.rewrite_base = Some(normalize_rewrite_base(base_url));
-    scope.rewrite_policy.rewrite_match_base = Some(normalize_rewrite_base(base_url));
+    scope.rewrite_policy.rewrite_base = Some(identity.url_mount.clone());
+    scope.rewrite_policy.rewrite_match_base = Some(identity.url_mount.clone());
     let mut i = 0;
     let mut next_chain = 0usize;
     parse_block(
@@ -661,57 +664,13 @@ fn parse_file_with_list(
         None,
     )
     .map_err(|e| format!("{}: {e}", path.display()))?;
+    for rule in &mut scope.rewrite_policy.rewrite_rules {
+        rule.subject_dir = Some(identity.dir.clone());
+    }
     Ok(Parsed {
         scope: Arc::new(scope),
         rules,
     })
-}
-
-/// F53/I50: derive a layer's per-directory URL base from the request URL and
-/// the layer's depth below the *requested* filesystem target, not from the
-/// path relative to an alias target.  `root` is retained only as a fallback
-/// for malformed callers; production mappings always strip `dir` from
-/// `fs_path` successfully.
-fn dir_url_base(root: &Path, dir: &Path, fs_path: &Path, url_path: &str) -> String {
-    let Some(rel) = fs_path.strip_prefix(dir).ok() else {
-        return match dir.strip_prefix(root) {
-            Ok(rel) => {
-                let rel = rel.to_string_lossy().replace('\\', "/");
-                let rel = rel.trim_matches('/');
-                if rel.is_empty() {
-                    "/".into()
-                } else {
-                    format!("/{rel}/")
-                }
-            }
-            Err(_) => normalize_rewrite_base(
-                url_path.rsplit_once('/').map(|(p, _)| p).unwrap_or(""),
-            ),
-        };
-    };
-    let depth = rel.components().count();
-    // Strip the last `depth` URL components without allocating a component
-    // vector or splitting the path.  This runs for every access-file layer on
-    // every request, so the hot path stays slice-only until the final String.
-    let trimmed = url_path.trim_end_matches('/');
-    let mut end = trimmed.len();
-    let mut remaining = depth;
-    let mut url_depth_sufficient = true;
-    while remaining > 0 {
-        let Some(slash) = trimmed[..end].rfind('/') else {
-            url_depth_sufficient = false;
-            break;
-        };
-        end = slash;
-        remaining -= 1;
-    }
-    if !vapache_verified::htaccess_layer_url_base_admit(true, url_depth_sufficient) {
-        // The filesystem target is deeper than the URL (for example an
-        // AliasMatch with a fixed target prefix).  The URL itself is the only
-        // sound upper bound; never invent an alias-target-relative base.
-        return normalize_rewrite_base(url_path);
-    }
-    normalize_rewrite_base(&trimmed[..end])
 }
 
 fn parse_block(
@@ -819,7 +778,8 @@ fn parse_block(
                             Some(&name),
                             false,
                             next_chain,
-                            None)?;
+                            None,
+                        )?;
                         inner_rules.retain(|rule| matches!(rule.kind, MatchKind::Always));
                         rules.push(ScopeRule {
                             kind: MatchKind::Always,
@@ -862,14 +822,13 @@ fn parse_block(
                         // nested parse rules are not expected here.
                         debug_assert!(inner_rules.is_empty());
                         let mut nodes = Vec::new();
-                        let inner_entries =
-                            if let Some(crate::config::AuthPolicy::List(entries)) =
-                                inner.authorization.requires.take()
-                            {
-                                entries
-                            } else {
-                                Vec::new()
-                            };
+                        let inner_entries = if let Some(crate::config::AuthPolicy::List(entries)) =
+                            inner.authorization.requires.take()
+                        {
+                            entries
+                        } else {
+                            Vec::new()
+                        };
                         for entry in inner_entries {
                             debug_assert_eq!(entry.limit.as_ref(), limit);
                             nodes.push(entry.node);
@@ -990,7 +949,8 @@ fn parse_block(
                                 Some(&name),
                                 require_only,
                                 next_chain,
-                                limit)?;
+                                limit,
+                            )?;
                         } else {
                             skip_section(lines, i, &name)?;
                         }
@@ -2002,9 +1962,7 @@ fn apply_options(scope: &mut Scope, args: &[String]) -> Result<(), String> {
         match sign {
             1 => scope.options.push_add(opt.0),
             -1 => scope.options.push_remove(opt.0),
-            _ if flag.eq_ignore_ascii_case("none") => {
-                scope.options.push_set(Options::empty().0)
-            }
+            _ if flag.eq_ignore_ascii_case("none") => scope.options.push_set(Options::empty().0),
             _ if flag.eq_ignore_ascii_case("all") => scope.options.push_set(Options::all().0),
             _ => scope.options.push_add(opt.0),
         }
@@ -2288,7 +2246,7 @@ mod tests {
             framing: crate::verified::BodyFraming::None,
         };
         req.headers.push("X-Block", "yes");
-        let env = p.scope.request_env(&req);
+        let env = p.scope.request_env(&req, "/");
         assert!(env.iter().any(|(n, v)| n == "STATIC" && v == "yes"));
         assert!(env.iter().any(|(n, v)| n == "BLOCK" && v == "1"));
         let _ = fs::remove_dir_all(&dir);
@@ -3164,6 +3122,7 @@ mod tests {
         assert_eq!(rule.match_base, "/sub/");
         assert_eq!(rule.base, "/other/");
         assert!(rule.per_dir);
+        assert_eq!(rule.subject_dir.as_deref(), Some(dir.as_path()));
         assert_eq!(rule.conditions[0].test, "%{QUERY_STRING}");
         assert!(rule.conditions[0].flags.nocase);
 
@@ -3306,7 +3265,7 @@ mod tests {
             "127.0.0.1".parse().unwrap(),
         )
         .unwrap();
-        let env = scope.request_env(&req);
+        let env = scope.request_env(&req, "/x");
         for expected in ["ROOT", "SECOND", "SUB"] {
             assert!(
                 env.iter().any(|(name, _)| name == expected),
@@ -3386,18 +3345,9 @@ mod tests {
         assert!(collect_layers(&cfg, None, &www.join("oversize/x"), "/oversize/x").is_err());
         std::os::unix::fs::symlink(".htaccess", www.join("loop/.htaccess")).unwrap();
         assert!(collect_layers(&cfg, None, &www.join("loop/x"), "/loop/x").is_err());
-        fs::write(
-            www.join("parse-error/.htaccess"),
-            "Frobnicate something\n",
-        )
-        .unwrap();
-        let trace = trace_access_files(
-            &cfg,
-            None,
-            &www.join("parse-error/x"),
-            "/parse-error/x",
-        )
-        .join("\n");
+        fs::write(www.join("parse-error/.htaccess"), "Frobnicate something\n").unwrap();
+        let trace =
+            trace_access_files(&cfg, None, &www.join("parse-error/x"), "/parse-error/x").join("\n");
         assert!(trace.contains("ERROR"));
 
         // A tree with no access files at all, and a path outside every
@@ -3420,9 +3370,11 @@ mod tests {
         assert!(trace.contains("no access files present"));
         let trace = trace_access_files(&cfg2, None, Path::new("/outside/file"), "/file").join("\n");
         assert!(trace.contains("skipped"));
-        assert!(collect_layers(&cfg2, None, Path::new("/outside/file"), "/file")
-            .unwrap()
-            .is_empty());
+        assert!(
+            collect_layers(&cfg2, None, Path::new("/outside/file"), "/file")
+                .unwrap()
+                .is_empty()
+        );
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&dir2);
@@ -3475,22 +3427,14 @@ mod tests {
         assert!(rule_matches(&MatchKind::Always, "x", "/x"));
         assert!(rule_matches(&MatchKind::Files(re("x")), "x", "/x"));
         assert!(rule_matches(&MatchKind::FilesMatch(re("x")), "x", "/x"));
-        assert!(rule_matches(&MatchKind::Location(String::new()), "x", "/any"));
         assert!(rule_matches(
-            &MatchKind::Location("/a/".into()),
+            &MatchKind::Location(String::new()),
             "x",
-            "/a"
+            "/any"
         ));
-        assert!(rule_matches(
-            &MatchKind::Location("/a".into()),
-            "x",
-            "/a/b"
-        ));
-        assert!(!rule_matches(
-            &MatchKind::Location("/a".into()),
-            "x",
-            "/ab"
-        ));
+        assert!(rule_matches(&MatchKind::Location("/a/".into()), "x", "/a"));
+        assert!(rule_matches(&MatchKind::Location("/a".into()), "x", "/a/b"));
+        assert!(!rule_matches(&MatchKind::Location("/a".into()), "x", "/ab"));
         assert!(rule_matches(
             &MatchKind::LocationMatch(re("^/a")),
             "x",
@@ -3508,13 +3452,21 @@ mod tests {
         ));
 
         assert_eq!(mode_key(OverrideMode::None), 0);
-        assert_eq!(dir_url_base(&www, &www, &www.join("x"), "/x"), "/");
         assert_eq!(
-            dir_url_base(&www, &alias, &alias.join("deep/file"), "/alias/deep/file"),
+            crate::request_plan::layer_url_mount(&www, &www, &www.join("x"), "/x"),
+            "/"
+        );
+        assert_eq!(
+            crate::request_plan::layer_url_mount(
+                &www,
+                &alias,
+                &alias.join("deep/file"),
+                "/alias/deep/file"
+            ),
             "/alias/"
         );
         assert_eq!(
-            dir_url_base(
+            crate::request_plan::layer_url_mount(
                 Path::new("/srv/www"),
                 Path::new("/srv/www/a/b"),
                 Path::new("/srv/www/a/b/f"),
@@ -3525,7 +3477,7 @@ mod tests {
         // F53: an alias target at the mapping root still has the URL mount,
         // not `/`, as its per-directory base.
         assert_eq!(
-            dir_url_base(
+            crate::request_plan::layer_url_mount(
                 Path::new("/srv/site"),
                 Path::new("/srv/site"),
                 Path::new("/srv/site/private/wallet.dat"),
@@ -3534,7 +3486,7 @@ mod tests {
             "/site/"
         );
         assert_eq!(
-            dir_url_base(
+            crate::request_plan::layer_url_mount(
                 Path::new("/srv/site"),
                 Path::new("/srv/site/private"),
                 Path::new("/srv/site/private/wallet.dat"),
@@ -3542,45 +3494,45 @@ mod tests {
             ),
             "/site/private/"
         );
-        // A target deeper than the URL (fixed AliasMatch suffix) falls back
-        // to the requested URL itself rather than inventing a target-relative
-        // base.  The remaining branches keep malformed compatibility callers
-        // from producing an alias-target-relative base.
+        // A target deeper than the URL (fixed AliasMatch suffix) cannot be
+        // described by URL depth; the layer uses Apache's filesystem
+        // directory form.  Rewrite subject matching itself is carried by
+        // `subject_dir`, not this substitution base (F58).
         assert_eq!(
-            dir_url_base(
+            crate::request_plan::layer_url_mount(
                 Path::new("/srv/site"),
                 Path::new("/srv/site"),
                 Path::new("/srv/site/sub1/sub2/private/wallet.dat"),
                 "/m/private/wallet.dat"
             ),
-            "/m/private/wallet.dat/"
+            "/srv/site/"
         );
         assert_eq!(
-            dir_url_base(
+            crate::request_plan::layer_url_mount(
                 Path::new("/srv/site"),
                 Path::new("/srv/site"),
                 Path::new("/other/wallet.dat"),
                 "/other/wallet.dat"
             ),
-            "/"
+            "/srv/site/"
         );
         assert_eq!(
-            dir_url_base(
+            crate::request_plan::layer_url_mount(
                 Path::new("/srv/site"),
                 Path::new("/other"),
                 Path::new("/srv/site/wallet.dat"),
                 "/other/deep/wallet.dat"
             ),
-            "/other/deep/"
+            "/other/"
         );
         assert_eq!(
-            dir_url_base(
+            crate::request_plan::layer_url_mount(
                 Path::new("/srv"),
                 Path::new("/srv/site"),
                 Path::new("/other/wallet.dat"),
                 "/other/wallet.dat"
             ),
-            "/site/"
+            "/srv/site/"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -3591,22 +3543,17 @@ mod tests {
         let dir = tempdir("coverage-parse-errors");
         let cfg = config(&dir, "Listen 127.0.0.1:0\n");
         let file = dir.join(".htaccess");
-        let parse = |text: &str,
-                     mode: OverrideMode,
-                     nonfatal: NonfatalMode,
-                     allow: &[String]| {
+        let parse = |text: &str, mode: OverrideMode, nonfatal: NonfatalMode, allow: &[String]| {
             fs::write(&file, text).unwrap();
-            parse_file_with_list(&cfg, &file, mode, allow, nonfatal, "/")
+            let identity = crate::request_plan::LayerIdentity::with_url_mount(&dir, &dir, "/");
+            parse_file_with_list(&cfg, &file, mode, allow, nonfatal, &identity)
         };
 
         let all = OverrideMode::All;
         let cases: &[(&str, bool)] = &[
             ("Header \"unterminated\n", false),
             ("<Files \"x\">\n</If>\n", false),
-            (
-                "<Limit GET>\n<Files \"x\">\n</Files>\n</Limit>\n",
-                false,
-            ),
+            ("<Limit GET>\n<Files \"x\">\n</Files>\n</Limit>\n", false),
             (
                 "<RequireAll>\n<If \"true\">\nRequire all granted\n</If>\n</RequireAll>\n",
                 false,
@@ -3615,10 +3562,7 @@ mod tests {
                 "<IfFile ignored path>\nHeader set X-IfFile yes\n</IfFile>\n",
                 true,
             ),
-            (
-                "<If \"true\">\n</If>\n<Else extra more>\n</Else>\n",
-                false,
-            ),
+            ("<If \"true\">\n</If>\n<Else extra more>\n</Else>\n", false),
             (
                 "<If \"true\">\n<FilesMatch \"[\">\n</FilesMatch>\n</If>\n",
                 false,
@@ -3648,10 +3592,7 @@ mod tests {
                 "<IfModule !mod_rewrite.c>\nRequire all denied\n</IfModule>\n",
                 true,
             ),
-            (
-                "<IfModule>\nRequire all denied\n</IfModule>\n",
-                true,
-            ),
+            ("<IfModule>\nRequire all denied\n</IfModule>\n", true),
             (
                 "<IfModule !mod_not_builtin.c>\nRequire all denied\n</IfModule>\n",
                 true,
@@ -3803,7 +3744,7 @@ mod tests {
                     OverrideMode::All,
                     &[],
                     nonfatal,
-                    "/",
+                    &crate::request_plan::LayerIdentity::with_url_mount(&dir, &dir, "/"),
                     &meta,
                 )
                 .unwrap(),
@@ -3827,7 +3768,9 @@ mod tests {
                         mode: 0,
                         allow_list: Vec::new(),
                         nonfatal: 0,
-                        base_url: String::new(),
+                        identity: crate::request_plan::LayerIdentity::with_url_mount(
+                            &dir, &dir, "/",
+                        ),
                     },
                     Arc::clone(&parsed),
                 );
@@ -3839,7 +3782,7 @@ mod tests {
             OverrideMode::All,
             &[],
             NonfatalMode::None,
-            "/",
+            &crate::request_plan::LayerIdentity::with_url_mount(&dir, &dir, "/"),
             &meta
         )
         .is_ok());
@@ -3891,7 +3834,7 @@ mod tests {
         assert!(!trace.contains("nonfile/.htaccess"));
         let layers = collect_layers(&cfg, None, &www.join("none/x"), "/none/x").unwrap();
         assert_eq!(layers.len(), 1);
-        assert_eq!(layers[0].dir, www);
+        assert_eq!(layers[0].identity.dir, www);
         let trace = trace_access_files(&cfg, None, &www.join("none/x"), "/none/x").join("\n");
         assert!(!trace.contains("none/.htaccess"));
 
@@ -3972,7 +3915,7 @@ mod tests {
 
         // A normal non-Files/non-conditional rule lands in the TopLevel slot.
         let mut layer = crate::policy_ref::AccessLayer {
-            dir: www.clone(),
+            identity: crate::request_plan::LayerIdentity::new(&www, &www, &www.join("x"), "/x"),
             scope: Arc::new(Scope::default()),
             files: Vec::new(),
             conditionals: Vec::new(),
@@ -4010,10 +3953,7 @@ mod tests {
             ("AddHandler cgi-script .cgi\n", true),
             ("AddHandler cgi-script\n", true),
             ("ErrorDocument 404\n", true),
-            (
-                "AddOutputFilterByType DEFLATE text/plain\n",
-                true,
-            ),
+            ("AddOutputFilterByType DEFLATE text/plain\n", true),
             ("AddOutputFilterByType DEFLATE\n", true),
             ("AddOutputFilter DEFLATE .html\n", true),
             ("AddOutputFilter DEFLATE\n", true),

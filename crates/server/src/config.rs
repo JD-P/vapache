@@ -688,6 +688,11 @@ pub struct RewriteRule {
     /// URL prefix that per-directory patterns are matched against.  This is
     /// the containing directory and is not changed by `RewriteBase`.
     pub match_base: String,
+    /// Access-file directory for a per-directory rule.  The rewrite subject is
+    /// the requested target relative to this directory (Apache's
+    /// `r->filename`-relative subject), which remains defined for layers above
+    /// the URL-mapping root and targets deeper than the URL mount (F58/I58).
+    pub subject_dir: Option<PathBuf>,
     pub per_dir: bool,
 }
 
@@ -1174,15 +1179,13 @@ impl Scope {
         self.error_policy.get(status)
     }
 
-    pub fn request_env(&self, req: &crate::http::Request) -> Vec<(String, String)> {
+    pub fn request_env(&self, req: &crate::http::Request, url_path: &str) -> Vec<(String, String)> {
         let mut env = self.environment_policy.set_env.clone();
         for rule in &self.environment_policy.set_env_if {
             let attr = rule.attribute.to_ascii_lowercase();
             let value = match attr.as_str() {
                 "request_method" | "request-method" => Some(req.method.clone()),
-                "request_uri" | "request-uri" => {
-                    Some(String::from_utf8_lossy(&req.target).into_owned())
-                }
+                "request_uri" | "request-uri" => Some(url_path.to_string()),
                 "host" => req.header_str("host").map(str::to_string),
                 "user-agent" | "user_agent" => req.header_str("user-agent").map(str::to_string),
                 "referer" => req.header_str("referer").map(str::to_string),
@@ -2664,8 +2667,7 @@ impl Compile {
                                 let tilde_regex =
                                     name == "directory" && p == "~" && args.len() >= 2;
                                 if name == "directorymatch" || tilde_regex {
-                                    let pattern =
-                                        if tilde_regex { args[1..].join(" ") } else { p };
+                                    let pattern = if tilde_regex { args[1..].join(" ") } else { p };
                                     match compile_regex(&pattern) {
                                         Ok(r) => MatchKind::DirectoryMatch(r),
                                         Err(e) => {
@@ -4233,8 +4235,7 @@ impl Compile {
             }
             "requestreadtimeout" => {
                 let raw = args.join(" ");
-                let Some((header, body, header_rate, body_rate)) =
-                    parse_request_read_timeout(&raw)
+                let Some((header, body, header_rate, body_rate)) = parse_request_read_timeout(&raw)
                 else {
                     return;
                 };
@@ -4460,9 +4461,7 @@ impl Compile {
                         continue;
                     };
                     match key.to_ascii_lowercase().as_str() {
-                        "hcmethod" => {
-                            self.cfg.balancers[i].health.method = Some(value.to_string())
-                        }
+                        "hcmethod" => self.cfg.balancers[i].health.method = Some(value.to_string()),
                         "hcuri" => self.cfg.balancers[i].health.uri = Some(value.to_string()),
                         "hcinterval" => {
                             self.cfg.balancers[i].health.interval = parse_duration(value)
@@ -4730,10 +4729,11 @@ pub(crate) fn rule_condition_matches(
     env: &[(String, String)],
     peer: IpAddr,
     docroot: &Path,
+    url_path: &str,
     chain_state: &mut HashMap<usize, bool>,
 ) -> bool {
     let eval = |expr: &crate::expr::Expr| {
-        let mut ctx = crate::expr::Context::new(req, env, peer, docroot);
+        let mut ctx = crate::expr::Context::new(req, env, peer, docroot, url_path);
         expr.eval(&mut ctx).map(|v| v.truthy()).unwrap_or(false)
     };
     match rule.branch {
@@ -4877,11 +4877,26 @@ fn transformed_rewrite_rules(
     let MatchKind::Directory(dir) = &rule.kind else {
         return None;
     };
-    let base = Config::url_base_for_directory(dir, fs_path, url_path)?;
+    // Wildcard/pattern <Directory> blocks keep the legacy non-per-directory
+    // rewrite treatment; a wildcard pattern is not itself a filesystem layer
+    // from which Apache can derive a per-directory prefix.
+    if dir
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .any(|b| matches!(b, b'*' | b'?' | b'['))
+    {
+        return None;
+    }
+    // Main-configuration <Directory> rewrites use the same layer identity as
+    // access files: the URL mount is the substitution base, while the match
+    // subject is always the selected target relative to the directory.
+    let base = crate::request_plan::layer_url_mount(dir, dir, fs_path, url_path);
     let mut rules = rule.delta.rewrite_policy.rewrite_rules.clone();
     for rr in &mut rules {
         rr.per_dir = true;
         rr.match_base = base.clone();
+        rr.subject_dir = Some(dir.clone());
         if rr.base == "/" {
             rr.base = base.clone();
         }
@@ -5117,8 +5132,8 @@ fn apply_conditional_rule(
     fname: &str,
     chain_state: &mut HashMap<usize, bool>,
 ) {
-    let env = s.request_env(req);
-    if !rule_condition_matches(rule, req, &env, peer, docroot, chain_state) {
+    let env = s.request_env(req, url_path);
+    if !rule_condition_matches(rule, req, &env, peer, docroot, url_path, chain_state) {
         return;
     }
     merge_rule_delta(s, rule, fs_path, url_path);
@@ -5683,6 +5698,7 @@ pub(crate) fn parse_rewrite_rule(
         conditions: Vec::new(),
         base: normalize_rewrite_base(base),
         match_base: normalize_rewrite_base(base),
+        subject_dir: None,
         per_dir,
     })
 }
@@ -6949,9 +6965,34 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
         assert!(s.rewrite_policy.rewrite_rules[0].per_dir);
         assert_eq!(s.rewrite_policy.rewrite_rules[0].match_base, "/sub/");
         assert_eq!(s.rewrite_policy.rewrite_rules[0].base, "/sub/");
+        assert_eq!(
+            s.rewrite_policy.rewrite_rules[0].subject_dir.as_deref(),
+            Some(Path::new("/srv/www/sub"))
+        );
 
         let s = c.effective_scope(None, Path::new("/srv/www/sub"), "/sub");
         assert_eq!(s.rewrite_policy.rewrite_rules[0].match_base, "/sub/");
+
+        // Wildcard <Directory> patterns are not filesystem layer identities;
+        // keep the legacy non-per-directory rewrite treatment.
+        let wildcard = load_text(
+            concat!(
+                "Listen 127.0.0.1:0\n",
+                "RewriteEngine On\n",
+                "<Directory /srv/www/*>\n",
+                "RewriteRule ^old$ new [L]\n",
+                "</Directory>\n",
+            ),
+            false,
+        )
+        .unwrap();
+        let s = wildcard.effective_scope(
+            None,
+            Path::new("/srv/www/sub/old"),
+            "/sub/old",
+        );
+        assert!(!s.rewrite_policy.rewrite_rules[0].per_dir);
+        assert!(s.rewrite_policy.rewrite_rules[0].subject_dir.is_none());
     }
 
     #[test]
@@ -7790,13 +7831,20 @@ ServerName localhost\n\
             "http://backend/app/file",
             &req,
             "127.0.0.1".parse().unwrap(),
+            "/app/file",
         );
         assert_eq!(
-            crate::access::check(&scope, &req, "127.0.0.1".parse().unwrap(), None),
+            crate::access::check(
+                &scope,
+                &req,
+                "127.0.0.1".parse().unwrap(),
+                None,
+                "/app/file"
+            ),
             crate::access::Access::Denied
         );
         assert!(
-            crate::access::check(&scope, &req, "10.1.2.3".parse().unwrap(), None)
+            crate::access::check(&scope, &req, "10.1.2.3".parse().unwrap(), None, "/app/file")
                 == crate::access::Access::Allowed
         );
 
@@ -7807,6 +7855,7 @@ ServerName localhost\n\
             "http://other/42/x",
             &req,
             "127.0.0.1".parse().unwrap(),
+            "/other/42/x",
         );
         // The <If> did not match; no authorization rule was added.
         assert!(scope.authorization.requires.is_none());
@@ -7819,9 +7868,16 @@ ServerName localhost\n\
             "http://other/42/x",
             &req_allowed,
             "127.0.0.1".parse().unwrap(),
+            "/other/42/x",
         );
         assert_eq!(
-            crate::access::check(&scope, &req_allowed, "127.0.0.1".parse().unwrap(), None),
+            crate::access::check(
+                &scope,
+                &req_allowed,
+                "127.0.0.1".parse().unwrap(),
+                None,
+                "/other/42/x"
+            ),
             crate::access::Access::Allowed
         );
     }
@@ -7893,10 +7949,10 @@ ServerName localhost\n\
         );
 
         assert!(HostSpec::All.matches("127.0.0.1".parse().unwrap()));
-        assert!(HostSpec::Net("10.0.0.0".parse().unwrap(), 8)
-            .matches("10.1.2.3".parse().unwrap()));
-        assert!(!HostSpec::Net("10.0.0.0".parse().unwrap(), 8)
-            .matches("127.0.0.1".parse().unwrap()));
+        assert!(HostSpec::Net("10.0.0.0".parse().unwrap(), 8).matches("10.1.2.3".parse().unwrap()));
+        assert!(
+            !HostSpec::Net("10.0.0.0".parse().unwrap(), 8).matches("127.0.0.1".parse().unwrap())
+        );
         let scoped = MethodScoped {
             limit: Some(MethodSet::Only(vec!["GET".into()])),
             value: 1,
@@ -7922,17 +7978,13 @@ ServerName localhost\n\
             MethodSet::Only(vec!["GET".into()])
         );
         assert_eq!(
-            MethodSet::Except(vec!["GET".into()]).intersect(&MethodSet::Only(vec![
-                "GET".into(),
-                "POST".into()
-            ])),
+            MethodSet::Except(vec!["GET".into()])
+                .intersect(&MethodSet::Only(vec!["GET".into(), "POST".into()])),
             MethodSet::Only(vec!["POST".into()])
         );
         assert_eq!(
-            MethodSet::Except(vec!["GET".into()]).intersect(&MethodSet::Except(vec![
-                "GET".into(),
-                "POST".into()
-            ])),
+            MethodSet::Except(vec!["GET".into()])
+                .intersect(&MethodSet::Except(vec!["GET".into(), "POST".into()])),
             MethodSet::Except(vec!["GET".into(), "POST".into()])
         );
         assert!(MethodSet::Only(Vec::new()).is_empty());
@@ -7979,7 +8031,10 @@ ServerName localhost\n\
         mime.add_type("text/plain", &["txt".into(), ".TXT".into(), String::new()]);
         mime.add_type("application/gzip", &["gz".into()]);
         mime.add_type("application/octet-stream", &["inner".into()]);
-        assert_eq!(mime.content_type(b"dir/name.TXT").as_deref(), Some("text/plain"));
+        assert_eq!(
+            mime.content_type(b"dir/name.TXT").as_deref(),
+            Some("text/plain")
+        );
         assert_eq!(
             mime.content_type(b"archive.tar.gz").as_deref(),
             Some("application/gzip")
@@ -7990,17 +8045,15 @@ ServerName localhost\n\
         let long = "a".repeat(65);
         mime.add_type("text/long", &[long.clone()]);
         assert_eq!(
-            mime.content_type(format!("file.{long}").as_bytes()).as_deref(),
+            mime.content_type(format!("file.{long}").as_bytes())
+                .as_deref(),
             Some("text/long")
         );
         mime.remove_type(&[".TXT".into(), "gz".into()]);
         assert_eq!(mime.content_type(b"name.txt"), None);
         assert_eq!(mime.content_type(b"name.gz"), None);
 
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-types-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("vapache-types-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let types = dir.join("mime.types");
@@ -8047,24 +8100,38 @@ ServerName localhost\n\
         assert!(parse_env_rule("setenvif", &["Host".into(), "x".into()]).is_err());
 
         let mut scope = Scope::default();
-        scope.environment_policy.set_env.push(("BASE".into(), "1".into()));
+        scope
+            .environment_policy
+            .set_env
+            .push(("BASE".into(), "1".into()));
         let mut rule = parse_env_rule(
             "setenvif",
-            &["Request_URI".into(), "^/x".into(), "HIT=yes".into(), "!BASE".into()],
+            &[
+                "Request_URI".into(),
+                "^/x".into(),
+                "HIT=yes".into(),
+                "!BASE".into(),
+            ],
         )
         .unwrap();
         scope.environment_policy.set_env_if.push(rule.clone());
         rule.attribute = "Content-Type".into();
         rule.negate = true;
         scope.environment_policy.set_env_if.push(rule);
-        scope.environment_policy.pass_env.push("VAPACHE_TEST_ENV".into());
+        scope
+            .environment_policy
+            .pass_env
+            .push("VAPACHE_TEST_ENV".into());
         scope.environment_policy.unset_env.push("DROP".into());
-        scope.environment_policy.set_env.push(("DROP".into(), "x".into()));
+        scope
+            .environment_policy
+            .set_env
+            .push(("DROP".into(), "x".into()));
         std::env::set_var("VAPACHE_TEST_ENV", "passed");
         let mut req = test_request("GET");
         req.target = b"/x?q=1".to_vec();
         req.headers.insert("content-type", b"text/plain".to_vec());
-        let env = scope.request_env(&req);
+        let env = scope.request_env(&req, "/x");
         assert!(env.contains(&("HIT".into(), "yes".into())));
         assert!(!env.iter().any(|(k, _)| k == "BASE"));
         assert!(env.contains(&("VAPACHE_TEST_ENV".into(), "passed".into())));
@@ -8108,6 +8175,7 @@ ServerName localhost\n\
             &[],
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
+            "/x",
             &mut chain
         ));
 
@@ -8120,6 +8188,7 @@ ServerName localhost\n\
             &[],
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
+            "/x",
             &mut chain
         ));
         assert_eq!(chain.get(&1), Some(&true));
@@ -8134,6 +8203,7 @@ ServerName localhost\n\
             &[],
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
+            "/x",
             &mut chain
         ));
         chain.insert(2, true);
@@ -8145,6 +8215,7 @@ ServerName localhost\n\
             &[],
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
+            "/x",
             &mut chain
         ));
         let missing = base.clone();
@@ -8157,6 +8228,7 @@ ServerName localhost\n\
             &[],
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
+            "/x",
             &mut chain
         ));
         let no_chain_condition = {
@@ -8172,6 +8244,7 @@ ServerName localhost\n\
             &[],
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
+            "/x",
             &mut chain
         ));
         let mut else_rule = base.clone();
@@ -8183,6 +8256,7 @@ ServerName localhost\n\
             &[],
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
+            "/x",
             &mut chain
         ));
         let mut else_rule = base.clone();
@@ -8194,6 +8268,7 @@ ServerName localhost\n\
             &[],
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
+            "/x",
             &mut chain
         ));
         let mut else_missing = base.clone();
@@ -8205,13 +8280,26 @@ ServerName localhost\n\
             &[],
             "127.0.0.1".parse().unwrap(),
             Path::new("/tmp"),
+            "/x",
             &mut chain
         ));
 
-        assert!(path_has_prefix(Path::new("/srv/www/x"), Path::new("/srv/www")));
-        assert!(path_has_prefix(Path::new("/srv/www/x"), Path::new("/srv/www/")));
-        assert!(path_has_prefix(Path::new("/srv/www"), Path::new("/srv/www")));
-        assert!(!path_has_prefix(Path::new("/srv/wwwx"), Path::new("/srv/www")));
+        assert!(path_has_prefix(
+            Path::new("/srv/www/x"),
+            Path::new("/srv/www")
+        ));
+        assert!(path_has_prefix(
+            Path::new("/srv/www/x"),
+            Path::new("/srv/www/")
+        ));
+        assert!(path_has_prefix(
+            Path::new("/srv/www"),
+            Path::new("/srv/www")
+        ));
+        assert!(!path_has_prefix(
+            Path::new("/srv/wwwx"),
+            Path::new("/srv/www")
+        ));
         assert!(path_has_prefix(Path::new("/anything"), Path::new("")));
         assert!(wildcard_path_matches(
             Path::new("/srv/*/www"),
@@ -8230,10 +8318,7 @@ ServerName localhost\n\
             Path::new("/srv/site/child")
         ));
 
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-rule-path-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("vapache-rule-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("file"), "x").unwrap();
@@ -8347,10 +8432,8 @@ ServerName localhost\n\
 
     #[test]
     fn coverage_parser_state_and_sections() {
-        let root = std::env::temp_dir().join(format!(
-            "vapache-parser-state-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("vapache-parser-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let loc = SourceLoc {
@@ -8363,13 +8446,13 @@ ServerName localhost\n\
         p.warn("first");
         assert_eq!(p.warnings, vec!["first"]);
         assert_eq!(
-            p.expand_vars(
-                &["${A}-${E}-${map:key}".into()],
-                &loc
-            ),
+            p.expand_vars(&["${A}-${E}-${map:key}".into()], &loc),
             Some(vec!["one-two-${map:key}".into()])
         );
-        assert_eq!(p.expand_vars(&["$plain".into()], &loc), Some(vec!["$plain".into()]));
+        assert_eq!(
+            p.expand_vars(&["$plain".into()], &loc),
+            Some(vec!["$plain".into()])
+        );
         assert!(p.expand_vars(&["${MISSING}".into()], &loc).is_none());
         p.warnings.clear();
         assert_eq!(p.errors.len(), 1);
@@ -8413,7 +8496,10 @@ ServerName localhost\n\
         p.include_pattern("missing*.conf", true, &loc);
         assert_eq!(p.include_count, 1);
         p.include_pattern("missing*.conf", false, &loc);
-        assert!(p.errors.iter().any(|e| e.msg.contains("Include file not found")));
+        assert!(p
+            .errors
+            .iter()
+            .any(|e| e.msg.contains("Include file not found")));
         p.errors.clear();
         p.include_pattern(&root.join("*.conf").to_string_lossy(), false, &loc);
         assert_eq!(p.include_count, 3);
@@ -8458,8 +8544,16 @@ ServerName localhost\n\
         assert!(load_text("Include /definitely/missing.conf\n", false).is_err());
         assert!(load_text("IncludeOptional /definitely/missing.conf\n", false).is_ok());
         assert!(load_text("<IfDefine !NOPE>\nServerName x\n</IfDefine>\n", false).is_ok());
-        assert!(load_text("LoadModule test_module /x.so\n<IfModule test_module>\nServerName x\n</IfModule>\n", false).is_ok());
-        assert!(load_text("Define X\n<IfDefine !X>\nServerName x\n</IfDefine>\n", false).is_ok());
+        assert!(load_text(
+            "LoadModule test_module /x.so\n<IfModule test_module>\nServerName x\n</IfModule>\n",
+            false
+        )
+        .is_ok());
+        assert!(load_text(
+            "Define X\n<IfDefine !X>\nServerName x\n</IfDefine>\n",
+            false
+        )
+        .is_ok());
     }
 
     #[test]
@@ -8539,12 +8633,15 @@ ServerName localhost\n\
                 Some(8)
             ))
         );
-        assert_eq!(parse_request_read_timeout("header=5 body=6"), Some((
-            Some(Duration::from_secs(5)),
-            Some(Duration::from_secs(6)),
-            None,
-            None
-        )));
+        assert_eq!(
+            parse_request_read_timeout("header=5 body=6"),
+            Some((
+                Some(Duration::from_secs(5)),
+                Some(Duration::from_secs(6)),
+                None,
+                None
+            ))
+        );
         assert_eq!(parse_request_read_timeout("header=x body=y"), None);
         assert_eq!(parse_request_read_timeout("none"), None);
         assert_eq!(parse_duration("5ms"), Some(Duration::from_millis(5)));
@@ -8601,15 +8698,42 @@ ServerName localhost\n\
         );
 
         assert!(matches!(parse_require(&[]), Require::Unsupported(_)));
-        assert!(matches!(parse_require(&["not".into()]), Require::Unsupported(_)));
-        assert!(matches!(parse_require(&["all".into(), "maybe".into()]), Require::Unsupported(_)));
-        assert!(matches!(parse_require(&["ip".into()]), Require::Unsupported(_)));
-        assert!(matches!(parse_require(&["ip".into(), "bad".into()]), Require::Unsupported(_)));
-        assert!(matches!(parse_require(&["method".into()]), Require::Unsupported(_)));
-        assert!(matches!(parse_require(&["method".into(), "NOPE".into()]), Require::Unsupported(_)));
-        assert!(matches!(parse_require(&["env".into()]), Require::Unsupported(_)));
-        assert!(matches!(parse_require(&["env".into(), "=x".into()]), Require::Unsupported(_)));
-        assert!(matches!(parse_require(&["expr".into(), "(".into()]), Require::Unsupported(_)));
+        assert!(matches!(
+            parse_require(&["not".into()]),
+            Require::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse_require(&["all".into(), "maybe".into()]),
+            Require::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse_require(&["ip".into()]),
+            Require::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse_require(&["ip".into(), "bad".into()]),
+            Require::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse_require(&["method".into()]),
+            Require::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse_require(&["method".into(), "NOPE".into()]),
+            Require::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse_require(&["env".into()]),
+            Require::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse_require(&["env".into(), "=x".into()]),
+            Require::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse_require(&["expr".into(), "(".into()]),
+            Require::Unsupported(_)
+        ));
         for provider in ["dbm", "dbd", "ldap", "file"] {
             assert!(matches!(
                 parse_require(&[provider.into()]),
@@ -8641,8 +8765,35 @@ ServerName localhost\n\
             Require::Group { names, .. } if names == vec!["g".to_string()]
         ));
 
-        assert!(parse_rewrite_flags(&["L".into(), "END".into(), "QSA,NC".into(), "NE".into(), "PT".into(), "P".into(), "C".into(), "N".into()]).unwrap().last);
-        assert!(parse_rewrite_flags(&["QSD".into(), "QSL".into(), "UNSAFEALLOW3F".into(), "B".into(), "BNE".into(), "BNP".into(), "BCTLS".into(), "UNSAFEPREFIXSTAT".into(), "DPI".into(), "F".into(), "G".into(), "NS".into()]).is_ok());
+        assert!(
+            parse_rewrite_flags(&[
+                "L".into(),
+                "END".into(),
+                "QSA,NC".into(),
+                "NE".into(),
+                "PT".into(),
+                "P".into(),
+                "C".into(),
+                "N".into()
+            ])
+            .unwrap()
+            .last
+        );
+        assert!(parse_rewrite_flags(&[
+            "QSD".into(),
+            "QSL".into(),
+            "UNSAFEALLOW3F".into(),
+            "B".into(),
+            "BNE".into(),
+            "BNP".into(),
+            "BCTLS".into(),
+            "UNSAFEPREFIXSTAT".into(),
+            "DPI".into(),
+            "F".into(),
+            "G".into(),
+            "NS".into()
+        ])
+        .is_ok());
         assert_eq!(
             parse_rewrite_flags(&["R".into()]).unwrap().redirect,
             Some(302)
@@ -8686,15 +8837,28 @@ ServerName localhost\n\
         assert!(parse_rewrite_cond(&["x".into(), "^a$".into(), "[BAD]".into()]).is_err());
         assert!(parse_rewrite_cond(&["x".into(), "%{HTTP_HOST}".into()]).is_err());
         assert!(parse_rewrite_cond(&["x".into(), "(".into()]).is_err());
-        assert!(parse_rewrite_cond(&["x".into(), "-f".into()]).unwrap().regex.is_none());
-        assert!(parse_rewrite_cond(&["x".into(), "!-d".into()]).unwrap().regex.is_none());
-        assert!(parse_rewrite_cond(&["x".into(), "=abc".into()]).unwrap().regex.is_none());
+        assert!(parse_rewrite_cond(&["x".into(), "-f".into()])
+            .unwrap()
+            .regex
+            .is_none());
+        assert!(parse_rewrite_cond(&["x".into(), "!-d".into()])
+            .unwrap()
+            .regex
+            .is_none());
+        assert!(parse_rewrite_cond(&["x".into(), "=abc".into()])
+            .unwrap()
+            .regex
+            .is_none());
 
         assert!(parse_rewrite_rule(&["only".into()], "/", false).is_err());
         assert!(parse_rewrite_rule(&["%{LA-REQUEST}".into(), "/x".into()], "/", false).is_err());
-        assert!(parse_rewrite_rule(&["^/x$".into(), "$1".into(), "[P]".into()], "/", false).is_err());
+        assert!(
+            parse_rewrite_rule(&["^/x$".into(), "$1".into(), "[P]".into()], "/", false).is_err()
+        );
         assert!(parse_rewrite_rule(&["%{HTTP_HOST}".into(), "/x".into()], "/", false).is_err());
-        let negated = parse_rewrite_rule(&["!^/x$".into(), "/y".into(), "[NC]".into()], "base", true).unwrap();
+        let negated =
+            parse_rewrite_rule(&["!^/x$".into(), "/y".into(), "[NC]".into()], "base", true)
+                .unwrap();
         assert!(negated.negated);
         assert_eq!(negated.base, "/base/");
         assert_eq!(negated.match_base, "/base/");
@@ -8703,8 +8867,14 @@ ServerName localhost\n\
         assert_eq!(normalize_rewrite_base("x"), "/x/");
         assert_eq!(normalize_rewrite_base("/x"), "/x/");
 
-        assert_eq!(parse_ip_net("10.0.0.1"), Some(("10.0.0.1".parse().unwrap(), 32)));
-        assert_eq!(parse_ip_net("2001:db8::1"), Some(("2001:db8::1".parse().unwrap(), 128)));
+        assert_eq!(
+            parse_ip_net("10.0.0.1"),
+            Some(("10.0.0.1".parse().unwrap(), 32))
+        );
+        assert_eq!(
+            parse_ip_net("2001:db8::1"),
+            Some(("2001:db8::1".parse().unwrap(), 128))
+        );
         assert_eq!(parse_ip_net("10.0.0.0/33"), None);
         assert_eq!(parse_ip_net("bad"), None);
         assert_eq!(parse_ip_net("10.0.0.0/bad"), None);
@@ -8740,10 +8910,7 @@ ServerName localhost\n\
 
     #[test]
     fn coverage_directive_matrix() {
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-directives-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("vapache-directives-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -8914,18 +9081,28 @@ RewriteOptions Inherit\n"
             s.compression_policy.brotli_alter_etag,
             Some(AlterEtag::Remove)
         );
-        assert!(s.mapping_policy.unsupported_filters.iter().any(|f| f == "INCLUDES"));
+        assert!(s
+            .mapping_policy
+            .unsupported_filters
+            .iter()
+            .any(|f| f == "INCLUDES"));
         assert_eq!(s.content_policy.force_type.as_deref(), Some("text/plain"));
         assert_eq!(s.content_policy.default_charset.as_deref(), Some("UTF-8"));
         assert_eq!(s.content_policy.file_etag, Some(ETAG_MTIME | ETAG_SIZE));
         assert_eq!(s.content_policy.enable_sendfile, Some(false));
         assert_eq!(s.content_policy.directory_slash, Some(false));
-        assert_eq!(s.content_policy.access_file_names.as_ref().unwrap().len(), 2);
+        assert_eq!(
+            s.content_policy.access_file_names.as_ref().unwrap().len(),
+            2
+        );
         assert_eq!(c.ssl.verify_client, Some(ClientVerify::Optional));
         assert!(c.ssl.engine);
         assert!(c.ssl.stapling);
         assert_eq!(c.ssl.stapling_responder_timeout, Duration::from_secs(5));
-        assert_eq!(c.ssl.stapling_standard_cache_timeout, Duration::from_secs(10));
+        assert_eq!(
+            c.ssl.stapling_standard_cache_timeout,
+            Duration::from_secs(10)
+        );
         assert!(c.ssl.stapling_return_responder_errors);
 
         let directory = format!(
@@ -8977,7 +9154,10 @@ SetEnv DIR yes\n\
         let s = c.effective_scope(None, Path::new("/srv/www/file"), "/file");
         assert_eq!(s.options.effective_bits(0), 0);
         assert_eq!(s.override_policy.raw_mode(), Some(OverrideMode::All));
-        assert!(s.authorization.auth_merging.is_none() || s.authorization.auth_merging == Some(AuthMerging::And));
+        assert!(
+            s.authorization.auth_merging.is_none()
+                || s.authorization.auth_merging == Some(AuthMerging::And)
+        );
         assert_eq!(
             s.authorization.allow_methods,
             Some(AllowMethods::Only(vec![
@@ -8988,8 +9168,14 @@ SetEnv DIR yes\n\
         );
         assert_eq!(s.authorization.auth_type.as_deref(), Some("basic"));
         assert_eq!(s.authorization.auth_name.as_deref(), Some("realm"));
-        assert_eq!(s.authorization.auth_user_file.as_deref(), Some(Path::new("/tmp/passwd")));
-        assert_eq!(s.authorization.auth_group_file.as_deref(), Some(Path::new("/tmp/group")));
+        assert_eq!(
+            s.authorization.auth_user_file.as_deref(),
+            Some(Path::new("/tmp/passwd"))
+        );
+        assert_eq!(
+            s.authorization.auth_group_file.as_deref(),
+            Some(Path::new("/tmp/group"))
+        );
         assert_eq!(s.mapping_policy.handlers.len(), 3);
         assert_eq!(s.mapping_policy.aliases.len(), 4);
         assert_eq!(s.mapping_policy.redirects.len(), 4);
@@ -9042,7 +9228,10 @@ ServerName plain.test\n\
         assert!(v.ssl.engine);
         assert_eq!(v.ssl.verify_client, Some(ClientVerify::Require));
         assert_eq!(v.ssl.stapling_responder_timeout, Duration::from_secs(4));
-        assert_eq!(v.ssl.stapling_standard_cache_timeout, Duration::from_secs(8));
+        assert_eq!(
+            v.ssl.stapling_standard_cache_timeout,
+            Duration::from_secs(8)
+        );
         assert!(v.ssl.stapling_return_responder_errors);
         assert_eq!(v.custom_logs.len(), 1);
         assert_eq!(v.error_log.as_deref(), Some("logs/vh-error.log"));
@@ -9057,10 +9246,8 @@ ServerName plain.test\n\
 
     #[test]
     fn coverage_directive_edge_paths() {
-        let dir = std::env::temp_dir().join(format!(
-            "vapache-directive-edges-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vapache-directive-edges-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(dir.join("rel")).unwrap();
@@ -9334,8 +9521,14 @@ Require all granted\n\
             "BrotliCompressionQuality 12\n",
         );
         let c = load_text(ok, false).unwrap();
-        assert!(c.warnings.iter().any(|w| w.contains("useless use of AllowOverride")));
-        assert!(c.warnings.iter().any(|w| w.contains("useless use of AllowOverrideList")));
+        assert!(c
+            .warnings
+            .iter()
+            .any(|w| w.contains("useless use of AllowOverride")));
+        assert!(c
+            .warnings
+            .iter()
+            .any(|w| w.contains("useless use of AllowOverrideList")));
         assert_eq!(c.encoded_slashes, EncodedSlashes::Off);
     }
 
@@ -9366,7 +9559,11 @@ Require all granted\n\
             chain: None,
             nested: Vec::new(),
         };
-        dir_rule.delta.header_policy.add_headers.push(("X-Dir".into(), "1".into()));
+        dir_rule
+            .delta
+            .header_policy
+            .add_headers
+            .push(("X-Dir".into(), "1".into()));
         let mut files_rule = ScopeRule {
             kind: MatchKind::Files(compile_regex("^file").unwrap()),
             delta: Scope::default(),
@@ -9376,7 +9573,11 @@ Require all granted\n\
             chain: None,
             nested: Vec::new(),
         };
-        files_rule.delta.header_policy.add_headers.push(("X-Files".into(), "1".into()));
+        files_rule
+            .delta
+            .header_policy
+            .add_headers
+            .push(("X-Files".into(), "1".into()));
         let mut loc_rule = ScopeRule {
             kind: MatchKind::Location("/file.php".into()),
             delta: Scope::default(),
@@ -9386,7 +9587,11 @@ Require all granted\n\
             chain: None,
             nested: Vec::new(),
         };
-        loc_rule.delta.header_policy.add_headers.push(("X-Loc".into(), "1".into()));
+        loc_rule
+            .delta
+            .header_policy
+            .add_headers
+            .push(("X-Loc".into(), "1".into()));
         let mut conditional = ScopeRule {
             kind: MatchKind::Always,
             delta: Scope::default(),
@@ -9396,7 +9601,11 @@ Require all granted\n\
             chain: Some(1),
             nested: Vec::new(),
         };
-        conditional.delta.header_policy.add_headers.push(("X-If".into(), "1".into()));
+        conditional
+            .delta
+            .header_policy
+            .add_headers
+            .push(("X-If".into(), "1".into()));
         let nested_conditional = ScopeRule {
             kind: MatchKind::Always,
             delta: Scope::default(),
@@ -9461,7 +9670,11 @@ Require all granted\n\
         assert_eq!(files.len(), 2);
         assert_eq!(locations.len(), 2);
         assert_eq!(conditionals.len(), 4);
-        assert!(scope.header_policy.add_headers.iter().any(|(n, _)| n == "X-Dir"));
+        assert!(scope
+            .header_policy
+            .add_headers
+            .iter()
+            .any(|(n, _)| n == "X-Dir"));
 
         let mut scope = Scope::default();
         let mut conditionals = Vec::new();
@@ -9482,8 +9695,16 @@ Require all granted\n\
             fname,
             &mut conditionals,
         );
-        assert!(scope.header_policy.add_headers.iter().any(|(n, _)| n == "X-Files"));
-        assert!(scope.header_policy.add_headers.iter().any(|(n, _)| n == "X-Loc"));
+        assert!(scope
+            .header_policy
+            .add_headers
+            .iter()
+            .any(|(n, _)| n == "X-Files"));
+        assert!(scope
+            .header_policy
+            .add_headers
+            .iter()
+            .any(|(n, _)| n == "X-Loc"));
         assert_eq!(conditionals.len(), 2);
 
         let mut scope = Scope::default();
@@ -9509,17 +9730,13 @@ Require all granted\n\
         assert_eq!(deferred.len(), 3);
         let mut chain = HashMap::new();
         apply_deferred_req(
-            &mut scope,
-            &deferred,
-            &req,
-            peer,
-            root,
-            fs_path,
-            url_path,
-            fname,
-            &mut chain,
+            &mut scope, &deferred, &req, peer, root, fs_path, url_path, fname, &mut chain,
         );
-        assert!(scope.header_policy.add_headers.iter().any(|(n, _)| n == "X-If"));
+        assert!(scope
+            .header_policy
+            .add_headers
+            .iter()
+            .any(|(n, _)| n == "X-If"));
 
         let mut non_dir_rewrite = files_rule.clone();
         non_dir_rewrite
@@ -9532,7 +9749,11 @@ Require all granted\n\
 
         let mut scope = Scope::default();
         apply_rules_config(&[dir_rule.clone()], &mut scope, fs_path, url_path, fname);
-        assert!(scope.header_policy.add_headers.iter().any(|(n, _)| n == "X-Dir"));
+        assert!(scope
+            .header_policy
+            .add_headers
+            .iter()
+            .any(|(n, _)| n == "X-Dir"));
         let mut scope = Scope::default();
         apply_rules_req(
             &[dir_rule, files_rule, loc_rule, conditional],
@@ -9545,16 +9766,41 @@ Require all granted\n\
             fname,
             &mut chain,
         );
-        assert!(scope.header_policy.add_headers.iter().any(|(n, _)| n == "X-If"));
+        assert!(scope
+            .header_policy
+            .add_headers
+            .iter()
+            .any(|(n, _)| n == "X-If"));
 
         let mut rules = vec![
-            ScopeRule { kind: MatchKind::LocationMatch(compile_regex("x").unwrap()), ..nested_conditional.clone() },
-            ScopeRule { kind: MatchKind::LocationMatch(compile_regex("y").unwrap()), ..nested_conditional.clone() },
-            ScopeRule { kind: MatchKind::Location("/a".into()), ..nested_conditional.clone() },
-            ScopeRule { kind: MatchKind::Location("/abcdef".into()), ..nested_conditional.clone() },
-            ScopeRule { kind: MatchKind::DirectoryMatch(compile_regex("x").unwrap()), ..nested_conditional.clone() },
-            ScopeRule { kind: MatchKind::Directory(PathBuf::from("/a")), ..nested_conditional.clone() },
-            ScopeRule { kind: MatchKind::Files(compile_regex("x").unwrap()), ..nested_conditional.clone() },
+            ScopeRule {
+                kind: MatchKind::LocationMatch(compile_regex("x").unwrap()),
+                ..nested_conditional.clone()
+            },
+            ScopeRule {
+                kind: MatchKind::LocationMatch(compile_regex("y").unwrap()),
+                ..nested_conditional.clone()
+            },
+            ScopeRule {
+                kind: MatchKind::Location("/a".into()),
+                ..nested_conditional.clone()
+            },
+            ScopeRule {
+                kind: MatchKind::Location("/abcdef".into()),
+                ..nested_conditional.clone()
+            },
+            ScopeRule {
+                kind: MatchKind::DirectoryMatch(compile_regex("x").unwrap()),
+                ..nested_conditional.clone()
+            },
+            ScopeRule {
+                kind: MatchKind::Directory(PathBuf::from("/a")),
+                ..nested_conditional.clone()
+            },
+            ScopeRule {
+                kind: MatchKind::Files(compile_regex("x").unwrap()),
+                ..nested_conditional.clone()
+            },
         ];
         sort_rules(&mut rules);
         assert_eq!(rules.len(), 7);
@@ -9698,10 +9944,8 @@ impl Config {
                     .into_iter()
                     .filter(|v| {
                         let candidate_exact = Self::vhost_address_is_specific(v, local_ip, port);
-                        crate::verified::vhost_address_precedence(
-                            exact_available,
-                            candidate_exact,
-                        ) && Self::vhost_address_applies(v, local_ip, port)
+                        crate::verified::vhost_address_precedence(exact_available, candidate_exact)
+                            && Self::vhost_address_applies(v, local_ip, port)
                     })
                     .collect()
             }
@@ -9955,8 +10199,9 @@ impl Config {
         proxy_url: &str,
         req: &crate::http::Request,
         peer: IpAddr,
+        url_path: &str,
     ) {
-        self.apply_proxy_access_urls(vhost, scope, &[proxy_url], req, peer);
+        self.apply_proxy_access_urls(vhost, scope, &[proxy_url], req, peer, url_path);
     }
 
     /// Match `<Proxy>`/`<ProxyMatch>` sections against every identity the
@@ -9970,6 +10215,7 @@ impl Config {
         proxy_urls: &[&str],
         req: &crate::http::Request,
         peer: IpAddr,
+        url_path: &str,
     ) {
         let containers: &[ProxyContainer] = vhost
             .map(|v| v.proxy_containers.as_slice())
@@ -10002,7 +10248,7 @@ impl Config {
                 peer,
                 &docroot,
                 Path::new(""),
-                "",
+                url_path,
                 "",
                 &mut chain_state,
             );
@@ -10254,28 +10500,6 @@ impl Config {
         scope
     }
 
-    fn url_base_for_directory(dir: &Path, fs_path: &Path, url_path: &str) -> Option<String> {
-        let rel = fs_path.strip_prefix(dir).ok()?;
-        let depth = rel.components().count();
-        let mut parts: Vec<&str> = url_path
-            .trim_matches('/')
-            .split('/')
-            .filter(|p| !p.is_empty())
-            .collect();
-        if parts.len() < depth {
-            return None;
-        }
-        if depth > 0 {
-            parts.truncate(parts.len() - depth);
-        }
-        let mut base = String::from("/");
-        base.push_str(&parts.join("/"));
-        if !base.ends_with('/') {
-            base.push('/');
-        }
-        Some(normalize_rewrite_base(&base))
-    }
-
     /// Human-readable inventory of the matching top-level rules in canonical
     /// merge order.  This is for `--explain`; it does not evaluate runtime
     /// conditions or access-file sections.
@@ -10295,7 +10519,7 @@ impl Config {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
         let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
-        let env = base.request_env(req);
+        let env = base.request_env(req, url_path);
         let docroot = self.documentation_root_for(vhost);
         let mut chain_state = HashMap::new();
         let mut out = Vec::new();
@@ -10319,7 +10543,7 @@ impl Config {
                 let conditional =
                     rule.condition.is_some() || rule.branch != ConditionBranch::Normal;
                 let matched = if conditional {
-                    rule_condition_matches(rule, req, env, peer, docroot, chain_state)
+                    rule_condition_matches(rule, req, env, peer, docroot, url_path, chain_state)
                 } else {
                     true
                 };

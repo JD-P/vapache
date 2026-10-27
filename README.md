@@ -193,7 +193,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **238 verified functions, 0 errors** (percent-decoding,
+Current result: **266 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -223,19 +223,20 @@ Current ledger: **51.1% weighted obligations**, **6/6 proof debt**,
 **8/8 grant-required sinks**, **8/8 path-target-bound sinks**, **4/8
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
-failures**, **45 adversarial replay cases** covering the findings classes,
-and **264 Verus functions with 0 errors** (including the I3 fast-path
+failures**, **52 adversarial replay cases** covering the findings classes,
+and **266 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
-kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, and
-the pass-7 I50–I53 URL-mounted rewrite-base/cache-key-byte/ErrorDocument/
-dynamic-handler kernels, and the strengthened cache-key injectivity, lookup,
-store-admission, freshness, disk-accounting and SHA-256 policy-binding proofs
-for I51/I54).
+kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
+pass-7 I50–I53 URL-mounted rewrite-base/cache-key-byte/ErrorDocument/
+dynamic-handler kernels, the pass-8 I57/I58 canonical-REQUEST_URI and
+access-file rewrite-subject kernels, and the strengthened cache-key
+injectivity, lookup, store-admission, freshness, disk-accounting and SHA-256
+policy-binding proofs for I51/I54).
 
 The ledger lives in `docs/verification-status.json`. It records:
 
-- weighted progress on the forty-five proof obligations,
+- weighted progress on the forty-six proof obligations,
 - named unverified security components,
 - sinks that need stronger resource binding,
 - explicit assumptions and unmodeled directive classes,
@@ -251,7 +252,7 @@ requiring a grant. Raising a budget is a deliberate, reviewable change.
 ```sh
 cargo test --workspace          # Rust unit tests
 python3 tests/conformance.py    # 165 Apache differential/conformance tests
-python3 tests/adversarial_regressions.py  # F23-F56 end-to-end replay suite
+python3 tests/adversarial_regressions.py  # F23-F58 end-to-end replay suite
 ```
 
 The conformance suite starts a real Apache `httpd` and `vapached` with
@@ -337,13 +338,13 @@ the HTTP proxy, request dispatch/server, rewrite execution and TLS are enforced
 at 100%; the remaining modules are tracked so they can be promoted one at a
 time.
 
-Latest snapshot: **94.0% regions**, **90.0% of functions** and **94.8% of
+Latest snapshot: **94.1% regions**, **90.1% of functions** and **94.9% of
 lines** across the Rust, conformance and adversarial replay suites. The current
-suite is 366 Rust library tests, 4 CLI tests, 165 conformance tests, 205
-generated configuration cases and 45 adversarial replay tests. Authentication
+suite is 372 Rust library tests, 4 CLI tests, 165 conformance tests, 205
+generated configuration cases and 52 adversarial replay tests. Authentication
 is at 91.8% line coverage, TLS/HTTP/2 at 97.9%/81.6%, access logging at 84.7%,
-the verified security kernels at 88.1%, compression at 90.0%, FastCGI at 98.9%,
-the HTTP proxy at 97.8%, rewrite execution at 98.7%, cache at 91.1%, OCSP at
+the verified security kernels at 88.3%, compression at 90.0%, FastCGI at 98.9%,
+the HTTP proxy at 97.8%, rewrite execution at 98.6%, cache at 91.4%, OCSP at
 80.8%, and the request-parsing and file-serving modules at 94.0%/83.6%.
 CLI lifecycle, HTTP/2 error branches, OCSP error-cache policies, `dbm`/`DPI`
 edge cases and exotic balancer policies remain the next coverage targets.

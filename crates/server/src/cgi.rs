@@ -189,10 +189,15 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
     put("SERVER_ADMIN", ctx.cfg.server_admin.clone());
     put("DOCUMENT_ROOT", ctx.docroot.to_string_lossy().into_owned());
     put("REQUEST_METHOD", ctx.req.method.clone());
-    put(
-        "REQUEST_URI",
-        String::from_utf8_lossy(&ctx.req.target).into_owned(),
-    );
+    // Apache's CGI REQUEST_URI is the canonical URL path, without the query
+    // string.  Never export the raw request-line target (F57).  The script
+    // name has already had PATH_INFO removed when it is nonempty.
+    let request_uri = if !ctx.path_info.is_empty() && !ctx.script_name.ends_with(ctx.path_info) {
+        format!("{}{}", ctx.script_name, ctx.path_info)
+    } else {
+        ctx.script_name.to_string()
+    };
+    put("REQUEST_URI", request_uri);
     put(
         "QUERY_STRING",
         String::from_utf8_lossy(&ctx.req.query).into_owned(),
@@ -317,15 +322,9 @@ pub fn execute(ctx: &CgiContext) -> Response {
         path.as_path()
     };
     if let Some(pool) = POOL.get() {
-        if let Some(resp) = execute_via_pool(
-            pool,
-            ctx,
-            worker_path,
-            &cwd,
-            &env,
-            &body,
-            worker_identity,
-        ) {
+        if let Some(resp) =
+            execute_via_pool(pool, ctx, worker_path, &cwd, &env, &body, worker_identity)
+        {
             return resp;
         }
     }
@@ -498,12 +497,7 @@ fn worker_ids(user: &str, group: &str) -> Result<(u32, u32), String> {
     )
 }
 
-fn worker_ids_for(
-    euid: u32,
-    egid: u32,
-    user: &str,
-    group: &str,
-) -> Result<(u32, u32), String> {
+fn worker_ids_for(euid: u32, egid: u32, user: &str, group: &str) -> Result<(u32, u32), String> {
     if euid != 0 {
         return Ok((euid, egid));
     }
@@ -609,7 +603,9 @@ fn start_pool_with_exe(
         }
         // Keep the descriptor across this exec (the worker needs it).  The
         // worker sets FD_CLOEXEC itself before spawning scripts.
-        unsafe { cmd.pre_exec(move || prepare_worker_fd(child_fd, WORKER_FD)); }
+        unsafe {
+            cmd.pre_exec(move || prepare_worker_fd(child_fd, WORKER_FD));
+        }
         let proc = cmd
             .spawn()
             .map_err(|e| format!("cannot spawn CGI worker: {e}"))?;
@@ -645,13 +641,7 @@ fn drop_worker_privileges(uid: u32, gid: u32, user: &str) -> bool {
     )
 }
 
-fn drop_worker_privileges_for(
-    euid: u32,
-    egid: u32,
-    uid: u32,
-    gid: u32,
-    user: &str,
-) -> bool {
+fn drop_worker_privileges_for(euid: u32, egid: u32, uid: u32, gid: u32, user: &str) -> bool {
     if euid != 0 {
         return euid == uid && egid == gid;
     }
@@ -1404,6 +1394,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(get("REQUEST_METHOD"), "GET");
+        assert_eq!(get("REQUEST_URI"), "/cgi-bin/env.sh");
         assert_eq!(
             get("SCRIPT_FILENAME"),
             dir.join("cgi-bin/env.sh").to_string_lossy()
@@ -1609,10 +1600,7 @@ mod tests {
 
     impl Write for ErrorWriter {
         fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                self.0,
-            ))
+            Err(std::io::Error::new(std::io::ErrorKind::Other, self.0))
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
@@ -1750,17 +1738,17 @@ mod tests {
         assert!(file_body.reader().is_ok());
 
         let mut req = request("/test", b"body".to_vec());
-        req.headers
-            .push("Authorization", "Basic c2VjcmV0");
+        req.headers.push("Authorization", "Basic c2VjcmV0");
         req.headers.push("Content-Type", "text/plain");
         req.headers.push("Content-Length", "4");
         let ctx = test_ctx(&cfg, &req, &dir, Path::new("hello.sh"), None);
         let env = build_env(&ctx);
         assert!(!env.iter().any(|(name, _)| name == "HTTP_AUTHORIZATION"));
-        assert!(env
-            .iter()
-            .any(|(name, value)| name == "CONTENT_TYPE"
-                && value.to_string_lossy() == "text/plain"));
+        assert!(
+            env.iter()
+                .any(|(name, value)| name == "CONTENT_TYPE"
+                    && value.to_string_lossy() == "text/plain")
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1781,13 +1769,7 @@ mod tests {
         assert_eq!(execute(&missing).status, 500);
 
         let bad_file = std::mem::ManuallyDrop::new(closed_file(&dir.join("stderr.sh")));
-        let bad = test_ctx(
-            &cfg,
-            &req,
-            &dir,
-            Path::new("stderr.sh"),
-            Some(&*bad_file),
-        );
+        let bad = test_ctx(&cfg, &req, &dir, Path::new("stderr.sh"), Some(&*bad_file));
         assert_eq!(execute(&bad).status, 500);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1902,11 +1884,7 @@ mod tests {
         let pool = start_pool_with_exe(&good, 0, 0, "root", 1).unwrap();
         shutdown_pool_inner(&pool);
 
-        let bad = script(
-            &dir,
-            "worker-bad.sh",
-            "#!/bin/sh\nprintf '\\2' >&3\n",
-        );
+        let bad = script(&dir, "worker-bad.sh", "#!/bin/sh\nprintf '\\2' >&3\n");
         assert!(start_pool_with_exe(&bad, 0, 0, "root", 1).is_err());
 
         // Exercise the worker branch through a local pool and fake responder.
@@ -1977,11 +1955,13 @@ mod tests {
         assert!(init_pool(&cfg).is_ok());
         shutdown_pool();
 
-        let bad = std::mem::ManuallyDrop::new(BodySource::File(closed_file(&dir.join(
-            "httpd.conf",
-        ))));
+        let bad =
+            std::mem::ManuallyDrop::new(BodySource::File(closed_file(&dir.join("httpd.conf"))));
         let (stream, _peer) = UnixStream::pair().unwrap();
-        let mut child = Command::new("/bin/cat").stdin(Stdio::piped()).spawn().unwrap();
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
         let stdin = child.stdin.take().unwrap();
         assert!(feed_stdin(stdin, &bad, 64 * 1024).is_none());
         let _ = child.wait();
@@ -2143,17 +2123,11 @@ mod tests {
         .is_err());
 
         let mut out = Vec::new();
-        assert!(read_with_deadline(
-            BadFd,
-            Instant::now() + Duration::from_millis(100),
-            &mut out
-        )
-        .is_ok());
-        assert!(!poll_result(
-            -1,
-            std::io::Error::from(std::io::ErrorKind::Interrupted)
-        )
-        .unwrap());
+        assert!(
+            read_with_deadline(BadFd, Instant::now() + Duration::from_millis(100), &mut out)
+                .is_ok()
+        );
+        assert!(!poll_result(-1, std::io::Error::from(std::io::ErrorKind::Interrupted)).unwrap());
         assert!(poll_result(-1, std::io::Error::from(std::io::ErrorKind::Other)).is_err());
         assert!(!poll_result(0, std::io::Error::from(std::io::ErrorKind::Other)).unwrap());
         assert!(poll_result(1, std::io::Error::from(std::io::ErrorKind::Other)).unwrap());
@@ -2162,23 +2136,16 @@ mod tests {
             file: File::open("/dev/null").unwrap(),
             stage: 0,
         };
-        assert!(read_with_deadline(
-            seq,
-            Instant::now() + Duration::from_millis(100),
-            &mut out
-        )
-        .is_err());
+        assert!(
+            read_with_deadline(seq, Instant::now() + Duration::from_millis(100), &mut out).is_err()
+        );
         drop(null);
         let mut flood = FloodRead {
             file: File::open("/dev/null").unwrap(),
         };
         assert_eq!(
-            read_with_deadline(
-                flood,
-                Instant::now() + Duration::from_secs(10),
-                &mut out
-            )
-            .unwrap_err(),
+            read_with_deadline(flood, Instant::now() + Duration::from_secs(10), &mut out)
+                .unwrap_err(),
             "CGI output too large"
         );
 
