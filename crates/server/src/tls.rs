@@ -14,6 +14,7 @@ use rustls::{RootCertStore, ServerConfig, SupportedProtocolVersion};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
+use std::net::IpAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -252,8 +253,11 @@ fn protocol_versions(spec: Option<&str>) -> Result<Vec<&'static SupportedProtoco
     Ok(out)
 }
 
-fn vhost_applies(v: &VHost, port: u16) -> bool {
-    v.addrs.iter().any(|a| vhost_port(a) == port)
+fn vhost_applies(v: &VHost, port: u16, local_ip: Option<IpAddr>) -> bool {
+    match local_ip {
+        Some(ip) => Config::vhost_address_applies(v, ip, port),
+        None => v.addrs.iter().any(|a| vhost_port(a) == port),
+    }
 }
 
 /// The client-certificate policy that Rustls applies to a listener.  A single
@@ -308,13 +312,27 @@ fn ensure_uniform_client_policy(policies: &[&SslConfig], port: u16) -> Result<()
 
 /// Build the TLS configuration for a listening port, if any virtual host on
 /// that port has `SSLEngine on` (or a global SSLEngine is configured).
-pub fn server_config(cfg: &Config, port: u16) -> Result<Option<Arc<ServerConfig>>, String> {
+/// `local_ip` filters address-bound vhosts when the listener itself is bound
+/// to a specific destination address.
+pub fn server_config(
+    cfg: &Config,
+    port: u16,
+    local_ip: Option<IpAddr>,
+) -> Result<Option<Arc<ServerConfig>>, String> {
     let provider = Arc::new(ring::default_provider());
     let mut vhosts: Vec<&VHost> = cfg
         .vhosts
         .iter()
-        .filter(|v| v.ssl.engine && vhost_applies(v, port))
+        .filter(|v| v.ssl.engine && vhost_applies(v, port, local_ip))
         .collect();
+    if let Some(ip) = local_ip {
+        let exact_available = vhosts
+            .iter()
+            .any(|v| Config::vhost_address_is_specific(v, ip, port));
+        vhosts.retain(|v| {
+            !exact_available || Config::vhost_address_is_specific(v, ip, port)
+        });
+    }
     let global_only = cfg.ssl.engine && vhosts.is_empty();
     if vhosts.is_empty() && !global_only {
         return Ok(None);
@@ -707,7 +725,7 @@ mod tests {
         let key_s = key.display();
 
         let none = test_config(&dir, "Listen 127.0.0.1:444\n");
-        assert!(server_config(&none, 444).unwrap().is_none());
+        assert!(server_config(&none, 444, None).unwrap().is_none());
 
         let global = test_config(
             &dir,
@@ -715,7 +733,7 @@ mod tests {
                 "Listen 127.0.0.1:443\nSSLEngine on\nSSLCertificateFile \"{cert_s}\"\nSSLCertificateKeyFile \"{key_s}\"\n"
             ),
         );
-        assert!(server_config(&global, 443).unwrap().is_some());
+        assert!(server_config(&global, 443, None).unwrap().is_some());
 
         let vhosts = test_config(
             &dir,
@@ -738,7 +756,37 @@ mod tests {
                  </VirtualHost>\n"
             ),
         );
-        assert!(server_config(&vhosts, 443).unwrap().is_some());
+        assert!(server_config(&vhosts, 443, None).unwrap().is_some());
+
+        let address_bound = test_config(
+            &dir,
+            &format!(
+                "Listen 0.0.0.0:443\n\
+                 <VirtualHost 127.0.0.1:443>\n\
+                     ServerName admin.test\n\
+                     SSLEngine on\n\
+                     SSLCertificateFile \"{cert_s}\"\n\
+                     SSLCertificateKeyFile \"{key_s}\"\n\
+                 </VirtualHost>\n\
+                 <VirtualHost *:443>\n\
+                     ServerName public.test\n\
+                     SSLEngine on\n\
+                     SSLCertificateFile \"{cert_s}\"\n\
+                     SSLCertificateKeyFile \"{key_s}\"\n\
+                 </VirtualHost>\n"
+            ),
+        );
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let other: IpAddr = "127.0.0.2".parse().unwrap();
+        assert!(vhost_applies(&address_bound.vhosts[0], 443, Some(loopback)));
+        assert!(!vhost_applies(&address_bound.vhosts[0], 443, Some(other)));
+        assert!(vhost_applies(&address_bound.vhosts[1], 443, Some(other)));
+        assert!(server_config(&address_bound, 443, Some(loopback))
+            .unwrap()
+            .is_some());
+        assert!(server_config(&address_bound, 443, Some(other))
+            .unwrap()
+            .is_some());
 
         for mode in ["optional", "require"] {
             let cfg = test_config(
@@ -752,7 +800,7 @@ mod tests {
                      SSLCACertificateFile \"{cert_s}\"\n"
                 ),
             );
-            assert!(server_config(&cfg, 443).unwrap().is_some(), "{mode}");
+            assert!(server_config(&cfg, 443, None).unwrap().is_some(), "{mode}");
         }
 
         let missing_ca = test_config(
@@ -765,7 +813,7 @@ mod tests {
                  SSLVerifyClient require\n"
             ),
         );
-        assert!(server_config(&missing_ca, 443).is_err());
+        assert!(server_config(&missing_ca, 443, None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

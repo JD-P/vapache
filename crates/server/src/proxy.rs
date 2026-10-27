@@ -3212,6 +3212,11 @@ mod coverage_tests {
             ..BalancerMember::default()
         });
         assert!(next_balancer_member(&balancer, Some(&r), None, None).is_some());
+        // A sticky route that names no member must fall through to the
+        // available-member selection rather than failing the request.
+        r.headers = Headers::default();
+        r.headers.push("Cookie", "route=node.2");
+        assert!(next_balancer_member(&balancer, Some(&r), None, None).is_some());
         let mut tried = HashSet::new();
         tried.insert(backend_key(&parse_http_url("http://127.0.0.1:9001").unwrap()));
         assert!(next_balancer_member(&balancer, None, Some(&tried), None).is_none());
@@ -3247,6 +3252,19 @@ mod coverage_tests {
         assert!(balancer_unavailable(&cfg, &scope, "/b/x"));
         assert!(!balancer_unavailable(&cfg, &scope, "/other"));
 
+        let mut plain = Scope::default();
+        plain
+            .proxy_policy
+            .proxy_passes
+            .push(crate::config::ProxyPassRule {
+                prefix: "/p".into(),
+                backend: "http://127.0.0.1:9000/base".into(),
+                sticky_cookie: None,
+                fail_on_status: Vec::new(),
+                route_order: 0,
+            });
+        assert!(!balancer_unavailable(&cfg, &plain, "/p/x"));
+
         let mut scope = Scope::default();
         scope.proxy_policy.proxy_rules.push(crate::config::ProxyRule {
             pattern: Arc::new(crate::config::compile_regex("^/r").unwrap()),
@@ -3261,6 +3279,7 @@ mod coverage_tests {
             backend: "http://127.0.0.1:9000/base".into(),
             route_order: 0,
         });
+        assert!(!balancer_unavailable(&cfg, &scope, "/r/x"));
         let t = match_target(&cfg, &scope, "/r/z").unwrap();
         assert_eq!(t.suffix, "z");
         assert_eq!(t.path, "/base/z");
@@ -4118,6 +4137,27 @@ mod coverage_tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn unbounded_body_within_limit_is_accepted() {
+        let stream = HugeStream {
+            header: Cursor::new(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()),
+            remaining: 5,
+        };
+        let (resp, _) = proxy_once(
+            Box::new(stream),
+            &target(),
+            &req("/x"),
+            &Scope::default(),
+            "/x",
+            "127.0.0.1:1".parse().unwrap(),
+            false,
+            "",
+        )
+        .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body_len(), 5);
     }
 
     #[test]

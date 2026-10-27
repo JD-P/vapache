@@ -16,12 +16,11 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use sha1::{Digest, Sha1};
 use std::borrow::Cow;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom};
 use std::net::IpAddr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -34,6 +33,10 @@ const MAX_DISK_ENTRIES: usize = 4096;
 /// Bound the number of stored variants for one key before evicting the oldest
 /// representation.
 const MAX_VARIANTS_PER_KEY: usize = 32;
+/// Full-strength policy/request digest.  The previous 64-bit fingerprint was
+/// collision-prone for an attacker who can vary request headers and force
+/// variants of one cache key.  A SHA-256 digest is still compared exactly.
+type PolicyFingerprint = [u8; 32];
 /// Configuration generation for persisted cache entries.  A reload bumps this
 /// value; entries from an older generation are never served, even if their
 /// body/meta files survived the reload cleanup.
@@ -65,7 +68,7 @@ struct Entry {
     body: Vec<u8>,
     stored: i64,
     expires: i64,
-    policy: u64,
+    policy: PolicyFingerprint,
     epoch: u64,
     vary: Vec<(String, Vec<u8>)>,
 }
@@ -203,6 +206,9 @@ pub struct CacheContext {
     /// and policy.  Lookup and store must use this exact key.
     pub key: String,
     pub target: std::path::PathBuf,
+    /// Effective cache URL.  For a directory request this is the selected
+    /// `DirectoryIndex` URL, so lookup and store authorize the same resource.
+    pub path: String,
 }
 
 /// Return the cache type selected for this request, if caching is enabled and
@@ -240,7 +246,13 @@ pub fn request_scope(
         None => return None,
     };
     let trailing_slash = decoded.len() > 1 && decoded.ends_with(b"/");
-    let mut url_path = String::from_utf8_lossy(&normalized).into_owned();
+    // F55/I51: a lossy URL conversion can collapse distinct byte paths into
+    // one cache identity.  A non-UTF-8 path is dispatched normally but is
+    // never admitted to the shared cache.
+    let mut url_path = match std::str::from_utf8(&normalized) {
+        Ok(path) => path.to_string(),
+        Err(_) => return None,
+    };
     if trailing_slash && url_path != "/" {
         url_path.push('/');
     }
@@ -300,6 +312,7 @@ pub fn request_scope(
     // script so a later `<Files "script.cgi">` deny is part of the scope and
     // fingerprint rather than being bypassed by `/script.cgi/<info>`.
     let mut fs_path = mapped_fs_path;
+    let mut cache_url_path = url_path.clone();
     let follow_symlinks = scope
         .effective_options()
         .contains(crate::config::Options::FOLLOW_SYMLINKS);
@@ -321,34 +334,113 @@ pub fn request_scope(
                     .unwrap_or(&url_path)
                     .to_string();
                 fs_path = root.join(&st.rel_script);
+                cache_url_path = script_url.clone();
                 scope = evaluate_cache_scope(cfg, vhost, req, peer, &root, &fs_path, &script_url)?;
             }
         }
     }
-    if !cache_enabled(&scope, path) {
+    // A directory URL is not the representation that dispatch will serve.
+    // Resolve `DirectoryIndex` before the cache decision and rebind the cache
+    // target, URL and policy to that index.  Without this, a cached directory
+    // response outlives a live `<Files "index.html">` deny and a dynamic index
+    // can be shared across queries under `CacheIgnoreQueryString` (F52).
+    let current_rel = fs_path.strip_prefix(&root).unwrap_or(&rel);
+    let mut directory_target = false;
+    let mut index_selected = false;
+    if let crate::files::Target::Directory { file, .. } =
+        crate::files::resolve_target_checked(&root, current_rel, follow, owner_match_only)
+    {
+        directory_target = true;
+        if let Some(index) = crate::files::directory_index_target(
+            cfg,
+            &scope,
+            req,
+            &file,
+            &url_path,
+            &req.raw_path,
+        ) {
+            // The cache identity must preserve the exact index name bytes.
+            // Reject a non-UTF-8 index name rather than sharing a lossy key.
+            let index_name = std::str::from_utf8(&index.name).ok()?;
+            let index_url = format!("{}/{}", url_path.trim_end_matches('/'), index_name);
+            let index_fs = crate::files::fd_path(&index.file).unwrap_or_else(|| {
+                fs_path.join(std::ffi::OsStr::from_bytes(&index.name))
+            });
+            scope = evaluate_cache_scope(cfg, vhost, req, peer, &root, &index_fs, &index_url)?;
+            fs_path = index_fs;
+            cache_url_path = index_url;
+            index_selected = true;
+        }
+    }
+    if !vapache_verified::cache_directory_index_bind_admit(
+        directory_target,
+        index_selected,
+        index_selected,
+        index_selected,
+    ) {
         return None;
     }
+    if !cache_enabled(&scope, &cache_url_path) {
+        return None;
+    }
+    // A local ErrorDocument is selected only after dispatch fails.  It is an
+    // internal subrequest with its own handler/query policy, so a *missing*
+    // URL must not be represented by that subrequest's response (F56/I52).
+    // Existing targets may still use the cache; `store` additionally refuses
+    // any response that actually came from a local error document.
+    let local_error_document = scope
+        .error_policy
+        .documents
+        .iter()
+        .any(|(_, doc)| matches!(doc, crate::config::ErrorDoc::Local(_)));
+    if local_error_document && !fs_path.exists() {
+        if !vapache_verified::cache_local_error_document_admit(true, true) {
+            return None;
+        }
+    }
     // `CacheIgnoreQueryString` is safe for static representations, but a
-    // query-driven CGI/FastCGI/proxy response cannot be shared across distinct
-    // queries.  Bypass the cache for those dynamic targets instead of leaking
-    // one query's representation to another (additional pass-4 review item).
+    // query-driven CGI/FastCGI/proxy/server-status/SetHandler response cannot
+    // be shared across distinct queries.  Classify every non-default handler,
+    // not just the proxy forms known to `match_proxy` (F52/F54/I49/I53).
     if cfg.cache.ignore_query_string && !req.query.is_empty() {
         let name = fs_path
             .file_name()
             .map(|n| n.as_encoded_bytes())
             .unwrap_or(b"");
+        let handler = crate::config::effective_handler(&scope, name)
+            .map(str::trim)
+            .filter(|h| {
+                !h.is_empty()
+                    && !h.eq_ignore_ascii_case("default-handler")
+                    && !h.eq_ignore_ascii_case("none")
+            })
+            .is_some();
         let dynamic = script_alias
             || crate::cgi::is_cgi(cfg, &scope, name, false)
-            || crate::fastcgi::match_proxy(&scope, &url_path, &root).is_some()
-            || crate::proxy::matches_route(&scope, &url_path);
-        if dynamic {
+            || handler
+            || crate::fastcgi::match_proxy(&scope, &cache_url_path, &root).is_some()
+            || crate::proxy::matches_route(&scope, &cache_url_path);
+        if !vapache_verified::cache_dynamic_handler_admit(handler, dynamic) {
+            return None;
+        }
+        if !vapache_verified::cache_ignore_query_admit(
+            cfg.cache.ignore_query_string,
+            !req.query.is_empty(),
+            dynamic,
+        ) {
             return None;
         }
     }
     // Never bypass per-directory access control or a rewrite-set environment
     // requirement by serving a cached object without running dispatch.
     let fingerprint = cache_policy_fingerprint(&scope, req, peer, &fs_path);
-    let resource = crate::access::ResourceKey::cache_policy(vhost, req, host, path, fingerprint);
+    let resource = crate::access::ResourceKey::cache_policy(
+        vhost,
+        req,
+        host,
+        &cache_url_path,
+        fingerprint,
+    );
     let grant = match crate::access::check_grant(&scope, req, peer, None, resource) {
         Ok(grant) => grant,
         Err(_) => return None,
@@ -358,7 +450,7 @@ pub fn request_scope(
     if !scope.method_allowed(&req.method) {
         return None;
     }
-    if crate::proxy::matches_route(&scope, &url_path) {
+    if crate::proxy::matches_route(&scope, &cache_url_path) {
         return None;
     }
     let key = base_key(
@@ -368,7 +460,7 @@ pub fn request_scope(
         local_port,
         https,
         host,
-        path,
+        &cache_url_path,
         &req.query,
         &fs_path,
         fingerprint,
@@ -378,6 +470,7 @@ pub fn request_scope(
         grant,
         key,
         target: fs_path,
+        path: cache_url_path,
     })
 }
 
@@ -401,7 +494,9 @@ fn evaluate_cache_scope(
     let mut htaccess_files = Vec::new();
     let mut htaccess_conditionals = Vec::new();
     let mut scope = if cfg.htaccess_may_apply(fs_path) {
-        let layers = crate::htaccess::collect_layers(cfg, vhost, fs_path, url_path).ok()?;
+        let layers =
+            crate::htaccess::collect_layers_with_root(cfg, vhost, fs_path, url_path, Some(root))
+                .ok()?;
         let (evaluated, conditionals, access_conditionals) =
             crate::policy_ref::effective_scope_with_layers(
                 cfg, vhost, fs_path, url_path, req, peer, &layers,
@@ -520,23 +615,36 @@ fn base_key(
     path: &str,
     query: &[u8],
     target: &std::path::Path,
-    policy_fingerprint: u64,
+    policy_fingerprint: PolicyFingerprint,
 ) -> String {
+    // F55/I51: every byte-bearing component is hex encoded, so raw query,
+    // path and filesystem-target bytes cannot collide with an empty value or
+    // with each other.  `CacheIgnoreQueryString` is an explicit opt-in.
     let query = if cfg.cache.ignore_query_string {
-        ""
+        String::new()
     } else {
-        std::str::from_utf8(query).unwrap_or("")
+        key_component(query)
     };
     let vhost_id = vhost
         .and_then(|v| cfg.vhosts.iter().position(|x| std::ptr::eq(x, v)))
         .map(|i| i.to_string())
         .unwrap_or_else(|| "default".into());
+    let policy_fingerprint = key_component(&policy_fingerprint);
     format!(
-        "{}\n{host}\n{path}\n{query}\n{scheme}\n{local_ip}\n{local_port}\n{vhost_id}\n{target}\n{policy_fingerprint:016x}",
-        cfg.server_root.display(),
+        "{}\n{host}\n{path}\n{query}\n{scheme}\n{local_ip}\n{local_port}\n{vhost_id}\n{target}\n{policy_fingerprint}",
+        key_component(cfg.server_root.as_os_str().as_bytes()),
+        host = key_component(host.as_bytes()),
+        path = key_component(path.as_bytes()),
         scheme = if https { "https" } else { "http" },
-        target = target.display(),
+        target = key_component(target.as_os_str().as_bytes()),
     )
+}
+
+/// Lossless ASCII hex for cache-key material.  The verifier proves the
+/// encoding length; the runtime never uses a lossy string conversion here.
+fn key_component(value: &[u8]) -> String {
+    String::from_utf8(vapache_verified::cache_key_hex(value))
+        .expect("cache key hex encoding is ASCII")
 }
 
 fn rewrite_map_material(map: &crate::config::RewriteMap) -> String {
@@ -608,12 +716,16 @@ fn cache_policy_fingerprint(
     req: &Request,
     peer: IpAddr,
     target: &std::path::Path,
-) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    cache_policy_material(scope).hash(&mut hasher);
-    peer.to_string().hash(&mut hasher);
-    req.method.hash(&mut hasher);
-    target.hash(&mut hasher);
+) -> PolicyFingerprint {
+    // Length-prefix every field so concatenation cannot make two different
+    // material tuples look identical.  Hash the exact bytes with SHA-256; a
+    // 64-bit `DefaultHasher` fingerprint was not collision-resistant enough
+    // for a value that decides whether two cache entries may be shared.
+    let mut material = Vec::new();
+    fingerprint_field(&mut material, cache_policy_material(scope).as_bytes());
+    fingerprint_field(&mut material, peer.to_string().as_bytes());
+    fingerprint_field(&mut material, req.method.as_bytes());
+    fingerprint_field(&mut material, target.as_os_str().as_bytes());
     // Configuration expressions (`Require expr`, `SetEnvIf`, rewrite
     // conditions) can read any request header.  The compiled policy text is
     // not enough to identify the branch a request takes, so bind the complete
@@ -621,10 +733,19 @@ fn cache_policy_fingerprint(
     // non-credential tenant/feature headers and cookies even when the response
     // did not name them in `Vary`.
     for (name, value) in req.headers.iter() {
-        name.hash(&mut hasher);
-        value.hash(&mut hasher);
+        fingerprint_field(&mut material, name.as_bytes());
+        fingerprint_field(&mut material, value);
     }
-    hasher.finish()
+    let digest = ring::digest::digest(&ring::digest::SHA256, &material);
+    let mut fingerprint = [0u8; 32];
+    fingerprint.copy_from_slice(digest.as_ref());
+    fingerprint
+}
+
+fn fingerprint_field(out: &mut Vec<u8>, field: &[u8]) {
+    // Verified four-byte big-endian framing; see
+    // `cache_fingerprint_field_injective`.
+    out.extend_from_slice(&vapache_verified::cache_fingerprint_field(field));
 }
 
 fn request_allows_lookup(cfg: &Config, req: &Request) -> bool {
@@ -831,7 +952,31 @@ pub fn lookup(
             .headers
             .retain(|(n, _)| !n.eq_ignore_ascii_case("content-length"));
     } else if req.method != "HEAD" {
-        response.body = Body::Bytes(entry.body);
+        // Large cached representations are already persisted as a body file.
+        // Serve that file through the file-body path so the plain-TCP writer
+        // can use sendfile instead of copying the whole body from user memory.
+        const FILE_BODY_THRESHOLD: usize = 64 * 1024;
+        let mut served_file = false;
+        if entry.body.len() > FILE_BODY_THRESHOLD {
+            if let Some(stem) = cache_stem(cfg, cache_key) {
+                let path = stem.with_extension("body");
+                if let Ok(file) = fs::File::open(&path) {
+                    if let Ok(meta) = file.metadata() {
+                        if meta.is_file() && meta.len() == entry.body.len() as u64 {
+                            response.body = Body::File {
+                                file,
+                                offset: 0,
+                                len: meta.len(),
+                            };
+                            served_file = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !served_file {
+            response.body = Body::Bytes(entry.body);
+        }
     }
     Some(response)
 }
@@ -863,7 +1008,11 @@ fn freshness(cfg: &CacheConfig, headers: &[(String, Vec<u8>)], now: i64) -> Opti
     if let Some(n) = directive_seconds(&directives, "s-maxage")
         .or_else(|| directive_seconds(&directives, "max-age"))
     {
-        let n = (n as i64).clamp(cfg.min_expire as i64, cfg.max_expire as i64);
+        let n = vapache_verified::cache_ttl_clamp(
+            n as i64,
+            cfg.min_expire as i64,
+            cfg.max_expire as i64,
+        );
         return Some(n);
     }
     if let Some(expires) = header(headers, "expires").and_then(parse_http_date) {
@@ -871,13 +1020,21 @@ fn freshness(cfg: &CacheConfig, headers: &[(String, Vec<u8>)], now: i64) -> Opti
         if n <= 0 {
             return None;
         }
-        return Some(n.clamp(cfg.min_expire as i64, cfg.max_expire as i64));
+        return Some(vapache_verified::cache_ttl_clamp(
+            n,
+            cfg.min_expire as i64,
+            cfg.max_expire as i64,
+        ));
     }
     if let Some(last) = header(headers, "last-modified").and_then(parse_http_date) {
         let age = (now - last).max(0) as f64;
         let n = (age * cfg.last_modified_factor) as i64;
         if n > 0 {
-            return Some(n.clamp(cfg.min_expire as i64, cfg.max_expire as i64));
+            return Some(vapache_verified::cache_ttl_clamp(
+                n,
+                cfg.min_expire as i64,
+                cfg.max_expire as i64,
+            ));
         }
         // A just-written file has no observable reuse window through the
         // Last-Modified heuristic; CacheDefaultExpire keeps it cacheable.
@@ -948,8 +1105,12 @@ fn cache_stem(cfg: &Config, key: &str) -> Option<std::path::PathBuf> {
 
 fn encode_meta(entry: &Entry) -> Vec<u8> {
     let mut out = format!(
-        "V2\nS {}\nT {}\nE {}\nP {}\nG {}\n",
-        entry.status, entry.stored, entry.expires, entry.policy, entry.epoch
+        "V3\nS {}\nT {}\nE {}\nP {}\nG {}\n",
+        entry.status,
+        entry.stored,
+        entry.expires,
+        STANDARD.encode(entry.policy),
+        entry.epoch
     );
     for (name, value) in &entry.vary {
         out.push_str(&format!(
@@ -972,7 +1133,7 @@ fn decode_meta(data: &[u8]) -> Option<Entry> {
     let text = std::str::from_utf8(data).ok()?;
     let mut lines = text.lines();
     let version = lines.next()?;
-    if version != "V1" && version != "V2" {
+    if version != "V1" && version != "V2" && version != "V3" {
         return None;
     }
     let mut status = None;
@@ -991,7 +1152,10 @@ fn decode_meta(data: &[u8]) -> Option<Entry> {
             "S" => status = parts.next()?.parse::<u16>().ok(),
             "T" => stored = parts.next()?.parse::<i64>().ok(),
             "E" => expires = parts.next()?.parse::<i64>().ok(),
-            "P" => policy = parts.next()?.parse::<u64>().ok(),
+            "P" => {
+                let raw = STANDARD.decode(parts.next()?).ok()?;
+                policy = Some(<[u8; 32]>::try_from(raw.as_slice()).ok()?);
+            }
             "G" => epoch = parts.next()?.parse::<u64>().ok(),
             "V" | "H" => {
                 let name = STANDARD.decode(parts.next()?).ok()?;
@@ -1042,10 +1206,7 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
         .or_insert_with(|| scan_disk_usage(root));
     let old_size = usage.stems.get(&stem).map(|(size, _)| *size).unwrap_or(0);
     let old_count = usize::from(old_size > 0);
-    let mut projected = usage
-        .total
-        .saturating_sub(old_size)
-        .saturating_add(incoming);
+    let mut projected = vapache_verified::cache_disk_projected(usage.total, old_size, incoming);
     let mut entries = usage
         .stems
         .len()
@@ -1066,7 +1227,7 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
             remove_disk_stem_files(&victim);
             if usage.stems.remove(&victim).is_some() {
                 usage.total = usage.total.saturating_sub(size);
-                projected = projected.saturating_sub(size);
+                projected = vapache_verified::cache_disk_evict(projected, size);
                 entries = entries.saturating_sub(1);
             }
         }
@@ -1096,10 +1257,7 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
         .map(|m| m.len())
         .unwrap_or(entry.body.len() as u64)
         .saturating_add(fs::metadata(&meta_path).map(|m| m.len()).unwrap_or(meta.len() as u64));
-    usage.total = usage
-        .total
-        .saturating_sub(old_size)
-        .saturating_add(actual);
+    usage.total = vapache_verified::cache_disk_projected(usage.total, old_size, actual);
     usage.stems.insert(stem, (actual, SystemTime::now()));
 }
 
@@ -1147,6 +1305,14 @@ pub fn store(
     cache_key: &str,
     target: &std::path::Path,
 ) {
+    // An ErrorDocument body belongs to the internal error target, not to the
+    // URL that failed.  Never persist it under the original key (F56/I52).
+    if !vapache_verified::cache_local_error_document_admit(
+        crate::files::local_error_document_response(),
+        true,
+    ) {
+        return;
+    }
     let fingerprint = cache_policy_fingerprint(scope, req, peer, target);
     if !grant.require(&crate::access::ResourceKey::cache_policy(
         vhost,
@@ -1157,16 +1323,19 @@ pub fn store(
     )) {
         return;
     }
-    if req.method != "GET" || req.body_len() > 0 {
-        return;
-    }
     // Credentialed responses are never placed in the shared cache.  The
     // cache has no identity dimension, so storing one and hoping a later
     // policy check rejects a different identity is not sufficient.
-    if req.header("authorization").is_some() || req.header("cookie").is_some() {
+    let credential_free =
+        req.header("authorization").is_none() && req.header("cookie").is_none();
+    if !vapache_verified::cache_store_request_admit(
+        req.method == "GET",
+        req.body_len() == 0,
+        credential_free,
+    ) {
         return;
     }
-    if !matches!(resp.status, 200 | 203 | 300 | 301 | 308 | 404 | 410) {
+    if !vapache_verified::cache_store_status_admit(resp.status) {
         return;
     }
     let response_headers: Vec<(String, Vec<u8>)> = resp
@@ -1175,39 +1344,41 @@ pub fn store(
         .map(|(n, v)| (n.to_string(), v.clone()))
         .collect();
     let directives = cache_control_directives(&response_headers);
-    if directives.iter().any(|d| {
-        (d == "no-store" && !cfg.cache.store_no_store)
-            || (d == "no-cache" && !cfg.cache.ignore_cache_control)
-            || (d == "private" && !cfg.cache.store_private)
-    }) {
+    let no_store = directives.iter().any(|d| d == "no-store");
+    let no_cache = directives.iter().any(|d| d == "no-cache");
+    let private = directives.iter().any(|d| d == "private");
+    if !vapache_verified::cache_store_control_admit(
+        no_store,
+        no_cache,
+        private,
+        cfg.cache.store_no_store,
+        cfg.cache.ignore_cache_control,
+        cfg.cache.store_private,
+    ) {
         return;
     }
-    if response_header(resp, "set-cookie").is_some() {
-        return;
-    }
+    let set_cookie = response_header(resp, "set-cookie").is_some();
     let response_headers_for_vary: Vec<(String, Vec<u8>)> = resp
         .headers
         .iter()
         .map(|(n, v)| (n.to_string(), v.clone()))
         .collect();
-    if combined_header(&response_headers_for_vary, "vary")
+    let vary_star = combined_header(&response_headers_for_vary, "vary")
         .map(|v| v.split(',').any(|part| part.trim() == "*"))
-        .unwrap_or(false)
-    {
-        return;
-    }
+        .unwrap_or(false);
     let Some(body) = response_body_bytes(&mut resp.body) else {
         return;
     };
-    if body.len() as u64 > cfg.cache.max_file_size || (body.len() as u64) < cfg.cache.min_file_size
-    {
+    let size_ok = body.len() as u64 <= cfg.cache.max_file_size
+        && (body.len() as u64) >= cfg.cache.min_file_size;
+    if !vapache_verified::cache_store_shape_admit(set_cookie, vary_star, size_ok) {
         return;
     }
     let now = unix_now();
     let Some(ttl) = freshness(&cfg.cache, &response_headers, now) else {
         return;
     };
-    if ttl <= 0 {
+    if !vapache_verified::cache_store_ttl_admit(ttl) {
         return;
     }
     let mut headers = Vec::new();
@@ -1227,7 +1398,7 @@ pub fn store(
         headers,
         body: body.clone(),
         stored: now,
-        expires: now.saturating_add(ttl),
+        expires: vapache_verified::cache_expiry(now, ttl),
         policy: fingerprint,
         epoch: current_epoch(),
         vary,
@@ -1306,7 +1477,15 @@ fn invalidate_disk(cfg: &Config) {
 }
 
 pub fn invalidate(cfg: &Config, host: &str, path: &str) {
-    let prefix = format!("{}\n{host}\n{path}\n", cfg.server_root.display());
+    // Keep the prefix in the same lossless encoding as `base_key`; a lossy
+    // `display()` prefix no longer matches keys and would leave stale entries
+    // after an unsafe method (F55/I51).
+    let prefix = format!(
+        "{}\n{}\n{}\n",
+        key_component(cfg.server_root.as_os_str().as_bytes()),
+        key_component(host.as_bytes()),
+        key_component(path.as_bytes()),
+    );
     let mut guard = entries().lock().unwrap_or_else(|e| e.into_inner());
     guard.retain(|key, _| !key.starts_with(&prefix));
     drop(guard);
@@ -1363,7 +1542,7 @@ mod tests {
             body: b"hello".to_vec(),
             stored: unix_now(),
             expires: unix_now() + 60,
-            policy: 7,
+            policy: [7u8; 32],
             epoch: current_epoch(),
             vary: vec![("accept".into(), b"text/plain".to_vec())],
         };
@@ -1432,6 +1611,37 @@ mod tests {
     }
 
     #[test]
+    fn large_cache_hit_is_served_from_the_disk_body_file() {
+        let (dir, cfg) = disk_test_config("file-body");
+        let request = test_request();
+        let peer = "127.0.0.1".parse().unwrap();
+        let scope = Scope::default();
+        let target = std::path::Path::new("/srv/large.bin");
+        let mut entry = disk_entry(&vec![b'z'; 128 * 1024], unix_now() + 60);
+        entry.policy = cache_policy_fingerprint(&scope, &request, peer, target);
+        let key = "host\n/large.bin\n";
+        disk_store(&cfg, key, &entry);
+        let hit = lookup(
+            &cfg,
+            None,
+            &request,
+            "localhost",
+            "/large.bin",
+            &scope,
+            peer,
+            &crate::access::test_grant(),
+            key,
+            target,
+        )
+        .expect("large cache hit");
+        match hit.body {
+            Body::File { len, .. } => assert_eq!(len, 128 * 1024),
+            _ => panic!("large cached body should use the file-body path"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn disk_entries_from_an_older_generation_are_not_served() {
         let dir = std::env::temp_dir().join(format!("vapache-cache-epoch-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1453,7 +1663,7 @@ mod tests {
             body: b"stale".to_vec(),
             stored: unix_now(),
             expires: unix_now() + 60,
-            policy: 7,
+            policy: [7u8; 32],
             epoch: current_epoch().saturating_sub(1),
             vary: Vec::new(),
         };
@@ -1958,7 +2168,7 @@ AddHandler cgi-script .cgi\n\
                    path: &str,
                    query: &[u8],
                    target: &std::path::Path,
-                   fingerprint: u64| {
+                   fingerprint: PolicyFingerprint| {
             base_key(
                 cfg,
                 vhost,
@@ -1982,7 +2192,7 @@ AddHandler cgi-script .cgi\n\
             "/x",
             b"",
             target,
-            7,
+            [7u8; 32],
         );
         let variants = [
             key(
@@ -1995,7 +2205,7 @@ AddHandler cgi-script .cgi\n\
                 "/x",
                 b"",
                 target,
-                7,
+                [7u8; 32],
             ),
             key(
                 &cfg,
@@ -2007,7 +2217,7 @@ AddHandler cgi-script .cgi\n\
                 "/x",
                 b"",
                 target,
-                7,
+                [7u8; 32],
             ),
             key(
                 &cfg,
@@ -2019,7 +2229,7 @@ AddHandler cgi-script .cgi\n\
                 "/x",
                 b"",
                 target,
-                7,
+                [7u8; 32],
             ),
             key(
                 &cfg,
@@ -2031,7 +2241,7 @@ AddHandler cgi-script .cgi\n\
                 "/x",
                 b"",
                 target,
-                7,
+                [7u8; 32],
             ),
             key(
                 &cfg,
@@ -2043,7 +2253,7 @@ AddHandler cgi-script .cgi\n\
                 "/y",
                 b"",
                 target,
-                7,
+                [7u8; 32],
             ),
             key(
                 &cfg,
@@ -2055,7 +2265,7 @@ AddHandler cgi-script .cgi\n\
                 "/x",
                 b"a=1",
                 target,
-                7,
+                [7u8; 32],
             ),
             key(
                 &cfg,
@@ -2067,7 +2277,7 @@ AddHandler cgi-script .cgi\n\
                 "/x",
                 b"",
                 std::path::Path::new("/srv/y"),
-                7,
+                [7u8; 32],
             ),
             key(
                 &cfg,
@@ -2079,7 +2289,7 @@ AddHandler cgi-script .cgi\n\
                 "/x",
                 b"",
                 target,
-                8,
+                [8u8; 32],
             ),
         ];
         for (index, variant) in variants.iter().enumerate() {
@@ -2100,7 +2310,7 @@ AddHandler cgi-script .cgi\n\
                 "/x",
                 b"",
                 target,
-                7
+                [7u8; 32]
             ),
             "server root is not bound"
         );
@@ -2119,7 +2329,7 @@ AddHandler cgi-script .cgi\n\
                 "/x",
                 b"",
                 target,
-                7
+                [7u8; 32]
             ),
             "vhost identity is not bound"
         );
@@ -2153,8 +2363,8 @@ AddHandler cgi-script .cgi\n\
 
     #[test]
     fn cache_key_includes_policy_fingerprint() {
-        let a = format!("{}\nhost\n/path\n\n{:016x}", "/srv", 0u64);
-        let b = format!("{}\nhost\n/path\n\n{:016x}", "/srv", 1u64);
+        let a = format!("{}\nhost\n/path\n\n{}", "/srv", key_component(&[0u8; 32]));
+        let b = format!("{}\nhost\n/path\n\n{}", "/srv", key_component(&[1u8; 32]));
         assert_ne!(a, b);
         // Credentials must never be persisted as cache metadata.
         assert!(HOP_HEADERS.contains(&"authorization"));
@@ -2229,10 +2439,400 @@ AddHandler cgi-script .cgi\n\
     }
 
     #[test]
+    fn cache_key_is_injective_over_raw_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-cache-key-bytes-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("httpd.conf");
+        fs::write(&conf, "Listen 127.0.0.1:0\n").unwrap();
+        let cfg = crate::config::Config::load(
+            &conf,
+            &dir,
+            &Default::default(),
+            &Default::default(),
+            false,
+        )
+        .unwrap();
+        let key = |query: &[u8], target: &std::path::Path| {
+            base_key(
+                &cfg,
+                None,
+                "127.0.0.1",
+                80,
+                false,
+                "example.test",
+                "/index.php",
+                query,
+                target,
+                [7u8; 32],
+            )
+        };
+        let target = std::path::Path::new("/srv/index.php");
+        assert_ne!(key(b"", target), key(b"\xff", target));
+        assert_ne!(key(b"?a=\xff", target), key(b"?a=\xfe", target));
+        // The UTF-8 replacement bytes of a lossy conversion must not share a
+        // key with the raw invalid byte (F55/I51).
+        assert_ne!(key(b"\xff", target), key(b"\xef\xbf\xbd", target));
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let invalid_target = std::path::Path::new(OsStr::from_bytes(b"/srv/\xff"));
+        assert_ne!(key(b"", target), key(b"", invalid_target));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_rejects_non_utf8_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-cache-non-utf8-path-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let www = dir.join("www");
+        fs::create_dir_all(&www).unwrap();
+        let conf = dir.join("httpd.conf");
+        fs::write(
+            &conf,
+            format!(
+                "Listen 127.0.0.1:0\n\
+DocumentRoot \"{www}\"\n\
+CacheRoot \"{cache}\"\n\
+CacheEnable disk /\n\
+<Directory \"{www}\">\n\
+    Require all granted\n\
+</Directory>\n",
+                www = www.display(),
+                cache = dir.join("cache").display(),
+            ),
+        )
+        .unwrap();
+        let cfg = crate::config::Config::load(
+            &conf,
+            &dir,
+            &Default::default(),
+            &Default::default(),
+            false,
+        )
+        .unwrap();
+        let request = crate::http::Request {
+            method: "GET".into(),
+            target: b"/\xff".to_vec(),
+            raw_path: b"/\xff".to_vec(),
+            query: Vec::new(),
+            version: crate::http::Version::Http11,
+            headers: crate::http::Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        };
+        assert!(request_scope(
+            &cfg,
+            None,
+            &request,
+            "127.0.0.1".parse().unwrap(),
+            "/\u{fffd}",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignore_query_string_bypasses_set_handler_and_server_status() {
+        for handler in ["proxy:unix:/nonexistent|fcgi://localhost", "server-status"] {
+            let dir = std::env::temp_dir().join(format!(
+                "vapache-cache-handler-{}-{}",
+                handler.contains("server-status") as u8,
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let www = dir.join("www");
+            fs::create_dir_all(&www).unwrap();
+            fs::write(www.join("direct.php"), "not executed\n").unwrap();
+            let conf = dir.join("httpd.conf");
+            fs::write(
+                &conf,
+                format!(
+                    "Listen 127.0.0.1:0\n\
+DocumentRoot \"{www}\"\n\
+CacheRoot \"{cache}\"\n\
+CacheEnable disk /\n\
+CacheIgnoreQueryString On\n\
+<FilesMatch \"\\.php$\">\n\
+    SetHandler \"{handler}\"\n\
+</FilesMatch>\n\
+<Directory \"{www}\">\n\
+    Require all granted\n\
+</Directory>\n",
+                    www = www.display(),
+                    cache = dir.join("cache").display(),
+                ),
+            )
+            .unwrap();
+            let cfg = crate::config::Config::load(
+                &conf,
+                &dir,
+                &Default::default(),
+                &Default::default(),
+                false,
+            )
+            .unwrap();
+            let request = crate::http::Request {
+                method: "GET".into(),
+                target: b"/direct.php?token=alpha".to_vec(),
+                raw_path: b"/direct.php".to_vec(),
+                query: b"token=alpha".to_vec(),
+                version: crate::http::Version::Http11,
+                headers: crate::http::Headers::default(),
+                body: Vec::new(),
+                body_spool: None,
+                keep_alive: true,
+                expect_continue: false,
+                framing: crate::verified::BodyFraming::None,
+            };
+            assert!(
+                request_scope(
+                    &cfg,
+                    None,
+                    &request,
+                    "127.0.0.1".parse().unwrap(),
+                    "/direct.php",
+                    80,
+                    false,
+                    "localhost",
+                    "localhost",
+                    "127.0.0.1",
+                )
+                .is_none(),
+                "dynamic handler {handler} was treated as static"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn local_error_document_is_never_cache_scoped() {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-cache-error-document-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let www = dir.join("www");
+        fs::create_dir_all(&www).unwrap();
+        fs::write(www.join("404.html"), "missing\n").unwrap();
+        let conf = dir.join("httpd.conf");
+        fs::write(
+            &conf,
+            format!(
+                "Listen 127.0.0.1:0\n\
+DocumentRoot \"{www}\"\n\
+CacheRoot \"{cache}\"\n\
+CacheEnable disk /\n\
+ErrorDocument 404 /404.html\n\
+<Directory \"{www}\">\n\
+    Require all granted\n\
+</Directory>\n",
+                www = www.display(),
+                cache = dir.join("cache").display(),
+            ),
+        )
+        .unwrap();
+        let cfg = crate::config::Config::load(
+            &conf,
+            &dir,
+            &Default::default(),
+            &Default::default(),
+            false,
+        )
+        .unwrap();
+        let request = crate::http::Request {
+            method: "GET".into(),
+            target: b"/missing".to_vec(),
+            raw_path: b"/missing".to_vec(),
+            query: Vec::new(),
+            version: crate::http::Version::Http11,
+            headers: crate::http::Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        };
+        assert!(request_scope(
+            &cfg,
+            None,
+            &request,
+            "127.0.0.1".parse().unwrap(),
+            "/missing",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_index_binds_cache_target_and_live_policy() {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-cache-dir-index-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let www = dir.join("www");
+        fs::create_dir_all(www.join("dir")).unwrap();
+        fs::write(www.join("dir/index.html"), "index\n").unwrap();
+        fs::write(www.join("dir/.htaccess"), "# no deny\n").unwrap();
+        let conf = dir.join("httpd.conf");
+        fs::write(
+            &conf,
+            format!(
+                "Listen 127.0.0.1:0\n\
+DocumentRoot \"{www}\"\n\
+CacheRoot \"{cache}\"\n\
+CacheEnable disk /\n\
+DirectoryIndex index.html\n\
+<Directory \"{www}\">\n\
+    AllowOverride All\n\
+    Require all granted\n\
+</Directory>\n",
+                www = www.display(),
+                cache = dir.join("cache").display(),
+            ),
+        )
+        .unwrap();
+        let cfg = crate::config::Config::load(
+            &conf,
+            &dir,
+            &Default::default(),
+            &Default::default(),
+            false,
+        )
+        .unwrap();
+        let request = crate::http::Request {
+            method: "GET".into(),
+            target: b"/dir/".to_vec(),
+            raw_path: b"/dir/".to_vec(),
+            query: Vec::new(),
+            version: crate::http::Version::Http11,
+            headers: crate::http::Headers::default(),
+            body: Vec::new(),
+            body_spool: None,
+            keep_alive: true,
+            expect_continue: false,
+            framing: crate::verified::BodyFraming::None,
+        };
+        let ctx = request_scope(
+            &cfg,
+            None,
+            &request,
+            "127.0.0.1".parse().unwrap(),
+            "/dir/",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .expect("directory index cache scope");
+        assert_eq!(ctx.target, www.join("dir/index.html"));
+        assert_eq!(ctx.path, "/dir/index.html");
+
+        fs::write(
+            www.join("dir/.htaccess"),
+            "<Files \"index.html\">\n    Require all denied\n</Files>\n",
+        )
+        .unwrap();
+        assert!(request_scope(
+            &cfg,
+            None,
+            &request,
+            "127.0.0.1".parse().unwrap(),
+            "/dir/",
+            80,
+            false,
+            "localhost",
+            "localhost",
+            "127.0.0.1",
+        )
+        .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cache_control_ttl_is_bounded() {
         let cfg = crate::config::CacheConfig::default();
         let headers = vec![("Cache-Control".into(), b"max-age=999999".to_vec())];
         assert_eq!(freshness(&cfg, &headers, 100), Some(cfg.max_expire as i64));
+
+        // A reversed configuration pair must disable reuse instead of
+        // panicking in `i64::clamp` (verified `cache_ttl_clamp`).
+        let mut reversed = crate::config::CacheConfig::default();
+        reversed.min_expire = 60;
+        reversed.max_expire = 5;
+        assert_eq!(freshness(&reversed, &headers, 100), Some(0));
+        assert_eq!(
+            vapache_verified::cache_expiry(i64::MAX - 1, 10),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn verified_cache_store_and_accounting_gates_cover_edge_cases() {
+        assert!(vapache_verified::cache_store_request_admit(
+            true, true, true
+        ));
+        assert!(!vapache_verified::cache_store_request_admit(
+            false, true, true
+        ));
+        assert!(!vapache_verified::cache_store_request_admit(
+            true, false, true
+        ));
+        assert!(!vapache_verified::cache_store_request_admit(
+            true, true, false
+        ));
+
+        assert!(vapache_verified::cache_store_status_admit(200));
+        assert!(vapache_verified::cache_store_status_admit(404));
+        assert!(!vapache_verified::cache_store_status_admit(500));
+
+        assert!(!vapache_verified::cache_store_control_admit(
+            true, false, false, false, false, false
+        ));
+        assert!(vapache_verified::cache_store_control_admit(
+            true, false, false, true, false, false
+        ));
+        assert!(!vapache_verified::cache_store_control_admit(
+            false, true, false, false, false, false
+        ));
+
+        assert!(vapache_verified::cache_store_shape_admit(
+            false, false, true
+        ));
+        assert!(!vapache_verified::cache_store_shape_admit(
+            true, false, true
+        ));
+        assert!(!vapache_verified::cache_store_shape_admit(
+            false, true, true
+        ));
+        assert!(!vapache_verified::cache_store_shape_admit(
+            false, false, false
+        ));
+        assert!(vapache_verified::cache_store_ttl_admit(1));
+        assert!(!vapache_verified::cache_store_ttl_admit(0));
+
+        assert_eq!(vapache_verified::cache_disk_projected(10, 20, 3), 3);
+        assert_eq!(vapache_verified::cache_disk_evict(10, 20), 0);
     }
 
     fn disk_test_config(name: &str) -> (std::path::PathBuf, Config) {
@@ -2263,7 +2863,7 @@ AddHandler cgi-script .cgi\n\
             body: body.to_vec(),
             stored: unix_now(),
             expires,
-            policy: 7,
+            policy: [7u8; 32],
             epoch: current_epoch(),
             vary: Vec::new(),
         }

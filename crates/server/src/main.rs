@@ -416,7 +416,7 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
         .clone()
         .or_else(|| cfg.server_name.clone())
         .unwrap_or_else(|| "localhost".to_string());
-    let vhost = cfg.select_vhost(port, Some(&host));
+    let vhost = cfg.select_vhost(None, port, Some(&host));
 
     let allow_encoded = cfg.encoded_slashes == EncodedSlashes::On;
     let decoded = percent_decode_path(raw_path.as_bytes(), allow_encoded)
@@ -448,11 +448,18 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
         framing: BodyFraming::None,
     };
     let peer = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-    let root = cfg.documentation_root_for(vhost);
-    let fs_path = root.join(url_path.trim_start_matches('/'));
+    let (root, rel, _) = vapached::server::map_path(cfg, vhost, &normalized)
+        .ok_or_else(|| format!("no mapping for '{path}'"))?;
+    let fs_path = root.join(rel);
     let layers = if cfg.htaccess_may_apply(&fs_path) {
-        vapached::htaccess::collect_layers(cfg, vhost, &fs_path, &url_path)
-            .map_err(|e| format!("htaccess: {e}"))?
+        vapached::htaccess::collect_layers_with_root(
+            cfg,
+            vhost,
+            &fs_path,
+            &url_path,
+            Some(&root),
+        )
+        .map_err(|e| format!("htaccess: {e}"))?
     } else {
         Vec::new()
     };
@@ -510,7 +517,13 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
         println!("    {rule}");
     }
     println!("  access_file_trace:");
-    for file in vapached::htaccess::trace_access_files(cfg, vhost, &fs_path, &url_path) {
+    for file in vapached::htaccess::trace_access_files_with_root(
+        cfg,
+        vhost,
+        &fs_path,
+        &url_path,
+        Some(&root),
+    ) {
         println!("    {file}");
     }
     println!("  options: {:?}", scope.effective_options());
@@ -722,7 +735,13 @@ fn main() {
         // Do this before printing Syntax OK so missing or unreadable TLS
         // files fail closed rather than at first HTTPS connection attempt.
         for listener in &cfg.listeners {
-            if let Err(e) = vapached::tls::server_config(&cfg, listener.port) {
+            let local_ip = listener
+                .addr
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .filter(|ip| !ip.is_unspecified())
+                .map(vapached::access::canonical_ip);
+            if let Err(e) = vapached::tls::server_config(&cfg, listener.port, local_ip) {
                 eprintln!("vapached: SSL configuration error: {e}");
                 eprintln!("vapached: configuration test failed");
                 std::process::exit(1);

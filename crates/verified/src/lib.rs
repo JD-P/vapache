@@ -819,6 +819,37 @@ pub fn path_under_base(target: &[u8], base: &[u8]) -> (ok: bool)
     target[base.len()] == b'/'
 }
 
+/// F46/I43: a `<RequireNone>` group with any granted child denies; a denied
+/// sibling cannot neutralize the positive hit.
+pub fn require_none_multi_result(
+    any_granted: bool,
+    result_is_denied: bool,
+) -> (ok: bool)
+    ensures ok == (!any_granted || result_is_denied),
+{
+    !any_granted || result_is_denied
+}
+
+/// F48/I45: an address-bound virtual host is eligible only on its configured
+/// destination address; wildcard (`*`, `_default_`) vhosts remain eligible.
+pub fn vhost_address_admit(
+    address_bound: bool,
+    wildcard: bool,
+    same_address: bool,
+) -> (ok: bool)
+    ensures ok == (!address_bound || wildcard || same_address),
+{
+    !address_bound || wildcard || same_address
+}
+
+/// F48/I45: when an exact-address vhost exists for the destination, wildcard
+/// vhosts cannot take precedence over it.
+pub fn vhost_address_precedence(exact_available: bool, candidate_exact: bool) -> (ok: bool)
+    ensures ok == (!exact_available || candidate_exact),
+{
+    !exact_available || candidate_exact
+}
+
 /// F39/I35: a prefix `Alias`/`ScriptAlias` whose target is a regular file is
 /// resolved as `(parent, basename)`, never `(file, empty)`.  The nonempty
 /// basename is what carries the handler and MIME extension.
@@ -911,6 +942,507 @@ pub fn expr_file_test_admit(
     ensures ok == (!absolute && !parent_relative && under_root),
 {
     !absolute && !parent_relative && under_root
+}
+
+/// F50/I47: an access-file layer participates for every ancestor directory
+/// whose effective `AllowOverride` policy permits it.  `DocumentRoot` and an
+/// alias target are URL-mapping labels, not lower bounds on this walk.
+pub fn access_walk_dir_admit(is_walk_ancestor: bool, override_permits: bool) -> (ok: bool)
+    ensures ok == (is_walk_ancestor && override_permits),
+{
+    is_walk_ancestor && override_permits
+}
+
+/// F51/I48: the mapping root used for URL/`RewriteBase` derivation is the one
+/// selected by URL mapping, never a root reconstructed from an arbitrary
+/// alias target that happens to contain the filesystem path.
+pub fn alias_mapping_root_admit(
+    selected_by_url_mapping: bool,
+    inferred_from_alias_containment: bool,
+) -> (ok: bool)
+    ensures ok == (selected_by_url_mapping && !inferred_from_alias_containment),
+{
+    selected_by_url_mapping && !inferred_from_alias_containment
+}
+
+/// F52/I49: a cache entry produced by `DirectoryIndex` is keyed and authorized
+/// against the selected index, not only the directory URL.  Directories that
+/// resolve to an autoindex or redirect have no index target to bind.
+pub fn cache_directory_index_bind_admit(
+    directory_target: bool,
+    index_selected: bool,
+    key_uses_index: bool,
+    policy_uses_index: bool,
+) -> (ok: bool)
+    ensures
+        ok == (!directory_target
+            || !index_selected
+            || (key_uses_index && policy_uses_index)),
+{
+    !directory_target || !index_selected || (key_uses_index && policy_uses_index)
+}
+
+/// F52/I49: `CacheIgnoreQueryString` may not merge a dynamic target's
+/// representations across different query strings.
+pub fn cache_ignore_query_admit(
+    ignore_query_string: bool,
+    query_present: bool,
+    dynamic_target: bool,
+) -> (ok: bool)
+    ensures ok == !(ignore_query_string && query_present && dynamic_target),
+{
+    !(ignore_query_string && query_present && dynamic_target)
+}
+
+/// F53/I50: a per-directory rewrite base is derived from the requested URL
+/// and the layer's depth below the requested target, never from a path
+/// relative to an alias target.  The layer must be an ancestor of the
+/// requested target and the URL must have enough components for that depth.
+pub fn htaccess_layer_url_base_admit(
+    layer_under_request_target: bool,
+    url_depth_sufficient: bool,
+) -> (ok: bool)
+    ensures ok == (layer_under_request_target && url_depth_sufficient),
+{
+    layer_under_request_target && url_depth_sufficient
+}
+
+/// F54/I53: every non-default handler (`SetHandler proxy:`, `server-status`,
+/// CGI, FastCGI, future handlers) is dynamic for cache-query purposes.  When
+/// a dynamic handler is present, `CacheIgnoreQueryString` must bypass the
+/// cache rather than merge representations across queries.
+pub fn cache_dynamic_handler_admit(
+    dynamic_handler: bool,
+    bypassed: bool,
+) -> (ok: bool)
+    ensures ok == (!dynamic_handler || bypassed),
+{
+    !dynamic_handler || bypassed
+}
+
+/// F56/I52: a local `ErrorDocument` is an internal subrequest selected after
+/// dispatch.  Its handler, target and query policy are not described by the
+/// original URL's cache scope, so a missing URL that can select one must not
+/// serve or store through the shared cache, and an error-document response is
+/// never stored under the URL that failed.
+pub fn cache_local_error_document_admit(
+    local_error_document: bool,
+    cache_allowed: bool,
+) -> (ok: bool)
+    ensures ok == (cache_allowed && !local_error_document),
+{
+    cache_allowed && !local_error_document
+}
+
+/// Lowercase hex digit for a nibble.  This is the spec twin of the runtime
+/// `hex_digit` helper; the `cache_key_hex` refinement below is checked against
+/// it.
+pub open spec fn hex_digit_char(n: u8) -> u8 {
+    if n < 10 { (b'0' + n) as u8 } else { (b'a' + (n - 10)) as u8 }
+}
+
+/// Inverse mapping used only by the injectivity proof.
+pub open spec fn hex_digit_value(c: u8) -> u8 {
+    match c {
+        b'0' => 0,
+        b'1' => 1,
+        b'2' => 2,
+        b'3' => 3,
+        b'4' => 4,
+        b'5' => 5,
+        b'6' => 6,
+        b'7' => 7,
+        b'8' => 8,
+        b'9' => 9,
+        b'a' => 10,
+        b'b' => 11,
+        b'c' => 12,
+        b'd' => 13,
+        b'e' => 14,
+        b'f' => 15,
+        _ => 0,
+    }
+}
+
+pub proof fn hex_digit_char_roundtrip(n: u8)
+    requires n < 16,
+    ensures hex_digit_value(hex_digit_char(n)) == n,
+{
+    if n == 0 {
+    } else if n == 1 {
+    } else if n == 2 {
+    } else if n == 3 {
+    } else if n == 4 {
+    } else if n == 5 {
+    } else if n == 6 {
+    } else if n == 7 {
+    } else if n == 8 {
+    } else if n == 9 {
+    } else if n == 10 {
+    } else if n == 11 {
+    } else if n == 12 {
+    } else if n == 13 {
+    } else if n == 14 {
+    } else {
+        assert(n == 15);
+    }
+}
+
+pub proof fn hex_digit_char_injective(a: u8, b: u8)
+    requires a < 16, b < 16, hex_digit_char(a) == hex_digit_char(b),
+    ensures a == b,
+{
+    hex_digit_char_roundtrip(a);
+    hex_digit_char_roundtrip(b);
+    assert(hex_digit_value(hex_digit_char(a)) == hex_digit_value(hex_digit_char(b)));
+}
+
+/// One byte as two hex digits.
+pub open spec fn hex_byte_spec(b: u8) -> Seq<u8> {
+    seq![hex_digit_char(b / 16), hex_digit_char(b % 16)]
+}
+
+/// Recursive, byte-exact model of `cache_key_hex`.
+pub open spec fn cache_key_hex_spec(value: Seq<u8>) -> Seq<u8>
+    decreases value.len(),
+{
+    if value.len() == 0 {
+        Seq::empty()
+    } else {
+        hex_byte_spec(value[0]) + cache_key_hex_spec(value.drop_first())
+    }
+}
+
+pub proof fn cache_key_hex_spec_len(value: Seq<u8>)
+    ensures cache_key_hex_spec(value).len() == value.len() * 2,
+    decreases value.len(),
+{
+    if value.len() == 0 {
+    } else {
+        cache_key_hex_spec_len(value.drop_first());
+        assert(hex_byte_spec(value[0]).len() == 2);
+    }
+}
+
+pub proof fn cache_key_hex_spec_head(value: Seq<u8>)
+    requires value.len() > 0,
+    ensures cache_key_hex_spec(value).subrange(0, 2) == hex_byte_spec(value[0]),
+{
+    cache_key_hex_spec_len(value.drop_first());
+    assert(hex_byte_spec(value[0]).len() == 2);
+}
+
+pub proof fn cache_key_hex_spec_tail(value: Seq<u8>)
+    requires value.len() > 0,
+    ensures cache_key_hex_spec(value).skip(2) == cache_key_hex_spec(value.drop_first()),
+{
+    cache_key_hex_spec_len(value.drop_first());
+    assert(hex_byte_spec(value[0]).len() == 2);
+}
+
+pub proof fn hex_byte_spec_injective(a: u8, b: u8)
+    requires hex_byte_spec(a) == hex_byte_spec(b),
+    ensures a == b,
+{
+    assert(hex_byte_spec(a)[0] == hex_digit_char(a / 16));
+    assert(hex_byte_spec(a)[1] == hex_digit_char(a % 16));
+    assert(hex_byte_spec(b)[0] == hex_digit_char(b / 16));
+    assert(hex_byte_spec(b)[1] == hex_digit_char(b % 16));
+    assert(hex_digit_char(a / 16) == hex_digit_char(b / 16));
+    assert(hex_digit_char(a % 16) == hex_digit_char(b % 16));
+    assert(a / 16 < 16);
+    assert(a % 16 < 16);
+    assert(b / 16 < 16);
+    assert(b % 16 < 16);
+    hex_digit_char_injective(a / 16, b / 16);
+    hex_digit_char_injective(a % 16, b % 16);
+    assert(a == b);
+}
+
+/// F55/I51: the complete hex encoding is injective over raw byte sequences.
+pub proof fn cache_key_hex_spec_injective(a: Seq<u8>, b: Seq<u8>)
+    requires cache_key_hex_spec(a) == cache_key_hex_spec(b),
+    ensures a == b,
+    decreases a.len() + b.len(),
+{
+    cache_key_hex_spec_len(a);
+    cache_key_hex_spec_len(b);
+    if a.len() == 0 {
+        assert(cache_key_hex_spec(a) == Seq::<u8>::empty());
+        assert(b.len() == 0);
+    } else if b.len() == 0 {
+        assert(cache_key_hex_spec(b) == Seq::<u8>::empty());
+        assert(a.len() == 0);
+    } else {
+        cache_key_hex_spec_head(a);
+        cache_key_hex_spec_head(b);
+        assert(cache_key_hex_spec(a).subrange(0, 2) == cache_key_hex_spec(b).subrange(0, 2));
+        hex_byte_spec_injective(a[0], b[0]);
+        cache_key_hex_spec_tail(a);
+        cache_key_hex_spec_tail(b);
+        assert(cache_key_hex_spec(a).skip(2) == cache_key_hex_spec(b).skip(2));
+        cache_key_hex_spec_injective(a.drop_first(), b.drop_first());
+        assert(a == seq![a[0]] + a.drop_first());
+        assert(b == seq![b[0]] + b.drop_first());
+    }
+}
+
+/// F55/I51: encode every cache-key byte as two lowercase hex digits.  The
+/// encoding is length-preserving up to the fixed factor of two and provably
+/// injective, so distinct raw byte sequences (including invalid UTF-8 and the
+/// empty sequence) cannot collapse to one key component.
+pub fn cache_key_hex(value: &[u8]) -> (out: Vec<u8>)
+    ensures
+        out@ == cache_key_hex_spec(value@),
+        out@.len() == value@.len() * 2,
+{
+    let mut out: Vec<u8> = Vec::with_capacity(value.len());
+    let mut i: usize = 0;
+    assert(value@.subrange(0, value@.len() as int) == value@);
+    while i < value.len()
+        invariant
+            0 <= i <= value.len(),
+            out@ + cache_key_hex_spec(value@.subrange(i as int, value@.len() as int))
+                == cache_key_hex_spec(value@),
+        decreases value.len() - i,
+    {
+        let hi: u8 = value[i] / 16;
+        let lo: u8 = value[i] % 16;
+        assert(hi < 16);
+        assert(lo < 16);
+        let hi_char = hex_digit(hi);
+        let lo_char = hex_digit(lo);
+        assert(hi_char == hex_digit_char(hi));
+        assert(lo_char == hex_digit_char(lo));
+        assert(value@.subrange(i as int, value@.len() as int)[0] == value[i as int]);
+        assert(value@.subrange(i as int, value@.len() as int).drop_first()
+            == value@.subrange((i + 1) as int, value@.len() as int));
+        out.push(hi_char);
+        out.push(lo_char);
+        i = i + 1;
+    }
+    proof {
+        cache_key_hex_spec_len(value@);
+    }
+    out
+}
+
+/// Cache freshness clamp.  `CacheMinExpire`/`CacheMaxExpire` come from
+/// configuration; a reversed pair must not panic the response path.  The
+/// verified form returns zero (no reusable entry) for a reversed pair.
+pub open spec fn cache_ttl_clamp_spec(value: i64, min: i64, max: i64) -> i64 {
+    if min > max {
+        0
+    } else if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
+    }
+}
+
+pub fn cache_ttl_clamp(value: i64, min: i64, max: i64) -> (ttl: i64)
+    ensures
+        ttl == cache_ttl_clamp_spec(value, min, max),
+        min <= max ==> (min <= ttl && ttl <= max),
+{
+    if min > max {
+        0
+    } else if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
+    }
+}
+
+/// Freshness expiry uses saturating arithmetic so a hostile or malformed
+/// freshness value can never wrap `expires` into the past.  The runtime only
+/// stores entries with `ttl > 0`.
+pub fn cache_expiry(now: i64, ttl: i64) -> (expires: i64)
+    requires ttl > 0,
+    ensures expires >= now,
+{
+    if let Some(value) = now.checked_add(ttl) {
+        value
+    } else {
+        i64::MAX
+    }
+}
+
+/// Disk accounting projection for replacing an existing representation with
+/// a new one.  Saturating subtraction makes a stale/over-large accounting
+/// value harmless instead of wrapping into a false positive.
+pub fn cache_disk_projected(used: u64, old: u64, incoming: u64) -> (projected: u64)
+    ensures projected == used.saturating_sub(old).saturating_add(incoming),
+{
+    used.saturating_sub(old).saturating_add(incoming)
+}
+
+/// Removing one eviction victim can only decrease the projected usage.
+pub fn cache_disk_evict(projected: u64, removed: u64) -> (after: u64)
+    ensures after <= projected,
+{
+    projected.saturating_sub(removed)
+}
+
+/// Four-byte big-endian length used to frame one policy-fingerprint field.
+pub open spec fn cache_fingerprint_len_bytes(len: nat) -> Seq<u8> {
+    seq![
+        (len / 16777216) as u8,
+        ((len / 65536) % 256) as u8,
+        ((len / 256) % 256) as u8,
+        (len % 256) as u8
+    ]
+}
+
+pub open spec fn cache_fingerprint_field_spec(field: Seq<u8>) -> Seq<u8> {
+    cache_fingerprint_len_bytes(field.len()) + field
+}
+
+/// Frame one exact byte field with a four-byte length prefix.  `cache.rs`
+/// feeds these frames into SHA-256, so no field boundary depends on a
+/// separator that could also occur inside attacker-controlled data.
+pub fn cache_fingerprint_field(field: &[u8]) -> (out: Vec<u8>)
+    requires field@.len() <= 0xffff_ffff,
+    ensures out@ == cache_fingerprint_field_spec(field@),
+{
+    let len = field.len() as u32;
+    assert(len as nat == field@.len());
+    let mut out: Vec<u8> = Vec::new();
+    out.push((len / 16777216) as u8);
+    out.push(((len / 65536) % 256) as u8);
+    out.push(((len / 256) % 256) as u8);
+    out.push((len % 256) as u8);
+    out.extend_from_slice(field);
+    out
+}
+
+pub proof fn cache_fingerprint_field_injective(a: Seq<u8>, b: Seq<u8>)
+    requires cache_fingerprint_field_spec(a) == cache_fingerprint_field_spec(b),
+    ensures a == b,
+{
+    assert(cache_fingerprint_field_spec(a).skip(4) == a);
+    assert(cache_fingerprint_field_spec(b).skip(4) == b);
+}
+
+/// Cache store request gate: only a bodyless GET without credentials may
+/// populate the shared cache.  The runtime consumes this predicate before it
+/// inspects response headers or buffers the body.
+pub fn cache_store_request_admit(
+    method_get: bool,
+    body_empty: bool,
+    credential_free: bool,
+) -> (ok: bool)
+    ensures ok == (method_get && body_empty && credential_free),
+{
+    method_get && body_empty && credential_free
+}
+
+/// Only these statuses carry reusable representations.  Everything else is
+/// either an error/tunnel response or a status whose semantics cannot be
+/// replayed from a shared cache.
+pub fn cache_store_status_admit(status: u16) -> (ok: bool)
+    ensures
+        ok == (status == 200
+            || status == 203
+            || status == 300
+            || status == 301
+            || status == 308
+            || status == 404
+            || status == 410),
+{
+    matches!(status, 200 | 203 | 300 | 301 | 308 | 404 | 410)
+}
+
+/// Cache-Control storage policy.  `no-store`, `no-cache` or `private` block
+/// storage unless the corresponding configuration override explicitly allows
+/// that directive.
+pub fn cache_store_control_admit(
+    no_store: bool,
+    no_cache: bool,
+    private: bool,
+    allow_no_store: bool,
+    allow_no_cache: bool,
+    allow_private: bool,
+) -> (ok: bool)
+    ensures
+        ok == !((no_store && !allow_no_store)
+            || (no_cache && !allow_no_cache)
+            || (private && !allow_private)),
+{
+    !((no_store && !allow_no_store)
+        || (no_cache && !allow_no_cache)
+        || (private && !allow_private))
+}
+
+/// Response-shape gate: a Set-Cookie response is identity-bound and never
+/// shared, `Vary: *` is uncacheable, and the body must be within the
+/// configured size window.
+pub fn cache_store_shape_admit(
+    set_cookie: bool,
+    vary_star: bool,
+    size_ok: bool,
+) -> (ok: bool)
+    ensures ok == (!set_cookie && !vary_star && size_ok),
+{
+    !set_cookie && !vary_star && size_ok
+}
+
+/// A representation is stored only with a strictly positive freshness
+/// lifetime; zero/negative TTLs are already stale.
+pub fn cache_store_ttl_admit(ttl: i64) -> (ok: bool)
+    ensures ok == (ttl > 0),
+{
+    ttl > 0
+}
+
+/// A hit admitted by `cache_lookup_admit` must satisfy every binding
+/// dimension and be strictly fresh, not merely present in the map.
+pub proof fn cache_lookup_hit_requires_binding(
+    key_match: bool,
+    policy_match: bool,
+    vary_match: bool,
+    generation_match: bool,
+    expires: i64,
+    now: i64,
+)
+    requires
+        key_match,
+        policy_match,
+        vary_match,
+        generation_match,
+        now < expires,
+    ensures
+        key_match,
+        policy_match,
+        vary_match,
+        generation_match,
+        now < expires,
+{
+}
+
+/// A stale entry can never be admitted, even when every other dimension
+/// matches.  This is the freshness half of the lookup gate used for both the
+/// memory and disk paths.
+pub proof fn cache_lookup_rejects_stale(
+    key_match: bool,
+    policy_match: bool,
+    vary_match: bool,
+    generation_match: bool,
+    expires: i64,
+    now: i64,
+)
+    requires expires <= now,
+    ensures
+        !(key_match
+            && policy_match
+            && vary_match
+            && generation_match
+            && now < expires),
+{
 }
 
 /// Escape access-log text so a hostile request field cannot inject a
@@ -2731,6 +3263,57 @@ pub open spec fn combine_or_spec(a: PolicyResult, b: PolicyResult) -> PolicyResu
     }
 }
 
+pub open spec fn require_none_result_spec(r: PolicyResult) -> PolicyResult {
+    match r {
+        PolicyResult::Granted => PolicyResult::Denied,
+        PolicyResult::Denied | PolicyResult::AuthRequired => PolicyResult::Neutral,
+        PolicyResult::Neutral => PolicyResult::Neutral,
+    }
+}
+
+/// OR-combine a whole sequence of `<RequireNone>` child results.  The group
+/// fails if *any* provider is satisfied, so a granted child must remain
+/// visible even when a sibling is denied (F46/I43).
+pub open spec fn combine_or_all_spec(rs: Seq<PolicyResult>) -> PolicyResult
+    decreases rs.len(),
+{
+    if rs.len() == 0 {
+        PolicyResult::Neutral
+    } else {
+        combine_or_spec(rs[0], combine_or_all_spec(rs.drop_first()))
+    }
+}
+
+pub fn combine_or_all(rs: &[PolicyResult]) -> (out: PolicyResult)
+    ensures out == combine_or_all_spec(rs@)
+    decreases rs.len()
+{
+    if rs.is_empty() {
+        PolicyResult::Neutral
+    } else {
+        let first = rs[0];
+        let rest = &rs[1..];
+        assert(rs@ == seq![first] + rest@);
+        let remainder = combine_or_all(rest);
+        combine_or(first, remainder)
+    }
+}
+
+pub open spec fn require_none_multi_spec(rs: Seq<PolicyResult>) -> PolicyResult {
+    require_none_result_spec(combine_or_all_spec(rs))
+}
+
+/// Negate an OR aggregate of all `<RequireNone>` children.  The result can
+/// never grant, and any satisfied child makes the group deny.
+pub fn require_none_multi(rs: &[PolicyResult]) -> (out: PolicyResult)
+    ensures
+        out == require_none_multi_spec(rs@),
+        out != PolicyResult::Granted,
+{
+    let combined = combine_or_all(rs);
+    require_none_result(combined)
+}
+
 /// `<RequireAll>` combination.
 pub fn combine_and(a: PolicyResult, b: PolicyResult) -> (r: PolicyResult)
     ensures r == combine_and_spec(a, b)
@@ -2764,7 +3347,9 @@ pub fn combine_or(a: PolicyResult, b: PolicyResult) -> (r: PolicyResult)
 /// A `<RequireNone>` group cannot grant authorization.  A granted child
 /// becomes denied; denied/auth-required children are neutral.
 pub fn require_none_result(r: PolicyResult) -> (out: PolicyResult)
-    ensures out != PolicyResult::Granted
+    ensures
+        out == require_none_result_spec(r),
+        out != PolicyResult::Granted
 {
     match r {
         PolicyResult::Granted => PolicyResult::Denied,
@@ -3650,6 +4235,28 @@ pub fn ipv6_in_net(ip: u128, net: u128, bits: u8) -> (out: bool)
     } else {
         let mask = u128::MAX << (128 - bits);
         (ip & mask) == (net & mask)
+    }
+}
+
+
+pub open spec fn ipv4_mapped_to_v4_spec(ip: u128) -> Option<u32> {
+    if (ip >> 32) == 0xffff {
+        Some((ip & 0xffff_ffff) as u32)
+    } else {
+        None
+    }
+}
+
+/// F49/I46: canonicalize an IPv6 `::ffff:a.b.c.d` address to IPv4 before any
+/// authorization or identity decision.  IPv4-mapped peers are the same policy
+/// identity as their IPv4 form.
+pub fn ipv4_mapped_to_v4(ip: u128) -> (out: Option<u32>)
+    ensures out == ipv4_mapped_to_v4_spec(ip)
+{
+    if (ip >> 32) == 0xffff {
+        Some((ip & 0xffff_ffff) as u32)
+    } else {
+        None
     }
 }
 
@@ -4784,8 +5391,9 @@ pub proof fn h2_budget_replay_preserves_inv(
 
 /// The runtime `.htaccess` gate is the conjunction of "overrides are enabled"
 /// and "the override policy can apply to this path".  The access-file walk
-/// reads a directory only when that gate holds (plus the directory being under
-/// the walk root and an access file existing there).
+/// reads a directory only when that gate holds and an access file exists.
+/// `DocumentRoot`/the alias root is deliberately not part of this predicate:
+/// it is a URL-mapping label, not an authorization boundary (F50/I47).
 pub open spec fn htaccess_may_apply_spec(enabled: bool, applicable: bool) -> bool {
     enabled && applicable
 }
@@ -4793,24 +5401,22 @@ pub open spec fn htaccess_may_apply_spec(enabled: bool, applicable: bool) -> boo
 pub open spec fn access_file_layer_read(
     enabled: bool,
     applicable: bool,
-    under_root: bool,
     file_present: bool,
 ) -> bool {
-    enabled && applicable && under_root && file_present
+    enabled && applicable && file_present
 }
 
-/// If the prefilter says the walk cannot matter, no directory in the walk can
+/// If the prefilter says the walk cannot matter, no ancestor directory can
 /// contribute an access-file layer.  This is the `htaccess_may_apply` half of
 /// I3; the path-pattern predicate itself is supplied by the unproved matcher.
 pub proof fn htaccess_prefilter_sound(
     enabled: bool,
     applicable: bool,
-    under_root: bool,
     file_present: bool,
 )
     ensures
         !htaccess_may_apply_spec(enabled, applicable)
-            ==> !access_file_layer_read(enabled, applicable, under_root, file_present),
+            ==> !access_file_layer_read(enabled, applicable, file_present),
 {
 }
 
@@ -5023,7 +5629,6 @@ pub proof fn first_match_none_means_no_match(flags: Seq<bool>)
 pub proof fn prefilter_sound(
     override_enabled: bool,
     override_applicable: bool,
-    under_root: bool,
     file_present: bool,
     base_enable: Seq<u64>,
     base_disable: Seq<u64>,
@@ -5035,7 +5640,6 @@ pub proof fn prefilter_sound(
             ==> !access_file_layer_read(
                 override_enabled,
                 override_applicable,
-                under_root,
                 file_present,
             ))
             && ((!any_cache_prefix_matches(base_enable, path)
@@ -5049,7 +5653,6 @@ pub proof fn prefilter_sound(
     htaccess_prefilter_sound(
         override_enabled,
         override_applicable,
-        under_root,
         file_present,
     );
     if !any_cache_prefix_matches(base_enable, path)

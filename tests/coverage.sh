@@ -29,6 +29,10 @@ VAPACHED="$PWD/target/cov/release/vapached" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
     python3 tests/conformance.py
 
+VAPACHED="$PWD/target/cov/release/vapached" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+    python3 tests/adversarial_regressions.py
+
 "$LLVM_BIN/llvm-profdata" merge -sparse "$PROFILE_DIR"/*.profraw \
     -o "$PROFILE_DIR/all.profdata"
 

@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""End-to-end regressions for the pass-2/pass-3 findings (F23-F38).
+"""End-to-end regressions for the pass-2 through pass-7 findings (F23-F55).
 
-The suite starts a fresh vapached instance in a temporary tree and exercises
+The suite starts fresh vapached instances in temporary trees and exercises
 the exploit shapes from findings.md: terminal rewrite/proxy authorization,
 cache generations and CGI PATH_INFO, relative and capture-only regex aliases,
 autoindex links, negated/environment Require providers, IndexIgnore,
 DirectorySlash Off, UnsafePrefixStat re-rooting, header-selected cache
-entries, .htaccess RequestHeader, and CGI REMOTE_USER/AUTH_TYPE.
+entries, .htaccess RequestHeader, CGI REMOTE_USER/AUTH_TYPE, multi-provider
+<RequireNone>, regex alias file targets, address-bound virtual hosts,
+IPv4-mapped peer canonicalization, ancestor access files above DocumentRoot,
+overlapping alias roots, DirectoryIndex-bound cache targets, alias per-directory
+rewrite bases, SetHandler/server-status cache classification, lossless cache
+key bytes and ErrorDocument cache scoping.
 
 Usage:
     cargo build --release -p vapached
@@ -61,8 +66,210 @@ class Backend(BaseHTTPRequestHandler):
         pass
 
 
+def start_vapached(base: Path, config: str):
+    logs = base / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    logs.chmod(0o777)
+    config_path = base / "vp.conf"
+    config_path.write_text(config)
+    proc = subprocess.Popen(
+        [str(VAPACHED), "-f", str(config_path), "-DFOREGROUND"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    port = next(
+        int(line.split(":", 1)[1])
+        for line in config.splitlines()
+        if line.strip().startswith("Listen ")
+    )
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return proc, config_path
+        except OSError:
+            time.sleep(0.05)
+    output = b""
+    if proc.stdout:
+        output = proc.stdout.read()
+    raise RuntimeError(
+        f"vapached failed to start:\n{output.decode(errors='replace')}"
+    )
+
+
+def stop_vapached(proc) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+
+
+class FastCgiMock:
+    """Minimal FastCGI responder that reflects QUERY_STRING in its body."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.listener: socket.socket | None = None
+        self.stop_event = threading.Event()
+
+    @staticmethod
+    def _recv_exact(conn: socket.socket, n: int) -> bytes:
+        data = b""
+        while len(data) < n:
+            chunk = conn.recv(n - len(data))
+            if not chunk:
+                raise EOFError
+            data += chunk
+        return data
+
+    @staticmethod
+    def _record(kind: int, content: bytes) -> bytes:
+        pad = (8 - len(content) % 8) % 8
+        return (
+            struct.pack(">BBHHBB", 1, kind, 1, len(content), pad, 0)
+            + content
+            + b"\0" * pad
+        )
+
+    @staticmethod
+    def _params(data: bytes) -> dict[str, str]:
+        out: dict[str, str] = {}
+        i = 0
+        while i < len(data):
+            def length() -> int:
+                nonlocal i
+                if data[i] & 0x80:
+                    n = struct.unpack(">I", data[i : i + 4])[0] & 0x7FFFFFFF
+                    i += 4
+                    return n
+                n = data[i]
+                i += 1
+                return n
+
+            nlen = length()
+            vlen = length()
+            name = data[i : i + nlen].decode("latin-1")
+            i += nlen
+            value = data[i : i + vlen].decode("latin-1")
+            i += vlen
+            out[name] = value
+        return out
+
+    def _connection(self, conn: socket.socket) -> None:
+        params: dict[str, str] = {}
+        try:
+            while True:
+                header = self._recv_exact(conn, 8)
+                if header[0] != 1:
+                    return
+                kind = header[1]
+                n = struct.unpack(">H", header[4:6])[0]
+                pad = header[6]
+                content = self._recv_exact(conn, n + pad)[:n]
+                if kind == 4:
+                    params.update(self._params(content))
+                elif kind == 5 and not content:
+                    query = params.get("QUERY_STRING", "")
+                    payload = (
+                        "Content-Type: text/plain\r\n"
+                        "Cache-Control: max-age=600\r\n\r\n"
+                        f"SECRET-FOR-{query}\n"
+                    ).encode("latin-1")
+                    conn.sendall(
+                        self._record(6, payload)
+                        + self._record(6, b"")
+                        + self._record(3, b"\0" * 8)
+                    )
+                    params = {}
+        except EOFError:
+            pass
+        finally:
+            conn.close()
+
+    def _loop(self) -> None:
+        assert self.listener is not None
+        while not self.stop_event.is_set():
+            try:
+                conn, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._connection, args=(conn,), daemon=True).start()
+
+    def start(self) -> None:
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(self.path))
+        os.chmod(self.path, 0o777)
+        self.listener.listen(16)
+        self.listener.settimeout(0.2)
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.listener is not None:
+            try:
+                self.listener.close()
+            except OSError:
+                pass
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def raw_request(address: str, port: int, target: bytes):
+    """Send a request target with arbitrary raw bytes (http.client refuses)."""
+
+    conn = socket.create_connection((address, port), timeout=5)
+    conn.sendall(
+        b"GET " + target + b" HTTP/1.1\r\nHost: localhost\r\n"
+        b"Connection: close\r\n\r\n"
+    )
+    data = b""
+    while True:
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    conn.close()
+    head, _, body = data.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    status = int(lines[0].split()[1])
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(b":")
+        headers[name.decode("latin-1").lower()] = value.strip().decode("latin-1")
+    return status, headers, body
+
+
+def basic_auth(user: str, password: str) -> dict[str, str]:
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
 def request(port: int, path: str, headers: dict[str, str] | None = None):
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    return request_to("127.0.0.1", port, path, headers)
+
+
+def request_to(
+    address: str,
+    port: int,
+    path: str,
+    headers: dict[str, str] | None = None,
+):
+    conn = http.client.HTTPConnection(address, port, timeout=5)
     conn.request("GET", path, headers=headers or {})
     response = conn.getresponse()
     body = response.read()
@@ -96,6 +303,8 @@ class F23ToF38Tests(unittest.TestCase):
             cls.www / "public-cgi",
             cls.www / "limit-cgi",
             cls.www / "exprtest",
+            cls.www / "reqnone-main",
+            cls.www / "reqnone-ht",
             cls.logs,
             cls.cache,
             cls.base / "private" / "sub",
@@ -168,6 +377,29 @@ class F23ToF38Tests(unittest.TestCase):
         (cls.www / "exprtest" / ".htaccess").write_text(
             "Require expr \"-f '/etc/passwd'\"\n"
         )
+        # F46: multi-provider <RequireNone> must fail if any child matches.
+        (cls.www / "reqnone-main" / "wallet.dat").write_text(
+            "WALLET-REQUIRENONE-MAIN\n"
+        )
+        (cls.www / "reqnone-ht" / "wallet.dat").write_text(
+            "WALLET-REQUIRENONE-HTACCESS\n"
+        )
+        (cls.www / "reqnone-ht" / ".htaccess").write_text(
+            "<RequireAll>\n"
+            "    Require all granted\n"
+            "    <RequireNone>\n"
+            "        Require ip 10.0.0.0/8\n"
+            "        Require ip 127.0.0.0/8\n"
+            "    </RequireNone>\n"
+            "</RequireAll>\n"
+        )
+        # F47: regex alias file targets with and without a trailing slash.
+        (cls.base / "private" / "secret.cgi").write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'WALLET-REGEX-ALIAS-CGI-SECRET\\n'\n"
+        )
+        (cls.base / "private" / "secret.cgi").chmod(0o755)
         # F41: a public symlink to a script in a denied directory.
         (cls.www / "private-cgi" / "admin.cgi").write_text(
             "#!/bin/sh\n"
@@ -279,6 +511,19 @@ DirectoryIndex index.html
     DirectorySlash Off
     Require all granted
 </Directory>
+<Directory "{cls.www}/reqnone-main">
+    <RequireAll>
+        Require all granted
+        <RequireNone>
+            Require ip 10.0.0.0/8
+            Require ip 127.0.0.0/8
+        </RequireNone>
+    </RequireAll>
+</Directory>
+<Directory "{cls.www}/reqnone-ht">
+    AllowOverride AuthConfig
+    Require all granted
+</Directory>
 <Directory "{cls.base}/private">
     AllowOverride All
     Require all granted
@@ -298,6 +543,10 @@ ProxyPassMatch ^/(.*\\.php)$ "unix:{cls.base}/fcgi.sock|fcgi://localhost{cls.www
 Alias /wallet "{cls.base}/private/wallet.dat"
 Alias /run "{cls.www}/cgi/alias-run.cgi"
 ScriptAlias /exec "{cls.www}/cgi/alias-run.cgi"
+AliasMatch "^/wallet-regex$" "{cls.base}/private/wallet.dat/"
+AliasMatch "^/wallet-regex-noslash$" "{cls.base}/private/wallet.dat"
+ScriptAliasMatch "^/secret-run-regex$" "{cls.base}/private/secret.cgi/"
+ScriptAliasMatch "^/secret-run-regex-noslash$" "{cls.base}/private/secret.cgi"
 
 RewriteEngine On
 RewriteRule ^/admin-rewrite$ /front [L]
@@ -584,6 +833,31 @@ AliasMatch "^/escape(.*)$" "$1"
             self.assertNotIn(b"WALLET-PRIVATE-CGI-SECRET", body)
             self.assertNotIn(b"WALLET-PRIVATE-PHP-SECRET", body)
 
+    def test_f46_require_none_multi_provider_denies(self):
+        for path, secret in (
+            ("/reqnone-main/wallet.dat", b"WALLET-REQUIRENONE-MAIN"),
+            ("/reqnone-ht/wallet.dat", b"WALLET-REQUIRENONE-HTACCESS"),
+        ):
+            status, _, body = request(self.port, path)
+            self.assertEqual(status, 403, f"{path}: {body[:200]}")
+            self.assertNotIn(secret, body)
+
+    def test_f47_regex_alias_file_targets_read_target_htaccess(self):
+        for path in (
+            "/wallet-regex",
+            "/wallet-regex-noslash",
+        ):
+            status, _, body = request(self.port, path)
+            self.assertEqual(status, 403, f"{path}: {body[:200]}")
+            self.assertNotIn(b"WALLET-SINGLE-FILE-ALIAS-SECRET", body)
+        for path in (
+            "/secret-run-regex",
+            "/secret-run-regex-noslash",
+        ):
+            status, _, body = request(self.port, path)
+            self.assertEqual(status, 403, f"{path}: {body[:200]}")
+            self.assertNotIn(b"WALLET-REGEX-ALIAS-CGI-SECRET", body)
+
     def test_f45_expression_file_test_is_confined_to_docroot(self):
         status, _, body = request(self.port, "/exprtest/secret.txt")
         self.assertEqual(status, 403, body[:200])
@@ -596,6 +870,842 @@ AliasMatch "^/escape(.*)$" "$1"
             self.assertNotIn(b"WALLET-REWRITE-SECRET", body)
             self.assertNotIn(b"ServerRoot", body)
             self.assertNotIn(b"alice:", body)
+
+
+class F48AddressBoundVhostTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-vhost-ip-", dir="/tmp/opencode"))
+        cls.public = cls.base / "public"
+        cls.admin = cls.base / "admin"
+        cls.logs = cls.base / "logs"
+        cls.base.chmod(0o755)
+        for directory in (cls.public, cls.admin, cls.logs):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        (cls.public / "index.html").write_text("WALLET-PUBLIC\n")
+        (cls.admin / "index.html").write_text("WALLET-ADMIN-SECRET\n")
+        cls.port = free_port()
+        cls.config = cls.base / "vp.conf"
+        cls.config.write_text(
+            f"""ServerRoot "{cls.base}"
+Listen 0.0.0.0:{cls.port}
+ServerName public.local
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.public}"
+<VirtualHost 127.0.0.1:{cls.port}>
+    ServerName admin.local
+    DocumentRoot "{cls.admin}"
+</VirtualHost>
+<VirtualHost *:{cls.port}>
+    ServerName public.local
+    DocumentRoot "{cls.public}"
+</VirtualHost>
+"""
+        )
+        cls.proc = subprocess.Popen(
+            [str(VAPACHED), "-f", str(cls.config), "-DFOREGROUND"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", cls.port), timeout=0.2):
+                    return
+            except OSError:
+                time.sleep(0.05)
+        output = b""
+        if cls.proc.stdout:
+            output = cls.proc.stdout.read()
+        raise RuntimeError(f"vapached failed to start:\n{output.decode(errors='replace')}")
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "proc", None) and cls.proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(cls.proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                cls.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(cls.proc.pid), signal.SIGKILL)
+        shutil.rmtree(cls.base, ignore_errors=True)
+
+    def test_f48_loopback_vhost_is_not_reachable_on_another_address(self):
+        status, _, body = request_to(
+            "127.0.0.2", self.port, "/", {"Host": "admin.local"}
+        )
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"WALLET-PUBLIC", body)
+        self.assertNotIn(b"WALLET-ADMIN-SECRET", body)
+
+        status, _, body = request_to(
+            "127.0.0.1", self.port, "/", {"Host": "admin.local"}
+        )
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"WALLET-ADMIN-SECRET", body)
+
+    def test_f48_address_bound_vhost_precedes_wildcard_host_match(self):
+        # Apache serves the exact-address vhost on 127.0.0.1 even when Host
+        # names the wildcard vhost; the reverse address must stay public.
+        status, _, body = request_to(
+            "127.0.0.1", self.port, "/", {"Host": "public.local"}
+        )
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"WALLET-ADMIN-SECRET", body)
+
+        status, _, body = request_to(
+            "127.0.0.2", self.port, "/", {"Host": "public.local"}
+        )
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"WALLET-PUBLIC", body)
+
+
+class F49IPv4MappedPeerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        if not socket.has_ipv6:
+            raise unittest.SkipTest("IPv6 unavailable")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-ipmapped-", dir="/tmp/opencode"))
+        cls.www = cls.base / "www"
+        cls.logs = cls.base / "logs"
+        cls.base.chmod(0o755)
+        for directory in (cls.www, cls.logs):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        for name in ("deny-ip", "allow-ip", "local"):
+            (cls.www / name).write_text(f"{name}\n")
+            (cls.www / name).chmod(0o644)
+        cls.port = free_port()
+        cls.config = cls.base / "vp.conf"
+        cls.config.write_text(
+            f"""ServerRoot "{cls.base}"
+Listen [::]:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+<Directory "{cls.www}">
+    Require all granted
+</Directory>
+<Location "/deny-ip">
+    <RequireAll>
+        Require all granted
+        Require not ip 127.0.0.0/8
+    </RequireAll>
+</Location>
+<Location "/allow-ip">
+    Require ip 127.0.0.0/8
+</Location>
+<Location "/local">
+    Require local
+</Location>
+"""
+        )
+        cls.proc = subprocess.Popen(
+            [str(VAPACHED), "-f", str(cls.config), "-DFOREGROUND"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("::1", cls.port), timeout=0.2):
+                    return
+            except OSError:
+                time.sleep(0.05)
+        output = b""
+        if cls.proc.stdout:
+            output = cls.proc.stdout.read()
+        cls.tearDownClass()
+        raise unittest.SkipTest(
+            "dual-stack IPv6 listener unavailable: "
+            + output.decode(errors="replace")[-800:]
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "proc", None) and cls.proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(cls.proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                cls.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(cls.proc.pid), signal.SIGKILL)
+        if getattr(cls, "base", None):
+            shutil.rmtree(cls.base, ignore_errors=True)
+
+    def test_f49_ipv4_mapped_peer_matches_ipv4_denylist(self):
+        status, _, body = request_to("127.0.0.1", self.port, "/deny-ip")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"deny-ip", body)
+
+        status, _, body = request_to("::1", self.port, "/deny-ip")
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"deny-ip", body)
+
+    def test_f49_ipv4_mapped_peer_matches_ipv4_allowlist_and_local(self):
+        status, _, body = request_to("127.0.0.1", self.port, "/allow-ip")
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"allow-ip", body)
+
+        status, _, body = request_to("::1", self.port, "/allow-ip")
+        self.assertEqual(status, 403, body[:200])
+
+        for address in ("127.0.0.1", "::1"):
+            status, _, body = request_to(address, self.port, "/local")
+            self.assertEqual(status, 200, f"{address}: {body[:200]}")
+
+
+class F50AncestorAccessFileTests(unittest.TestCase):
+    """An access file above DocumentRoot/an alias target is still effective."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f50-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.app = cls.base / "app"
+        cls.www = cls.app / "public"
+        cls.srv = cls.base / "srv"
+        cls.cache = cls.base / "cache"
+        cls.logs = cls.base / "logs"
+        for directory in (
+            cls.www,
+            cls.www / "dir",
+            cls.www / "cgi",
+            cls.srv / "site" / "assets",
+            cls.cache,
+            cls.logs,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        (cls.app / "public" / "wallet.dat").write_text(
+            "WALLET-DOCPARENT-AUTH-SECRET\n"
+        )
+        (cls.www / "dir" / "index.html").write_text(
+            "WALLET-DOCPARENT-INDEX-SECRET\n"
+        )
+        (cls.www / "cgi" / "run.cgi").write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'WALLET-DOCPARENT-CGI-SECRET\\n'\n"
+        )
+        (cls.www / "cgi" / "run.cgi").chmod(0o755)
+        (cls.srv / "site" / "assets" / "wallet.dat").write_text(
+            "WALLET-PARENTHT-SECRET\n"
+        )
+        digest = base64.b64encode(hashlib.sha1(b"secret").digest()).decode()
+        (cls.base / ".htpasswd").write_text(f"alice:{{SHA}}{digest}\n")
+        (cls.base / ".htpasswd").chmod(0o644)
+        (cls.app / ".htaccess").write_text(
+            "AuthType Basic\n"
+            'AuthName "wallet"\n'
+            f'AuthUserFile "{cls.base}/.htpasswd"\n'
+            "Require valid-user\n"
+        )
+        (cls.srv / ".htaccess").write_text("Require all denied\n")
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+CacheRoot "{cls.cache}"
+CacheEnable disk /
+CacheHeader On
+CacheDefaultExpire 3600
+CacheMaxExpire 3600
+AddHandler cgi-script .cgi
+DirectoryIndex index.html
+<Directory "{cls.app}">
+    AllowOverride All
+    Options +ExecCGI
+</Directory>
+<Directory "{cls.srv}">
+    AllowOverride All
+</Directory>
+Alias "/site" "{cls.srv}/site"
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(cls.base, ignore_errors=True)
+
+    def test_f50_parent_basic_auth_covers_static_index_cgi_and_cache(self):
+        for path in ("/wallet.dat", "/dir/", "/cgi/run.cgi"):
+            status, _, body = request(self.port, path)
+            self.assertEqual(status, 401, f"{path}: {body[:200]}")
+            self.assertNotIn(b"WALLET-DOCPARENT", body)
+
+        creds = basic_auth("alice", "secret")
+        for path, secret in (
+            ("/wallet.dat", b"WALLET-DOCPARENT-AUTH-SECRET"),
+            ("/dir/", b"WALLET-DOCPARENT-INDEX-SECRET"),
+            ("/cgi/run.cgi", b"WALLET-DOCPARENT-CGI-SECRET"),
+        ):
+            status, _, body = request(self.port, path, creds)
+            self.assertEqual(status, 200, f"{path}: {body[:200]}")
+            self.assertIn(secret, body)
+
+        # Warm the cache with an authenticated request, then ensure an
+        # unauthenticated lookup cannot use the entry.
+        status, _, _ = request(self.port, "/wallet.dat", creds)
+        self.assertEqual(status, 200)
+        status, _, body = request(self.port, "/wallet.dat")
+        self.assertEqual(status, 401, body[:200])
+        self.assertNotIn(b"WALLET-DOCPARENT-AUTH-SECRET", body)
+
+    def test_f50_alias_target_parent_htaccess_denies(self):
+        status, _, body = request(self.port, "/site/assets/wallet.dat")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"WALLET-PARENTHT-SECRET", body)
+
+    def test_f50_explain_reports_the_parent_access_file(self):
+        result = subprocess.run(
+            [str(VAPACHED), "-f", str(self.config), "--explain", "/wallet.dat"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout[-1000:])
+        self.assertIn(str(self.app / ".htaccess"), result.stdout)
+        self.assertNotIn("no access files present", result.stdout)
+
+
+class F51OverlappingAliasAccessRootTests(unittest.TestCase):
+    """The access root is the URL-selected alias, not an earlier target."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f51-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.site = cls.base / "site"
+        cls.logs = cls.base / "logs"
+        for directory in (
+            cls.www,
+            cls.site / "assets",
+            cls.site / "cgi",
+            cls.logs,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        (cls.site / "assets" / "wallet.dat").write_text("WALLET-AUTH-SECRET\n")
+        (cls.site / "cgi" / "run.cgi").write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'WALLET-CGI-SECRET\\n'\n"
+        )
+        (cls.site / "cgi" / "run.cgi").chmod(0o755)
+        (cls.site / ".htaccess").write_text("Require all denied\n")
+        cls.port = free_port()
+        cls.port_swapped = free_port()
+        config_prefix = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{{port}}
+ServerName localhost
+PidFile "{cls.logs}/httpd-{{port}}.pid"
+ErrorLog "{cls.logs}/error-{{port}}.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+AddHandler cgi-script .cgi
+<Directory "{cls.site}">
+    AllowOverride All
+    Options +ExecCGI
+</Directory>
+"""
+        narrow_first = f"""AliasMatch "^/massets/(.*)$" "{cls.site}/assets/$1"
+Alias "/assets" "{cls.site}/assets"
+ScriptAlias "/cgia" "{cls.site}/cgi"
+Alias "/site" "{cls.site}"
+ScriptAlias "/scripts" "{cls.site}"
+"""
+        broad_first = f"""Alias "/site" "{cls.site}"
+Alias "/assets" "{cls.site}/assets"
+ScriptAlias "/scripts" "{cls.site}"
+ScriptAlias "/cgia" "{cls.site}/cgi"
+"""
+        cls.proc, cls.config = start_vapached(
+            cls.base,
+            config_prefix.format(port=cls.port) + narrow_first,
+        )
+        swapped_dir = cls.base / "swapped"
+        swapped_dir.mkdir(exist_ok=True)
+        swapped_dir.chmod(0o755)
+        cls.proc_swapped, _ = start_vapached(
+            swapped_dir,
+            config_prefix.format(port=cls.port_swapped) + broad_first,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        stop_vapached(getattr(cls, "proc_swapped", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(cls.base, ignore_errors=True)
+
+    def test_f51_overlapping_alias_reads_the_url_selected_parent_policy(self):
+        for path in (
+            "/site/assets/wallet.dat",
+            "/massets/wallet.dat",
+        ):
+            status, _, body = request(self.port, path)
+            self.assertEqual(status, 403, f"{path}: {body[:200]}")
+            self.assertNotIn(b"WALLET-AUTH-SECRET", body)
+
+        # Reordering the aliases must not change the decision.
+        status, _, body = request(self.port_swapped, "/site/assets/wallet.dat")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"WALLET-AUTH-SECRET", body)
+
+    def test_f51_overlapping_script_alias_cannot_execute_protected_cgi(self):
+        for path in ("/site/cgi/run.cgi", "/scripts/cgi/run.cgi"):
+            status, _, body = request(self.port, path)
+            self.assertEqual(status, 403, f"{path}: {body[:200]}")
+            self.assertNotIn(b"WALLET-CGI-SECRET", body)
+
+
+class F52DirectoryIndexCacheTargetTests(unittest.TestCase):
+    """Cache lookup/store must bind the selected DirectoryIndex target."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f52-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.cache = cls.base / "cache"
+        cls.logs = cls.base / "logs"
+        for directory in (
+            cls.www / "dir",
+            cls.www / "dir-cgi",
+            cls.cache,
+            cls.logs,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        (cls.www / "dir" / "index.html").write_text("WALLET-CACHED-INDEX\n")
+        (cls.www / "dir" / ".htaccess").write_text("# initially no deny\n")
+        (cls.www / "dir-cgi" / "index.cgi").write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'SECRET-FOR-%s\\n' \"$QUERY_STRING\"\n"
+        )
+        (cls.www / "dir-cgi" / "index.cgi").chmod(0o755)
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+CacheRoot "{cls.cache}"
+CacheEnable disk /
+CacheIgnoreQueryString On
+CacheIgnoreNoLastMod On
+CacheHeader On
+CacheDefaultExpire 3600
+CacheMaxExpire 3600
+AddHandler cgi-script .cgi
+DirectoryIndex index.html
+<Directory "{cls.www}">
+    AllowOverride All
+    Options +ExecCGI
+    Require all granted
+</Directory>
+<Directory "{cls.www}/dir-cgi">
+    DirectoryIndex index.cgi
+</Directory>
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(cls.base, ignore_errors=True)
+
+    def test_f52_query_strings_never_share_dynamic_index_representation(self):
+        for token in ("alpha", "beta", "gamma"):
+            status, headers, body = request(self.port, f"/dir-cgi/?token={token}")
+            self.assertEqual(status, 200, body[:200])
+            self.assertNotEqual(headers.get("X-Cache"), "HIT", body[:200])
+            self.assertIn(f"SECRET-FOR-token={token}".encode(), body)
+
+    def test_f52_live_files_deny_invalidates_cached_directory_index(self):
+        status, headers, body = request(self.port, "/dir/")
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"WALLET-CACHED-INDEX", body)
+        self.assertEqual(headers.get("X-Cache"), "MISS")
+
+        # The same selected index is reachable through the directory URL and
+        # the direct URL; both must share the index-bound cache entry.
+        status, headers, _ = request(self.port, "/dir/")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("X-Cache"), "HIT")
+
+        (self.www / "dir" / ".htaccess").write_text(
+            '<Files "index.html">\n    Require all denied\n</Files>\n'
+        )
+        for path in ("/dir/", "/dir/index.html"):
+            status, headers, body = request(self.port, path)
+            self.assertEqual(status, 403, f"{path}: {body[:200]}")
+            self.assertNotEqual(headers.get("X-Cache"), "HIT", path)
+            self.assertNotIn(b"WALLET-CACHED-INDEX", body)
+
+
+class F53AliasRewriteBaseTests(unittest.TestCase):
+    """Per-directory RewriteRule bases follow the URL mount, not the alias target."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f53-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.site = cls.base / "site"
+        cls.logs = cls.base / "logs"
+        for directory in (
+            cls.www,
+            cls.site / "private",
+            cls.site / "nested",
+            cls.site / "gone",
+            cls.site / "env",
+            cls.site / "moved",
+            cls.site / "cgi",
+            cls.logs,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        (cls.site / "private" / "wallet.dat").write_text(
+            "WALLET-F53-STATIC-SECRET\n"
+        )
+        (cls.site / "nested" / "secret.txt").write_text(
+            "WALLET-F53-NESTED-SECRET\n"
+        )
+        (cls.site / "gone" / "secret.txt").write_text("WALLET-F53-GONE\n")
+        (cls.site / "moved" / "file.txt").write_text("WALLET-F53-MOVED\n")
+        (cls.site / "env" / "show.cgi").write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'F53_ENV=%s\\n' \"${F53_ENV:-missing}\"\n"
+        )
+        (cls.site / "env" / "show.cgi").chmod(0o755)
+        (cls.site / "cgi" / "run.cgi").write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'WALLET-F53-CGI-SECRET\\n'\n"
+        )
+        (cls.site / "cgi" / "run.cgi").chmod(0o755)
+        (cls.site / ".htaccess").write_text(
+            "RewriteEngine On\n"
+            "RewriteBase /site/\n"
+            "RewriteRule ^private/ - [F,L]\n"
+            "RewriteRule ^gone/ - [G,L]\n"
+            "RewriteRule ^env/show\\.cgi$ - [E=F53_ENV:yes,L]\n"
+            "RewriteRule ^redirect/(.*)$ /site/moved/$1 [R=302,L]\n"
+        )
+        (cls.site / "nested" / ".htaccess").write_text(
+            "RewriteEngine On\nRewriteRule ^secret\\.txt$ - [F,L]\n"
+        )
+        (cls.site / "cgi" / ".htaccess").write_text(
+            "RewriteEngine On\nRewriteRule ^run\\.cgi$ - [F,L]\n"
+        )
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+AddHandler cgi-script .cgi
+<Directory "{cls.site}">
+    AllowOverride All
+    Options +ExecCGI
+    Require all granted
+</Directory>
+Alias /site "{cls.site}"
+AliasMatch "^/m/(.*)$" "{cls.site}/$1"
+ScriptAlias /cgi "{cls.site}/cgi"
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def test_root_rewrite_base_blocks_files_alias_forms(self):
+        for path in ("/site/private/wallet.dat", "/m/private/wallet.dat"):
+            status, _, body = request(self.port, path)
+            self.assertEqual(status, 403, f"{path}: {body[:200]}")
+            self.assertNotIn(b"WALLET-P7", body)
+            self.assertNotIn(b"WALLET-F53", body)
+
+    def test_nested_rewrite_base_under_alias(self):
+        status, _, body = request(self.port, "/site/nested/secret.dat")
+        self.assertEqual(status, 404, body[:200])
+
+        status, _, body = request(self.port, "/site/nested/secret.txt")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"WALLET-F53-NESTED-SECRET", body)
+
+    def test_script_alias_anchored_deny_blocks_execution(self):
+        status, _, body = request(self.port, "/cgi/run.cgi")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"WALLET-F53-CGI-SECRET", body)
+
+    def test_rewrite_gone_flag_uses_the_alias_base(self):
+        status, _, body = request(self.port, "/site/gone/secret.txt")
+        self.assertEqual(status, 410, body[:200])
+        self.assertNotIn(b"WALLET-F53-GONE", body)
+
+    def test_rewrite_environment_and_redirect_use_the_alias_base(self):
+        status, _, body = request(self.port, "/site/env/show.cgi")
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"F53_ENV=yes", body)
+
+        status, headers, _ = request(self.port, "/site/redirect/file.txt")
+        self.assertEqual(status, 302)
+        self.assertTrue(
+            headers.get("Location", "").endswith("/site/moved/file.txt"),
+            headers.get("Location"),
+        )
+
+
+class F54SetHandlerCacheTests(unittest.TestCase):
+    """SetHandler proxy/server-status targets are dynamic for cache queries."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f54-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.cache = cls.base / "cache"
+        cls.logs = cls.base / "logs"
+        for directory in (cls.www / "dir", cls.cache, cls.logs):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        (cls.www / "direct.php").write_text("not executed locally\n")
+        (cls.www / "dir" / "index.php").write_text("not executed locally\n")
+        cls.mock = FastCgiMock(cls.base / "fcgi.sock")
+        cls.mock.start()
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+CacheRoot "{cls.cache}"
+CacheEnable disk /
+CacheIgnoreQueryString On
+CacheIgnoreNoLastMod On
+CacheHeader On
+CacheDefaultExpire 3600
+CacheMaxExpire 3600
+DirectoryIndex index.php
+<FilesMatch \\.php$>
+    SetHandler "proxy:unix:{cls.base}/fcgi.sock|fcgi://localhost"
+</FilesMatch>
+<Location "/status">
+    SetHandler server-status
+</Location>
+<Directory "{cls.www}">
+    Require all granted
+</Directory>
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "mock", None):
+            cls.mock.stop()
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def test_set_handler_direct_and_index_each_keep_query(self):
+        for path in ("/direct.php", "/dir/"):
+            for token in ("alpha", "beta", "gamma"):
+                status, headers, body = request(
+                    self.port, f"{path}?token={token}"
+                )
+                self.assertEqual(status, 200, body[:200])
+                self.assertNotEqual(headers.get("X-Cache"), "HIT", body[:200])
+                self.assertIn(f"SECRET-FOR-token={token}".encode(), body)
+
+    def test_server_status_handler_is_not_query_merged(self):
+        status, headers, body = request(self.port, "/status?auto")
+        self.assertEqual(status, 200, body[:200])
+        self.assertNotEqual(headers.get("X-Cache"), "HIT")
+        self.assertIn(b"Total Accesses", body)
+
+
+class F55CacheKeyBytesTests(unittest.TestCase):
+    """Invalid-byte keys never collide with the clean URL or another query."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f55-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.cache = cls.base / "cache"
+        cls.logs = cls.base / "logs"
+        for directory in (cls.www, cls.cache, cls.logs):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        (cls.www / "index.php").write_text("not executed locally\n")
+        cls.mock = FastCgiMock(cls.base / "fcgi.sock")
+        cls.mock.start()
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+CacheRoot "{cls.cache}"
+CacheEnable disk /
+CacheIgnoreNoLastMod On
+CacheHeader On
+CacheDefaultExpire 3600
+CacheMaxExpire 3600
+<FilesMatch \\.php$>
+    SetHandler "proxy:unix:{cls.base}/fcgi.sock|fcgi://localhost"
+</FilesMatch>
+<Directory "{cls.www}">
+    Require all granted
+</Directory>
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "mock", None):
+            cls.mock.stop()
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def test_invalid_query_does_not_poison_the_clean_url(self):
+        status, headers, body = raw_request(
+            "127.0.0.1", self.port, b"/index.php?\xffPOISON"
+        )
+        self.assertEqual(status, 200, body[:200])
+        self.assertNotEqual(headers.get("x-cache"), "HIT")
+        self.assertIn(b"POISON", body)
+
+        for attempt in range(2):
+            status, headers, body = raw_request(
+                "127.0.0.1", self.port, b"/index.php"
+            )
+            self.assertEqual(status, 200, body[:200])
+            if attempt == 0:
+                self.assertNotEqual(headers.get("x-cache"), "HIT")
+            self.assertNotIn(b"POISON", body)
+
+        status, headers, body = request(self.port, "/index.php?normal")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("X-Cache"), "MISS")
+        status, headers, body = request(self.port, "/index.php?normal")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("X-Cache"), "HIT")
+        self.assertIn(b"normal", body)
+
+
+class F56ErrorDocumentCacheTests(unittest.TestCase):
+    """A local ErrorDocument subrequest is never cached under the missing URL."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f56-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.cache = cls.base / "cache"
+        cls.logs = cls.base / "logs"
+        for directory in (cls.www, cls.cache, cls.logs):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        (cls.www / "err.php").write_text("not executed locally\n")
+        cls.mock = FastCgiMock(cls.base / "fcgi.sock")
+        cls.mock.start()
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+CacheRoot "{cls.cache}"
+CacheEnable disk /
+CacheIgnoreQueryString On
+CacheIgnoreNoLastMod On
+CacheHeader On
+CacheDefaultExpire 3600
+CacheMaxExpire 3600
+ErrorDocument 404 /err.php
+<FilesMatch \\.php$>
+    SetHandler "proxy:unix:{cls.base}/fcgi.sock|fcgi://localhost"
+</FilesMatch>
+<Directory "{cls.www}">
+    Require all granted
+</Directory>
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "mock", None):
+            cls.mock.stop()
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def test_error_document_query_does_not_poison_missing_url(self):
+        status, headers, body = request(self.port, "/missing?attack=POISON")
+        self.assertIn(b"SECRET-FOR-attack=POISON", body)
+        self.assertNotEqual(headers.get("X-Cache"), "HIT")
+
+        status, headers, body = request(self.port, "/missing")
+        self.assertNotEqual(headers.get("X-Cache"), "HIT")
+        self.assertNotIn(b"POISON", body)
 
 
 if __name__ == "__main__":

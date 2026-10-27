@@ -509,7 +509,7 @@ impl Expr {
                     s.is_empty()
                 })
             }
-            Expr::IfFile(path) => Value::Bool(std::fs::symlink_metadata(path).is_ok()),
+            Expr::IfFile(path) => Value::Bool(crate::files::symlink_metadata_cached(std::path::Path::new(path)).is_ok()),
             Expr::FileTest(op, e) => {
                 let raw = e.eval(ctx)?.string();
                 // File tests are a metadata oracle too.  Use the same

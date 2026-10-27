@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "updated": "2026-10-25",
+  "updated": "2026-10-26",
   "verus": {
-    "verified_functions": 227,
+    "verified_functions": 264,
     "errors": 0
   },
   "obligations": [
@@ -25,7 +25,7 @@
       "title": "per-directory Directory; access-file interleaving",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "verified plan and collect_layers classifier; alias targets walk to the alias root instead of stopping at DocumentRoot; parser-to-AccessLayer refinement is assumed"
+      "evidence": "verified plan and collect_layers classifier; the access walk covers every ancestor whose effective AllowOverride permits a layer and is not bounded by DocumentRoot or an alias target (access_walk_dir_admit, I47); parser-to-AccessLayer refinement is assumed"
     },
     {
       "id": "require_eval_sound",
@@ -109,7 +109,7 @@
       "title": "Reload advances a cache generation and stale entries are never served",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "cache_lookup_admit binds generation_match, disk metadata records the epoch, reload clears memory/disk and bumps the epoch, and PATH_INFO keys resolve to the actual CGI script; admission is verified, reload orchestration is not"
+      "evidence": "cache_lookup_admit binds key/policy/Vary/generation/freshness; cache_lookup_hit_requires_binding and cache_lookup_rejects_stale mechanize the consequences; disk metadata records the epoch, reload clears memory/disk and bumps the epoch, and PATH_INFO keys resolve to the actual CGI script; expiry uses verified saturating cache_expiry so positive TTLs cannot wrap into the past; admission is verified, reload orchestration is not"
     },
     {
       "id": "resolve_root_identity",
@@ -172,7 +172,7 @@
       "title": "Cache keys bind request inputs that select authorization branches",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "cache_policy_material destructures Scope and hashes every policy slice (rewrite maps canonicalized); cache_policy_fingerprint also binds all request headers, peer, method and target; the unit matrix mutates every policy field plus listener/vhost/URL/query/target/header dimensions, and F34 replay verifies tenant beta cannot receive tenant alpha's entry"
+      "evidence": "cache_policy_material destructures Scope and hashes every policy slice (rewrite maps canonicalized); cache_policy_fingerprint frames each exact field with the verified injective cache_fingerprint_field and uses a 256-bit SHA-256 digest instead of the old 64-bit DefaultHasher; the digest also binds all request headers, peer, method and target and is stored base64 in V3 metadata. The unit matrix mutates every policy field plus listener/vhost/URL/query/target/header dimensions, and F34 replay verifies header partitioning"
     },
     {
       "id": "proxy_serialization_safety",
@@ -228,14 +228,98 @@
       "title": "Disk cache has a total quota, entry cap and expiry cleanup",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "persisted bytes are tracked per cache root, CacheMaxDiskSize and MAX_DISK_ENTRIES are enforced by evicting the oldest stems, oversized entries are refused, expired/old-generation files are deleted on load, per-key variants are capped, and CacheIgnoreQueryString bypasses dynamic CGI/FastCGI/proxy targets; cache_disk_size_admit is mechanized and unit cases cover eviction, oversize refusal, expiry deletion and dynamic query bypass"
+      "evidence": "cache_disk_projected and cache_disk_evict mechanize replacement projection and monotone eviction; persisted bytes are tracked per cache root, CacheMaxDiskSize and MAX_DISK_ENTRIES are enforced by evicting the oldest stems, oversized entries are refused, expired/old-generation files are deleted on load, per-key variants are capped, and CacheIgnoreQueryString bypasses dynamic CGI/FastCGI/proxy targets"
     },
     {
       "id": "expr_file_test_confined",
       "title": "Expression file tests use the document-root confinement",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "Expr::FileTest consumes confined_expr_path for -f/-d/-e/-s/-F/-U, rejecting absolute, parent-relative and escaping-symlink arguments; main-config <IfFile> uses a separate operator-supplied Expr::IfFile; expr_file_test_admit is mechanized and unit cases cover absolute paths and an escaping symlink"
+      "evidence": "Expr::FileTest consumes confined_expr_path for -f/-d/-e/-s/-F/-U, rejecting absolute, parent-relative and escaping-symlink arguments; main-config <IfFile> uses a separate operator-supplied Expr::IfFile; expr_file_test_admit is mechanized and unit cases cover absolute paths and an escaping symlink; rewrite condition -f/-d/-s/-l tests now also canonicalize the probed path and consume path_under_base so an in-root symlink cannot probe outside the document/alias root"
+    },
+    {
+      "id": "require_none_multi",
+      "title": "RequireNone fails when any child provider is satisfied",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "combine_or_all and require_none_multi aggregate every child as an OR of positive hits before negation, so a granted child cannot be neutralized by a denied sibling; access.rs consumes require_none_multi and require_none_multi_result is the mechanized disposition predicate; main-config, .htaccess, unit and generated Apache differential cases cover two-provider and three-provider block lists"
+    },
+    {
+      "id": "regex_alias_file_target",
+      "title": "Regex alias file targets use parent plus basename and the parent access root",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "map_path splits a regex alias target that resolves to a regular file into parent plus basename with or without a trailing slash in the replacement; the URL/base root uses the file parent via alias_access_root_admit for regex and prefix aliases alike, while ancestor authorization follows I47 independently of that root; unit plus F47 replays cover AliasMatch/ScriptAliasMatch static and CGI targets"
+    },
+    {
+      "id": "vhost_local_address",
+      "title": "Virtual-host selection is bound to destination address and port",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Config::select_vhost consumes vhost_address_admit and vhost_address_precedence with the destination address; address-bound vhosts are ineligible on another address and exact-address vhosts precede wildcard vhosts; HTTP/1.1, HTTP/2, WebSocket, cache and logging pass the local address, TLS filters vhosts when the listener has a concrete address, and unit plus F48 replays cover both loopback addresses"
+    },
+    {
+      "id": "canonical_peer",
+      "title": "Authorization consumes a canonical IPv4/IPv6 peer identity",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "ipv4_mapped_to_v4 is the verified conversion consumed by access::canonical_ip; the accept boundary and RemoteIP path canonicalize before request context construction, and ip_in_net, Require local, logs, cache and CGI identities use the canonical peer; unit plus dual-stack F49 replays cover mapped deny, allow and local cases"
+    },
+    {
+      "id": "access_walk_domain",
+      "title": "Access-file walk covers every applicable ancestor",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "access_walk_dir_admit states that each ancestor participates when its effective AllowOverride policy permits a layer; collect_layers/apply_req_deferred walk filesystem ancestors without a DocumentRoot or alias-root lower bound, and access_file_layer_read no longer contains an under_root conjunct; unit plus F50 replays cover DocumentRoot parent Basic auth/deny, directory index, CGI, cache lookup and alias-target parents"
+    },
+    {
+      "id": "alias_mapping_root",
+      "title": "Mapping root comes from URL-selected alias",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "alias_mapping_root_admit states that a root inferred from alias-target containment is never admitted; map_path returns the URL-selected root and dispatch, cache, rewrite reauthorization and --explain pass it to the access walk for RewriteBase/URL-base derivation only; unit plus F51 replays cover overlapping prefix/regex Alias, ScriptAlias and both alias orders"
+    },
+    {
+      "id": "directory_index_cache_target",
+      "title": "DirectoryIndex cache key and policy bind the selected target",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "cache_directory_index_bind_admit requires an index-selected directory cache entry to bind both key and policy to the index; cache_ignore_query_admit forbids merging dynamic index/script representations across queries; request_scope resolves DirectoryIndex, re-evaluates the index scope and binds the opened index target before lookup/store; unit plus F52 replays cover cross-query CGI indexes and live <Files> denies for directory and direct index URLs"
+    },
+    {
+      "id": "htaccess_rewrite_subject_base",
+      "title": "Per-directory rewrite base follows the URL mount",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "htaccess_layer_url_base_admit requires every access-file layer to derive its match base from the requested URL and its depth below the requested target; collect_layers, apply_req_deferred and --explain no longer use an alias-target-relative base. Unit plus F53 replays cover prefix Alias, AliasMatch, ScriptAlias, nested .htaccess, explicit RewriteBase and [F]/[G]/[E]/[R] effects"
+    },
+    {
+      "id": "dynamic_handler_cache_classification",
+      "title": "Every non-default handler is dynamic for cache-query isolation",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "cache_dynamic_handler_admit states that a dynamic handler requires a cache bypass; request_scope classifies the effective handler after DirectoryIndex resolution, covering SetHandler proxy:fcgi (direct and index), cgi-script, server-status and future non-default handlers in addition to ProxyPass routes. Unit plus F54 fastcgi-mock replays cover direct and index queries"
+    },
+    {
+      "id": "cache_key_byte_identity",
+      "title": "Cache key material is injective over raw bytes",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "cache_key_hex is refined to cache_key_hex_spec and proved length-preserving and injective (cache_key_hex_spec_injective, hex_byte_spec_injective); base_key hex-encodes server root, host, path, raw query and resolved target bytes, non-UTF-8 URL paths bypass the shared cache, invalid index names are rejected, and invalidation uses the same encoding. Unit plus F55 raw-socket replays cover invalid query bytes versus empty and replacement-byte queries"
+    },
+    {
+      "id": "error_document_cache_scope",
+      "title": "Local ErrorDocument subrequests are excluded from the original URL cache",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "cache_local_error_document_admit excludes a missing target that can select a local ErrorDocument from lookup/store and refuses to store any response produced by an ErrorDocument internal subrequest (response-provenance marker); existing targets retain normal cache behavior. Unit plus F56 fastcgi-mock replays cover query-dependent local error documents without regressing the Apache cache conformance cases"
+    },
+    {
+      "id": "cache_store_admission",
+      "title": "Only bodyless credential-free GETs with safe response shape enter the cache",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "cache_store_request_admit, cache_store_status_admit, cache_store_control_admit, cache_store_shape_admit and cache_store_ttl_admit mechanize the runtime store gates for method/body/credentials, cacheable statuses, Cache-Control overrides, Set-Cookie/Vary:*/size and positive freshness; cache_ttl_clamp returns zero for reversed CacheMinExpire/CacheMaxExpire instead of panicking. Unit matrix plus conformance cache cases exercise each branch"
     }
   ],
   "minimum_weighted_score": 3.5,
@@ -270,7 +354,7 @@
   },
   "adversarial": {
     "conformance": 165,
-    "semantics": 194,
+    "semantics": 204,
     "random": 300,
     "cve_replay_cases": 29,
     "unexplained_replay_failures": 0,
@@ -333,6 +417,10 @@
     "Capture-only regex alias base rejection",
     "Exclusive private spool-file creation",
     "Disk-cache total quota, entry cap and expiry cleanup",
-    "Expression file-test document-root confinement"
+    "Expression file-test document-root confinement",
+    "Multi-provider RequireNone OR-of-hits aggregation and non-granting negation",
+    "Regex alias file-target split and parent access root",
+    "Destination-address virtual-host eligibility and exact-address precedence",
+    "IPv4-mapped IPv6 peer canonicalization for authorization and identity"
   ]
 }

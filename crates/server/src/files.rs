@@ -12,6 +12,7 @@ use crate::util::{html_escape, http_date, parse_http_date};
 use crate::verified::{parse_byte_range, RangeDecision};
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt::Write as _;
 use std::fs::{File, Metadata};
@@ -128,6 +129,68 @@ thread_local! {
     /// each connection thread serves a small set of roots (vhosts/aliases).
     static ROOT_FDS: RefCell<Vec<(PathBuf, Arc<File>)>> =
         const { RefCell::new(Vec::new()) };
+
+    /// Per-request metadata memoization.  Dispatch, policy construction and
+    /// handler selection repeatedly ask the same question (is this path a
+    /// directory, does this access file exist, what is its mtime?).  The cache
+    /// is active only inside one outer request and is cleared by a drop guard;
+    /// direct library calls outside dispatch always see fresh metadata.
+    static REQUEST_METADATA: RefCell<Option<HashMap<PathBuf, Metadata>>> =
+        const { RefCell::new(None) };
+    static REQUEST_SYMLINK_METADATA: RefCell<Option<HashMap<PathBuf, Metadata>>> =
+        const { RefCell::new(None) };
+}
+
+pub(crate) struct RequestMetadataGuard;
+
+impl Drop for RequestMetadataGuard {
+    fn drop(&mut self) {
+        REQUEST_METADATA.with(|cache| *cache.borrow_mut() = None);
+        REQUEST_SYMLINK_METADATA.with(|cache| *cache.borrow_mut() = None);
+    }
+}
+
+pub(crate) fn request_metadata_scope() -> RequestMetadataGuard {
+    REQUEST_METADATA.with(|cache| *cache.borrow_mut() = Some(HashMap::new()));
+    REQUEST_SYMLINK_METADATA.with(|cache| *cache.borrow_mut() = Some(HashMap::new()));
+    RequestMetadataGuard
+}
+
+/// `fs::metadata` with per-request memoization.  Only successful results are
+/// cached; an error is re-probed so fail-closed error handling is unchanged.
+pub(crate) fn metadata_cached(path: &Path) -> io::Result<Metadata> {
+    REQUEST_METADATA.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(map) = cache.as_mut() {
+            if let Some(meta) = map.get(path) {
+                return Ok(meta.clone());
+            }
+            let meta = std::fs::metadata(path)?;
+            map.insert(path.to_path_buf(), meta.clone());
+            return Ok(meta);
+        }
+        std::fs::metadata(path)
+    })
+}
+
+/// `fs::symlink_metadata` with per-request memoization, used by `<IfFile>`.
+pub(crate) fn symlink_metadata_cached(path: &Path) -> io::Result<Metadata> {
+    REQUEST_SYMLINK_METADATA.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(map) = cache.as_mut() {
+            if let Some(meta) = map.get(path) {
+                return Ok(meta.clone());
+            }
+            let meta = std::fs::symlink_metadata(path)?;
+            map.insert(path.to_path_buf(), meta.clone());
+            return Ok(meta);
+        }
+        std::fs::symlink_metadata(path)
+    })
+}
+
+pub(crate) fn is_dir_cached(path: &Path) -> bool {
+    metadata_cached(path).map(|meta| meta.is_dir()).unwrap_or(false)
 }
 
 fn root_file(root: &Path) -> io::Result<Arc<File>> {
@@ -569,6 +632,36 @@ fn directory_action(
     DirAction::Forbidden
 }
 
+/// The configured directory index selected for a directory target, including
+/// the opened file descriptor and metadata.  Cache authorization uses this to
+/// bind its key/policy fingerprint to the actual index target (F52) before the
+/// internal subrequest runs.
+pub struct DirectoryIndex {
+    pub name: Vec<u8>,
+    pub file: File,
+    pub meta: Metadata,
+}
+
+pub fn directory_index_target(
+    cfg: &Config,
+    scope: &Scope,
+    req: &Request,
+    dir: &File,
+    url_path: &str,
+    raw_path: &[u8],
+) -> Option<DirectoryIndex> {
+    let follow = scope
+        .effective_options()
+        .contains(crate::config::Options::FOLLOW_SYMLINKS)
+        || scope
+            .effective_options()
+            .contains(crate::config::Options::SYMLINKS_IF_OWNER_MATCH);
+    match directory_action(cfg, scope, req, dir, url_path, raw_path, follow) {
+        DirAction::Index(file, meta, name) => Some(DirectoryIndex { name, file, meta }),
+        _ => None,
+    }
+}
+
 /// Return the configured directory index filename when the directory should
 /// serve one.  The caller is expected to perform an internal subrequest so
 /// handlers (CGI, FastCGI, filters) run exactly as for a direct request.
@@ -580,16 +673,7 @@ pub fn directory_index_name(
     url_path: &str,
     raw_path: &[u8],
 ) -> Option<Vec<u8>> {
-    let follow = scope
-        .effective_options()
-        .contains(crate::config::Options::FOLLOW_SYMLINKS)
-        || scope
-            .effective_options()
-            .contains(crate::config::Options::SYMLINKS_IF_OWNER_MATCH);
-    match directory_action(cfg, scope, req, dir, url_path, raw_path, follow) {
-        DirAction::Index(_, _, name) => Some(name),
-        _ => None,
-    }
+    directory_index_target(cfg, scope, req, dir, url_path, raw_path).map(|target| target.name)
 }
 
 /// Serve a directory target (index file, autoindex or redirect).
@@ -889,6 +973,19 @@ fn error_message(status: u16, url: &str) -> String {
 
 thread_local! {
     static IN_ERROR_DOCUMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set for the duration of one outer request when the returned response
+    /// was produced by a local `ErrorDocument` internal subrequest.  The cache
+    /// uses this provenance marker to avoid storing the error body under the
+    /// URL that failed (F56/I52).
+    static LOCAL_ERROR_DOCUMENT_RESPONSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn reset_local_error_document_response() {
+    LOCAL_ERROR_DOCUMENT_RESPONSE.with(|active| active.set(false));
+}
+
+pub(crate) fn local_error_document_response() -> bool {
+    LOCAL_ERROR_DOCUMENT_RESPONSE.with(|active| active.get())
 }
 
 fn serve_error_document(
@@ -918,6 +1015,7 @@ fn serve_error_document(
     if response.status >= 300 {
         return None;
     }
+    LOCAL_ERROR_DOCUMENT_RESPONSE.with(|active| active.set(true));
     let mut response = response;
     response.status = status;
     Some(response)

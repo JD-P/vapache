@@ -81,7 +81,7 @@ pub fn effective_scope_with_layers(
         &mut config_conditionals,
     );
     let root = cfg.documentation_root_for(vhost);
-    let start = if fs_path.is_dir() {
+    let start = if crate::files::is_dir_cached(fs_path) {
         fs_path
     } else {
         fs_path.parent().unwrap_or(fs_path)

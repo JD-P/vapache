@@ -193,7 +193,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **227 verified functions, 0 errors** (percent-decoding,
+Current result: **238 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -207,7 +207,9 @@ guard, directive disposition, access-layer slot translation, config front-end
 line-kind IR and section-context transitions, rewrite backreference encoding
 and filesystem-target admission, and the configuration access-plan,
 authorization-merge, Options-merge and `.htaccess` rule-classification kernels
-used by the dispatcher).
+used by the dispatcher, plus the pass-6 ancestor access-walk, URL-selected
+alias mapping-root and `DirectoryIndex` cache-target/query-isolation
+predicates).
 
 Function count is not the progress metric. The verification ledger tracks
 security obligations and proof debt:
@@ -217,17 +219,23 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus   # include the Verus gate
 ```
 
-Current ledger: **50.0% weighted obligations**, **6/6 proof debt**,
-**8/8 grant-required sinks**, **4/8 inode-bound sinks**, **3/8
-backend-target-bound sinks**, **3/8 policy-key-bound sinks**, **0 partially
-bound sinks**, **0 unexplained replay failures**, and **29 adversarial replay
-cases** covering the findings classes, and **227 Verus functions with 0
-errors** (including the I3 fast-path prefilter, I14 first-match, and the
-pass-4 I35–I42 alias/limit/CGI/spool/cache/expression dispositions).
+Current ledger: **51.1% weighted obligations**, **6/6 proof debt**,
+**8/8 grant-required sinks**, **8/8 path-target-bound sinks**, **4/8
+inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
+policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
+failures**, **45 adversarial replay cases** covering the findings classes,
+and **264 Verus functions with 0 errors** (including the I3 fast-path
+prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
+expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
+kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, and
+the pass-7 I50–I53 URL-mounted rewrite-base/cache-key-byte/ErrorDocument/
+dynamic-handler kernels, and the strengthened cache-key injectivity, lookup,
+store-admission, freshness, disk-accounting and SHA-256 policy-binding proofs
+for I51/I54).
 
 The ledger lives in `docs/verification-status.json`. It records:
 
-- weighted progress on the thirty-three proof obligations,
+- weighted progress on the forty-five proof obligations,
 - named unverified security components,
 - sinks that need stronger resource binding,
 - explicit assumptions and unmodeled directive classes,
@@ -243,7 +251,7 @@ requiring a grant. Raising a budget is a deliberate, reviewable change.
 ```sh
 cargo test --workspace          # Rust unit tests
 python3 tests/conformance.py    # 165 Apache differential/conformance tests
-python3 tests/adversarial_regressions.py  # F23-F38 end-to-end replay suite
+python3 tests/adversarial_regressions.py  # F23-F56 end-to-end replay suite
 ```
 
 The conformance suite starts a real Apache `httpd` and `vapached` with
@@ -255,7 +263,7 @@ compares status codes, selected headers and bodies.
 Security-sensitive configuration semantics are checked separately:
 
 ```sh
-python3 tests/config_semantics.py  # 194 generated differential cases
+python3 tests/config_semantics.py  # 205 generated differential cases
 python3 tests/config_semantics.py --random 300 --seed 7  # deterministic randomized matrix
 python3 tests/config_validity.py  # context acceptance matrix (Apache -t vs vapached -t)
 python3 tests/config_grammar.py   # finite valid/invalid grammar matrix
@@ -323,21 +331,22 @@ python3 tests/security_coverage.py --check
 ```
 
 `security_coverage.py` reports production-line coverage before each file's
-test module for the unproven security-critical surfaces. CGI, configuration
-parsing, the expression engine, FastCGI, `.htaccess`, HTTP/1.1, the HTTP proxy,
-rewrite execution and TLS are enforced at 100%; the remaining modules are
-tracked so they can be promoted one at a time.
+test module for the unproven security-critical surfaces. Access control, CGI,
+configuration parsing, the expression engine, FastCGI, `.htaccess`, HTTP/1.1,
+the HTTP proxy, request dispatch/server, rewrite execution and TLS are enforced
+at 100%; the remaining modules are tracked so they can be promoted one at a
+time.
 
-Latest snapshot (`coverage/SUMMARY.md`): **92.0% lines**, **88.2% of
-functions** across the Rust and conformance suites. The current suite is 337
-Rust library tests, 4 CLI tests, 165 conformance tests and the generated
-configuration matrices. Authentication is at 91.8% line coverage, TLS/HTTP/2 at
-97.7%/81.8%, access logging at 84.5%, the verified security kernels at 87.0%,
-compression at 90.0%, FastCGI at 98.8%, the HTTP proxy at 100%, rewrite
-execution at 98.7%, cache at 88.9%, OCSP at 80.8%, and the request-parsing and
-file-serving modules at 93.5%/81.4%. CLI lifecycle, HTTP/2 error branches,
-OCSP error-cache policies, `dbm`/`DPI` edge cases and exotic balancer policies
-remain the next coverage targets.
+Latest snapshot: **94.0% regions**, **90.0% of functions** and **94.8% of
+lines** across the Rust, conformance and adversarial replay suites. The current
+suite is 366 Rust library tests, 4 CLI tests, 165 conformance tests, 205
+generated configuration cases and 45 adversarial replay tests. Authentication
+is at 91.8% line coverage, TLS/HTTP/2 at 97.9%/81.6%, access logging at 84.7%,
+the verified security kernels at 88.1%, compression at 90.0%, FastCGI at 98.9%,
+the HTTP proxy at 97.8%, rewrite execution at 98.7%, cache at 91.1%, OCSP at
+80.8%, and the request-parsing and file-serving modules at 94.0%/83.6%.
+CLI lifecycle, HTTP/2 error branches, OCSP error-cache policies, `dbm`/`DPI`
+edge cases and exotic balancer policies remain the next coverage targets.
 
 Known, deliberate divergences from Apache (reported by the differential run):
 
@@ -361,20 +370,23 @@ python3 bench/bench.py           # 3s samples
 `wrk` is used when available (HTTP/1.1, reliable keep-alive under load) with
 `ab` as a fallback. Both servers use identical configurations and access logs
 are written to `/dev/null` so the harness does not fill `/tmp`. Results are
-appended to `bench/RESULTS.md`. Latest full run (2026-10-24, 3s samples, median of three,
+appended to `bench/RESULTS.md`. Latest full run (2026-10-27, 3s samples, median of three,
 100 connections for small files and 20 for the 1 MB case):
 
 | scenario | Apache req/s | vapache req/s | ratio |
 |---|---:|---:|---:|
-| index.html | 101,155 | 216,600 | 2.14x |
-| hello.txt (1.1 KB) | 95,172 | 193,079 | 2.03x |
-| 10 KB file | 87,488 | 171,844 | 1.96x |
-| 1 MB file | 8,785 | 11,677 | 1.34x |
+| index.html | 92,792 | 205,324 | 2.21x |
+| hello.txt (1.1 KB) | 96,773 | 188,648 | 1.95x |
+| 10 KB file | 89,396 | 154,126 | 1.72x |
+| 1 MB file | 8,850 | 12,388 | 1.40x |
 
-The run recorded 2–27 Apache-side keep-alive read errors (out of ~20,000
+The run recorded 13–22 Apache-side keep-alive read errors (out of ~20,000
 requests), which lower Apache's measured rate and make these ratios
-conservative. Absolute rates vary with host load; recent full runs put the
-small-file ratio around 1.96–2.14x and the 1 MB scenario around 1.34–1.38x.
+conservative. This run was taken during elevated host load, so absolute rates
+are lower than the earlier snapshot while the server-to-server ratios remain
+in the usual range. Recent full runs put the index/hello ratio around
+1.95–2.21x, the 10 KB case around 1.72–1.96x and the 1 MB scenario around
+1.34–1.40x.
 Recent hot-path work caches the `Date` header and document-root descriptors,
 coalesces small response bodies, and reduces per-request allocation in MIME
 and access-log formatting. The latest policy migration also caches
@@ -385,20 +397,45 @@ literal `<Directory>` rules, and avoids per-request ancestor sorting.
 against the richer conformance configuration: static and large-file serving,
 conditional/range requests, directory handling, access policies, Basic auth,
 rewrites, `.htaccess`, CGI, proxy authorization, internal
-`DirectoryIndex`/`ErrorDocument` handler dispatch, HTTPS/1.1 and HTTP/2. New
-access-policy scenarios cover `<Limit>`/`<LimitExcept>`, `Satisfy`,
+`DirectoryIndex`/`ErrorDocument` handler dispatch, HTTPS/1.1 and HTTP/2.
+Access-policy scenarios cover `<Limit>`/`<LimitExcept>`, `Satisfy`,
 `AllowMethods`, `AuthMerging`, `<ElseIf>`, and `<Proxy>`/`<ProxyMatch>`.
-After the hot-path fixes, the latest quick feature run puts `.htaccess`
-rewrite at **1.05x** and `.htaccess` Header at **1.30x** (previously 0.67x
-and 0.96x). Bound CGI scripts now execute inside the worker pool after
-reopening and dev/inode-verifying the authorized script, instead of forking
-the main server; CGI GET is **2.66x**, CGI POST **2.57x**, DirectoryIndex CGI
-**3.22x**, ErrorDocument CGI **3.82x**, and HTTP/2 CGI **4.33–4.90x**.
-All migrated access-policy scenarios remain ahead of Apache, and server
-rewrite is 1.34x. The remaining sub-1.0 cases are proxy static/ProxyMatch
-(0.85x/0.83x in this run), which are limited by the Python test backend and
-backend connection setup, plus a 0.99x directory redirect within noise. See
-`bench/FEATURE_RESULTS.md` for the full matrix and measurement caveats.
+After the access-walk prefilter and per-request metadata memoization,
+`.htaccess` rewrite moved from **0.70x** to **0.96x** and `.htaccess` Header to
+**1.25x** in the latest 3s/five-sample run.
+Bound CGI scripts execute inside the worker pool after reopening and
+dev/inode-verifying the authorized script, instead of forking the main server;
+the latest quick run measured CGI GET **2.60x**, CGI POST **2.57x**,
+DirectoryIndex CGI **3.11x**, ErrorDocument CGI **3.55x**, and HTTP/2 CGI
+**4.44–5.16x**. Most access-policy scenarios remain ahead of Apache, and
+server rewrite is about **1.14x**. The remaining sub-1.0 cases are proxy
+static/ProxyMatch (about 0.82–0.85x), limited by the Python test backend and
+backend connection setup, HTTP/2 1 MB (about 0.82x), and `.htaccess` rewrite
+near parity. See `bench/FEATURE_RESULTS.md` for the full matrix and
+measurement caveats.
+
+`bench/cache_bench.py` isolates the shared-cache hit path. Both servers warm
+the same `/cached/` entries and the harness refuses to time a scenario unless
+the second request reports `X-Cache: HIT`. It also measures an uncached static
+file as the baseline:
+
+```sh
+python3 bench/cache_bench.py --quick
+python3 bench/cache_bench.py
+```
+
+Latest full run (2026-10-27, 3s samples, median of three):
+
+| scenario | Apache req/s | vapache req/s | ratio |
+|---|---:|---:|---:|
+| cache HIT 1.1 KB | 86,780 | 141,844 | 1.63x |
+| cache HIT 10 KB | 80,218 | 136,152 | 1.70x |
+| cache HIT 1 MB | 8,158 | 13,140 | 1.61x |
+| static 1.1 KB baseline | 88,894 | 207,076 | 2.33x |
+
+The cache-hit path still costs vapache some of its static throughput on small
+files, but large cached bodies now use the file-body/sendfile path instead of
+copying a heap buffer. Results are appended to `bench/CACHE_RESULTS.md`.
 
 `bench/app_bench.py` exercises the production-shaped dynamic paths with the
 same upstreams:
@@ -451,7 +488,7 @@ not extra parallelism.
 crates/verified   Verus specifications and verified pure functions
 crates/server     HTTP/TLS/HTTP/2, config + .htaccess, pure config front-end + policy core, auth, file/CGI, daemon
 tests             Apache differential conformance suite
-bench             Apache-vs-vapache static/feature/app benchmark harness and history
+bench             Apache-vs-vapache static/feature/cache/app benchmark harness and history
 ```
 
 ## Roadmap

@@ -288,3 +288,12 @@ Apache rate look slightly better and therefore the reported ratio conservative.
 | hello.txt (1.1KB, keepalive) | 95172 | 193079 | 2.03x | 0.41 | 2 |
 | 10k.bin (10KB, keepalive) | 87488 | 171844 | 1.96x | 0.49 | 3 |
 | 1m.bin (1MB, keepalive) | 8785 | 11777 | 1.34x | 1.02 | 2 |
+
+## 2026-10-27T00:27:19.615538+00:00
+
+| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+|---|---:|---:|---:|---:|---:|
+| index.html (small, keepalive) | 92792 | 205324 | 2.21x | 0.40 | 2 |
+| hello.txt (1.1KB, keepalive) | 96773 | 188648 | 1.95x | 0.47 | 3 |
+| 10k.bin (10KB, keepalive) | 89396 | 154126 | 1.72x | 0.51 | 3 |
+| 1m.bin (1MB, keepalive) | 8850 | 12388 | 1.40x | 0.97 | 2 |

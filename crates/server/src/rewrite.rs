@@ -781,6 +781,22 @@ fn file_test(value: &str, ctx: &Context<'_>, test: impl Fn(&Path) -> bool) -> bo
     {
         return false;
     }
+    // Lexical containment is not enough: a symlink inside the document root
+    // can point at an outside file and turn `-f`/`-d`/`-s` into a metadata
+    // oracle.  Canonicalize both sides and reuse the verified component-aware
+    // containment kernel before the metadata test (pass-7 review target).
+    let Ok(root) = fs::canonicalize(ctx.docroot) else {
+        return false;
+    };
+    let Ok(real) = fs::canonicalize(&p) else {
+        return false;
+    };
+    if !vapache_verified::path_under_base(
+        real.as_os_str().as_encoded_bytes(),
+        root.as_os_str().as_encoded_bytes(),
+    ) {
+        return false;
+    }
     test(&p)
 }
 
@@ -2348,6 +2364,23 @@ mod tests {
         assert!(file_test(&dir.join("file.txt").to_string_lossy(), &c, |p| p.is_file()));
         assert!(!file_test("../etc/passwd", &c, |_| true));
         assert!(!file_test("/etc/passwd", &c, |_| true));
+        let outside = std::env::temp_dir().join(format!(
+            "vapache-rewrite-outside-{}-{}",
+            std::process::id(),
+            "file_test"
+        ));
+        fs::write(&outside, "outside").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("escape.txt")).unwrap();
+        assert!(!file_test("escape.txt", &c, |p| p.is_file()));
+        // A symlink that stays inside the root still works normally.
+        assert!(file_test("link.txt", &c, |p| p.is_file()));
+        // Missing probed paths and missing roots fail closed at canonicalize.
+        assert!(!file_test("missing.txt", &c, |_| true));
+        let missing_root = dir.join("missing-root");
+        let missing_target = missing_root.join("x");
+        let c_missing = ctx("/x", &missing_target, &missing_root);
+        assert!(!file_test("file.txt", &c_missing, |_| true));
+        let _ = fs::remove_file(&outside);
 
         assert_eq!(
             condition_header("x %{HTTP_X_TEST} y").as_deref(),

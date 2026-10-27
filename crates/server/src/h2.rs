@@ -639,9 +639,13 @@ async fn handle_stream(
     crate::status::hit(body_sent);
 
     let host = req.header_str("host").unwrap_or("");
-    let server_name = crate::server::server_name_for_public(&cfg, &req, local_port);
+    let server_name = crate::server::server_name_for_public(&cfg, &req, &local_ip, local_port);
     let vhost_idx = cfg
-        .select_vhost(local_port, if host.is_empty() { None } else { Some(host) })
+        .select_vhost(
+            local_ip.parse().ok(),
+            local_port,
+            if host.is_empty() { None } else { Some(host) },
+        )
         .and_then(|v| cfg.vhosts.iter().position(|x| std::ptr::eq(x, v)));
     let uri_text = String::from_utf8_lossy(&req.target).into_owned();
     logger.access(&AccessEntry {

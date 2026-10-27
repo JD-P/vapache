@@ -694,6 +694,7 @@ dependencies = [
  "libc",
  "md-5",
  "regex",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "sha1",

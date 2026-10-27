@@ -6466,6 +6466,64 @@ mod tests {
         assert_eq!(parse_listen("[::1]:8082").unwrap().addr, "::1");
     }
 
+    #[test]
+    fn vhost_selection_respects_destination_address() {
+        let cfg = load_text(
+            "Listen 0.0.0.0:19213\n\
+             ServerName public.local\n\
+             DocumentRoot /srv/public\n\
+             <VirtualHost 127.0.0.1:19213>\n\
+                 ServerName admin.local\n\
+                 DocumentRoot /srv/private\n\
+             </VirtualHost>\n\
+             <VirtualHost *:19213>\n\
+                 ServerName public.local\n\
+                 DocumentRoot /srv/public\n\
+             </VirtualHost>\n",
+            false,
+        )
+        .unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let other: IpAddr = "127.0.0.2".parse().unwrap();
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let admin =
+            |v: Option<&VHost>| v.and_then(|v| v.server_name.as_deref()) == Some("admin.local");
+
+        assert!(admin(cfg.select_vhost(
+            Some(loopback),
+            19213,
+            Some("admin.local")
+        )));
+        assert!(admin(cfg.select_vhost(
+            Some(mapped),
+            19213,
+            Some("admin.local")
+        )));
+        // The loopback-bound vhost is not eligible on another address even
+        // when the attacker controls Host (F48).
+        assert!(!admin(cfg.select_vhost(
+            Some(other),
+            19213,
+            Some("admin.local")
+        )));
+        // An exact-address vhost wins over a wildcard vhost on its address,
+        // matching Apache's address/port bucket precedence.
+        assert!(admin(cfg.select_vhost(
+            Some(loopback),
+            19213,
+            Some("public.local")
+        )));
+        assert!(!admin(cfg.select_vhost(
+            Some(other),
+            19213,
+            Some("public.local")
+        )));
+        // Without a destination address the historical Host-first behavior
+        // remains available for --explain.
+        assert!(admin(cfg.select_vhost(None, 19213, Some("admin.local"))));
+        assert!(cfg.select_vhost(Some(loopback), 19214, None).is_none());
+    }
+
     fn load_text(text: &str, strict: bool) -> Result<Config, Vec<ConfigError>> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -9525,6 +9583,7 @@ impl Config {
         peer: std::net::SocketAddr,
         req: &crate::http::Request,
     ) -> std::net::SocketAddr {
+        let peer = crate::access::canonical_socket_addr(peer);
         let Some(header) = &self.remoteip_header else {
             return peer;
         };
@@ -9548,6 +9607,7 @@ impl Config {
         for part in text.split(',').rev() {
             let part = part.trim();
             if let Ok(ip) = part.parse::<IpAddr>() {
+                let ip = crate::access::canonical_ip(ip);
                 let internal = self
                     .remoteip_internal
                     .iter()
@@ -9562,12 +9622,91 @@ impl Config {
         }
     }
 
-    pub fn select_vhost(&self, port: u16, host: Option<&str>) -> Option<&VHost> {
-        let candidates: Vec<&VHost> = self
+    fn vhost_port_matches(v: &VHost, port: u16) -> bool {
+        v.ports.iter().any(|p| *p == 0 || *p == port)
+    }
+
+    fn vhost_address_text(addr: &str) -> &str {
+        authority_host(addr)
+    }
+
+    fn vhost_address_is_wildcard(addr: &str) -> bool {
+        let host = Self::vhost_address_text(addr);
+        host.is_empty() || host == "*" || host.starts_with("_default_")
+    }
+
+    pub(crate) fn vhost_address_is_specific(v: &VHost, local_ip: IpAddr, port: u16) -> bool {
+        v.addrs.iter().any(|addr| {
+            (vhost_port(addr) == 0 || vhost_port(addr) == port)
+                && !Self::vhost_address_is_wildcard(addr)
+                && Self::vhost_address_text(addr)
+                    .parse::<IpAddr>()
+                    .map(crate::access::canonical_ip)
+                    .is_ok_and(|bound| bound == crate::access::canonical_ip(local_ip))
+        })
+    }
+
+    pub(crate) fn vhost_address_applies(v: &VHost, local_ip: IpAddr, port: u16) -> bool {
+        if v.addrs.is_empty() {
+            return true;
+        }
+        v.addrs.iter().any(|addr| {
+            if vhost_port(addr) != 0 && vhost_port(addr) != port {
+                return false;
+            }
+            let host = Self::vhost_address_text(addr);
+            let wildcard = Self::vhost_address_is_wildcard(addr);
+            let bound = if wildcard {
+                None
+            } else {
+                host.parse::<IpAddr>().ok().map(crate::access::canonical_ip)
+            };
+            let same = bound == Some(crate::access::canonical_ip(local_ip));
+            crate::verified::vhost_address_admit(!wildcard, wildcard, same)
+        })
+    }
+
+    /// Select the virtual host for a connection.  `local_ip` is the
+    /// destination address the connection arrived on, `port` the local
+    /// listening port and `host` the Host header value (possibly with port).
+    /// Address-bound vhosts are never candidates on a different destination
+    /// address, and an exact-address vhost takes precedence over wildcard
+    /// vhosts exactly as Apache's address/port buckets do (F48/I45).
+    pub fn select_vhost(
+        &self,
+        local_ip: Option<IpAddr>,
+        port: u16,
+        host: Option<&str>,
+    ) -> Option<&VHost> {
+        let port_candidates: Vec<&VHost> = self
             .vhosts
             .iter()
-            .filter(|v| v.addrs.is_empty() || v.ports.iter().any(|p| *p == 0 || *p == port))
+            .filter(|v| v.addrs.is_empty() || Self::vhost_port_matches(v, port))
             .collect();
+        if port_candidates.is_empty() {
+            return None;
+        }
+        let candidates: Vec<&VHost> = match local_ip {
+            Some(local_ip) => {
+                let exact: Vec<&VHost> = port_candidates
+                    .iter()
+                    .copied()
+                    .filter(|v| Self::vhost_address_is_specific(v, local_ip, port))
+                    .collect();
+                let exact_available = !exact.is_empty();
+                port_candidates
+                    .into_iter()
+                    .filter(|v| {
+                        let candidate_exact = Self::vhost_address_is_specific(v, local_ip, port);
+                        crate::verified::vhost_address_precedence(
+                            exact_available,
+                            candidate_exact,
+                        ) && Self::vhost_address_applies(v, local_ip, port)
+                    })
+                    .collect()
+            }
+            None => port_candidates,
+        };
         if candidates.is_empty() {
             return None;
         }
@@ -9696,12 +9835,29 @@ impl Config {
     /// request-time rule matcher; a plain `starts_with` would silently skip
     /// override-enabled trees such as `<Directory "/srv/*/public">`.
     pub fn override_applicable(&self, fs_path: &Path) -> bool {
-        !self.override_enabled
-            || self.override_anywhere
-            || self
-                .override_prefixes
+        if !self.override_enabled {
+            return true;
+        }
+        if self.override_anywhere {
+            return true;
+        }
+        self.override_prefixes.iter().any(|prefix| {
+            use std::os::unix::ffi::OsStrExt;
+            if prefix
+                .as_os_str()
+                .as_bytes()
                 .iter()
-                .any(|prefix| directory_wildcard_matches(prefix, fs_path))
+                .any(|b| matches!(b, b'*' | b'?' | b'['))
+            {
+                directory_wildcard_matches(prefix, fs_path)
+            } else {
+                // Literal prefixes are ancestors of the request path.  Avoid
+                // the metadata probe in `directory_wildcard_matches`, which
+                // otherwise stats the request target once per configured
+                // override prefix on every request.
+                fs_path.starts_with(prefix)
+            }
+        })
     }
 
     /// True when an access file could affect this request.  When false the
@@ -9709,6 +9865,34 @@ impl Config {
     /// directory walk entirely.
     pub fn htaccess_may_apply(&self, fs_path: &Path) -> bool {
         self.override_enabled && self.override_applicable(fs_path)
+    }
+
+    /// Per-directory prefilter for the ancestor walk.  An access file in
+    /// `dir` can participate only when `dir` is at or below a directory whose
+    /// effective policy enables overrides.  Literal override prefixes are
+    /// compared without filesystem metadata; a wildcard prefix conservatively
+    /// admits the walk so the existing effective-policy check decides.
+    pub(crate) fn access_file_dir_applicable(&self, dir: &Path) -> bool {
+        if !self.override_enabled {
+            return false;
+        }
+        if self.override_anywhere {
+            return true;
+        }
+        self.override_prefixes.iter().any(|prefix| {
+            use std::os::unix::ffi::OsStrExt;
+            if prefix
+                .as_os_str()
+                .as_bytes()
+                .iter()
+                .any(|b| matches!(b, b'*' | b'?' | b'['))
+            {
+                // Wildcard/pattern sections cannot be decided by a cheap
+                // prefix check; keep the established matcher for them.
+                return true;
+            }
+            dir.starts_with(prefix)
+        })
     }
 
     /// The effective server header value for this configuration.

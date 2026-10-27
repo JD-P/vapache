@@ -114,33 +114,54 @@ pub fn apply_req_deferred(
     apply_config_dirs: bool,
     config_files: &mut Vec<crate::config::ScopeRule>,
 ) -> Result<(), String> {
-    let root = access_root_for(cfg, vhost, fs_path);
-    let start = if fs_path.is_dir() {
-        fs_path
-    } else {
-        fs_path.parent().unwrap_or(fs_path)
-    };
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut cur = Some(start);
-    while let Some(d) = cur {
-        dirs.push(d.to_path_buf());
-        let Some(parent) = d.parent() else {
-            break;
-        };
-        cur = Some(parent);
-    }
-    // The parent walk already produces leaf-to-root order; reversing is
-    // equivalent to sorting by component count for normal absolute paths and
-    // avoids repeated `Path::components` parsing on every request.
-    dirs.reverse();
-    dirs.dedup();
+    apply_req_deferred_with_root(
+        cfg,
+        vhost,
+        scope,
+        fs_path,
+        url_path,
+        req,
+        peer,
+        files,
+        deferred,
+        apply_config_dirs,
+        config_files,
+        None,
+    )
+}
+
+/// The access-file walk with the actual URL-mapping root supplied by
+/// `map_path()`.  The root is only a URL/base label for `RewriteBase`; it is
+/// never an authorization boundary.  Every ancestor directory participates
+/// when its effective `AllowOverride` policy permits an access file (F50/F51).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_req_deferred_with_root(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    scope: &mut Scope,
+    fs_path: &Path,
+    url_path: &str,
+    req: Option<&crate::http::Request>,
+    peer: std::net::IpAddr,
+    files: &mut Vec<crate::config::ScopeRule>,
+    deferred: &mut Vec<crate::config::ScopeRule>,
+    apply_config_dirs: bool,
+    config_files: &mut Vec<crate::config::ScopeRule>,
+    mapping_root: Option<&Path>,
+) -> Result<(), String> {
+    let root = mapping_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| access_root_for(cfg, vhost, fs_path));
+    let start = walk_start(fs_path);
+    let dirs = ancestor_dirs(start);
     let can_read_access = cfg.override_enabled && cfg.override_applicable(fs_path);
     let mut ignored_locations = Vec::new();
     for dir in dirs {
         // A PATH_INFO request maps to `script.cgi/info`; the immediate
         // "parent" is the script file, not a directory.  Only real
         // directories can contain access files.
-        if !dir.is_dir() {
+        let is_dir = crate::files::is_dir_cached(&dir);
+        if !is_dir {
             continue;
         }
         if apply_config_dirs {
@@ -159,7 +180,13 @@ pub fn apply_req_deferred(
                 );
             }
         }
-        if !can_read_access || !dir.starts_with(&root) {
+        if !can_read_access {
+            continue;
+        }
+        // Ancestors above every override-enabled directory cannot contribute
+        // an access-file layer; skip their existence probes (F50 still covers
+        // an enabled ancestor itself).
+        if !cfg.access_file_dir_applicable(&dir) {
             continue;
         }
         // Resolving a per-directory scope walks the vhost and rule lists.  The
@@ -167,7 +194,7 @@ pub fn apply_req_deferred(
         // avoid that work unless an access file is actually present here.
         let mut has_access_file = false;
         for name in &cfg.access_file_names {
-            match fs::metadata(dir.join(name)) {
+            match crate::files::metadata_cached(&dir.join(name)) {
                 Ok(meta) if meta.is_file() => {
                     has_access_file = true;
                     break;
@@ -187,7 +214,7 @@ pub fn apply_req_deferred(
         }
         for name in cfg.access_file_names_for(&dir_scope) {
             let path = dir.join(&name);
-            let delta = match fs::metadata(&path) {
+            let delta = match crate::files::metadata_cached(&path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(format!("{}: {e}", path.display())),
                 Ok(m) if !m.is_file() => {
@@ -197,7 +224,7 @@ pub fn apply_req_deferred(
                     return Err(format!("{}: access file too large", path.display()))
                 }
                 Ok(meta) => {
-                    let base = dir_url_base(&root, &dir, url_path);
+                    let base = dir_url_base(&root, &dir, fs_path, url_path);
                     parse_cached(cfg, &path, mode, allow_list, nonfatal, &base, &meta)?
                 }
             };
@@ -234,20 +261,52 @@ pub fn apply_req_deferred(
     Ok(())
 }
 
-/// The filesystem root that bounds an access-file walk.  For a document-root
-/// target this is `DocumentRoot`; for an `Alias`/`ScriptAlias` target outside
-/// the document root it is the alias target directory.  The walk must stop at
-/// that root, not at the document root, or parent access files between the
-/// filesystem root and the alias target are skipped.
+fn walk_start(fs_path: &Path) -> &Path {
+    if crate::files::is_dir_cached(fs_path) {
+        fs_path
+    } else {
+        fs_path.parent().unwrap_or(fs_path)
+    }
+}
+
+/// Every ancestor of `start`, from the filesystem root down to `start`.
+/// Access-file authorization is directory-based, so this list is independent
+/// of `DocumentRoot` and of any alias root (F50).
+fn ancestor_dirs(start: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut cur = Some(start);
+    while let Some(d) = cur {
+        dirs.push(d.to_path_buf());
+        let Some(parent) = d.parent() else {
+            break;
+        };
+        cur = Some(parent);
+    }
+    // The parent walk already produces leaf-to-root order; reversing is
+    // equivalent to sorting by component count for normal absolute paths and
+    // avoids repeated `Path::components` parsing on every request.
+    dirs.reverse();
+    dirs.dedup();
+    dirs
+}
+
+/// Fallback mapping root used only for URL/`RewriteBase` derivation when a
+/// compatibility caller does not supply the root returned by `map_path()`.
+/// For a document-root target this is `DocumentRoot`; for an
+/// `Alias`/`ScriptAlias` target outside the document root it is the alias
+/// target directory.  This value never bounds which ancestors contribute an
+/// access file: Apache walks every ancestor whose `<Directory>` permits
+/// `AllowOverride` (F50/F51).  Production authorization callers always pass
+/// the URL-selected root explicitly.
 fn access_root_for(cfg: &Config, vhost: Option<&VHost>, fs_path: &Path) -> PathBuf {
     let docroot = cfg.documentation_root_for(vhost);
     if fs_path == docroot || fs_path.starts_with(&docroot) {
         return docroot;
     }
     let base = vhost.map(|v| &v.scope).unwrap_or(&cfg.global);
-    // Aliases are an ordered table.  The first alias whose target contains
-    // this path is the one that mapped the request; a later overlapping alias
-    // cannot be reached, so it must not change the access-file walk root.
+    // Best-effort compatibility reconstruction only.  This containment-based
+    // search cannot distinguish overlapping aliases; production callers use
+    // the root selected by the URL mapping instead (F51/I48).
     for alias in &base.mapping_policy.aliases {
         if alias.fs_path.as_os_str().is_empty() {
             continue;
@@ -256,8 +315,10 @@ fn access_root_for(cfg: &Config, vhost: Option<&VHost>, fs_path: &Path) -> PathB
             // A single-file target's access root is its parent directory.
             // Returning the file path made every `dir.starts_with(root)` test
             // fail and silently skipped the target directory's `.htaccess`
-            // (F39/I36).  Regex aliases always store a directory base.
-            if alias.regex.is_none() && !alias.fs_path.is_dir() {
+            // (F39/I36).  This applies to regex aliases too: a replacement
+            // ending in `/` whose stable prefix names a file still has a file
+            // base (F47/I44).
+            if !alias.fs_path.is_dir() {
                 return alias
                     .fs_path
                     .parent()
@@ -280,39 +341,52 @@ pub fn collect_layers(
     fs_path: &Path,
     url_path: &str,
 ) -> Result<Vec<crate::policy_ref::AccessLayer>, String> {
+    collect_layers_with_root(cfg, vhost, fs_path, url_path, None)
+}
+
+/// Collect access-file layers using the actual alias/mapping root selected by
+/// `map_path()` for URL-base derivation.  The ancestor walk itself is not
+/// bounded by that root (F50/F51).
+pub fn collect_layers_with_root(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    fs_path: &Path,
+    url_path: &str,
+    mapping_root: Option<&Path>,
+) -> Result<Vec<crate::policy_ref::AccessLayer>, String> {
     if !cfg.htaccess_may_apply(fs_path) {
         return Ok(Vec::new());
     }
-    let root = access_root_for(cfg, vhost, fs_path);
-    let start = if fs_path.is_dir() {
-        fs_path
-    } else {
-        fs_path.parent().unwrap_or(fs_path)
+    let root = match mapping_root {
+        Some(root) => {
+            // Callers pass the root returned by `map_path()` for the URL that
+            // actually matched; they never infer it from alias containment.
+            debug_assert!(crate::verified::alias_mapping_root_admit(true, false));
+            root.to_path_buf()
+        }
+        None => access_root_for(cfg, vhost, fs_path),
     };
-    let mut dirs = Vec::new();
-    let mut cur = Some(start);
-    while let Some(d) = cur {
-        dirs.push(d.to_path_buf());
-        let Some(parent) = d.parent() else {
-            break;
-        };
-        cur = Some(parent);
-    }
-    // The parent walk already produces leaf-to-root order; reversing is
-    // equivalent to sorting by component count for normal absolute paths and
-    // avoids repeated `Path::components` parsing on every request.
-    dirs.reverse();
-    dirs.dedup();
+    let start = walk_start(fs_path);
+    let dirs = ancestor_dirs(start);
     let mut layers = Vec::new();
     for dir in dirs {
-        if !dir.is_dir() || !dir.starts_with(&root) {
+        // Ancestors above every override-enabled directory cannot contribute
+        // an accessible layer (F50 still covers an enabled ancestor itself).
+        if !cfg.access_file_dir_applicable(&dir) {
+            continue;
+        }
+        let is_dir = crate::files::is_dir_cached(&dir);
+        if !is_dir {
             continue;
         }
         let dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
         let mode = dir_scope.override_policy.mode();
         let allow_list = dir_scope.override_policy.allow_list();
         let nonfatal = dir_scope.override_policy.nonfatal();
-        if !mode.is_enabled() && allow_list.is_empty() {
+        if !crate::verified::access_walk_dir_admit(
+            is_dir,
+            mode.is_enabled() || !allow_list.is_empty(),
+        ) {
             continue;
         }
         let mut layer = crate::policy_ref::AccessLayer {
@@ -324,7 +398,7 @@ pub fn collect_layers(
         let mut found = false;
         for name in cfg.access_file_names_for(&dir_scope) {
             let path = dir.join(&name);
-            let meta = match fs::metadata(&path) {
+            let meta = match crate::files::metadata_cached(&path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(format!("{}: {e}", path.display())),
                 Ok(m) if !m.is_file() => {
@@ -335,7 +409,7 @@ pub fn collect_layers(
                 }
                 Ok(m) => m,
             };
-            let base = dir_url_base(&root, &dir, url_path);
+            let base = dir_url_base(&root, &dir, fs_path, url_path);
             let parsed = parse_cached(cfg, &path, mode, allow_list, nonfatal, &base, &meta)?;
             if found {
                 Arc::make_mut(&mut layer.scope).merge(&parsed.scope);
@@ -377,34 +451,32 @@ pub fn trace_access_files(
     fs_path: &Path,
     url_path: &str,
 ) -> Vec<String> {
+    trace_access_files_with_root(cfg, vhost, fs_path, url_path, None)
+}
+
+/// `--explain` trace using the actual mapping root for URL-base derivation.
+/// Like `collect_layers_with_root`, it reports every ancestor access file that
+/// can participate, not only files below `DocumentRoot`/the alias target.
+pub fn trace_access_files_with_root(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    fs_path: &Path,
+    url_path: &str,
+    mapping_root: Option<&Path>,
+) -> Vec<String> {
     let mut out = Vec::new();
     if !cfg.htaccess_may_apply(fs_path) {
         out.push("skipped (no override-enabled directory in path)".into());
         return out;
     }
-    let root = access_root_for(cfg, vhost, fs_path);
-    let start = if fs_path.is_dir() {
-        fs_path
-    } else {
-        fs_path.parent().unwrap_or(fs_path)
-    };
-    let mut dirs = Vec::new();
-    let mut cur = Some(start);
-    while let Some(d) = cur {
-        dirs.push(d.to_path_buf());
-        let Some(parent) = d.parent() else {
-            break;
-        };
-        cur = Some(parent);
-    }
-    // The parent walk already produces leaf-to-root order; reversing is
-    // equivalent to sorting by component count for normal absolute paths and
-    // avoids repeated `Path::components` parsing on every request.
-    dirs.reverse();
-    dirs.dedup();
+    let root = mapping_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| access_root_for(cfg, vhost, fs_path));
+    let start = walk_start(fs_path);
+    let dirs = ancestor_dirs(start);
     let mut found = false;
     for dir in dirs {
-        if !dir.is_dir() || !dir.starts_with(&root) {
+        if !dir.is_dir() {
             continue;
         }
         let dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
@@ -423,7 +495,7 @@ pub fn trace_access_files(
                 continue;
             }
             found = true;
-            let base = dir_url_base(&root, &dir, url_path);
+            let base = dir_url_base(&root, &dir, fs_path, url_path);
             match parse_cached(cfg, &path, mode, allow_list, nonfatal, &base, &meta) {
                 Ok(parsed) => out.push(format!(
                     "{} mode={:?} list={:?} nonfatal={:?} rules={}",
@@ -595,19 +667,51 @@ fn parse_file_with_list(
     })
 }
 
-fn dir_url_base(root: &Path, dir: &Path, url_path: &str) -> String {
-    if let Ok(rel) = dir.strip_prefix(root) {
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        let rel = rel.trim_matches('/');
-        return if rel.is_empty() {
-            "/".into()
-        } else {
-            format!("/{rel}/")
+/// F53/I50: derive a layer's per-directory URL base from the request URL and
+/// the layer's depth below the *requested* filesystem target, not from the
+/// path relative to an alias target.  `root` is retained only as a fallback
+/// for malformed callers; production mappings always strip `dir` from
+/// `fs_path` successfully.
+fn dir_url_base(root: &Path, dir: &Path, fs_path: &Path, url_path: &str) -> String {
+    let Some(rel) = fs_path.strip_prefix(dir).ok() else {
+        return match dir.strip_prefix(root) {
+            Ok(rel) => {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                let rel = rel.trim_matches('/');
+                if rel.is_empty() {
+                    "/".into()
+                } else {
+                    format!("/{rel}/")
+                }
+            }
+            Err(_) => normalize_rewrite_base(
+                url_path.rsplit_once('/').map(|(p, _)| p).unwrap_or(""),
+            ),
         };
+    };
+    let depth = rel.components().count();
+    // Strip the last `depth` URL components without allocating a component
+    // vector or splitting the path.  This runs for every access-file layer on
+    // every request, so the hot path stays slice-only until the final String.
+    let trimmed = url_path.trim_end_matches('/');
+    let mut end = trimmed.len();
+    let mut remaining = depth;
+    let mut url_depth_sufficient = true;
+    while remaining > 0 {
+        let Some(slash) = trimmed[..end].rfind('/') else {
+            url_depth_sufficient = false;
+            break;
+        };
+        end = slash;
+        remaining -= 1;
     }
-    // Aliased content: derive the URL directory from the requested path.
-    let parent = url_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-    normalize_rewrite_base(parent)
+    if !vapache_verified::htaccess_layer_url_base_admit(true, url_depth_sufficient) {
+        // The filesystem target is deeper than the URL (for example an
+        // AliasMatch with a fixed target prefix).  The URL itself is the only
+        // sound upper bound; never invent an alias-target-relative base.
+        return normalize_rewrite_base(url_path);
+    }
+    normalize_rewrite_base(&trimmed[..end])
 }
 
 fn parse_block(
@@ -3266,6 +3370,11 @@ mod tests {
         )
         .unwrap();
 
+        // PATH_INFO starts at the script file; the trace must skip that
+        // non-directory entry and still report the script's parent layers.
+        let trace = trace_access_files(&cfg, None, &path_info, "/sub/secret.txt/more").join("\n");
+        assert!(trace.contains(".htaccess"));
+
         // Metadata errors and parse errors are fail-closed.
         fs::create_dir_all(www.join("bad/.htaccess")).unwrap();
         assert!(collect_layers(&cfg, None, &www.join("bad/x"), "/bad/x").is_err());
@@ -3332,6 +3441,10 @@ mod tests {
         fs::create_dir_all(&file_dir).unwrap();
         let target = file_dir.join("wallet.dat");
         fs::write(&target, "wallet\n").unwrap();
+        let regex_dir = dir.join("regex-files");
+        fs::create_dir_all(&regex_dir).unwrap();
+        let regex_target = regex_dir.join("wallet.dat");
+        fs::write(&regex_target, "wallet\n").unwrap();
         let cfg = config(
             &dir,
             &format!(
@@ -3340,15 +3453,22 @@ mod tests {
                  DocumentRoot \"{}\"\n\
                  Alias /dir \"{}/\"\n\
                  Alias /file \"{}\"\n\
+                 AliasMatch \"^/regex-wallet$\" \"{}/\"\n\
                  AliasMatch \"^/cap(.*)$\" \"$1\"\n",
                 dir.display(),
                 www.display(),
                 alias.display(),
-                target.display()
+                target.display(),
+                regex_target.display()
             ),
         );
         assert_eq!(access_root_for(&cfg, None, &alias.join("x")), alias);
         assert_eq!(access_root_for(&cfg, None, &target), file_dir);
+        assert_eq!(
+            access_root_for(&cfg, None, &regex_target),
+            regex_dir,
+            "regex file target with trailing slash must use its parent"
+        );
         assert_eq!(access_root_for(&cfg, None, &dir.join("other")), www);
 
         let re = |p: &str| regex::Regex::new(p).unwrap();
@@ -3388,11 +3508,79 @@ mod tests {
         ));
 
         assert_eq!(mode_key(OverrideMode::None), 0);
-        assert_eq!(dir_url_base(&www, &www, "/x"), "/");
-        assert_eq!(dir_url_base(&www, &alias, "/alias/deep/file"), "/alias/deep/");
+        assert_eq!(dir_url_base(&www, &www, &www.join("x"), "/x"), "/");
         assert_eq!(
-            dir_url_base(Path::new("/srv/www"), Path::new("/srv/www/a/b"), "/a/b/f"),
+            dir_url_base(&www, &alias, &alias.join("deep/file"), "/alias/deep/file"),
+            "/alias/"
+        );
+        assert_eq!(
+            dir_url_base(
+                Path::new("/srv/www"),
+                Path::new("/srv/www/a/b"),
+                Path::new("/srv/www/a/b/f"),
+                "/a/b/f"
+            ),
             "/a/b/"
+        );
+        // F53: an alias target at the mapping root still has the URL mount,
+        // not `/`, as its per-directory base.
+        assert_eq!(
+            dir_url_base(
+                Path::new("/srv/site"),
+                Path::new("/srv/site"),
+                Path::new("/srv/site/private/wallet.dat"),
+                "/site/private/wallet.dat"
+            ),
+            "/site/"
+        );
+        assert_eq!(
+            dir_url_base(
+                Path::new("/srv/site"),
+                Path::new("/srv/site/private"),
+                Path::new("/srv/site/private/wallet.dat"),
+                "/site/private/wallet.dat"
+            ),
+            "/site/private/"
+        );
+        // A target deeper than the URL (fixed AliasMatch suffix) falls back
+        // to the requested URL itself rather than inventing a target-relative
+        // base.  The remaining branches keep malformed compatibility callers
+        // from producing an alias-target-relative base.
+        assert_eq!(
+            dir_url_base(
+                Path::new("/srv/site"),
+                Path::new("/srv/site"),
+                Path::new("/srv/site/sub1/sub2/private/wallet.dat"),
+                "/m/private/wallet.dat"
+            ),
+            "/m/private/wallet.dat/"
+        );
+        assert_eq!(
+            dir_url_base(
+                Path::new("/srv/site"),
+                Path::new("/srv/site"),
+                Path::new("/other/wallet.dat"),
+                "/other/wallet.dat"
+            ),
+            "/"
+        );
+        assert_eq!(
+            dir_url_base(
+                Path::new("/srv/site"),
+                Path::new("/other"),
+                Path::new("/srv/site/wallet.dat"),
+                "/other/deep/wallet.dat"
+            ),
+            "/other/deep/"
+        );
+        assert_eq!(
+            dir_url_base(
+                Path::new("/srv"),
+                Path::new("/srv/site"),
+                Path::new("/other/wallet.dat"),
+                "/other/wallet.dat"
+            ),
+            "/site/"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -3429,6 +3617,14 @@ mod tests {
             ),
             (
                 "<If \"true\">\n</If>\n<Else extra more>\n</Else>\n",
+                false,
+            ),
+            (
+                "<If \"true\">\n<FilesMatch \"[\">\n</FilesMatch>\n</If>\n",
+                false,
+            ),
+            (
+                "<IfModule mod_authz_core.c>\n<FilesMatch \"[\">\n</FilesMatch>\n</IfModule>\n",
                 false,
             ),
             ("<RequireAll>\n</RequireAll>\n", true),

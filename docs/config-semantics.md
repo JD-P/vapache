@@ -358,8 +358,10 @@ transforms.  In particular:
   (`<Location>`/`<LocationMatch>`) and the final target scope to allow; an
   absolute rewrite target is only admitted when its canonical file remains
   below the current document/alias root, so a rewrite cannot name a new root;
-- an `.htaccess` walk for an alias target starts at that alias root, so parent
-  access files outside `DocumentRoot` cannot be skipped;
+- an `.htaccess` walk covers every applicable ancestor of an alias or document
+  root target, so parent access files outside `DocumentRoot` cannot be skipped
+  (I47); the URL-selected alias root is used only for URL-base derivation
+  (I48);
 - `SymLinksIfOwnerMatch` compares each symlink owner with the resolved target
   owner unless unconditional `FollowSymLinks` is also enabled.
 
@@ -533,21 +535,25 @@ bumping the generation.  A CGI `PATH_INFO` request is resolved to the actual
 script target (and that script's policy) for both the fingerprint and the key,
 so a later `<Files "script.cgi">` deny cannot leave a usable path-info entry.
 Authorization still runs on every hit; the cache is a derived view, never an
-authorization shortcut.
+authorization shortcut.  A directory URL additionally resolves its
+`DirectoryIndex` target before the cache decision; the key, target and policy
+fingerprint then describe that selected file/script rather than the directory
+(I49).
 
 ### I21 — Alias root identity
 
 ```text
 alias_target(template, captures, server_root) -> (root, rel)
 root is non-empty and absolute
-access_walk_root = target.alias_root
+mapping_root = root of the alias selected by the request URL
 ```
 
 Prefix aliases and regex aliases (absolute, relative, fixed or capture-only)
-must produce the same root for `map_path()`, `ResourceKey`, the access-file
-walk and the cache.  A relative substitute such as `private/$1` is anchored
-at `ServerRoot` when the alias is compiled; it is never represented as an
-empty root that the walk silently skips.
+must produce the same mapping root for `map_path()`, `ResourceKey`,
+URL-base/`RewriteBase` derivation and the cache.  A relative substitute such
+as `private/$1` is anchored at `ServerRoot` when the alias is compiled; it is
+never represented as an empty root that the walk silently skips.  Per I47 the
+mapping root does not bound the authorization walk.
 
 ### I22 — Contextual output encoding
 
@@ -865,13 +871,15 @@ is mechanized as `alias_file_target_split`.
 ### I36 — Single-file alias access root
 
 ```text
-access_root(alias target) == target             if target is a directory
-access_root(alias target) == target.parent      otherwise
+mapping_root(alias target) == target             if target is a directory
+mapping_root(alias target) == target.parent      otherwise
 ```
 
-The access-file walk stops at and includes the target directory.  Returning the
-file itself made every `dir.starts_with(root)` check fail, silently skipping
-the target `.htaccess` (F39).  `alias_access_root_admit` states the file case.
+The URL/base root for a file target is its parent directory.  Returning the
+file itself broke URL-base derivation and handler identity (F39).  This root
+is not an authorization boundary: per I47 the access-file walk covers every
+applicable ancestor regardless of the alias target.  `alias_access_root_admit`
+states the file case.
 
 ### I37 — Handler selection from the resolved target
 
@@ -950,6 +958,216 @@ exception because its argument is operator supplied.  Without this, a writable
 `.htaccess` could use absolute paths or escaping symlinks as a metadata oracle
 (F45).  `expr_file_test_admit` is consumed by `confined_expr_path`.
 
+### I43 — Multi-provider `<RequireNone>`
+
+```text
+RequireNone(children) -> deny    if any child is Granted
+                      -> neutral if no child is Granted
+RequireNone(children) never grants
+```
+
+The children are aggregated as an OR of positive hits before the negation is
+applied.  Combining the children with AND let a denied sibling neutralize a
+granted child, turning a multi-network block list into an allow list (F46).
+`combine_or_all`, `require_none_multi` and `require_none_multi_result` are the
+mechanized aggregation/negation kernels consumed by `access.rs`.
+
+### I44 — Regex alias file target
+
+```text
+regex_alias(target is file) -> (root = target.parent, rel = target.basename)
+access_root(alias target) == target.parent if target is not a directory
+```
+
+A regex replacement ending in `/` may still name a regular file.  The target
+must be split exactly like a prefix file alias, whether or not the replacement
+had a trailing slash (F47).  The regex mapping branch consumes
+`alias_file_target_split`, and the URL/base root uses the file's parent via
+`alias_access_root_admit`.  Ancestor authorization still follows I47, so the
+mapping-root choice cannot hide a parent access file.
+
+### I45 — Destination-address virtual-host selection
+
+```text
+select_vhost(destination, port, Host):
+    address_bound(vhost) && destination != vhost.address -> not a candidate
+    exact_address_vhost_present -> wildcard vhost cannot take precedence
+```
+
+Apache groups virtual hosts by destination address and port.  A loopback-bound
+administrative vhost is therefore not reachable through a public address even
+when the client supplies its `Host` name, and an exact-address vhost wins over
+a wildcard vhost on that address (F48).  `vhost_address_admit` and
+`vhost_address_precedence` are consumed by `Config::select_vhost` and the TLS
+vhost filter when a listener has a concrete destination address; HTTP/1.1,
+HTTP/2, WebSocket, cache and logging call sites all pass the connection's local
+address.
+
+### I46 — Canonical peer identity
+
+```text
+peer ::ffff:a.b.c.d  ==  peer a.b.c.d
+```
+
+IPv4-mapped IPv6 peers on dual-stack listeners are canonicalized before any
+authorization, logging, cache or CGI identity decision.  An IPv4
+`Require ip`/`Require not ip` network therefore sees the IPv4 client, and
+`Require local` treats `::ffff:127.0.0.1` as loopback (F49).
+`ipv4_mapped_to_v4` is the verified conversion consumed by
+`access::canonical_ip`; the connection boundary and RemoteIP path apply it
+before the request context is built.
+
+### I47 — Access walk domain
+
+```text
+dir in access_walk(target)  <==>  dir is an ancestor of target
+                                  && effective_override(dir) permits access files
+DocumentRoot(target) and alias_root(target) are not lower bounds
+```
+
+Apache consults `.htaccess` at every ancestor directory for which its
+`<Directory>`/`AllowOverride` policy permits overrides.  A `DocumentRoot` or
+alias target is a URL-mapping label only; using it as the walk boundary
+silently discarded policies in an application root above `public/` or in a
+parent of an alias target (F50).  The runtime walk consumes
+`access_walk_dir_admit`, and `access_file_layer_read` no longer contains an
+`under_root` conjunct.  URL-base/`RewriteBase` derivation still receives the
+root selected by `map_path()`, but that root never decides participation.
+
+### I48 — URL-selected alias mapping root
+
+```text
+alias_root(req) == root returned by map_path(req.url)
+alias_root(req) != first alias target that happens to contain resolve(req)
+```
+
+An ordered alias table is selected by URL prefix or regex, not by filesystem
+containment.  Overlapping targets can therefore make “the first alias whose
+target contains the path” a different alias from the one that mapped the
+request.  `map_path()` returns the actual mapping root, and every caller passes
+that value to the access walk/cache; `alias_mapping_root_admit` states that a
+root inferred from alias-target containment is never admitted (F51).  The
+mapping root selects the alias for `ResourceKey` and containment, while
+per-directory rewrite/URL bases follow the URL mount (I50) rather than a path
+relative to the alias target.  Authorization still walks every ancestor per
+I47.
+
+### I49 — DirectoryIndex cache target
+
+```text
+CacheKey(req for /dir/) binds selected_index(target)
+CacheFingerprint(req for /dir/) binds selected_index(target).policy
+dynamic(selected_index) && CacheIgnoreQueryString && query != "" -> no cache
+```
+
+A directory URL resolves through `DirectoryIndex` to a different file or
+script before dispatch.  The cache decision must therefore resolve the index
+first and bind the key, target, authorization grant and policy fingerprint to
+that selected index.  `CacheIgnoreQueryString` may never merge a dynamic
+index/script representation across queries, and a live `<Files>`/`.htaccess`
+change affecting the index must change the computed policy before a lookup
+(F52).  The runtime consumes `cache_directory_index_bind_admit` and
+`cache_ignore_query_admit` before lookup/store.
+
+### I50 — Per-directory rewrite subject base
+
+```text
+layer_dir <= target_dir
+depth(layer_dir, target_dir) == number of filesystem components below layer_dir
+match_base(layer) == URL_path(target)[0 .. len - depth] with a trailing slash
+match_base(layer) != path(layer_dir) relative to an alias target
+```
+
+Apache's per-directory rewrite subject is the request URL with the layer's URL
+prefix removed.  For an `Alias`/`AliasMatch`/`ScriptAlias` tree the layer's
+prefix is the URL mount, not the directory's position under the alias target.
+Using the target-relative path made `RewriteRule ^private/ - [F]` miss and
+served or executed protected files (F53).  `dir_url_base()` now derives the
+base from the requested URL and depth for every layer; `RewriteBase` remains
+the substitution base only.  The runtime consumes
+`htaccess_layer_url_base_admit`, and `subject_for()` strips that URL base.
+
+### I51 — Cache key byte identity
+
+```text
+base_key(req) == base_key(req')
+  ==> listener, vhost, host, raw URL path, raw query, resolved target bytes
+      and policy fingerprint are identical as byte strings
+```
+
+A cache key must be injective over the raw bytes that select an entry.
+`String::from_utf8_lossy` and `Path::display()` can map distinct invalid-byte
+queries, paths or targets to the same replacement text.  `cache_key_hex`
+encodes every byte component as two ASCII hex digits; paths that are not valid
+UTF-8 bypass the shared cache, and invalidation uses the same encoding.  The
+Verus refinement proves the runtime encoder equals `cache_key_hex_spec`, and
+`cache_key_hex_spec_injective` proves the encoding is injective over raw byte
+sequences, not merely length-preserving.  This closes the
+invalid-query/clean-URL collision (F55) for query, path and target material.
+Policy/request identity is a separate 256-bit value: every exact material
+field is framed by the verified, injective `cache_fingerprint_field` and
+hashed with SHA-256.  The old 64-bit `DefaultHasher` fingerprint was small
+enough for a header-varying attacker to target; SHA-256 collision resistance
+remains a cryptographic assumption, not a Verus theorem.
+
+### I52 — ErrorDocument cache scope
+
+```text
+missing(target) && scope.selects_local_error_document
+  -> no cache lookup or store for the missing URL
+response.from_local_error_document -> no store under the original URL
+```
+
+A local `ErrorDocument` is an internal subrequest selected only after dispatch
+fails.  Its effective handler, target, query handling and live `.htaccess`
+policy belong to the error target, not the missing URL.  Binding the outer
+request to the internal subrequest's response would let a query-dependent or
+dynamic error document poison the missing URL's entry (F56).  The runtime
+consumes `cache_local_error_document_admit` at lookup for a missing target and
+again at store using the subrequest's response-provenance marker; the internal
+dispatch itself still runs the normal authorization and handler chain.  Existing
+targets keep normal cache behavior even when the scope defines an error
+document.
+
+### I53 — Dynamic handler classification
+
+```text
+effective_handler(target) != default-handler
+  -> dynamic(target)
+dynamic(target) && CacheIgnoreQueryString && query != "" -> no cache
+```
+
+`CacheIgnoreQueryString` may only merge representations whose target is a
+static default handler.  The classifier consumes the effective handler after
+`DirectoryIndex` resolution and covers `SetHandler "proxy:…|fcgi://…"`,
+`cgi-script`, `server-status` and future non-default handlers, not just
+`ProxyPass` routes.  The runtime consumes `cache_dynamic_handler_admit` before
+`cache_ignore_query_admit`, closing the FastCGI `SetHandler` query leak (F54).
+
+### I54 — Cache store admission
+
+```text
+store(req, resp) ==> req.method == GET && req.body == empty
+                    && no Authorization/Cookie
+                    && status in {200,203,300,301,308,404,410}
+                    && Cache-Control permits storage
+                    && no Set-Cookie && Vary != *
+                    && min_file_size <= body <= max_file_size
+                    && freshness_ttl > 0
+```
+
+A representation enters the shared cache only through these gates.  The
+runtime consumes `cache_store_request_admit`, `cache_store_status_admit`,
+`cache_store_control_admit`, `cache_store_shape_admit` and
+`cache_store_ttl_admit` instead of an unverified chain of early returns.
+Freshness values pass through `cache_ttl_clamp`, which returns zero for a
+reversed `CacheMinExpire`/`CacheMaxExpire` pair rather than panicking, and
+expiry uses the verified saturating `cache_expiry`, so a positive TTL can never
+wrap into the past.  Disk accounting consumes `cache_disk_projected` and
+`cache_disk_evict`; eviction steps are proven not to increase projected usage.
+Policy binding uses `cache_fingerprint_field`, whose length framing is proven
+injective, before the SHA-256 digest is stored in V3 cache metadata.
+
 ## 9. Formalization boundary
 
 The first Verus model should cover:
@@ -1022,11 +1240,17 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **227 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **238 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
-- `PolicyResult`, `combine_and`, `combine_or`, `require_none_result`.
+- `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
+  `require_none_result`, `require_none_multi`, `require_none_multi_result`.
   `crates/server/src/access.rs` calls these for
-  `<RequireAll>`/`<RequireAny>`/`<RequireNone>`.
+  `<RequireAll>`/`<RequireAny>`/`<RequireNone>`; the multi-provider
+  `<RequireNone>` path aggregates positive hits with OR before negation.
+- `ipv4_mapped_to_v4`, consumed by `access::canonical_ip` at the connection
+  and RemoteIP boundaries; `vhost_address_admit` and
+  `vhost_address_precedence`, consumed by `Config::select_vhost` and the TLS
+  vhost filter.
 - `AccessStep`, `access_walk_plan`, `access_plan`, `access_plan_exec`.
   `policy_ref::effective_scope_with_layers` iterates the verified plan.  The
   plan has one `Walk { access }` step per ancestor directory, with the
@@ -1074,6 +1298,37 @@ construction: there is no second production interleaver.
   quota and expression file-test confinement (I35–I42).  `confined_expr_path`
   consumes `expr_file_test_admit`; the remaining predicates document and
   mechanize the runtime branches exercised by the F39–F45 replay suite.
+- `combine_or_all`, `require_none_multi`, `require_none_multi_result`,
+  `vhost_address_admit`, `vhost_address_precedence` and
+  `ipv4_mapped_to_v4`.  These are the pass-5 kernels for multi-provider
+  `<RequireNone>` (I43), regex alias file targets (I44, sharing the pass-4
+  split predicates), destination-address virtual-host eligibility (I45) and
+  canonical IPv4-mapped peer identity (I46).  `access::eval_node`,
+  `Config::select_vhost`, the TLS vhost filter and `access::canonical_ip`
+  consume them directly.
+- `access_walk_dir_admit`, `alias_mapping_root_admit`,
+  `cache_directory_index_bind_admit` and `cache_ignore_query_admit`.  These are
+  the pass-6 kernels for the ancestor access-file walk (I47), URL-selected
+  alias mapping root (I48) and `DirectoryIndex` cache target/query isolation
+  (I49).  `access_file_layer_read` was simplified to remove the mapping-root
+  conjunct.  `htaccess::collect_layers_with_root`,
+  `cache::request_scope` and the dispatch/`--explain` callers consume these
+  predicates; unit plus F50–F52 replays exercise each branch.
+- `htaccess_layer_url_base_admit`, `cache_dynamic_handler_admit`,
+  `cache_local_error_document_admit` and `cache_key_hex`.  These are the
+  pass-7 kernels for URL-mounted rewrite bases (I50), lossless cache-key bytes
+  (I51), local `ErrorDocument` cache scoping (I52) and complete dynamic-handler
+  classification (I53).  The `.htaccess` walk, cache request scope and key
+  builder consume them; unit plus F53–F56 fastcgi-mock/raw-socket replays
+  exercise each branch.
+- `cache_key_hex_spec_injective`, `cache_lookup_hit_requires_binding`,
+  `cache_lookup_rejects_stale`, `cache_store_request_admit`,
+  `cache_store_status_admit`, `cache_store_control_admit`,
+  `cache_store_shape_admit`, `cache_store_ttl_admit`, `cache_ttl_clamp`,
+  `cache_expiry`, `cache_disk_projected` and `cache_disk_evict`.  These
+  mechanize the cache key encoder/refinement, lookup consequences, store
+  admission gates, freshness arithmetic and disk projection/eviction steps
+  consumed by `cache.rs` (I51, I54).
 - `regex_dialect_admit` / `guard_regex` / `compile_regex`.  Every
   configuration- and expression-supplied regex is admitted only after the
   verified dialect guard: backreferences, look-around, other PCRE-only

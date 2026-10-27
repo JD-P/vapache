@@ -7,9 +7,9 @@
 use crate::config::{AuthPolicy, Order, Require, RequireNode, Satisfy, Scope};
 use crate::http::Request;
 use crate::verified::{
-    combine_and, combine_or, ipv4_in_net, ipv6_in_net, require_none_result, PolicyResult,
+    combine_and, combine_or, ipv4_in_net, ipv6_in_net, require_none_multi, PolicyResult,
 };
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -46,7 +46,7 @@ pub struct ResourceKey {
     pub file_dev: Option<u64>,
     pub file_ino: Option<u64>,
     pub backend_target: Option<String>,
-    pub policy_fingerprint: Option<u64>,
+    pub policy_fingerprint: Option<[u8; 32]>,
 }
 
 fn vhost_id(vhost: Option<&crate::config::VHost>) -> usize {
@@ -108,7 +108,7 @@ impl ResourceKey {
         req: &Request,
         host: &str,
         path: &str,
-        policy_fingerprint: u64,
+        policy_fingerprint: [u8; 32],
     ) -> Self {
         let mut key = Self::cache(vhost, req, host, path);
         key.policy_fingerprint = Some(policy_fingerprint);
@@ -402,13 +402,15 @@ fn eval_node(
             result
         }
         RequireNode::None(items) => {
-            // A negated group can fail or stay neutral, but can never grant
-            // authorization by itself.
-            let mut result = PolicyResult::Neutral;
-            for item in items {
-                result = combine_and(result, eval_node(item, req, peer, identity, env, docroot));
-            }
-            require_none_result(result)
+            // Apache's <RequireNone> fails when *any* child provider is
+            // satisfied.  Aggregate the children as an OR of positive hits
+            // first; combining them with AND let one denied sibling erase a
+            // granted child and turned the group into an allow (F46/I43).
+            let results: Vec<PolicyResult> = items
+                .iter()
+                .map(|item| eval_node(item, req, peer, identity, env, docroot))
+                .collect();
+            require_none_multi(&results)
         }
     }
 }
@@ -443,7 +445,7 @@ fn eval_require(
             let hit = nets.iter().any(|(n, b)| ip_in_net(peer, *n, *b));
             decide(hit, *negate)
         }
-        Require::Local { negate } => decide(peer.is_loopback(), *negate),
+        Require::Local { negate } => decide(canonical_ip(peer).is_loopback(), *negate),
         Require::Host { negate, names } => decide(reverse_dns_matches(peer, names), *negate),
         Require::Method { negate, methods } => {
             decide(methods.iter().any(|m| same_method(m, &req.method)), *negate)
@@ -509,8 +511,26 @@ fn same_method(configured: &str, request: &str) -> bool {
     configured == request
 }
 
+/// Canonicalize an IPv4-mapped IPv6 address to IPv4 before it is used for an
+/// authorization or identity decision.  A dual-stack listener reports IPv4
+/// peers as `::ffff:a.b.c.d`; without this step IPv4 `Require` networks and
+/// `Require local` see a different identity (F49/I46).
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match vapache_verified::ipv4_mapped_to_v4(u128::from(v6)) {
+            Some(v4) => IpAddr::V4(Ipv4Addr::from(v4)),
+            None => ip,
+        },
+        IpAddr::V4(_) => ip,
+    }
+}
+
+pub fn canonical_socket_addr(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(canonical_ip(addr.ip()), addr.port())
+}
+
 pub fn ip_in_net(ip: IpAddr, net: IpAddr, bits: u8) -> bool {
-    match (ip, net) {
+    match (canonical_ip(ip), canonical_ip(net)) {
         (IpAddr::V4(a), IpAddr::V4(n)) => ipv4_in_net(u32::from(a), u32::from(n), bits),
         (IpAddr::V6(a), IpAddr::V6(n)) => ipv6_in_net(u128::from(a), u128::from(n), bits),
         _ => false,
@@ -518,6 +538,7 @@ pub fn ip_in_net(ip: IpAddr, net: IpAddr, bits: u8) -> bool {
 }
 
 fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
+    let ip = canonical_ip(ip);
     // Forward-confirmed reverse DNS (FCrDNS), matching Apache's behavior:
     // a PTR result is only accepted if it resolves back to the peer address.
     let Ok(host) = reverse_dns(ip) else {
@@ -537,9 +558,13 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
     if !name_ok {
         return false;
     }
-    // Confirm forward resolution.
+    forward_dns_confirms(&host, ip)
+}
+
+fn forward_dns_confirms(host: &str, ip: IpAddr) -> bool {
+    // Confirm forward resolution (FCrDNS).
     use std::net::ToSocketAddrs;
-    match (host.as_str(), 0).to_socket_addrs() {
+    match (host, 0).to_socket_addrs() {
         Ok(addrs) => addrs.into_iter().any(|a| a.ip() == ip),
         Err(_) => false,
     }
@@ -698,6 +723,217 @@ mod tests {
         );
         assert_eq!(
             check(&s, &req("GET"), "11.1.2.3".parse().unwrap(), None),
+            Access::Allowed
+        );
+    }
+
+    #[test]
+    fn grant_binding_rejects_a_different_resource() {
+        let req = req("GET");
+        let scope = Scope::default();
+        let allowed = ResourceKey::request(None, &req, "/a", None, None);
+        let other = ResourceKey::request(None, &req, "/b", None, None);
+        let grant = check_grant(&scope, &req, "127.0.0.1".parse().unwrap(), None, allowed)
+            .expect("allowed");
+        let meta = std::fs::metadata("/proc/self/exe").expect("self metadata");
+        assert!(grant.bind_file(&other, &meta).is_none());
+    }
+
+    #[test]
+    fn satisfy_any_host_denial_falls_back_to_authorization() {
+        use crate::config::{HostSpec, LegacyAccess, MethodScoped};
+        let mut s = Scope::default();
+        s.authorization.legacy = Some(LegacyAccess {
+            satisfy: vec![MethodScoped {
+                limit: None,
+                value: Satisfy::Any,
+            }],
+            deny: vec![MethodScoped {
+                limit: None,
+                value: HostSpec::All,
+            }],
+            ..LegacyAccess::default()
+        });
+        s.authorization.requires = reqs(vec![Require::AllGranted]);
+        assert_eq!(
+            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None),
+            Access::Allowed
+        );
+        s.authorization.requires = reqs(vec![Require::AllDenied]);
+        assert_eq!(
+            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None),
+            Access::Denied
+        );
+    }
+
+    #[test]
+    fn method_limited_children_are_neutral_under_or_and_empty_any_is_denied() {
+        use crate::config::MethodSet;
+        let r = req("GET");
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let docroot = Path::new("/");
+        let post = |node| {
+            AuthPolicy::List(vec![RequireEntry {
+                node,
+                limit: Some(MethodSet::Only(vec!["POST".into()])),
+            }])
+        };
+        let policy = AuthPolicy::Or(
+            Box::new(post(RequireNode::Provider(Require::AllDenied))),
+            Box::new(post(RequireNode::Provider(Require::AllGranted))),
+        );
+        assert_eq!(
+            eval_policy(&policy, &r, peer, None, &[], false, docroot),
+            PolicyResult::Neutral
+        );
+        assert_eq!(
+            eval_node(
+                &RequireNode::Any(vec![
+                    RequireNode::Provider(Require::AllDenied),
+                    RequireNode::Provider(Require::AllDenied),
+                ]),
+                &r,
+                peer,
+                None,
+                &[],
+                docroot,
+            ),
+            PolicyResult::Denied
+        );
+    }
+
+    #[test]
+    fn legacy_check_without_rules_allows() {
+        let s = Scope::default();
+        assert_eq!(
+            legacy_check(&s, "127.0.0.1".parse().unwrap(), "GET"),
+            Access::Allowed
+        );
+    }
+
+    #[test]
+    fn head_configured_for_get_and_host_provider_reverse_dns() {
+        let r = req("GET");
+        assert!(same_method("HEAD", "GET"));
+        assert!(same_method("GET", "HEAD"));
+        assert!(!same_method("POST", "GET"));
+
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let host = reverse_dns(ip).expect("reverse localhost");
+        assert!(reverse_dns_matches(ip, &[host.clone()]));
+        assert!(reverse_dns_matches(ip, &[format!(".{host}")]));
+        assert!(!reverse_dns_matches(
+            ip,
+            &[format!("*.not-{host}"), "definitely.invalid".into()]
+        ));
+        assert!(!reverse_dns_matches(ip, &["definitely.invalid".into()]));
+        assert!(!reverse_dns_matches(
+            "0.0.0.0".parse::<IpAddr>().unwrap(),
+            &["anything".into()]
+        ));
+        assert!(!forward_dns_confirms("\0", ip));
+        let ip6: IpAddr = "::1".parse().unwrap();
+        let host6 = reverse_dns(ip6).expect("reverse ipv6 localhost");
+        assert!(reverse_dns_matches(ip6, &[host6]));
+        assert!(reverse_dns("0.0.0.0".parse::<IpAddr>().unwrap()).is_err());
+
+        let mut s = Scope::default();
+        s.authorization.requires = reqs(vec![Require::Host {
+            negate: false,
+            names: vec!["localhost".into()],
+        }]);
+        let result = check(&s, &req("GET"), ip, None);
+        assert!(matches!(result, Access::Allowed | Access::Denied));
+    }
+
+    #[test]
+    fn require_none_denies_when_any_child_matches() {
+        let mut s = Scope::default();
+        let inside = "127.0.0.1".parse().unwrap();
+        // Two block-list providers: loopback matches one but not the other.
+        s.authorization.requires = nodes(vec![RequireNode::All(vec![
+            RequireNode::Provider(Require::AllGranted),
+            RequireNode::None(vec![
+                RequireNode::Provider(Require::Ip {
+                    negate: false,
+                    nets: vec![("10.0.0.0".parse().unwrap(), 8)],
+                }),
+                RequireNode::Provider(Require::Ip {
+                    negate: false,
+                    nets: vec![("127.0.0.0".parse().unwrap(), 8)],
+                }),
+            ]),
+        ])]);
+        assert_eq!(check(&s, &req("GET"), inside, None), Access::Denied);
+        assert_eq!(
+            check(&s, &req("GET"), "10.1.2.3".parse().unwrap(), None),
+            Access::Denied
+        );
+        assert_eq!(
+            check(&s, &req("GET"), "192.0.2.1".parse().unwrap(), None),
+            Access::Allowed
+        );
+
+        // Three providers where two match must deny as well.
+        s.authorization.requires = nodes(vec![RequireNode::All(vec![
+            RequireNode::Provider(Require::AllGranted),
+            RequireNode::None(vec![
+                RequireNode::Provider(Require::Ip {
+                    negate: false,
+                    nets: vec![("10.0.0.0".parse().unwrap(), 8)],
+                }),
+                RequireNode::Provider(Require::Ip {
+                    negate: false,
+                    nets: vec![("127.0.0.0".parse().unwrap(), 8)],
+                }),
+                RequireNode::Provider(Require::Ip {
+                    negate: false,
+                    nets: vec![("127.0.0.1".parse().unwrap(), 32)],
+                }),
+            ]),
+        ])]);
+        assert_eq!(check(&s, &req("GET"), inside, None), Access::Denied);
+
+        // A granted child is not neutralized by a denied sibling.
+        s.authorization.requires = nodes(vec![RequireNode::None(vec![
+            RequireNode::Provider(Require::AllGranted),
+            RequireNode::Provider(Require::AllDenied),
+        ])]);
+        assert_eq!(check(&s, &req("GET"), inside, None), Access::Denied);
+
+        // No child satisfied means the negated group cannot grant by itself.
+        s.authorization.requires = nodes(vec![RequireNode::None(vec![
+            RequireNode::Provider(Require::AllDenied),
+            RequireNode::Provider(Require::AllDenied),
+        ])]);
+        assert_eq!(check(&s, &req("GET"), inside, None), Access::Denied);
+    }
+
+    #[test]
+    fn ipv4_mapped_peers_are_canonicalized_for_policy() {
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert_eq!(canonical_ip(mapped), "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            canonical_ip("2001:db8::1".parse::<IpAddr>().unwrap()),
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
+        assert!(ip_in_net(mapped, "127.0.0.0".parse().unwrap(), 8));
+        assert!(!ip_in_net(
+            "::ffff:192.0.2.1".parse().unwrap(),
+            "127.0.0.0".parse().unwrap(),
+            8
+        ));
+
+        let mut s = Scope::default();
+        s.authorization.requires = reqs(vec![Require::Local { negate: false }]);
+        assert_eq!(check(&s, &req("GET"), mapped, None), Access::Allowed);
+        s.authorization.requires = nodes(vec![RequireNode::All(vec![
+            RequireNode::Provider(Require::AllGranted),
+            RequireNode::Provider(Require::Local { negate: true }),
+        ])]);
+        assert_eq!(check(&s, &req("GET"), mapped, None), Access::Denied);
+        assert_eq!(
+            check(&s, &req("GET"), "::ffff:192.0.2.1".parse().unwrap(), None),
             Access::Allowed
         );
     }

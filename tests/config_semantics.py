@@ -226,6 +226,26 @@ def request(port: int, method: str, path: str, headers=None, body=b""):
 # `config` is emitted verbatim; `{dir}` is expanded to the case directory.
 CASES = [
     {
+        "name": "alias-overlap-parent-htaccess",
+        "dir": "alias_overlap",
+        "files": {
+            ".htaccess": "Require all denied\n",
+            "assets/wallet.dat": "WALLET-ALIAS-OVERLAP\n",
+        },
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    AllowOverride All",
+            "    Require all granted",
+            "</Directory>",
+            f'Alias "/sem-alias-assets" "{{dir}}/assets"',
+            f'Alias "/sem-alias-site" "{{dir}}"',
+        ],
+        "requests": [
+            ("GET", "/sem-alias-site/assets/wallet.dat", None, {}),
+            ("GET", "/sem-alias-assets/wallet.dat", None, {}),
+        ],
+    },
+    {
         "name": "allowoverride-none-denies-htaccess",
         "dir": "ao_none",
         "files": {".htaccess": "Require all denied\n"},
@@ -448,6 +468,55 @@ CASES = [
             "</Directory>",
         ],
         "requests": [("GET", "/req_none/file.txt", None, {})],
+    },
+    {
+        "name": "require-none-multi-one-match",
+        "dir": "req_none_multi_one",
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    <RequireAll>",
+            "        Require all granted",
+            "        <RequireNone>",
+            "            Require ip 10.0.0.0/8",
+            "            Require ip 127.0.0.0/8",
+            "        </RequireNone>",
+            "    </RequireAll>",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/req_none_multi_one/file.txt", None, {})],
+    },
+    {
+        "name": "require-none-multi-two-of-three-match",
+        "dir": "req_none_multi_two",
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    <RequireAll>",
+            "        Require all granted",
+            "        <RequireNone>",
+            "            Require ip 10.0.0.0/8",
+            "            Require ip 127.0.0.0/8",
+            "            Require ip 127.0.0.1",
+            "        </RequireNone>",
+            "    </RequireAll>",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/req_none_multi_two/file.txt", None, {})],
+    },
+    {
+        "name": "require-none-multi-nonmatching-allows",
+        "dir": "req_none_multi_none",
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    <RequireAll>",
+            "        Require all granted",
+            "        <RequireNone>",
+            "            Require ip 10.0.0.0/8",
+            "            Require ip 192.0.2.0/24",
+            "        </RequireNone>",
+            "    </RequireAll>",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/req_none_multi_none/file.txt", None, {})],
     },
     {
         "name": "authmerging-and",
@@ -1443,6 +1512,49 @@ CASES = [
             "</Directory>",
         ],
         "requests": [("GET", "/ht_requirenone/file.txt", None, {})],
+    },
+    {
+        "name": "htaccess-requirenone-multi-one-match",
+        "dir": "ht_requirenone_multi",
+        "files": {
+            ".htaccess": (
+                "<RequireAll>\n"
+                "    Require all granted\n"
+                "    <RequireNone>\n"
+                "        Require ip 10.0.0.0/8\n"
+                "        Require ip 127.0.0.0/8\n"
+                "    </RequireNone>\n"
+                "</RequireAll>\n"
+            )
+        },
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    AllowOverride AuthConfig",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/ht_requirenone_multi/file.txt", None, {})],
+    },
+    {
+        "name": "htaccess-requirenone-multi-two-of-three-match",
+        "dir": "ht_requirenone_multi_two",
+        "files": {
+            ".htaccess": (
+                "<RequireAll>\n"
+                "    Require all granted\n"
+                "    <RequireNone>\n"
+                "        Require ip 10.0.0.0/8\n"
+                "        Require ip 127.0.0.0/8\n"
+                "        Require ip 127.0.0.1\n"
+                "    </RequireNone>\n"
+                "</RequireAll>\n"
+            )
+        },
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    AllowOverride AuthConfig",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/ht_requirenone_multi_two/file.txt", None, {})],
     },
     {
         "name": "nested-if-files-grant",
