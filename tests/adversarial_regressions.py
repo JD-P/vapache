@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end regressions for the pass-2 through pass-9 findings (F23-F59).
+"""End-to-end regressions for the pass-2 through pass-10 findings (F23-F60).
 
 The suite starts fresh vapached instances in temporary trees and exercises
 the exploit shapes from findings.md: terminal rewrite/proxy authorization,
@@ -12,8 +12,9 @@ IPv4-mapped peer canonicalization, ancestor access files above DocumentRoot,
 overlapping alias roots, DirectoryIndex-bound cache targets, alias per-directory
 rewrite bases, SetHandler/server-status cache classification, lossless cache
 key bytes, ErrorDocument cache scoping, canonical REQUEST_URI identity,
-access-file rewrite subjects above the mapping root, and explicit-target
-access-layer binding for symlinked mapping roots.
+access-file rewrite subjects above the mapping root, explicit-target
+access-layer binding for symlinked mapping roots, and the pass-10
+resolved-target/rewrite scope conjunction.
 
 Usage:
     cargo build --release -p vapached
@@ -1895,6 +1896,308 @@ Alias /aliased "{cls.alias_link}"
 
     def test_symlinked_alias_root_keeps_child_policy(self):
         self.assert_not_executed("/aliased/admin/run.cgi", b"WALLET-F59-ALIAS-CGI")
+
+
+class F60ResolvedTargetScopeTests(unittest.TestCase):
+    """Resolved-target policy must be a meet, never a replacement (F60/I61)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f60-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.real = cls.base / "real" / "public"
+        cls.root = cls.base / "www" / "html"
+        cls.alias_real = cls.base / "alias-real" / "public"
+        cls.alias_link = cls.base / "alias-link"
+        cls.anc = cls.base / "anc"
+        cls.anc_real = cls.base / "anc-real" / "public"
+        cls.anc_root = cls.anc / "html"
+        cls.anc_handler = cls.base / "anc-handler"
+        cls.anc_handler_real = cls.base / "anc-handler-real" / "public"
+        cls.anc_handler_root = cls.anc_handler / "html"
+        cls.anc_set = cls.base / "anc-set"
+        cls.anc_set_real = cls.base / "anc-set-real" / "public"
+        cls.anc_set_root = cls.anc_set / "html"
+        cls.logs = cls.base / "logs"
+        for directory in (
+            cls.real / "uploads",
+            cls.real / "admin",
+            cls.real / "list",
+            cls.real / "dirindex",
+            cls.real / "payload",
+            cls.real / "handler",
+            cls.real / "rw-protected",
+            cls.alias_real / "uploads",
+            cls.anc_real / "admin",
+            cls.anc,
+            cls.anc_handler,
+            cls.anc_handler_real / "admin",
+            cls.anc_set,
+            cls.anc_set_real / "admin",
+            cls.base / "www",
+            cls.logs,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        cls.root.symlink_to(cls.real, target_is_directory=True)
+        cls.alias_link.symlink_to(cls.alias_real, target_is_directory=True)
+        cls.anc_root.symlink_to(cls.anc_real, target_is_directory=True)
+        cls.anc_handler_root.symlink_to(cls.anc_handler_real, target_is_directory=True)
+        cls.anc_set_root.symlink_to(cls.anc_set_real, target_is_directory=True)
+
+        def script(marker: str) -> str:
+            return (
+                "#!/bin/sh\n"
+                "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+                f"printf '{marker}\\n'\n"
+            )
+
+        (cls.real / "uploads" / "sh.cgi").write_text(script("WALLET-F60-UPLOADS"))
+        (cls.real / "uploads" / "sh.cgi").chmod(0o755)
+        (cls.real / "uploads" / "index.cgi").write_text(script("WALLET-F60-DIRINDEX"))
+        (cls.real / "uploads" / "index.cgi").chmod(0o755)
+        (cls.real / "payload" / "sh.cgi").write_text(script("WALLET-F60-PAYLOAD"))
+        (cls.real / "payload" / "sh.cgi").chmod(0o755)
+        (cls.real / "uploads" / "link.cgi").symlink_to("../payload/sh.cgi")
+        (cls.real / "admin" / "run.cgi").write_text(script("WALLET-F60-ADMIN"))
+        (cls.real / "admin" / "run.cgi").chmod(0o755)
+        (cls.real / "dirindex" / "index.cgi").write_text(
+            script("WALLET-F60-DIRINDEX-CGI")
+        )
+        (cls.real / "dirindex" / "index.cgi").chmod(0o755)
+        (cls.real / "list" / "wallet.dat").write_text("WALLET-F60-LIST-SECRET\n")
+        (cls.real / "handler" / "run.cgi").write_text(
+            "#!/bin/sh\n"
+            "# WALLET-F60-HANDLER-SOURCE\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'WALLET-F60-HANDLER-%s\\n' 'EXEC'\n"
+        )
+        (cls.real / "handler" / "run.cgi").chmod(0o755)
+        (cls.alias_real / "uploads" / "sh.cgi").write_text(
+            script("WALLET-F60-ALIAS")
+        )
+        (cls.alias_real / "uploads" / "sh.cgi").chmod(0o755)
+        (cls.anc_real / "admin" / "run.cgi").write_text(
+            script("WALLET-F60-ANCESTOR")
+        )
+        (cls.anc_real / "admin" / "run.cgi").chmod(0o755)
+        # F60-B: the hardening layer is above the symlinked mapping root.
+        (cls.anc / ".htaccess").write_text("Options -ExecCGI\n")
+        (cls.anc_handler / ".htaccess").write_text("RemoveHandler .cgi\n")
+        (cls.anc_set / ".htaccess").write_text("SetHandler none\n")
+        for real in (cls.anc_handler_real, cls.anc_set_real):
+            (real / "admin" / "run.cgi").write_text(
+                "#!/bin/sh\n"
+                "# WALLET-F60-ANCESTOR-HANDLER-SOURCE\n"
+                "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+                "printf 'WALLET-F60-ANCESTOR-HANDLER-%s\\n' 'EXEC'\n"
+            )
+            (real / "admin" / "run.cgi").chmod(0o755)
+        # A per-directory rewrite must not launder a protected upload into the
+        # globally executable payload directory.
+        (cls.real / "rw-protected" / ".htaccess").write_text(
+            "RewriteEngine On\n"
+            "RewriteRule ^go$ /payload/sh.cgi [L]\n"
+        )
+
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.root}"
+Options +ExecCGI +FollowSymLinks +Indexes
+AddHandler cgi-script .cgi
+DirectoryIndex index.html index.cgi
+<Directory "{cls.root}">
+    AllowOverride None
+    Require all granted
+</Directory>
+<Directory "{cls.root}/uploads">
+    Options -ExecCGI
+    Require all granted
+</Directory>
+<Directory "{cls.root}/admin">
+    Options -ExecCGI
+    Require all granted
+</Directory>
+<Directory "{cls.root}/dirindex">
+    Options -ExecCGI
+    Require all granted
+</Directory>
+<Directory "{cls.root}/list">
+    Options -Indexes
+    Require all granted
+</Directory>
+<Directory "{cls.root}/handler">
+    RemoveHandler .cgi
+    Require all granted
+</Directory>
+<Directory "{cls.root}/rw-protected">
+    Options -ExecCGI
+    AllowOverride All
+    Require all granted
+</Directory>
+<Directory "{cls.alias_link}">
+    Options -ExecCGI
+    Require all granted
+</Directory>
+Alias /aliased "{cls.alias_link}"
+Alias /ancestor "{cls.anc_root}"
+Alias /ancestor-handler "{cls.anc_handler_root}"
+Alias /ancestor-sethandler "{cls.anc_set_root}"
+<Directory "{cls.anc}">
+    AllowOverride All
+    Require all granted
+</Directory>
+<Directory "{cls.anc_handler}">
+    AllowOverride All
+    Require all granted
+</Directory>
+<Directory "{cls.anc_set}">
+    AllowOverride All
+    Require all granted
+</Directory>
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def assert_denied(self, path: str, marker: bytes):
+        status, _, body = request(self.port, path)
+        self.assertEqual(status, 403, f"{path}: {body[:300]}")
+        self.assertNotIn(marker, body, path)
+
+    def test_plain_directory_policy_survives_symlinked_document_root(self):
+        # No .htaccess and AllowOverride None: the child <Directory> is the
+        # only denial, exactly the F60-A shape.
+        self.assert_denied("/uploads/sh.cgi", b"WALLET-F60-UPLOADS")
+
+    def test_symlinked_alias_target_keeps_lexical_directory_policy(self):
+        self.assert_denied("/aliased/uploads/sh.cgi", b"WALLET-F60-ALIAS")
+
+    def test_pre_existing_protected_cgi_is_not_executed(self):
+        self.assert_denied("/admin/run.cgi", b"WALLET-F60-ADMIN")
+
+    def test_in_root_symlink_cannot_escape_upload_exec_policy(self):
+        self.assert_denied("/uploads/link.cgi", b"WALLET-F60-PAYLOAD")
+
+    def test_ancestor_htaccess_above_symlinked_root_is_retained(self):
+        self.assert_denied("/ancestor/admin/run.cgi", b"WALLET-F60-ANCESTOR")
+
+    def test_ancestor_remove_handler_is_retained(self):
+        status, _, body = request(self.port, "/ancestor-handler/admin/run.cgi")
+        self.assertEqual(status, 200, body[:300])
+        self.assertIn(b"WALLET-F60-ANCESTOR-HANDLER-SOURCE", body)
+        self.assertNotIn(b"WALLET-F60-ANCESTOR-HANDLER-EXEC", body)
+
+    def test_ancestor_set_handler_none_is_retained(self):
+        status, _, body = request(self.port, "/ancestor-sethandler/admin/run.cgi")
+        self.assertEqual(status, 200, body[:300])
+        self.assertIn(b"WALLET-F60-ANCESTOR-HANDLER-SOURCE", body)
+        self.assertNotIn(b"WALLET-F60-ANCESTOR-HANDLER-EXEC", body)
+
+    def test_directory_index_cgi_in_protected_upload_directory(self):
+        for path in ("/uploads/", "/uploads/index.cgi"):
+            self.assert_denied(path, b"WALLET-F60-DIRINDEX")
+
+    def test_directory_policy_survives_symlinked_root(self):
+        self.assert_denied("/dirindex/", b"WALLET-F60-DIRINDEX-CGI")
+
+    def test_options_indexes_is_not_lost(self):
+        status, _, body = request(self.port, "/list/")
+        self.assertEqual(status, 403, body[:300])
+        self.assertNotIn(b"WALLET-F60-LIST-SECRET", body)
+
+    def test_remove_handler_survives_symlinked_root(self):
+        status, _, body = request(self.port, "/handler/run.cgi")
+        self.assertEqual(status, 200, body[:300])
+        self.assertIn(b"WALLET-F60-HANDLER-SOURCE", body)
+        self.assertNotIn(b"WALLET-F60-HANDLER-EXEC", body)
+
+    def test_rewrite_cannot_launder_a_protected_upload(self):
+        self.assert_denied("/rw-protected/go", b"WALLET-F60-PAYLOAD")
+
+
+class F60AllowOverrideDenyTests(unittest.TestCase):
+    """Lexical AllowOverride None must veto canonical AllowOverride All."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f60-override-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.real = cls.base / "real" / "public"
+        cls.root = cls.base / "www" / "html"
+        cls.control = cls.base / "www" / "control"
+        cls.logs = cls.base / "logs"
+        for directory in (cls.real / "uploads", cls.base / "www", cls.logs):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        cls.root.symlink_to(cls.real, target_is_directory=True)
+        cls.control.symlink_to(cls.real, target_is_directory=True)
+        (cls.real / "uploads" / ".htaccess").write_text(
+            "Options +ExecCGI\n"
+            "AddHandler cgi-script .cgi\n"
+        )
+        (cls.real / "uploads" / "sh.cgi").write_text(
+            "#!/bin/sh\n"
+            "# WALLET-F60-OVERRIDE-SOURCE\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'WALLET-F60-OVERRIDE-%s\\n' 'EXEC'\n"
+        )
+        (cls.real / "uploads" / "sh.cgi").chmod(0o755)
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.root}"
+Options +FollowSymLinks
+<Directory "{cls.root}">
+    AllowOverride None
+    Require all granted
+</Directory>
+<Directory "{cls.real}">
+    AllowOverride All
+    Require all granted
+</Directory>
+Alias /override "{cls.root}"
+Alias /control "{cls.control}"
+<Directory "{cls.control}">
+    AllowOverride All
+    Require all granted
+</Directory>
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def test_lexical_none_does_not_read_canonical_all_htaccess(self):
+        status, _, body = request(self.port, "/override/uploads/sh.cgi")
+        self.assertEqual(status, 200, body[:300])
+        self.assertIn(b"WALLET-F60-OVERRIDE-SOURCE", body)
+        self.assertNotIn(b"WALLET-F60-OVERRIDE-EXEC", body)
+
+    def test_control_lexical_all_still_reads_the_uploaded_htaccess(self):
+        status, _, body = request(self.port, "/control/uploads/sh.cgi")
+        self.assertEqual(status, 200, body[:300])
+        self.assertIn(b"WALLET-F60-OVERRIDE-EXEC", body)
 
 
 class F54SetHandlerCacheTests(unittest.TestCase):

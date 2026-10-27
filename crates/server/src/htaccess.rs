@@ -408,16 +408,21 @@ pub fn collect_layers_with_root(
         if !is_dir {
             continue;
         }
-        let mut dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
+        let dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
+        // A canonical target directory and its lexical URL-mapped counterpart
+        // are two policy identities.  An explicit `AllowOverride None` on
+        // either one denies the access file; when only one identity is
+        // configured it supplies the policy; enabled category sets meet
+        // (F60-D/I61).  Keeping the canonical scope merely because the lexical
+        // scope was disabled was a fail-open branch.
+        let mut override_policy = dir_scope.override_policy.clone();
         if let Some(mapped) = mapped_dir.as_deref().filter(|mapped| *mapped != dir) {
             let mapped_scope = cfg.effective_scope_cached(vhost, mapped, url_path);
-            if mapped_scope.override_policy.is_enabled() {
-                dir_scope = mapped_scope;
-            }
+            override_policy = override_policy.conjoined_with(&mapped_scope.override_policy);
         }
-        let mode = dir_scope.override_policy.mode();
-        let allow_list = dir_scope.override_policy.allow_list();
-        let nonfatal = dir_scope.override_policy.nonfatal();
+        let mode = override_policy.mode();
+        let allow_list = override_policy.allow_list();
+        let nonfatal = override_policy.nonfatal();
         if !crate::verified::access_walk_dir_admit(
             is_dir,
             mode.is_enabled() || !allow_list.is_empty(),
@@ -530,16 +535,15 @@ pub fn trace_access_files_with_root(
         if !policy_applicable {
             continue;
         }
-        let mut dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
+        let dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
+        let mut override_policy = dir_scope.override_policy.clone();
         if let Some(mapped) = mapped_dir.as_deref().filter(|mapped| *mapped != dir) {
             let mapped_scope = cfg.effective_scope_cached(vhost, mapped, url_path);
-            if mapped_scope.override_policy.is_enabled() {
-                dir_scope = mapped_scope;
-            }
+            override_policy = override_policy.conjoined_with(&mapped_scope.override_policy);
         }
-        let mode = dir_scope.override_policy.mode();
-        let allow_list = dir_scope.override_policy.allow_list();
-        let nonfatal = dir_scope.override_policy.nonfatal();
+        let mode = override_policy.mode();
+        let allow_list = override_policy.allow_list();
+        let nonfatal = override_policy.nonfatal();
         if !mode.is_enabled() && allow_list.is_empty() {
             continue;
         }
@@ -3465,6 +3469,46 @@ mod tests {
                 .unwrap();
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].identity.dir, admin);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lexical_allow_override_none_vetoes_canonical_all() {
+        let dir = tempdir("coverage-walk-override-deny");
+        let real = dir.join("real/public");
+        let admin = real.join("admin");
+        fs::create_dir_all(&admin).unwrap();
+        fs::create_dir_all(dir.join("www")).unwrap();
+        let root = dir.join("www/html");
+        std::os::unix::fs::symlink(&real, &root).unwrap();
+        fs::write(
+            admin.join(".htaccess"),
+            "Options +ExecCGI\nAddHandler cgi-script .cgi\n",
+        )
+        .unwrap();
+        let cfg = config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:0\nDocumentRoot \"{}\"\n\
+                 <Directory \"{}\">\nAllowOverride None\n</Directory>\n\
+                 <Directory \"{}\">\nAllowOverride All\n</Directory>\n",
+                root.display(),
+                root.display(),
+                real.display()
+            ),
+        );
+        let canonical = admin.join("run.cgi");
+        let layers = collect_layers_with_root(&cfg, None, &canonical, "/admin/run.cgi", Some(&root))
+            .unwrap();
+        assert!(
+            layers.is_empty(),
+            "a lexical AllowOverride None must suppress the canonical access file"
+        );
+        let trace =
+            trace_access_files_with_root(&cfg, None, &canonical, "/admin/run.cgi", Some(&root))
+                .join("\n");
+        assert!(!trace.contains(&admin.join(".htaccess").display().to_string()));
 
         let _ = fs::remove_dir_all(&dir);
     }

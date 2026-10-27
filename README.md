@@ -60,7 +60,10 @@ Implemented today:
   `UnsafeAllow3F`, `UnsafePrefixStat`), including backreferences, common
   `%{...}` variables and loop protection. Internal rewrites reauthorize the
   original URL with the original request context and accumulated rewrite
-  effects, then authorize the final target. `UnsafePrefixStat` is accepted for
+  effects, retain its `Options`/`AllowOverride`/header policy, and authorize
+  the final target as a conjunction with the rewritten URL scope. A rewrite
+  cannot launder a protected upload into an executable directory.
+  `UnsafePrefixStat` is accepted for
   compatibility but never weakens the document/alias containment base. `dbm`
   maps and exact `DPI` path-info handling remain unsupported; malformed
   patterns are rejected rather than approximated.
@@ -193,7 +196,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **268 verified functions, 0 errors** (percent-decoding,
+Current result: **277 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -209,7 +212,8 @@ and filesystem-target admission, and the configuration access-plan,
 authorization-merge, Options-merge and `.htaccess` rule-classification kernels
 used by the dispatcher, plus the pass-6 ancestor access-walk, URL-selected
 alias mapping-root and `DirectoryIndex` cache-target/query-isolation
-predicates).
+predicates, and the pass-10 I61 Options/handler/`AllowOverride` meet and
+rewrite-scope-retention kernels).
 
 Function count is not the progress metric. The verification ledger tracks
 security obligations and proof debt:
@@ -219,19 +223,22 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus   # include the Verus gate
 ```
 
-Current ledger: **51.1% weighted obligations**, **6/6 proof debt**,
+Current ledger: **51.0% weighted obligations**, **6/6 proof debt**,
 **8/8 grant-required sinks**, **8/8 path-target-bound sinks**, **4/8
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
-failures**, **57 adversarial replay cases** covering the findings classes,
-and **268 Verus functions with 0 errors** (including the I3 fast-path
+failures**, **71 adversarial replay cases** covering the findings classes,
+and **277 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
 pass-7 I50–I53 URL-mounted rewrite-base/cache-key-byte/ErrorDocument/
 dynamic-handler kernels, the pass-8 I57/I58 canonical-REQUEST_URI and
 access-file rewrite-subject kernels, the pass-9 I60 explicit-target
-access-layer binding kernels, and the strengthened cache-key
+access-layer binding kernels, the pass-10 I61 resolved-target/rewrite
+scope-conjunction kernels (`options_conjoin`, `handler_conjoin_admit`,
+`override_categories_conjoin`, `rewrite_scope_retained_admit`), and the
+strengthened cache-key
 injectivity, lookup, store-admission, freshness, disk-accounting and SHA-256
 policy-binding proofs for I51/I54).
 
@@ -253,7 +260,7 @@ requiring a grant. Raising a budget is a deliberate, reviewable change.
 ```sh
 cargo test --workspace          # Rust unit tests
 python3 tests/conformance.py    # 165 Apache differential/conformance tests
-python3 tests/adversarial_regressions.py  # F23-F59 end-to-end replay suite
+python3 tests/adversarial_regressions.py  # F23-F60 end-to-end replay suite
 ```
 
 The conformance suite starts a real Apache `httpd` and `vapached` with
@@ -342,7 +349,7 @@ time.
 Latest snapshot: **94.1% regions**, **90.1% of functions** and **94.9% of
 lines** across the Rust, conformance and adversarial replay suites. The current
 suite is 373 Rust library tests, 4 CLI tests, 165 conformance tests, 205
-generated configuration cases and 57 adversarial replay tests. Authentication
+generated configuration cases and 71 adversarial replay tests. Authentication
 is at 91.8% line coverage, TLS/HTTP/2 at 97.9%/81.6%, access logging at 84.7%,
 the verified security kernels at 88.3%, compression at 90.0%, FastCGI at 98.9%,
 the HTTP proxy at 97.8%, rewrite execution at 98.6%, cache at 91.4%, OCSP at

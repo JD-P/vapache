@@ -355,9 +355,12 @@ transforms.  In particular:
   walk are bounded by the configured FastCGI prefix (or the request's
   document/alias root), and symlinks that leave that base are rejected;
 - an internal rewrite requires both the original request URL scope
-  (`<Location>`/`<LocationMatch>`) and the final target scope to allow; an
-  absolute rewrite target is only admitted when its canonical file remains
-  below the current document/alias root, so a rewrite cannot name a new root;
+  (`<Location>`/`<LocationMatch>`) and the final target scope to allow; the
+  original URL's `Options`/`AllowOverride`/header policy is conjoined with the
+  rewritten target policy, and an absolute rewrite target is only admitted
+  when its canonical file remains below the current document/alias root, so a
+  rewrite cannot name a new root or launder a protected upload into an
+  executable directory (I61);
 - an `.htaccess` walk covers every applicable ancestor of an alias or document
   root target, so parent access files outside `DocumentRoot` cannot be skipped
   (I47); the URL-selected alias root is used only for URL-base derivation
@@ -730,14 +733,16 @@ forall terminal positive outcomes after a transform:
 ```
 
 A transform adds an authorization obligation; it never replaces one.  The
-inventory is closed over every request-to-resource conversion:
+final target policy is likewise a meet with the URL policy, never a
+replacement (I61).  The inventory is closed over every request-to-resource
+conversion:
 
 | Transform | Target identity | Reauthorization / binding |
 |---|---|---|
 | prefix alias, `ScriptAlias` | `map_path` root + rel | target scope, alias-root access walk, file grant |
 | `AliasMatch`, `ScriptAliasMatch` | capture-expanded target inside stable alias base | mapping failure outside base; target scope, file grant |
-| internal URL rewrite | canonical rewritten URL | target scope + original-URL gate with rewrite effects |
-| internal filesystem rewrite | canonical file below current root | target scope, original-URL gate, file inode grant |
+| internal URL rewrite | canonical rewritten URL | target scope + original-URL gate with rewrite effects; original and target policy meet (I61) |
+| internal filesystem rewrite | canonical file below current root | target scope + rewritten URL scope meet, original-URL gate, file inode grant |
 | CGI `PATH_INFO` | `find_script_checked` actual script | script scope, inode-bound CGI grant |
 | FastCGI `ProxyPassMatch`/`PATH_INFO` | contained script filename + `PATH_INFO` | script scope, backend-bound FastCGI grant |
 | `SetHandler proxy:fcgi` | contained handler script | script scope, backend-bound FastCGI grant |
@@ -1177,6 +1182,41 @@ target paths consume `explicit_target_layer_admit` and
 `target_layer_consume_admit`; a nonempty layer set is never silently replaced
 by the configuration-only scope (F59).
 
+### I61 — Resolved-target and rewrite scope conjunction
+
+```text
+L = URL-mapped lexical path/scope
+T = opened/canonical target path/scope (or the rewritten URL target)
+L != T  ==>  effective_scope = meet(scope(L), scope(T))
+options_effective(L, T)    == options(L) AND options(T)
+handler(L, ext) == handler(T, ext)  -> permitted
+otherwise                            -> no handler (source/default)
+AllowOverride(L) None  ==> no access-file layer of T is read
+every transform target (symlink, alias, rewrite, PATH_INFO, FastCGI,
+DirectoryIndex, DirectorySlash, cache target) uses the same meet
+rewrite changes the URL ==> original URL policy is retained as well
+```
+
+The URL identity and the resolved filesystem identity can differ without any
+URI normalizer, `openat2` or inode-binding failure: a symlinked `DocumentRoot`
+or alias, an in-root symlink created by upload/archive extraction, a
+`DirectoryIndex`, or a rewrite-selected target all produce two policy
+identities.  Replacing `scope(L)` with `scope(T)` dropped child
+`<Directory>` and ancestor `.htaccess` restrictions, so `Options -ExecCGI`,
+`Options -Indexes`, `RemoveHandler` and lexical `AllowOverride None` were
+bypassed (F60).  `Scope::restrict_with()` now computes the meet:
+`options_conjoin`, `handler_conjoin_admit` and
+`override_categories_conjoin` are the verified kernels; handler maps are
+projected to explicit per-extension grants only when both identities agree.
+The `AllowOverride` walk consumes `OverridePolicy::conjoined_with()` so an
+explicit `None` on either path identity denies the canonical access file,
+while an unconfigured canonical directory does not erase an enabled lexical
+policy (the F59 shape).  Rewrite-selected filesystem targets and cache targets
+use the same meet; the post-rewrite original-URL gate uses
+`restrict_policy_with()` so it retains the original `Options`/headers without
+forcing the old filename's handler extension onto a legitimately rewritten
+target.
+
 ### I51 — Cache key byte identity
 
 ```text
@@ -1422,12 +1462,17 @@ construction: there is no second production interleaver.
   and `LayerIdentity` plus the shared subject/URL-mount functions replace the
   duplicate layer arithmetic in `config.rs`, `htaccess.rs` and `rewrite.rs`.
 - `explicit_target_layer_admit` and `target_layer_consume_admit`.  These are
-  the pass-9 kernels for explicit-target access-layer binding (I60).
+  the pass-9 kernels for explicit-target access-layer binding (I60), extended
+  by the pass-10 `options_conjoin`/`handler_conjoin_admit`/
+  `override_categories_conjoin` meet kernels and the resolved-target/rewrite
+  scope invariants (I61).
   `RequestPlan::from_fs_target`/`build_with_fs_path` walk the supplied target
   itself and fail closed if a collected layer is not its ancestor;
   `RequestPlan::evaluate_scope` always consumes a nonempty layer set even
   when the canonical target is outside the lexical `AllowOverride` prefix.
-  Unit plus F59 symlinked-document-root/alias, `DirectoryIndex` and autoindex
+  Unit plus F59/F60 symlinked-document-root/alias, in-root symlink,
+  ancestor access-file, `DirectoryIndex`, autoindex, `RemoveHandler` and
+  `AllowOverride None`/rewrite-laundering cases
   replays exercise both predicates.
 - `cache_key_hex_spec_injective`, `cache_lookup_hit_requires_binding`,
   `cache_lookup_rejects_stale`, `cache_store_request_admit`,

@@ -1458,6 +1458,12 @@ fn bind_target_grant(
         req,
         peer,
     );
+    // The canonical target may add restrictions but it must never replace the
+    // policy of the URL that selected it.  Apache keeps the URL-mapped
+    // `<Directory>`/access-file execution policy across a symlink; replacing
+    // the scope here let `Options -ExecCGI`, `-Indexes`, `RemoveHandler` and
+    // `AllowOverride None` disappear (F60/I61).
+    target_scope.restrict_with(scope);
     let mut key = access::ResourceKey::request(vhost, req, url_path, Some(actual_path), None);
     let target_grant = match helper_access_response(
         cfg,
@@ -1507,6 +1513,7 @@ fn authorize_resolved_target(
     peer: IpAddr,
     target_fs: &Path,
     target_url: &str,
+    base_scope: &Scope,
     proxy_url: Option<&str>,
     mapping_root: &Path,
     local_port: u16,
@@ -1543,6 +1550,38 @@ fn authorize_resolved_target(
         req,
         peer,
     );
+    // A transform-selected target (PATH_INFO, FastCGI, DirectorySlash, alias
+    // target) has a lexical target URL and a canonical filesystem target.
+    // Meet those two identities, then retain the original request URL's
+    // non-handler policy (the selected target may legitimately use a different
+    // filename extension, so its handler map comes from the target URL)
+    // (F60/I61).
+    let lexical_target_scope = match CanonicalTarget::from_url_path(target_url)
+        .ok_or_else(|| format!("invalid canonical target URL '{target_url}'"))
+        .and_then(|target| {
+            RequestPlan::resolve(cfg, vhost, target)
+                .map_err(|error| format!("target URL has no mapping: {error:?}"))
+        }) {
+        Ok(plan) => plan.effective_scope(cfg, vhost, req, peer),
+        // coverage:ignore-start
+        Err(e) => {
+            eprintln!("vapached: target URL scope error: {e}");
+            return Err(error_response(
+                cfg,
+                vhost,
+                &cfg.global,
+                500,
+                req,
+                target_url,
+                local_port,
+                server_name,
+                peer,
+                local_ip,
+            ));
+        } // coverage:ignore-stop
+    };
+    target_scope.restrict_with(&lexical_target_scope);
+    target_scope.restrict_policy_with(base_scope);
     let mut key = access::ResourceKey::request(vhost, req, target_url, Some(target_fs), proxy_url);
     let grant = helper_access_response(
         cfg,
@@ -1600,7 +1639,7 @@ fn authorize_original_request(
     peer: SocketAddr,
     local_ip: &str,
     rewrite_effects: &crate::rewrite::Effects,
-) -> Result<(), Response> {
+) -> Result<Scope, Response> {
     let (mut original_scope, config_conditionals, htaccess_conditionals) =
         match evaluate_scope_for_path(cfg, vhost, fs_path, url_path, req, peer.ip(), mapping_root) {
             Ok(v) => v,
@@ -1638,7 +1677,7 @@ fn authorize_original_request(
     );
     let mut original_resource =
         access::ResourceKey::request(vhost, req, url_path, Some(fs_path), None);
-    helper_access_response(
+    match helper_access_response(
         cfg,
         vhost,
         &original_scope,
@@ -1649,8 +1688,10 @@ fn authorize_original_request(
         peer.ip(),
         local_ip,
         &mut original_resource,
-    )
-    .map(|_| ())
+    ) {
+        Ok(_) => Ok(original_scope),
+        Err(r) => Err(r),
+    }
 }
 
 fn dispatch_inner(
@@ -2161,6 +2202,11 @@ fn dispatch_inner(
                     req,
                     peer.ip(),
                 );
+                // A rewrite-selected filesystem target has the same two
+                // identities as a symlink target: the rewritten URL scope and
+                // the canonical file scope.  Meet them instead of replacing
+                // the URL policy (F60/I61).
+                target_scope.restrict_with(&scope);
                 scope = target_scope;
             }
             Err(e) => {
@@ -2190,7 +2236,7 @@ fn dispatch_inner(
         || original_req.query != req.query
         || !rewrite_effects.is_empty()
     {
-        if let Err(r) = authorize_original_request(
+        let original_scope = match authorize_original_request(
             cfg,
             vhost,
             original_req,
@@ -2203,8 +2249,15 @@ fn dispatch_inner(
             local_ip,
             &rewrite_effects,
         ) {
-            return r;
-        }
+            Ok(scope) => scope,
+            Err(r) => return r,
+        };
+        // An internal rewrite may change the URL, but it must not launder the
+        // original URL's execution/listing policy.  Conjoin policy (not the
+        // handler map, because the rewrite may legitimately select a new
+        // extension) with the final target scope; the target bind later meets
+        // the canonical scope too (F60/I61).
+        scope.restrict_policy_with(&original_scope);
     }
 
     // Redirects are evaluated after rewrites but before access control and
@@ -2584,6 +2637,7 @@ fn dispatch_inner(
                     peer.ip(),
                     &fs_path,
                     &canonical,
+                    &scope,
                     None,
                     &root,
                     local_port,
@@ -2700,6 +2754,7 @@ fn dispatch_inner(
                             peer.ip(),
                             &actual_path,
                             &script_name,
+                            &scope,
                             None,
                             &root,
                             local_port,
@@ -2983,6 +3038,7 @@ fn run_fastcgi(
         peer.ip(),
         &target.script_filename,
         &script_url,
+        scope,
         Some(&proxy_identity),
         mapping_root,
         local_port,
@@ -4159,11 +4215,7 @@ mod tests {
         let dir = cov_dir("dispatch-rewrites");
         std::fs::write(dir.join("www/file.txt"), "hello\n").unwrap();
         std::fs::create_dir_all(dir.join("www/bad")).unwrap();
-        std::fs::write(
-            dir.join("www/bad/.htaccess"),
-            "Header \"unterminated\n",
-        )
-        .unwrap();
+        std::fs::write(dir.join("www/bad/.htaccess"), "Header \"unterminated\n").unwrap();
         let cfg = cov_config(
             &dir,
             &format!(
@@ -4300,6 +4352,7 @@ mod tests {
             peer,
             &target,
             "/bad/file.txt",
+            &scope,
             None,
             &map_root,
             80,

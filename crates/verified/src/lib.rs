@@ -1066,6 +1066,108 @@ pub fn target_layer_consume_admit(
     override_may_apply || has_access_layers
 }
 
+/// F60/I61: the effective `Options` set for a resolved target is the meet of
+/// the URL-mapped scope and the canonical target scope.  A permission bit is
+/// present only when both scopes grant it, so resolving a symlink (or any
+/// other target-changing transform) can never add `ExecCGI`, `Indexes` or
+/// `FollowSymLinks`.
+pub open spec fn options_conjoin_spec(url_bits: u32, target_bits: u32) -> u32 {
+    url_bits & target_bits
+}
+
+pub fn options_conjoin(url_bits: u32, target_bits: u32) -> (out: u32)
+    ensures out == options_conjoin_spec(url_bits, target_bits),
+{
+    url_bits & target_bits
+}
+
+/// The meet contains no permission bit that either input scope lacks.
+pub proof fn options_conjoin_never_grants(url_bits: u32, target_bits: u32)
+    ensures
+        options_conjoin_spec(url_bits, target_bits) & url_bits
+            == options_conjoin_spec(url_bits, target_bits),
+        options_conjoin_spec(url_bits, target_bits) & target_bits
+            == options_conjoin_spec(url_bits, target_bits),
+{
+    assert(
+        options_conjoin_spec(url_bits, target_bits) & url_bits
+            == options_conjoin_spec(url_bits, target_bits)
+    ) by (bit_vector);
+    assert(
+        options_conjoin_spec(url_bits, target_bits) & target_bits
+            == options_conjoin_spec(url_bits, target_bits)
+    ) by (bit_vector);
+}
+
+/// F60/I61: a handler is usable only when both the URL-mapped and canonical
+/// target scopes select the same effective handler.  A target `AddHandler`
+/// therefore cannot undo a lexical `RemoveHandler`, and a lexical `AddHandler`
+/// cannot smuggle execution through a target that removes the handler.
+pub open spec fn handler_conjoin_spec(
+    url_has_handler: bool,
+    target_has_handler: bool,
+    same_handler: bool,
+) -> bool {
+    url_has_handler && target_has_handler && same_handler
+}
+
+pub fn handler_conjoin_admit(
+    url_has_handler: bool,
+    target_has_handler: bool,
+    same_handler: bool,
+) -> (ok: bool)
+    ensures
+        ok == handler_conjoin_spec(url_has_handler, target_has_handler, same_handler),
+{
+    url_has_handler && target_has_handler && same_handler
+}
+
+pub proof fn handler_conjoin_requires_both(
+    url_has_handler: bool,
+    target_has_handler: bool,
+    same_handler: bool,
+)
+    ensures
+        handler_conjoin_spec(url_has_handler, target_has_handler, same_handler)
+            ==> url_has_handler && target_has_handler,
+{
+}
+
+/// F60/I61: component-aware intersection for `AllowOverride` categories.
+pub fn override_categories_conjoin(url_bits: u32, target_bits: u32) -> (out: u32)
+    ensures out == (url_bits & target_bits),
+{
+    url_bits & target_bits
+}
+
+/// F60/I61: whenever the opened target differs from the URL-mapped path, the
+/// served policy must be a conjunction of both scopes.  Replacing the lexical
+/// scope with the canonical scope is never admissible.
+pub fn resolved_target_scope_admit(
+    target_differs: bool,
+    scopes_conjoined: bool,
+) -> (ok: bool)
+    ensures ok == (!target_differs || scopes_conjoined),
+{
+    !target_differs || scopes_conjoined
+}
+
+/// F60/I61: an internal rewrite that changes the request must retain the
+/// original URL-mapped execution policy and evaluate the rewritten target
+/// policy.  Terminal rewrite outcomes (proxy/redirect) retain the original
+/// authorization gate as well.
+pub fn rewrite_scope_retained_admit(
+    rewrite_changed: bool,
+    original_scope_retained: bool,
+    target_scope_evaluated: bool,
+) -> (ok: bool)
+    ensures
+        ok == (!rewrite_changed
+            || (original_scope_retained && target_scope_evaluated)),
+{
+    !rewrite_changed || (original_scope_retained && target_scope_evaluated)
+}
+
 /// F54/I53: every non-default handler (`SetHandler proxy:`, `server-status`,
 /// CGI, FastCGI, future handlers) is dynamic for cache-query purposes.  When
 /// a dynamic handler is present, `CacheIgnoreQueryString` must bypass the

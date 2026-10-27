@@ -722,6 +722,24 @@ impl Handler {
     }
 }
 
+/// Resolve the effective handler for one extension token.  `*` matches every
+/// extension.  Scanning the merged list in reverse gives the last operation
+/// for each matching name.
+pub(crate) fn effective_handler_for_ext<'a>(scope: &'a Scope, ext: &str) -> Option<&'a str> {
+    for handler in scope.mapping_policy.handlers.iter().rev() {
+        let matches = handler.ext == "*" || handler.ext.eq_ignore_ascii_case(ext);
+        if !matches {
+            continue;
+        }
+        return if handler.remove {
+            None
+        } else {
+            Some(handler.handler.as_str())
+        };
+    }
+    None
+}
+
 /// Resolve the effective handler for a filename.  Apache applies handler
 /// operations in configuration order: `SetHandler`/`AddHandler` install a
 /// handler and a later `RemoveHandler` removes it again.  Scanning the merged
@@ -734,18 +752,83 @@ pub(crate) fn effective_handler<'a>(scope: &'a Scope, name: &[u8]) -> Option<&'a
         .and_then(|e| std::str::from_utf8(e).ok())
         .unwrap_or("")
         .to_ascii_lowercase();
-    for handler in scope.mapping_policy.handlers.iter().rev() {
-        let matches = handler.ext == "*" || handler.ext.eq_ignore_ascii_case(&ext);
-        if !matches {
+    effective_handler_for_ext(scope, &ext)
+}
+
+/// Meet two handler maps.  For every extension either side mentions, the
+/// result grants a handler only when both scopes resolve to the same handler;
+/// everything else is an explicit removal.  Unknown extensions follow the
+/// same rule through the wildcard entry.  This is what prevents a canonical
+/// target `AddHandler` from undoing a lexical `RemoveHandler` (F60/I61).
+fn conjoined_handlers(base: &[Handler], target: &[Handler]) -> Vec<Handler> {
+    fn lookup<'a>(handlers: &'a [Handler], ext: &str) -> Option<&'a str> {
+        for handler in handlers.iter().rev() {
+            if handler.ext == "*" || handler.ext.eq_ignore_ascii_case(ext) {
+                return if handler.remove {
+                    None
+                } else {
+                    Some(handler.handler.as_str())
+                };
+            }
+        }
+        None
+    }
+
+    fn same(a: Option<&str>, b: Option<&str>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    // A sentinel extension cannot collide with a configured literal one, so
+    // it observes only the wildcard operations from each side.
+    const SENTINEL: &str = "\u{1}vapache-no-extension";
+    let base_wild = lookup(base, SENTINEL);
+    let target_wild = lookup(target, SENTINEL);
+    let mut out = Vec::new();
+    if base_wild.is_some() || target_wild.is_some() {
+        if vapache_verified::handler_conjoin_admit(
+            base_wild.is_some(),
+            target_wild.is_some(),
+            same(base_wild, target_wild),
+        ) {
+            out.push(Handler::add(
+                "*".into(),
+                base_wild.unwrap_or_default().to_string(),
+            ));
+        } else {
+            out.push(Handler::remove("*".into()));
+        }
+    }
+    let mut extensions: Vec<String> = Vec::new();
+    for handler in base.iter().chain(target.iter()) {
+        if handler.ext == "*" {
             continue;
         }
-        return if handler.remove {
-            None
-        } else {
-            Some(handler.handler.as_str())
-        };
+        let ext = handler.ext.to_ascii_lowercase();
+        if !extensions.contains(&ext) {
+            extensions.push(ext);
+        }
     }
-    None
+    for ext in extensions {
+        let base_handler = lookup(base, &ext);
+        let target_handler = lookup(target, &ext);
+        if vapache_verified::handler_conjoin_admit(
+            base_handler.is_some(),
+            target_handler.is_some(),
+            same(base_handler, target_handler),
+        ) {
+            out.push(Handler::add(
+                ext,
+                base_handler.unwrap_or_default().to_string(),
+            ));
+        } else {
+            out.push(Handler::remove(ext));
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1307,6 +1390,51 @@ impl Scope {
             Scope::merge_container_snapshots(&audit_parent, &audit_child),
             "Scope::merge container-field audit failed"
         );
+    }
+
+    /// Restrict `self` (a canonical-target or rewritten-target scope) with the
+    /// policy of the URL identity the client actually requested.  This is a
+    /// meet, never a replacement: a resolved target may add restrictions but
+    /// may not grant an `Options` bit, handler or `AllowOverride` category the
+    /// URL scope denies.  Authorization is checked separately before and after
+    /// resolution, so both grants remain required (F60/I61).
+    pub fn restrict_with(&mut self, base: &Scope) {
+        self.restrict_policy_with(base);
+        self.mapping_policy.handlers =
+            conjoined_handlers(&base.mapping_policy.handlers, &self.mapping_policy.handlers);
+    }
+
+    /// Conjoin execution/list/override/header policy without touching the
+    /// handler map.  Used when a rewrite legitimately changes the filename
+    /// extension, so the original URL's handler map is not the handler map of
+    /// the selected target.
+    pub fn restrict_policy_with(&mut self, base: &Scope) {
+        let url_options = base.options.effective_bits(Options::FOLLOW_SYMLINKS);
+        let target_options = self.options.effective_bits(Options::FOLLOW_SYMLINKS);
+        let conjoined = vapache_verified::options_conjoin(url_options, target_options);
+        self.options = crate::scope_policy::OptionsPolicy::default();
+        self.options.push_set(conjoined);
+
+        self.override_policy = self.override_policy.conjoined_with(&base.override_policy);
+
+        // Preserve lexical response-header policy while still allowing the
+        // target to add its own restrictions.  Unsets from either identity are
+        // retained; target sets override lexical values only when the lexical
+        // scope did not explicitly unset the header.
+        let mut headers = base.header_policy.clone();
+        headers.merge_child(&self.header_policy);
+        self.header_policy = headers;
+
+        for filter in &base.mapping_policy.unsupported_filters {
+            if !self
+                .mapping_policy
+                .unsupported_filters
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(filter))
+            {
+                self.mapping_policy.unsupported_filters.push(filter.clone());
+            }
+        }
     }
 
     pub fn effective_options(&self) -> Options {
@@ -6986,11 +7114,7 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
             false,
         )
         .unwrap();
-        let s = wildcard.effective_scope(
-            None,
-            Path::new("/srv/www/sub/old"),
-            "/sub/old",
-        );
+        let s = wildcard.effective_scope(None, Path::new("/srv/www/sub/old"), "/sub/old");
         assert!(!s.rewrite_policy.rewrite_rules[0].per_dir);
         assert!(s.rewrite_policy.rewrite_rules[0].subject_dir.is_none());
     }
@@ -9804,6 +9928,131 @@ Require all granted\n\
         ];
         sort_rules(&mut rules);
         assert_eq!(rules.len(), 7);
+    }
+
+    #[test]
+    fn resolved_target_scope_is_a_meet_not_a_replacement() {
+        let mut url = Scope::default();
+        url.options.push_add(Options::EXEC_CGI | Options::INDEXES);
+        url.mapping_policy
+            .handlers
+            .push(Handler::remove("cgi".into()));
+
+        let mut target = Scope::default();
+        target
+            .options
+            .push_add(Options::EXEC_CGI | Options::INDEXES);
+        target.options.push_remove(Options::INDEXES);
+        target
+            .mapping_policy
+            .handlers
+            .push(Handler::add("cgi".into(), "cgi-script".into()));
+
+        target.restrict_with(&url);
+        let options = target.effective_options();
+        assert!(options.contains(Options::EXEC_CGI));
+        assert!(!options.contains(Options::INDEXES));
+        // The lexical RemoveHandler survives a canonical AddHandler.
+        assert_eq!(effective_handler(&target, b"upload.cgi"), None);
+
+        // A target-only AddHandler cannot grant execution either.
+        let mut url = Scope::default();
+        let mut target = Scope::default();
+        target
+            .mapping_policy
+            .handlers
+            .push(Handler::add("cgi".into(), "cgi-script".into()));
+        target.restrict_with(&url);
+        assert_eq!(effective_handler(&target, b"upload.cgi"), None);
+
+        // Matching handler maps remain usable.
+        let mut url = Scope::default();
+        url.mapping_policy
+            .handlers
+            .push(Handler::add("cgi".into(), "cgi-script".into()));
+        let mut target = Scope::default();
+        target
+            .mapping_policy
+            .handlers
+            .push(Handler::add("cgi".into(), "CGI-SCRIPT".into()));
+        target.restrict_with(&url);
+        assert_eq!(
+            effective_handler(&target, b"upload.cgi"),
+            Some("cgi-script")
+        );
+
+        // Wildcard handlers meet in the same way; disagreement denies every
+        // extension rather than letting the target grant one.
+        let mut url = Scope::default();
+        url.mapping_policy
+            .handlers
+            .push(Handler::add("*".into(), "cgi-script".into()));
+        let mut target = Scope::default();
+        target
+            .mapping_policy
+            .handlers
+            .push(Handler::add("*".into(), "cgi-script".into()));
+        target.restrict_with(&url);
+        assert_eq!(
+            effective_handler(&target, b"upload.anything"),
+            Some("cgi-script")
+        );
+        let mut target = Scope::default();
+        target
+            .mapping_policy
+            .handlers
+            .push(Handler::add("*".into(), "proxy:fcgi://localhost".into()));
+        target.restrict_with(&url);
+        assert_eq!(effective_handler(&target, b"upload.anything"), None);
+
+        // Two matching RemoveHandler operations stay removed.
+        let mut url = Scope::default();
+        url.mapping_policy
+            .handlers
+            .push(Handler::remove("cgi".into()));
+        let mut target = Scope::default();
+        target
+            .mapping_policy
+            .handlers
+            .push(Handler::remove("cgi".into()));
+        target.restrict_with(&url);
+        assert_eq!(effective_handler(&target, b"upload.cgi"), None);
+
+        // Lexical filters are retained even when the target does not repeat
+        // them.
+        let mut url = Scope::default();
+        url.mapping_policy
+            .unsupported_filters
+            .push("INCLUDES".into());
+        let mut target = Scope::default();
+        target.restrict_with(&url);
+        assert_eq!(target.mapping_policy.unsupported_filters, vec!["INCLUDES"]);
+    }
+
+    #[test]
+    fn rewrite_original_policy_keeps_the_target_handler_extension() {
+        let mut original = Scope::default();
+        original.options.push_add(Options::EXEC_CGI);
+        original
+            .mapping_policy
+            .handlers
+            .push(Handler::remove("cgi".into()));
+
+        let mut rewritten = Scope::default();
+        rewritten.options.push_add(Options::EXEC_CGI);
+        rewritten
+            .mapping_policy
+            .handlers
+            .push(Handler::add("cgi".into(), "cgi-script".into()));
+
+        rewritten.restrict_policy_with(&original);
+        assert!(rewritten.effective_options().contains(Options::EXEC_CGI));
+        // The rewrite intentionally selected a CGI filename; the original
+        // URL's RemoveHandler does not erase the new target's handler map.
+        assert_eq!(
+            effective_handler(&rewritten, b"target.cgi"),
+            Some("cgi-script")
+        );
     }
 }
 

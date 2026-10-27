@@ -357,7 +357,18 @@ pub fn request_scope_with_plan(
                     script_alias,
                 )
                 .ok()?;
-                scope = script_plan.effective_scope(cfg, vhost, req, peer);
+                let mut script_scope = script_plan.effective_scope(cfg, vhost, req, peer);
+                // The PATH_INFO script target must keep the lexical script
+                // URL's execution/list policy as well as its own canonical
+                // policy.  The handler map comes from the script URL, not the
+                // PATH_INFO spelling.
+                let lexical = crate::request_plan::CanonicalTarget::from_url_path(&script_url)?;
+                let lexical_plan =
+                    crate::request_plan::RequestPlan::resolve(cfg, vhost, lexical).ok()?;
+                let lexical_scope = lexical_plan.effective_scope(cfg, vhost, req, peer);
+                script_scope.restrict_with(&lexical_scope);
+                script_scope.restrict_policy_with(&scope);
+                scope = script_scope;
             }
         }
     }
@@ -392,10 +403,41 @@ pub fn request_scope_with_plan(
                 script_alias,
             )
             .ok()?;
-            scope = index_plan.effective_scope(cfg, vhost, req, peer);
+            let mut index_scope = index_plan.effective_scope(cfg, vhost, req, peer);
+            // The selected index has its own URL identity; conjoin that
+            // lexical scope and the directory URL's non-handler policy.
+            let lexical = crate::request_plan::CanonicalTarget::from_url_path(&index_url)?;
+            let lexical_plan =
+                crate::request_plan::RequestPlan::resolve(cfg, vhost, lexical).ok()?;
+            let lexical_scope = lexical_plan.effective_scope(cfg, vhost, req, peer);
+            index_scope.restrict_with(&lexical_scope);
+            index_scope.restrict_policy_with(&scope);
+            scope = index_scope;
             fs_path = index_fs;
             cache_url_path = index_url;
             index_selected = true;
+        }
+    }
+    // The opened/canonical target may differ from the URL-mapped path when a
+    // document root, alias target or in-root component is a symlink.  The
+    // cache must use the same two-identity meet as dispatch before deciding
+    // that a representation is servable (F60/I61).
+    if let Ok(actual) = std::fs::canonicalize(&fs_path) {
+        if actual != fs_path {
+            let target = crate::request_plan::CanonicalTarget::from_url_path(&cache_url_path)?;
+            let target_plan = crate::request_plan::RequestPlan::from_fs_target(
+                cfg,
+                vhost,
+                target,
+                root.clone(),
+                actual.clone(),
+                script_alias,
+            )
+            .ok()?;
+            let mut target_scope = target_plan.effective_scope(cfg, vhost, req, peer);
+            target_scope.restrict_with(&scope);
+            scope = target_scope;
+            fs_path = actual;
         }
     }
     if !vapache_verified::cache_directory_index_bind_admit(

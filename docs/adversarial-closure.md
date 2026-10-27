@@ -2,7 +2,7 @@
 
 This document records how the `findings.md` adversarial pass is reflected in
 the implementation and the security model.  The numbered findings are the
-source of the regression classes; the invariants (`I9`–`I60` in
+source of the regression classes; the invariants (`I9`–`I61` in
 `docs/config-semantics.md`) are the properties that prevent the class from
 returning through a different directive or dispatch path.
 
@@ -66,6 +66,7 @@ returning through a different directive or dispatch path.
 | F57 | `%{REQUEST_URI}` used the raw request-line target, including the query, percent escapes and dot segments, so expression/rewrite/environment path policies authorized different bytes than dispatch served | Every `%{REQUEST_URI}` implementation receives the dispatcher's decoded, normalized, query-free URL path: expression variables/functions, `Require expr`, `<If>`, `SetEnvIf Request_URI`, `RewriteCond`/rule expansion and CGI environment. `expr::Context::new` consumes `request_uri_identity_admit`; no path appends the query string | I57 |
 | F58 | Access-file rewrite rules above the alias/document-root mapping root had an impossible URL match base, so anchored `[F]`/`[G]` deny rules were silently skipped | Every parsed access-file rule carries its layer directory; `request_plan::layer_subject()` matches the selected filesystem target relative to that directory, exactly Apache's per-directory subject. `htaccess_rewrite_subject_admit` requires a derivable subject or fails closed. `request_plan::layer_url_mount()` is used only for relative substitutions and uses the filesystem-directory form for ancestor layers instead of an unmatchable URL fallback | I58, I59 |
 | F59 | A symlinked `DocumentRoot`/`Alias`/`ScriptAlias` root made `RequestPlan::from_fs_target()` walk `root.join(file_name)` instead of the canonical target, discarding every child `.htaccess` layer during target reauthorization; child `Options -ExecCGI`, `DirectoryIndex` CGI and `Options -Indexes` were bypassed | Explicit targets derive the access-file walk, layer identities and scope evaluation from the same target path. Canonical ancestors are walked even when the lexical mapping root contains a symlink, with `AllowOverride` policy inherited from the corresponding lexical directory; nonempty layers are always consumed and a layer set that does not belong to the target fails closed (`explicit_target_layer_admit`, `target_layer_consume_admit`) | I60 |
+| F60 / F60-A–E | Canonical-target reauthorization replaced the URL-mapped scope with the canonical target scope. A symlinked document root/alias, an attacker-created in-root symlink, or a rewrite-selected target lost child/ancestor `<Directory>` and `.htaccess` policy, enabling `Options -ExecCGI` bypass, `Options -Indexes` listings, `RemoveHandler` bypass, and uploaded `.htaccess` execution when lexical `AllowOverride None` failed to veto canonical `AllowOverride All` | Every target-changing transform computes `meet(scope(URL), scope(target))`: `Options` permissions meet (`options_conjoin`), handlers are granted only when both identities resolve to the same handler (`handler_conjoin_admit`), and `AllowOverride` categories meet with explicit `None` denying either identity (`override_categories_conjoin`, `OverridePolicy::conjoined_with`). Rewrite-selected filesystem/cache targets use the same meet and retain the original URL's non-handler policy; the verified `rewrite_scope_retained_admit` states the dual-scope obligation | I61 |
 | Additional | `Require not valid-user` dropped negation; non-HTTP control bytes passed header serialization; `close, keep-alive` re-enabled a connection; mmap allowed other-owner write races | Negation is carried into `Require::ValidUser`; header values admit only HTAB/SP/VCHAR/obs-text; `close` is sticky; mmap requires no owner/group/other write bits | I23, I33-adjacent |
 
 ## Additional hardening before the next pass
@@ -155,7 +156,7 @@ The closure is exercised by:
 - `tests/conformance.py`, `tests/config_semantics.py`,
   `tests/config_validity.py` and `tests/config_grammar.py`;
 - `tests/adversarial_regressions.py`, which starts fresh servers and replays
-  the F23–F59 exploit shapes (rewrite-to-proxy/redirect authorization, cache
+  the F23–F60 exploit shapes (rewrite-to-proxy/redirect authorization, cache
   reload plus PATH_INFO, relative and capture-only aliases, autoindex schemes,
   negated/env providers, `IndexIgnore`, `DirectorySlash Off`,
   `UnsafePrefixStat` re-rooting, header-selected cache entries,
@@ -168,13 +169,16 @@ The closure is exercised by:
   `DirectoryIndex` cache-target/query/live-policy changes, canonical
   `REQUEST_URI` query/encoding/dot-segment policies, document-root/ancestor
   rewrite subjects for alias and alias-match targets, and explicit-target
-  access-layer binding for symlinked document roots and aliases);
+  access-layer binding for symlinked document roots and aliases, plus the
+  pass-10 resolved-target/rewrite scope-conjunction cases for plain
+  `<Directory>` policy, in-root symlinks, ancestor access files,
+  `RemoveHandler`, `AllowOverride None`, and rewrite laundering);
 - operator replay harnesses that reproduce the Apache-versus-vapached
   differentials in `findings.md`.
 
 Any new directive that changes a request-to-resource mapping, cache key,
 handler selection, authorization identity or inherited descriptor must state
-which of I9–I60 it preserves.  A directive that is recognized but not
+which of I9–I61 it preserves.  A directive that is recognized but not
 implemented is not allowed to pass as “inert” unless that inertness is
 explicit and local to the directive; request-mutating directives such as
 `RequestHeader` are never inert.

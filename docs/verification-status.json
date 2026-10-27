@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-10-26",
   "verus": {
-    "verified_functions": 268,
+    "verified_functions": 277,
     "errors": 0
   },
   "obligations": [
@@ -74,7 +74,7 @@
       "title": "Every target-changing transform reauthorizes the sink",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "the I30 transform inventory covers alias mapping, CGI/FastCGI PATH_INFO and handlers, symlink targets, internal URL/filesystem rewrites, DirectoryIndex, ErrorDocument, DirectorySlash, proxy/balancer failover, cache PATH_INFO and WebSocket targets; each re-evaluates the target scope and binds the sink grant, and original-URL rechecks use the original request context plus accumulated rewrite effects; the universal Resolve/Authorize/Transform/Sink theorem remains a proof obligation"
+      "evidence": "the I30 transform inventory covers alias mapping, CGI/FastCGI PATH_INFO and handlers, symlink targets, internal URL/filesystem rewrites, DirectoryIndex, ErrorDocument, DirectorySlash, proxy/balancer failover, cache PATH_INFO and WebSocket targets; each re-evaluates the target scope and binds the sink grant, and original-URL rechecks use the original request context plus accumulated rewrite effects; the universal Resolve/Authorize/Transform/Sink theorem remains a proof obligation; F60 adds the resolved-target/rewrite two-identity meet so a transform can add restrictions but never drop URL-mapped Options, handlers or AllowOverride policy"
     },
     {
       "id": "trusted_request_context",
@@ -158,7 +158,7 @@
       "title": "Internal rewrite filesystem targets never change the authorization base",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "verified rewrite_filesystem_admit admits only files below the current document/alias root; its under_base input is produced by the verified component-aware path_under_base kernel; UnsafePrefixStat cannot re-root at the target parent; rewrite unit tests and the F32 replay cover the former server-root escape"
+      "evidence": "verified rewrite_filesystem_admit admits only files below the current document/alias root; its under_base input is produced by the verified component-aware path_under_base kernel; UnsafePrefixStat cannot re-root at the target parent; rewrite unit tests and the F32 replay cover the former server-root escape; the rewrite target scope is conjoined with the rewritten URL and original URL policy rather than replacing it (I61)"
     },
     {
       "id": "fastcgi_script_containment",
@@ -270,7 +270,7 @@
       "title": "Access-file walk covers every applicable ancestor",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "access_walk_dir_admit states that each ancestor participates when its effective AllowOverride policy permits a layer; collect_layers/apply_req_deferred walk filesystem ancestors without a DocumentRoot or alias-root lower bound, and access_file_layer_read no longer contains an under_root conjunct; unit plus F50 replays cover DocumentRoot parent Basic auth/deny, directory index, CGI, cache lookup and alias-target parents"
+      "evidence": "access_walk_dir_admit states that each ancestor participates when its effective AllowOverride policy permits a layer; collect_layers/apply_req_deferred walk filesystem ancestors without a DocumentRoot or alias-root lower bound, and access_file_layer_read no longer contains an under_root conjunct; unit plus F50 replays cover DocumentRoot parent Basic auth/deny, directory index, CGI, cache lookup and alias-target parents; lexical and canonical AllowOverride identities are conjoined so an explicit None on either path denies the canonical access file (F60-D)"
     },
     {
       "id": "alias_mapping_root",
@@ -298,7 +298,21 @@
       "title": "One immutable request plan for dispatch, cache, rewrite and explain",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "RequestPlan is built once per request or rewrite round from CanonicalTarget and map_path, collects the access-file layers once, and exposes canonical URL path, mapping root, relative/fs paths, script-alias state and layers. dispatch_inner_request passes the same plan to cache lookup/store and dispatch; cache no longer re-decodes raw_path or rebuilds mapping; rewrite::Context::for_plan consumes plan identity; --explain prints the plan's canonical path, mapping, layer directories, URL mounts and subjects. Explicit-target plans walk the supplied fs_path itself (never root.join(file_name)), inherit AllowOverride policy from the lexically mapped directory when the root is a symlink, always consume a nonempty layer set, and fail closed when a layer does not belong to the target (explicit_target_layer_admit and target_layer_consume_admit, I60). Integration coverage exercises cache hits, rewrite rounds, CGI PATH_INFO, DirectoryIndex, explain and the F59 symlinked-root regressions; the universal refinement theorem remains open"
+      "evidence": "RequestPlan is built once per request or rewrite round from CanonicalTarget and map_path, collects the access-file layers once, and exposes canonical URL path, mapping root, relative/fs paths, script-alias state and layers. dispatch_inner_request passes the same plan to cache lookup/store and dispatch; cache no longer re-decodes raw_path or rebuilds mapping; rewrite::Context::for_plan consumes plan identity; --explain prints the plan's canonical path, mapping, layer directories, URL mounts and subjects. Explicit-target plans walk the supplied fs_path itself (never root.join(file_name)), inherit AllowOverride policy from the lexically mapped directory when the root is a symlink, always consume a nonempty layer set, and fail closed when a layer does not belong to the target (explicit_target_layer_admit and target_layer_consume_admit, I60). Integration coverage exercises cache hits, rewrite rounds, CGI PATH_INFO, DirectoryIndex, explain and the F59 symlinked-root regressions; the universal refinement theorem remains open; pass-10 I61 conjoins the URL-mapped and canonical/rewrite target scopes (Options meet, handler agreement, AllowOverride deny) instead of replacing the lexical scope"
+    },
+    {
+      "id": "resolved_target_scope_conjunction",
+      "title": "Resolved-target scope is a meet with the URL-mapped scope",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "options_conjoin computes the bitwise meet of URL and canonical target Options; handler_conjoin_admit permits an extension only when both identities resolve to the same handler, and conjoined_handlers projects disagreement to RemoveHandler; override_categories_conjoin plus OverridePolicy::conjoined_with make an explicit AllowOverride None on either path identity deny the canonical access file. Scope::restrict_with is consumed by symlink target binding, DirectorySlash/PATH_INFO/FastCGI target reauthorization, rewrite filesystem targets and cache script/index/canonical targets (F60/I61). Unit, htaccess policy and F60 end-to-end cases cover plain <Directory> policy, in-root symlinks, ancestor .htaccess, RemoveHandler, -Indexes and AllowOverride None"
+    },
+    {
+      "id": "rewrite_scope_conjunction",
+      "title": "Rewrite rules cannot launder URL policy into an executable target",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "rewrite_scope_retained_admit states that a changed rewrite retains the original URL policy and evaluates the rewritten target; the dispatcher conjoins the original URL's Options/AllowOverride/header policy with the final/rewrite-target scope via restrict_policy_with, while the same-URL target bind performs the full Options+handler meet. Internal URL/file rewrites, terminal proxy/redirect original gates and cache targets use the shared gate; F60 rewrite-laundering and F23/F53/F58 rewrite regressions exercise the shape. The regex/substitution interpreter remains outside Verus; its security consequence is expressed by the verified scope-conjunction and filesystem-containment kernels"
     },
     {
       "id": "htaccess_rewrite_subject_base",
@@ -437,6 +451,8 @@
     "Destination-address virtual-host eligibility and exact-address precedence",
     "IPv4-mapped IPv6 peer canonicalization for authorization and identity",
     "Canonical decoded, query-free REQUEST_URI identity for expressions, rewrite conditions/substitutions, environment rules and CGI",
-    "Filesystem-relative access-file rewrite subjects for layers at, below and above the URL mapping root"
+    "Filesystem-relative access-file rewrite subjects for layers at, below and above the URL mapping root",
+    "Resolved-target/rewrite scope conjunction (Options meet, handler agreement, AllowOverride deny)",
+    "Rewrite original-policy retention and final-target reauthorization obligation"
   ]
 }

@@ -133,6 +133,75 @@ impl OverridePolicy {
         self.mode().is_enabled() || !self.allow_list().is_empty()
     }
 
+    /// True when this policy was stated by an actual directive.  An absent
+    /// policy (no matching `<Directory>` or `.htaccess` setting) is not a
+    /// denial; an explicit `AllowOverride None` is.
+    pub fn is_explicit(&self) -> bool {
+        self.mode.is_some() || self.allow_list.is_some()
+    }
+
+    pub fn explicitly_denies(&self) -> bool {
+        self.is_explicit() && !self.is_enabled()
+    }
+
+    /// Conjoin two `AllowOverride` identities for a target that has both a
+    /// lexical URL-mapped directory and a canonical filesystem directory.
+    /// An explicit denial on either identity wins; when only one identity is
+    /// configured, it supplies the policy.  Enabled category sets meet.
+    pub fn conjoined_with(&self, other: &Self) -> Self {
+        if self.explicitly_denies() || other.explicitly_denies() {
+            return Self {
+                mode: Some(crate::config::OverrideMode::None),
+                allow_list: None,
+                nonfatal: Some(crate::config::NonfatalMode::None),
+            };
+        }
+        if !self.is_explicit() {
+            return other.clone();
+        }
+        if !other.is_explicit() {
+            return self.clone();
+        }
+        let mode = match (self.mode, other.mode) {
+            (Some(crate::config::OverrideMode::All), Some(b)) => Some(b),
+            (Some(a), Some(crate::config::OverrideMode::All)) => Some(a),
+            (
+                Some(crate::config::OverrideMode::Categories(a)),
+                Some(crate::config::OverrideMode::Categories(b)),
+            ) => Some(crate::config::OverrideMode::Categories(
+                crate::config::OverrideCategories(vapache_verified::override_categories_conjoin(
+                    a.0, b.0,
+                )),
+            )),
+            _ => None,
+        };
+        let allow_list = match (&self.allow_list, &other.allow_list) {
+            (Some(a), Some(b)) => Some(
+                a.iter()
+                    .filter(|name| b.iter().any(|other| other.eq_ignore_ascii_case(name)))
+                    .cloned()
+                    .collect(),
+            ),
+            (Some(a), None) if other.mode == Some(crate::config::OverrideMode::All) => {
+                Some(a.clone())
+            }
+            (None, Some(b)) if self.mode == Some(crate::config::OverrideMode::All) => {
+                Some(b.clone())
+            }
+            _ => None,
+        };
+        let nonfatal = if self.nonfatal == other.nonfatal {
+            self.nonfatal
+        } else {
+            Some(crate::config::NonfatalMode::None)
+        };
+        Self {
+            mode,
+            allow_list,
+            nonfatal,
+        }
+    }
+
     pub fn merge_child(&mut self, child: &OverridePolicy) {
         if child.mode.is_some() {
             self.mode = child.mode;
@@ -149,7 +218,7 @@ impl OverridePolicy {
 #[cfg(test)]
 mod override_tests {
     use super::*;
-    use crate::config::{NonfatalMode, OverrideCategories, OverrideMode};
+    use crate::config::{NonfatalMode, OverrideCategories, OverrideMode, OverrideCategory};
 
     #[test]
     fn child_presence_wins_for_override_fields() {
@@ -171,6 +240,45 @@ mod override_tests {
         );
         assert_eq!(parent.raw_allow_list(), Some(&["Require".to_string()][..]));
         assert_eq!(parent.raw_nonfatal(), Some(NonfatalMode::All));
+    }
+
+    #[test]
+    fn explicit_none_vetoes_an_enabled_canonical_identity() {
+        let mut lexical = OverridePolicy::default();
+        lexical.set_mode(OverrideMode::None);
+        let mut canonical = OverridePolicy::default();
+        canonical.set_mode(OverrideMode::All);
+        let joined = canonical.conjoined_with(&lexical);
+        assert!(!joined.is_enabled());
+        assert!(joined.explicitly_denies());
+
+        // An unconfigured canonical directory does not erase an enabled
+        // lexical policy (the F59 symlinked-root shape).
+        let mut canonical = OverridePolicy::default();
+        canonical.set_mode(OverrideMode::All);
+        let absent = OverridePolicy::default();
+        assert!(canonical
+            .conjoined_with(&absent)
+            .raw_mode()
+            .is_some_and(|mode| mode.is_enabled()));
+        assert!(!absent.conjoined_with(&canonical).explicitly_denies());
+    }
+
+    #[test]
+    fn override_categories_meet_across_path_identities() {
+        let mut lexical = OverridePolicy::default();
+        lexical.set_mode(OverrideMode::Categories(OverrideCategories(
+            OverrideCategories::AUTH_CONFIG | OverrideCategories::EXEC_CGI,
+        )));
+        let mut canonical = OverridePolicy::default();
+        canonical.set_mode(OverrideMode::Categories(OverrideCategories(
+            OverrideCategories::EXEC_CGI | OverrideCategories::OPT_INDEXES,
+        )));
+        let joined = lexical.conjoined_with(&canonical);
+        let mode = joined.mode();
+        assert!(mode.allows(OverrideCategory::ExecCgi));
+        assert!(!mode.allows(OverrideCategory::AuthConfig));
+        assert!(!mode.allows(OverrideCategory::Options));
     }
 }
 
