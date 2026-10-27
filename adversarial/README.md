@@ -13,9 +13,11 @@ prevents re-deriving them from scratch.
 | `findings_p4.md` … `findings_p9.md` | Pass 4–9 write-ups |
 | `findings_p10.md` | Pass 10 write-ups (F60–F69) |
 | `findings_p11.md` | Pass 11 write-ups (F61–F66, F69, F70; F66 was the only fixed survivor) |
+| `findings_p12.md` | Pass 12 write-ups (P12-A–P12-F): trailing-slash `ProxyPass` auth bypass/local RCE, dotless-basename CGI execution, ScriptAlias PATH_INFO gate bypass, HTTP/2 body-window stall, plus secondary findings |
 | `p11/exploit_p11.py` | Pass-11 differential exploit battery: 13 micro-apps run against Apache 2.4.69 and vapached, one per finding row |
 | `p11/case01-F61-A` … `case13-F61-C` | Captured case dossiers (rendered `apache.conf` / `vp.conf`, fixture tree, server logs, `ap.strace`) |
 | `p11/f70_accessfilename.py` | F70 probe (dead finding: Apache rejects the configuration) |
+| `p12/exploit_p12.py` | Pass-12 differential battery (P12-A–C/E/F vs Apache 2.4.69 on sibling loopback ports; P12-D single-server h2 body check) |
 
 ## Running the pass-11 battery
 
@@ -31,11 +33,38 @@ paths.  Case index: 1 F61-A, 2 F61-A2, 3 F61-B, 4 F62, 5 F63, 6 F63b, 7 F64,
 8 F65, 9 F66, 10 F69, 11 F64b, 12 F62b, 13 F61-C (control).
 
 The dossiers were captured at HEAD `d219efb` (before the pass-11
-remediation) and are regenerated in place on each run.  On this shared host
-Apache occasionally fails to start (a cron-restarted system Apache steals the
-pidfile); the harness retries each case once, and an `apache=-1` row means the
-oracle was unavailable, not that vapached diverged.
+remediation) and are regenerated in place on each run.  The harness starts
+Apache with `-X` (single process) and gives Apache and vapached *separate*
+`logs/{apache,vapache}.pid` / `error-{apache,vapache}.log` files: the
+original single `logs/httpd.pid` was written by whichever server started
+last, so a concurrently starting vapached could make Apache abort with
+`httpd (pid ...) already running` and produce an `apache=-1` row.  With the
+split pidfiles the full 13-case battery completes without a single retry;
+the retry loop and `-1` sentinel are kept as a safety net for the shared
+host.
 
 The matching end-to-end regression replays live in
 `tests/adversarial_regressions.py` (`F61ToF69Pass11Tests`); the closure status
 of every finding is tracked in `docs/adversarial-closure.md`.
+
+## Running the pass-12 battery
+
+```sh
+cargo build --release -p vapached
+python3 adversarial/p12/exploit_p12.py          # all groups A-F
+python3 adversarial/p12/exploit_p12.py A B C    # proxy, extension, ScriptAlias cases
+python3 adversarial/p12/exploit_p12.py D --keep # h2 body-window check, keep dossiers
+```
+
+Pass-12 cases: **A** trailing-slash/catch-all `ProxyPass` prefix (local
+serving, `<Proxy>` authorization bypass, local CGI execution), with the
+no-slash control; **B** dotless/hidden basenames (`cgi`, `.cgi`, `..cgi`, `pl`,
+`php`) executed by the handler table, including the `<Files "*.cgi">` bypass;
+**C** ScriptAlias + `SetHandler default-handler` + PATH_INFO; **D** HTTP/2
+request bodies above the 256 KiB stream window (Apache oracle not applicable);
+**E** `AuthType` with no applicable `Require` (Apache 500 vs vapache 200);
+**F** streamed proxy responses skipping the `Header` policy.
+Fixtures are built under `/tmp/opencode/p12-harness` unless `--keep` is given.
+Both batteries now use separate per-server pidfiles (`<case>/logs/{apache,vapache}.pid`)
+and single-process Apache (`-X`), so neither can trip over the other's
+startup.
