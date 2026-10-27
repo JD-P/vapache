@@ -2088,9 +2088,10 @@ fn dispatch_inner(
                 effects,
                 filesystem,
             } => {
-                if filesystem.is_some() {
-                    rewrite_filesystem = filesystem;
-                }
+                // The filesystem override is per-round: a later round without
+                // a file target must clear the earlier round's target so only
+                // the final round's filesystem selection can be applied (F68).
+                rewrite_filesystem = filesystem;
                 rewrite_effects.merge(effects);
                 rewrite_rounds += 1;
                 if rewrite_rounds > 10 {

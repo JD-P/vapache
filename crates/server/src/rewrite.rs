@@ -9,6 +9,15 @@
 //! `[UnsafeAllow3F]`, and `[UnsafePrefixStat]`.  Unsupported syntax is
 //! rejected while parsing the configuration rather than silently skipped;
 //! `[DPI]` is accepted but path-info is resolved later by the request mapper.
+//!
+//! Round semantics (F67/F68): a `[PT]` substitution stays in URL space and is
+//! re-resolved by the dispatcher on the next round instead of being promoted
+//! to a filesystem target, an absolute non-`[PT]` substitution only becomes a
+//! filesystem target when the producing rule reaches the target construction,
+//! and each successful rule replaces (rather than merely optionally sets) the
+//! round's filesystem override — only the final target is ever applied.
+//! `[UnsafePrefixStat]` remains parsed and deliberately inert (the F32
+//! remediation), with a load-time warning in the main config.
 
 use crate::config::{RewriteCond, RewriteMap, RewriteRule, Scope};
 use crate::http::Request;
@@ -132,8 +141,12 @@ fn escape_spec(flags: &crate::config::RewriteFlags) -> Option<EscapeSpec> {
 }
 
 fn escape_backref_value(value: &str, spec: &EscapeSpec) -> String {
-    let mut out: Vec<u8> = Vec::with_capacity(value.len());
-    for b in value.bytes() {
+    // The [B]/[BNE]/[BCTLS]/[BNP] family all refine to the one verified
+    // percent-encoding loop: build the escape mask from the flag set
+    // (custom chars, control bytes, preserved chars) and encode.  A masked
+    // space becomes `+` unless [BNP] set `no_plus`.
+    let mut mask = [false; 256];
+    for b in 0..=255u8 {
         let escaped = if spec.preserve.contains(&b) {
             false
         } else if let Some(custom) = &spec.custom {
@@ -143,22 +156,22 @@ fn escape_backref_value(value: &str, spec: &EscapeSpec) -> String {
         } else {
             !b.is_ascii_alphanumeric()
         };
-        if escaped {
-            if b == b' ' && !spec.no_plus {
-                out.push(b'+');
-            } else {
-                out.extend_from_slice(format!("%{b:02x}").as_bytes());
-            }
-        } else {
-            out.push(b);
-        }
+        mask[b as usize] = escaped;
     }
+    let out = vapache_verified::percent_encode(value.as_bytes(), &mask, !spec.no_plus);
     String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Build an Apache-shaped `Set-Cookie` value for `[CO=name:value:domain:
 /// lifetime:path:secure:httponly:samesite]`.  The caller has already expanded
 /// backreferences in the raw flag text.
+///
+/// The colon-split field layout follows Apache, but the fields are validated
+/// so a capture can never inject further attributes: the name must be an RFC
+/// 6265 `token`, value and Domain/Path text must stay within the cookie-octet
+/// visible set (attribute separators `;`, `,` and `"` excluded), and the
+/// `secure`/`httponly`/`samesite` slots accept exactly their documented
+/// tokens.
 fn build_cookie(raw: &str) -> Result<String, String> {
     let fields: Vec<&str> = if let Some(rest) = raw.strip_prefix(';') {
         rest.split(';').collect()
@@ -169,9 +182,24 @@ fn build_cookie(raw: &str) -> Result<String, String> {
     if name.is_empty() {
         return Err("RewriteRule [CO] cookie has an empty name".into());
     }
+    if !is_cookie_name(name) {
+        return Err(format!(
+            "invalid RewriteRule [CO] cookie name '{name}' (must be an RFC 6265 token)"
+        ));
+    }
     let value = fields.get(1).copied().unwrap_or("");
+    if !is_cookie_value(value) {
+        return Err(format!(
+            "invalid RewriteRule [CO] cookie value '{value}' (cookie-octets only)"
+        ));
+    }
     let mut out = format!("{name}={value}");
     if let Some(domain) = fields.get(2).map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        if !is_cookie_value(domain) {
+            return Err(format!(
+                "invalid RewriteRule [CO] domain '{domain}' (cookie-octets only)"
+            ));
+        }
         out.push_str("; Domain=");
         out.push_str(domain);
     }
@@ -187,37 +215,76 @@ fn build_cookie(raw: &str) -> Result<String, String> {
         }
     }
     if let Some(path) = fields.get(4).map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        if !is_cookie_value(path) {
+            return Err(format!(
+                "invalid RewriteRule [CO] path '{path}' (cookie-octets only)"
+            ));
+        }
         out.push_str("; Path=");
         out.push_str(path);
     }
     if let Some(secure) = fields.get(5) {
         let secure = secure.trim();
-        if secure.eq_ignore_ascii_case("secure")
-            || secure.eq_ignore_ascii_case("true")
-            || secure == "1"
-        {
+        if !secure.is_empty() {
+            if !matches!(
+                secure.to_ascii_lowercase().as_str(),
+                "secure" | "true" | "1"
+            ) {
+                return Err(format!(
+                    "invalid RewriteRule [CO] secure flag '{secure}' (expected secure, true or 1)"
+                ));
+            }
             out.push_str("; Secure");
         }
     }
     if let Some(http_only) = fields.get(6) {
         let http_only = http_only.trim();
-        if http_only.eq_ignore_ascii_case("httponly")
-            || http_only.eq_ignore_ascii_case("true")
-            || http_only == "1"
-        {
+        if !http_only.is_empty() {
+            if !matches!(
+                http_only.to_ascii_lowercase().as_str(),
+                "httponly" | "true" | "1"
+            ) {
+                return Err(format!(
+                    "invalid RewriteRule [CO] httponly flag '{http_only}' (expected httponly, true or 1)"
+                ));
+            }
             out.push_str("; HttpOnly");
         }
     }
     if let Some(same_site) = fields.get(7).map(|v| v.trim()).filter(|v| !v.is_empty()) {
-        if !matches!(same_site.to_ascii_lowercase().as_str(), "0" | "false") {
-            out.push_str("; SameSite=");
-            out.push_str(same_site);
+        if !matches!(
+            same_site.to_ascii_lowercase().as_str(),
+            "lax" | "strict" | "none"
+        ) {
+            return Err(format!(
+                "invalid RewriteRule [CO] SameSite '{same_site}' (expected lax, strict or none)"
+            ));
         }
+        out.push_str("; SameSite=");
+        out.push_str(same_site);
     }
     if out.chars().any(|c| c.is_control()) {
         return Err("control character in RewriteRule [CO] cookie".into());
     }
     Ok(out)
+}
+
+/// RFC 6265 `token` for a cookie-name: 1*tchar (`;`, `,`, `=`, whitespace and
+/// control bytes are separators and cannot appear).
+fn is_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// Lenient cookie-octet set for values and attribute text: visible ASCII plus
+/// the space traditionally tolerated, but never the attribute separators
+/// `;`, `,`, `"`, control bytes (or DEL), and no non-ASCII bytes.
+fn is_cookie_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| (b == b' ' || b.is_ascii_graphic()) && !matches!(b, b';' | b',' | b'"'))
 }
 
 fn rule_effects(
@@ -521,7 +588,11 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             return Outcome::Error("control character in rewrite query".into());
         }
 
-        let filesystem = if !external && Path::new(&joined).is_absolute() {
+        // A [PT] substitution maps back through URL space (it is re-resolved
+        // by the dispatcher next round), so it must never be promoted to a
+        // filesystem target (F67). The flag stays accepted and inert-legal.
+        let filesystem = if !external && !rule.flags.passthrough && Path::new(&joined).is_absolute()
+        {
             let candidate = fs::canonicalize(&joined).ok();
             let docroot = fs::canonicalize(ctx.docroot).ok();
             match (candidate, docroot) {
@@ -547,9 +618,12 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         } else {
             None
         };
-        if filesystem.is_some() {
-            filesystem_override = filesystem;
-        }
+        // Only the substitution this rule just produced may become a
+        // filesystem target: assigning unconditionally drops any target an
+        // earlier rule in this round selected (F68). Rules that match nothing
+        // or rewrite to `-` `continue` before this point, so they cannot
+        // clear an override either.
+        filesystem_override = filesystem;
 
         if rule.flags.proxy {
             let mut url = joined;
@@ -741,17 +815,17 @@ fn eval_cond(
         None => (false, cond.pattern.as_str()),
     };
     let result = if let Some(rest) = pattern.strip_prefix("-f") {
-        rest.is_empty() && file_test(value, ctx, |p| p.is_file())
+        rest.is_empty() && file_test(value, ctx, |_, real| real.is_file())
     } else if let Some(rest) = pattern.strip_prefix("-d") {
-        rest.is_empty() && file_test(value, ctx, |p| p.is_dir())
+        rest.is_empty() && file_test(value, ctx, |_, real| real.is_dir())
     } else if let Some(rest) = pattern.strip_prefix("-s") {
         rest.is_empty()
-            && file_test(value, ctx, |p| {
-                fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
+            && file_test(value, ctx, |_, real| {
+                fs::metadata(real).map(|m| m.len() > 0).unwrap_or(false)
             })
     } else if let Some(rest) = pattern.strip_prefix("-l") {
         rest.is_empty()
-            && file_test(value, ctx, |p| {
+            && file_test(value, ctx, |p, _| {
                 fs::symlink_metadata(p)
                     .map(|m| m.file_type().is_symlink())
                     .unwrap_or(false)
@@ -813,7 +887,7 @@ fn compare_cond(value: &str, expected: &str, nocase: bool) -> std::cmp::Ordering
     }
 }
 
-fn file_test(value: &str, ctx: &Context<'_>, test: impl Fn(&Path) -> bool) -> bool {
+fn file_test(value: &str, ctx: &Context<'_>, test: impl Fn(&Path, &Path) -> bool) -> bool {
     let p = PathBuf::from(value);
     let p = if p.is_absolute() {
         p
@@ -833,7 +907,10 @@ fn file_test(value: &str, ctx: &Context<'_>, test: impl Fn(&Path) -> bool) -> bo
     // Lexical containment is not enough: a symlink inside the document root
     // can point at an outside file and turn `-f`/`-d`/`-s` into a metadata
     // oracle.  Canonicalize both sides and reuse the verified component-aware
-    // containment kernel before the metadata test (pass-7 review target).
+    // containment kernel (with its reflexivity/transitivity lemmas) before
+    // the metadata test.  The test closure receives both spellings: `-l`
+    // inspects the lexical link itself, while `-f`/`-d`/`-s` inspect the
+    // canonicalized target so the probe cannot race back through a symlink.
     let Ok(root) = fs::canonicalize(ctx.docroot) else {
         return false;
     };
@@ -846,7 +923,7 @@ fn file_test(value: &str, ctx: &Context<'_>, test: impl Fn(&Path) -> bool) -> bo
     ) {
         return false;
     }
-    test(&p)
+    test(&p, &real)
 }
 
 fn expand_vars(
@@ -941,7 +1018,10 @@ fn variable_value(
         "REQUEST_URI" => path.to_string(),
         "REQUEST_FILENAME" | "SCRIPT_FILENAME" => ctx.fs_path.to_string_lossy().into_owned(),
         "DOCUMENT_ROOT" => ctx.docroot.to_string_lossy().into_owned(),
-        "QUERY_STRING" => String::from_utf8_lossy(query).into_owned(),
+        // Raw request-target bytes may fail UTF-8; fail closed instead of
+        // conflating distinct byte strings through the replacement character.
+        "QUERY_STRING" => String::from_utf8(query.to_vec())
+            .map_err(|_| "QUERY_STRING is not valid UTF-8".to_string())?,
         "HTTP_HOST" => req
             .header_str("host")
             .unwrap_or(ctx.server_name)
@@ -981,18 +1061,18 @@ fn int_map(function: &str, key: &str) -> String {
     match function {
         "tolower" => key.to_lowercase(),
         "toupper" => key.to_uppercase(),
-        "escape" => key
-            .bytes()
-            .map(|b| {
-                if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
-                    (b as char).to_string()
-                } else if b == b' ' {
-                    "+".into()
-                } else {
-                    format!("%{b:02x}")
-                }
-            })
-            .collect(),
+        "escape" => {
+            // The int:escape map refines to the same verified
+            // percent-encoding loop as rewrite backreference escaping:
+            // alphanumerics and `-._~/` stay raw, a space becomes `+`
+            // (form-urlencoded), everything else is `%xx`.
+            let mut mask = [false; 256];
+            for b in 0..=255u8 {
+                mask[b as usize] = !(b.is_ascii_alphanumeric() || b"-._~/".contains(&b));
+            }
+            let out = vapache_verified::percent_encode(key.as_bytes(), &mask, true);
+            String::from_utf8_lossy(&out).into_owned()
+        }
         "unescape" => {
             let bytes = key.as_bytes();
             let mut out = Vec::with_capacity(bytes.len());
@@ -1181,22 +1261,21 @@ fn expand_backrefs(
 }
 
 fn escape_redirect_location(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for b in value.bytes() {
-        let unsafe_byte = b <= b' '
-            || b == 0x7f
+    // Redirect Location values refine to the same verified percent-encoding
+    // loop.  Besides the control/DEL/dangerous-visible set this also escapes
+    // every non-ASCII byte: the old loop pushed such bytes as Latin-1 chars,
+    // which re-encoded as mojibake UTF-8 in the Location header.
+    let mut mask = [false; 256];
+    for b in 0..=255u8 {
+        mask[b as usize] = b <= b' '
+            || b >= 0x7f
             || matches!(
                 b,
                 b'"' | b'<' | b'>' | b'\\' | b'^' | b'`' | b'{' | b'|' | b'}'
             );
-        if unsafe_byte {
-            out.push('%');
-            out.push_str(&format!("{b:02x}"));
-        } else {
-            out.push(b as char);
-        }
     }
-    out
+    let out = vapache_verified::percent_encode(value.as_bytes(), &mask, false);
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn same_host_internal(ctx: &Context<'_>, req: &Request, url: &str) -> Option<String> {
@@ -1474,6 +1553,32 @@ mod tests {
     }
 
     #[test]
+    fn query_string_variable_fails_closed_on_invalid_utf8() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/q$".into(), "%{QUERY_STRING}".into(), "[L]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let r = req();
+        let root = Path::new("/tmp");
+        let subject = root.join("q");
+        let bad_query: &[u8] = b"\xff\xfe";
+        let mut c = ctx("/q", &subject, root);
+        c.query = bad_query;
+        // Lossy decoding would silently rewrite every invalid query to the
+        // same replacement string; the engine instead fails the request.
+        assert!(matches!(
+            process(&scope, &r, &c),
+            Outcome::Error(ref e) if e == "QUERY_STRING is not valid UTF-8"
+        ));
+    }
+
+    #[test]
     fn qsa_keeps_substitution_query_first() {
         let mut scope = Scope::default();
         scope.rewrite_policy.rewrite_engine = Some(true);
@@ -1536,6 +1641,116 @@ mod tests {
             c.query = query;
             assert_eq!(process(&scope, &r, &c), expected);
         }
+    }
+
+    #[test]
+    fn passthrough_targets_are_never_promoted_to_filesystem() {
+        let base = std::env::temp_dir().join(format!("vp-rewrite-pt-{}", std::process::id()));
+        let docroot = base.join("www");
+        fs::create_dir_all(&docroot).unwrap();
+        let target = docroot.join("tool.cgi");
+        fs::write(&target, "inside").unwrap();
+        let query = target.to_string_lossy().as_bytes().to_vec();
+        let r = req();
+
+        let run = |flag: &str| {
+            let mut scope = Scope::default();
+            scope.rewrite_policy.rewrite_engine = Some(true);
+            scope.rewrite_policy.rewrite_rules.push(
+                parse_rewrite_rule(
+                    &["^/q$".into(), "%{QUERY_STRING}".into(), flag.into()],
+                    "/",
+                    false,
+                )
+                .unwrap(),
+            );
+            let c = Context {
+                url_path: "/q",
+                fs_path: &docroot,
+                docroot: &docroot,
+                server_root: &base,
+                query: &query,
+                peer: "127.0.0.1".parse().unwrap(),
+                port: 80,
+                https: false,
+                server_name: "localhost",
+            };
+            process(&scope, &r, &c)
+        };
+        // Without [PT] the absolute substitution is a filesystem target.
+        assert!(matches!(
+            run("[L]"),
+            Outcome::Internal {
+                filesystem: Some(p),
+                ..
+            } if p == target
+        ));
+        // With [PT] the same substitution stays in URL space (F67): no
+        // filesystem override, and the dispatcher re-maps the URL next round.
+        assert!(matches!(
+            run("[PT,L]"),
+            Outcome::Internal {
+                filesystem: None,
+                ref path,
+                ..
+            } if path.ends_with("/www/tool.cgi")
+        ));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_later_rule_replaces_an_earlier_filesystem_target() {
+        let base = std::env::temp_dir().join(format!("vp-rewrite-sticky-{}", std::process::id()));
+        let docroot = base.join("www");
+        fs::create_dir_all(&docroot).unwrap();
+        let hit = docroot.join("a.txt");
+        fs::write(&hit, "hit").unwrap();
+        let query = hit.to_string_lossy().as_bytes().to_vec();
+        let r = req();
+
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        // Rule 1 without [L]: rewrites /q onto the file path and keeps going,
+        // which used to make the file target stick across this round (F68).
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/q$".into(), "%{QUERY_STRING}".into(), "".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        // Rule 2 with [L]: an ordinary URL rewrite with no filesystem target.
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^".into(), "/rewrite-remapped-url".into(), "[L]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        let c = Context {
+            url_path: "/q",
+            fs_path: &docroot,
+            docroot: &docroot,
+            server_root: &base,
+            query: &query,
+            peer: "127.0.0.1".parse().unwrap(),
+            port: 80,
+            https: false,
+            server_name: "localhost",
+        };
+        // Only the final rule's target may be applied: this round's outcome is
+        // the URL rewrite, with no filesystem override carried from rule 1.
+        assert!(matches!(
+            process(&scope, &r, &c),
+            Outcome::Internal {
+                filesystem: None,
+                ref path,
+                ..
+            } if path == "/rewrite-remapped-url"
+        ));
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2285,6 +2500,20 @@ mod tests {
         let spec = escape_spec(&flags).unwrap();
         assert_eq!(escape_backref_value("a b.c", &spec), "a%20b%2ec");
 
+        // The whole backreference-escape family refines to the verified
+        // percent_encode loop; the [BNP] plus-suppression and [B] custom
+        // sets keep their exact per-byte semantics.
+        let mut flags = crate::config::RewriteFlags::default();
+        flags.escape_backrefs = true;
+        let spec = escape_spec(&flags).unwrap();
+        assert_eq!(escape_backref_value("a b.c", &spec), "a+b%2ec");
+
+        // Redirect Location escaping is the same verified loop and now
+        // percent-encodes non-ASCII bytes instead of emitting Latin-1
+        // mojibake, while keeping the query separator raw.
+        assert_eq!(escape_redirect_location("/new/a b?q=1"), "/new/a%20b?q=1");
+        assert_eq!(escape_redirect_location("/new/\u{e9}"), "/new/%c3%a9");
+
         assert_eq!(
             build_cookie("name:value:example.test:10:/:secure:httponly:lax").unwrap(),
             "name=value; Domain=example.test; Max-Age=600; Path=/; Secure; HttpOnly; SameSite=lax"
@@ -2298,12 +2527,37 @@ mod tests {
             "name=value; Domain=example.test; Max-Age=600; Path=/; Secure; HttpOnly; SameSite=lax"
         );
         assert_eq!(
-            build_cookie("name:value:example.test:1:/:1:true:false").unwrap(),
-            "name=value; Domain=example.test; Max-Age=60; Path=/; Secure; HttpOnly"
+            build_cookie("name:value:example.test:1:/:1:true:Strict").unwrap(),
+            "name=value; Domain=example.test; Max-Age=60; Path=/; Secure; HttpOnly; SameSite=Strict"
         );
         assert!(build_cookie(":value").is_err());
         assert!(build_cookie("name:value:example.test:nope").is_err());
         assert!(build_cookie("name=bad\u{1}value").is_err());
+        // The [CO] cookie fields parse under a strict RFC 6265 grammar: a
+        // capture cannot inject attributes, and flag slots accept only their
+        // documented tokens.
+        assert!(build_cookie("na;me:value").is_err());
+        assert!(build_cookie("name:va;ue").is_err());
+        assert!(build_cookie("name:value:\"injected\"").is_err());
+        assert!(build_cookie("name:value:ev;il.test").is_err());
+        assert!(build_cookie("name:value:example.test:10:/:pa;th").is_err());
+        assert!(build_cookie("name:value:example.test:10:/:yes").is_err());
+        assert!(build_cookie("name:value:example.test:10:/:secure:yes").is_err());
+        assert!(build_cookie("name:value:example.test:10:/:secure:httponly:foo").is_err());
+        assert!(build_cookie("name:value:example.test:10:/:secure:httponly:0").is_err());
+        // Canonical accepted shapes, case-insensitive.
+        assert_eq!(
+            build_cookie("name:value:example.test:10:/").unwrap(),
+            "name=value; Domain=example.test; Max-Age=600; Path=/"
+        );
+        assert_eq!(
+            build_cookie("n:v::0:/:SECURE:True:LAX").unwrap(),
+            "n=v; Path=/; Secure; HttpOnly; SameSite=LAX"
+        );
+        assert_eq!(
+            build_cookie("a!z09:$&'()+-./^_`|~").unwrap(),
+            "a!z09=$&'()+-./^_`|~"
+        );
 
         let r = req();
         let root = Path::new("/tmp");
@@ -2451,14 +2705,14 @@ mod tests {
         assert_eq!(compare_cond("10", "9", false), std::cmp::Ordering::Greater);
         assert_eq!(compare_cond("ABC", "abc", true), std::cmp::Ordering::Equal);
         assert_eq!(compare_cond("ABC", "abc", false), std::cmp::Ordering::Less);
-        assert!(file_test("file.txt", &c, |p| p.is_file()));
+        assert!(file_test("file.txt", &c, |_, real| real.is_file()));
         assert!(file_test(
             &dir.join("file.txt").to_string_lossy(),
             &c,
-            |p| p.is_file()
+            |_, real| real.is_file()
         ));
-        assert!(!file_test("../etc/passwd", &c, |_| true));
-        assert!(!file_test("/etc/passwd", &c, |_| true));
+        assert!(!file_test("../etc/passwd", &c, |_, _| true));
+        assert!(!file_test("/etc/passwd", &c, |_, _| true));
         let outside = std::env::temp_dir().join(format!(
             "vapache-rewrite-outside-{}-{}",
             std::process::id(),
@@ -2466,15 +2720,15 @@ mod tests {
         ));
         fs::write(&outside, "outside").unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("escape.txt")).unwrap();
-        assert!(!file_test("escape.txt", &c, |p| p.is_file()));
+        assert!(!file_test("escape.txt", &c, |_, _| true));
         // A symlink that stays inside the root still works normally.
-        assert!(file_test("link.txt", &c, |p| p.is_file()));
+        assert!(file_test("link.txt", &c, |_, real| real.is_file()));
         // Missing probed paths and missing roots fail closed at canonicalize.
-        assert!(!file_test("missing.txt", &c, |_| true));
+        assert!(!file_test("missing.txt", &c, |_, _| true));
         let missing_root = dir.join("missing-root");
         let missing_target = missing_root.join("x");
         let c_missing = ctx("/x", &missing_target, &missing_root);
-        assert!(!file_test("file.txt", &c_missing, |_| true));
+        assert!(!file_test("file.txt", &c_missing, |_, _| true));
         let _ = fs::remove_file(&outside);
 
         assert_eq!(

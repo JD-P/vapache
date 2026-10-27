@@ -2408,5 +2408,195 @@ ErrorDocument 404 /err.php
         self.assertNotIn(b"POISON", body)
 
 
+class F67PassthroughTargetTests(unittest.TestCase):
+    """[PT] substitutions stay in URL space: absolute targets never execute (F67)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f67-pt-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.logs = cls.base / "logs"
+        for directory in (cls.www / "secret", cls.logs):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        (cls.www / "secret" / "secret.cgi").write_text(
+            "#!/bin/sh\n"
+            "# WALLET-F67-SOURCE\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'WALLET-F67-EXEC\\n'\n"
+        )
+        (cls.www / "secret" / "secret.cgi").chmod(0o755)
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+Options +ExecCGI
+AddHandler cgi-script .cgi
+RewriteEngine On
+<Location "/secret">
+    Require all denied
+</Location>
+RewriteRule "^/app/(.*)$" "%{{DOCUMENT_ROOT}}/$1" [PT,L]
+<Directory "{cls.www}">
+    Require all granted
+</Directory>
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def test_pt_target_never_executes_host_script(self):
+        status, _, body = request(self.port, "/app/secret/secret.cgi")
+        self.assertNotEqual(status, 200, body[:300])
+        self.assertNotIn(b"WALLET-F67-EXEC", body)
+        self.assertNotIn(b"WALLET-F67-SOURCE", body)
+
+    def test_location_policy_still_denies_the_real_url(self):
+        status, _, body = request(self.port, "/secret/secret.cgi")
+        self.assertNotEqual(status, 200, body[:200])
+        self.assertNotIn(b"WALLET-F67-EXEC", body)
+
+
+class F68StickyFilesystemOverrideTests(unittest.TestCase):
+    """A later filesystem override must replace earlier stale ones (F68)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f68-sticky-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.logs = cls.base / "logs"
+        for directory in (cls.www, cls.logs):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        (cls.www / "index.html").write_text("WALLET-F68-INDEX\n")
+        for name in ("sticky-target.cgi", "direct-target.cgi"):
+            (cls.www / name).write_text(
+                "#!/bin/sh\n"
+                "# WALLET-F68-SOURCE\n"
+                "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+                "printf 'WALLET-F68-EXEC\\n'\n"
+            )
+            (cls.www / name).chmod(0o755)
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+Options +ExecCGI
+AddHandler cgi-script .cgi
+RewriteEngine On
+RewriteRule "^/app/(.*)$" "%{{DOCUMENT_ROOT}}/sticky-target.cgi"
+RewriteRule "^" "/index.html" [L]
+<Directory "{cls.www}">
+    Require all granted
+</Directory>
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+        # Capability server: no rewrites at all, so the sticky assertion can
+        # be compared against the real behaviour of the same .cgi target.
+        cls.control_port = free_port()
+        cls.control_proc, _ = start_vapached(
+            cls.base,
+            f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.control_port}
+ServerName localhost
+PidFile "{cls.logs}/httpd-control.pid"
+ErrorLog "{cls.logs}/error-control.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+Options +ExecCGI
+AddHandler cgi-script .cgi
+<Directory "{cls.www}">
+    Require all granted
+</Directory>
+""",
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        stop_vapached(getattr(cls, "control_proc", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def test_later_url_rewrite_replaces_stale_filesystem_target(self):
+        status, _, body = request(self.port, "/app/sticky-target.cgi")
+        self.assertEqual(status, 200, body[:300])
+        self.assertIn(b"WALLET-F68-INDEX", body)
+        self.assertNotIn(b"WALLET-F68-EXEC", body)
+
+    def test_cgi_pipeline_executes_the_target_on_a_plain_url(self):
+        # Capability control: the .cgi target is executable on a rewrite-free
+        # server, so the sticky assertion genuinely proves the stale
+        # filesystem override was replaced by the later URL rewrite rather
+        # than the handler being unavailable.
+        status, _, body = request(self.control_port, "/direct-target.cgi")
+        self.assertEqual(status, 200, body[:300])
+        self.assertIn(b"WALLET-F68-EXEC", body)
+
+
+class UnsafePrefixStatWarningTests(unittest.TestCase):
+    """[UnsafePrefixStat] is inert but must be acknowledged in the log (H2c/F32)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-f32-warn-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.logs = cls.base / "logs"
+        for directory in (cls.www, cls.logs):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+RewriteEngine On
+RewriteRule "^/unsafe/(.*)$" "{cls.base}/$1" [L,UnsafePrefixStat]
+<Directory "{cls.www}">
+    Require all granted
+</Directory>
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def test_flag_is_parsed_with_a_load_time_warning(self):
+        # The server loaded (setUpClass succeeded); stop it first so the
+        # buffered startup output can be drained from the pipe.
+        stop_vapached(self.proc)
+        assert self.proc.stdout is not None
+        output = self.proc.stdout.read().decode(errors="replace")
+        self.assertIn("[UnsafePrefixStat]", output)
+        self.assertIn("has no effect", output)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

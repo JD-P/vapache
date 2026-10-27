@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-10-26",
   "verus": {
-    "verified_functions": 277,
+    "verified_functions": 293,
     "errors": 0
   },
   "obligations": [
@@ -158,7 +158,7 @@
       "title": "Internal rewrite filesystem targets never change the authorization base",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "verified rewrite_filesystem_admit admits only files below the current document/alias root; its under_base input is produced by the verified component-aware path_under_base kernel; UnsafePrefixStat cannot re-root at the target parent; rewrite unit tests and the F32 replay cover the former server-root escape; the rewrite target scope is conjoined with the rewritten URL and original URL policy rather than replacing it (I61)"
+      "evidence": "verified rewrite_filesystem_admit admits only files below the current document/alias root; its under_base input is produced by the verified component-aware path_under_base kernel; UnsafePrefixStat cannot re-root at the target parent; rewrite unit tests and the F32 replay cover the former server-root escape; the rewrite target scope is conjoined with the rewritten URL and original URL policy rather than replacing it (I61); rewrite-condition file tests probe the canonicalized target path through path_under_base rather than the lexical spelling"
     },
     {
       "id": "fastcgi_script_containment",
@@ -235,7 +235,7 @@
       "title": "Expression file tests use the document-root confinement",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "Expr::FileTest consumes confined_expr_path for -f/-d/-e/-s/-F/-U, rejecting absolute, parent-relative and escaping-symlink arguments; main-config <IfFile> uses a separate operator-supplied Expr::IfFile; expr_file_test_admit is mechanized and unit cases cover absolute paths and an escaping symlink; rewrite condition -f/-d/-s/-l tests now also canonicalize the probed path and consume path_under_base so an in-root symlink cannot probe outside the document/alias root"
+      "evidence": "Expr::FileTest consumes confined_expr_path for -f/-d/-e/-s/-F/-U, rejecting absolute, parent-relative and escaping-symlink arguments; the containment check consumes the verified component-aware path_under_base kernel (matching the rewrite/alias/FastCGI call sites) instead of a local starts_with; main-config <IfFile> uses a separate operator-supplied Expr::IfFile; expr_file_test_admit is mechanized and unit cases cover absolute paths and an escaping symlink; rewrite condition -f/-d/-s/-l tests now also canonicalize the probed path and consume path_under_base so an in-root symlink cannot probe outside the document/alias root"
     },
     {
       "id": "require_none_multi",
@@ -305,7 +305,77 @@
       "title": "Resolved-target scope is a meet with the URL-mapped scope",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "options_conjoin computes the bitwise meet of URL and canonical target Options; handler_conjoin_admit permits an extension only when both identities resolve to the same handler, and conjoined_handlers projects disagreement to RemoveHandler; override_categories_conjoin plus OverridePolicy::conjoined_with make an explicit AllowOverride None on either path identity deny the canonical access file. Scope::restrict_with is consumed by symlink target binding, DirectorySlash/PATH_INFO/FastCGI target reauthorization, rewrite filesystem targets and cache script/index/canonical targets (F60/I61). Unit, htaccess policy and F60 end-to-end cases cover plain <Directory> policy, in-root symlinks, ancestor .htaccess, RemoveHandler, -Indexes and AllowOverride None"
+      "evidence": "options_conjoin computes the bitwise meet of URL and canonical target Options; handler_conjoin_admit permits an extension only when both identities resolve to the same handler, and conjoined_handlers projects disagreement to RemoveHandler; override_categories_conjoin plus OverridePolicy::conjoined_with make an explicit AllowOverride None on either path identity deny the canonical access file. Scope::restrict_with is consumed by symlink target binding, DirectorySlash/PATH_INFO/FastCGI target reauthorization, rewrite filesystem targets and cache script/index/canonical targets (F60/I61). The Options and AllowOverride-category meets are now aliases of one generalized bits_meet spec with no-broadening (bits_meet_never_grants), commutativity, associativity, idempotence and narrowing lemmas proved once for every policy bit-vector conjoin. Unit, htaccess policy and F60 end-to-end cases cover plain <Directory> policy, in-root symlinks, ancestor .htaccess, RemoveHandler, -Indexes and AllowOverride None"
+    },
+    {
+      "id": "percent_encode_family",
+      "title": "One verified percent-encoding loop for every escape site",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "percent_encode refines to percent_encode_from with out@ equality, a 3x length bound, identity on unmasked input (percent_encode_from_identity) and no-raw-masked-byte output (no_masked_raw/percent_encode_no_masked_raw, given an alphabet-safe mask). Rewrite backreference [B]/[BNE]/[BCTLS]/[BNP] escaping, redirect-Location escaping (which now also escapes non-ASCII bytes instead of emitting Latin-1 mojibake) and the int:escape map all consume the one verified loop; the per-site masks remain runtime data outside Verus and int:unescape remains unverified"
+    },
+    {
+      "id": "containment_composition",
+      "title": "Component-aware containment composes across path identities",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "path_under_base_reflexive and path_under_base_transitive mechanize composition of the verified component-aware containment kernel: every base contains itself, and target-under-mid plus mid-under-base implies target-under-base for the lexical byte domain. expr file-test confinement now consumes path_under_base (with starts_with removed), matching the rewrite, alias and FastCGI containment call sites; the canonicalize/join-stability half of the composition argument remains the documented filesystem-view assumption"
+    },
+    {
+      "id": "expr_parser_totality",
+      "title": "Expression parsing is total: malformed input errors, never panics",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Implemented; agent handoff item H1. Parser::regex() bounds-checks that a delimiter byte exists after =~/!~ and fails closed with an error instead of panicking ('expected a regex after =~'); the recursive-descent parser gained a depth budget (MAX_EXPR_DEPTH 64 for the primary/unary frames, chosen so the worst ~2 KiB-per-level chain stay under the 2 MiB default thread stacks used by request handlers) enforced in wrapper functions that decrement on every return path; a depth overflow returns Err rather than aborting. Unit tests cover the end-of-operator panic shape and depth exhaustion (expr.rs tests in cargo test -p vapached)."
+    },
+    {
+      "id": "rewrite_flag_state_machine",
+      "title": "Rewrite flags and rounds select one target: [PT] maps URLs, overrides are not sticky, dead flags warn",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Partially implemented; agent handoff item H2 (findings_p10 F67/F68). [PT] is now honoured: a passthrough-flagged rule keeps its substitution in URL space and the filesystem promotion is skipped in rewrite.rs process(), so an absolute substitution under [PT] can no longer execute a host file (F67). The per-rule filesystem override is replaced unconditionally every rule and the server clears the per-round target (server.rs rewrite_filesystem), so a later URL-only [L] rewrite no longer lets an earlier round's file target win (F68 sticky override). [UnsafePrefixStat] remains parsed-but-inert by design and now logs a load-time warning ('[UnsafePrefixStat] ... has no effect') from the main-config rewriterule arm; .htaccess rules still have no warning surface. Differential regressions: tests/adversarial_regressions.py (F67PassthroughTargetTests, F68StickyFilesystemOverrideTests). The Verus flags/round state-machine (spec fn over RewriteFlags and the 10-round loop) from the handoff is still not mechanized."
+    },
+    {
+      "id": "apache_options_reset",
+      "title": "Signless Options words reset the set like Apache",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Implemented; agent handoff item H3. Both parsers (config.rs main-config Options arm and htaccess.rs apply_options) now collect recognized signless words into a reset mask and apply push_set(Options::empty()) followed by the mask and the compiled FollowSymLinks default BEFORE the per-word loop, so `Options Indexes` resets the inheritance set exactly as the Apache oracle (local httpd 2.4.69) does: inherited ExecCGI is dropped and the compiled default bits return. Differential coverage agrees on both engines (htaccess-options-absolute-resets-inherited, htaccess-options-none-removes-indexes in tests/config_semantics.py); +/- sign and per-word semantics are unchanged."
+    },
+    {
+      "id": "rewritemap_load_validation",
+      "title": "RewriteMap sources are validated and bounded at load time",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Implemented (load-time validation); agent handoff item H4. txt/rnd map loads go through Compile::load_rewritemap_file, which fails closed with a ConfigError when stat fails, the file cannot be read, or the file exceeds MAX_REWRITEMAP (1 MiB) - previously unreadable maps silently loaded as empty; int maps validate the function against tolower/toupper/escape/unescape and reject unknown functions; prg maps resolve their first whitespace-delimited token against ServerRoot and require an executable regular file, storing only the resolved command plus remaining args. The runtime prg spawn timeout / unbounded-stdout budget was NOT attempted in this pass (handoff stretch goal, left open). Unit tests: rewritemap_loading_fails_closed in config.rs."
+    },
+    {
+      "id": "htaccess_cookie_grammar",
+      "title": "[CO=...] cookie fields parse under a strict grammar",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Implemented; agent handoff item H5. build_cookie validates the RFC 6265 grammar before emitting: the cookie name must be an RFC 6265 token, value/Domain/Path must be field-octets (ASCII graphic plus space; ';', ',', '\"' and DEL/controls rejected), SameSite only accepts lax|strict|none (case-insensitive) and secure/httponly only their true|1|secure|httponly tokens, so a backref containing ':' or ';' can no longer shift fields or inject attributes and fails closed with Err. The old tolerant '0'/'false' flag spellings were removed and the matching suite expectation was updated to the strict spelling; the compiled flag-file conformance case [CO=TEST:VAL:localhost:3600:/:secure:httponly:none] still conforms. Unit tests: cookie_escape_and_effect_helpers in rewrite.rs."
+    },
+    {
+      "id": "query_byte_identity",
+      "title": "Raw query bytes reach authorization without lossy conflation",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Implemented with a deliberate behavioral diff - flagged for human review (per handoff, this item is subtle); agent handoff item H6. ResourceKey.cache_query is now Option<Vec<u8>>: raw query byte strings keep their byte identity in cache keys, so distinct invalid-UTF-8 queries no longer conflate after String::from_utf8_lossy (unit test cache_keys_keep_invalid_utf8_query_bytes_distinct in access.rs). %{QUERY_STRING} expression evaluation and the QUERY_STRING rewrite variable fail closed with the error 'QUERY_STRING is not valid UTF-8' instead of substituting a lossily-decoded string (expr.rs, rewrite.rs). The reviewed diff: on non-UTF-8 queries vapache now errors where Apache substitutes a lossy string - a fail-closed divergence in the attacker-controlled byte space, mirroring the cache layer's existing raw-byte policy. Unit tests in expr.rs and rewrite.rs cover the distinct-keys and error paths."
+    },
+    {
+      "id": "iffile_htaccess_argument",
+      "title": ".htaccess <IfFile> tests the operator-supplied path",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Implemented; agent handoff item H7. The .htaccess <IfFile> arm now tests the operator-supplied argument (SectionStart.args excludes the tag, mirroring the main-config args.first() use), so single-argument <IfFile flag> tests the named file rather than the empty path that forced the section on; a two-word <IfFile a b> tests 'a' and documents the second word as ignored. Apache (local 2.4.69) resolves .htaccess <IfFile> relative paths against ServerRoot while vapached confines .htaccess file probes to relative DocumentRoot paths (F45/I42, CVE-2026-24072/44119), so the differential suite cases were reshaped to relative paths that exist under both roots (tests/config_semantics.py htaccess-*-iffile*, plus the new negative branch htaccess-all-iffile-absent); absolute-path .htaccess <IfFile> stays FALSE (a deliberate fail-closed divergence under the user-approved parity waiver). Unit test: htaccess.rs iffile_tests_the_operator_path_not_a_second_word."
+    },
+    {
+      "id": "strict_config_silence",
+      "title": "Strict configuration rejects every silently dropped directive",
+      "status": "partial",
+      "weight": 1.0,
+      "evidence": "Implemented; agent handoff item H8. New Compile::strict_failure helper: under --strict-config a silent drop becomes a ConfigError, in compatible mode it logs 'file:line: msg (ignored)'. Promoted: under-argument AddType/AddHandler, Header (action requires an argument pair), ExpiresByType (type + code), ProxyPass (path + backend), unknown Options tokens, unknown RewriteOptions tokens, and unparsable failonstatus entries for ProxyPass and ProxySet/balancer (parse_status_list now returns statuses plus the unparsable remainder instead of shortening silently). Differential coverage: tests/config_validity.py STRICT_CASES - nine rows where apache2 -t fails, vapached compatible -t loads with the ignore warning, and vapached --strict-config fails (AddType/AddHandler/Header/ExpiresByType/ProxyPass arities, unknown Options and RewriteOptions tokens, ProxyPass and ProxySet failonstatus). Unit test: strict_mode_refuses_silently_dropped_directives in config.rs."
     },
     {
       "id": "rewrite_scope_conjunction",
@@ -382,7 +452,7 @@
   },
   "adversarial": {
     "conformance": 165,
-    "semantics": 204,
+    "semantics": 206,
     "random": 300,
     "cve_replay_cases": 29,
     "unexplained_replay_failures": 0,
@@ -453,6 +523,9 @@
     "Canonical decoded, query-free REQUEST_URI identity for expressions, rewrite conditions/substitutions, environment rules and CGI",
     "Filesystem-relative access-file rewrite subjects for layers at, below and above the URL mapping root",
     "Resolved-target/rewrite scope conjunction (Options meet, handler agreement, AllowOverride deny)",
-    "Rewrite original-policy retention and final-target reauthorization obligation"
+    "Rewrite original-policy retention and final-target reauthorization obligation",
+    "Generalized policy bit meet (bits_meet) with no-broadening and order algebra",
+    "Component-aware containment reflexivity and transitivity across path identities",
+    "Generalized percent encoding (percent_encode_from) with identity and no-raw-masked-byte guarantees"
   ]
 }

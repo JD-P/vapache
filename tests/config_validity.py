@@ -6,6 +6,8 @@ rejects them.  A permissive parser is not automatically a vulnerability, but
 for access-control directives it is exactly the kind of surprise that turns
 into a bypass.  This harness deliberately uses `-t` only: the question is
 whether the configuration is accepted, not how it behaves after startup.
+The STRICT_CASES rows additionally check that `vapached --strict-config`
+fails where Apache `apache2 -t` fails (H8 promoted directive drops).
 """
 
 import argparse
@@ -43,6 +45,7 @@ MODULES = [
     "authz_groupfile_module",
     "rewrite_module",
     "proxy_module",
+    "expires_module",
 ]
 
 
@@ -211,6 +214,34 @@ CASES = [
     ),
 ]
 
+# H8: promoted directive drops.  Apache rejects each of these snippets at
+# plain `-t`; vapached in compatible mode keeps loading with a warning (a
+# documented compatibility divergence), but `--strict-config` must refuse to
+# run so the configuration cannot pass a strict deployment unnoticed.
+STRICT_CASES = [
+    ("AddType requires two args", "AddType image/png\n"),
+    ("AddHandler requires two args", "AddHandler cgi-script\n"),
+    ("Header requires an action pair", "Header set\n"),
+    ("ExpiresByType requires type + code", "ExpiresByType text/html\n"),
+    ("ProxyPass requires path and url", "ProxyPass /x\n"),
+    ("RewriteOptions unknown token", "RewriteEngine On\nRewriteOptions Bogus\n"),
+    (
+        "Options unknown token",
+        f'<Directory "{DOCROOT}">\n    Options Bogus\n</Directory>\n',
+    ),
+    (
+        "ProxyPass failonstatus unparsable",
+        "ProxyPass /b http://127.0.0.1:1/ failonstatus=9xx,foo\n",
+    ),
+    (
+        "ProxySet failonstatus unparsable",
+        '<Proxy "balancer://alpha">\n'
+        '    BalancerMember "http://127.0.0.1:1"\n'
+        "    ProxySet failonstatus=9xx,foo\n"
+        "</Proxy>\n",
+    ),
+]
+
 
 def run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=20)
@@ -252,9 +283,33 @@ def main():
             if args.verbose or aok != vok:
                 print(f"  apache: {(a.stderr or a.stdout).strip()[-500:]}")
                 print(f"  vapache: {(v.stderr or v.stdout).strip()[-500:]}")
+        strict_failures = 0
+        for name, snippet in STRICT_CASES:
+            acfg = BASE / "apache.conf"
+            vcfg = BASE / "vapache.conf"
+            acfg.write_text(prefix(PORT) + snippet)
+            vcfg.write_text(prefix(PORT + 1) + snippet)
+            a = run([APACHE, "-t", "-f", str(acfg)])
+            v = run([str(VAPACHED), "-t", "-f", str(vcfg)])
+            s = run([str(VAPACHED), "-t", "--strict-config", "-f", str(vcfg)])
+            aok = a.returncode == 0
+            vok = v.returncode == 0
+            sok = s.returncode == 0
+            # Expected triple: apache refuses the snippet, vapached warns but
+            # loads in compatible mode, and strict mode refuses as well.
+            bad = (not aok) and vok and sok
+            status = "strict" if not bad else "STRICT-DIFF"
+            if bad:
+                strict_failures += 1
+            print(f"{status} {name}: apache={aok} vapache={vok} strict={sok}")
+            if args.verbose or bad:
+                print(f"  apache: {(a.stderr or a.stdout).strip()[-400:]}")
+                print(f"  vapache: {(v.stderr or v.stdout).strip()[-300:]}")
+                print(f"  strict: {(s.stderr or s.stdout).strip()[-300:]}")
         print(f"\n{failures} context divergence(s)")
+        print(f"{strict_failures} strict refusal divergence(s)")
         print(f"tree: {BASE}")
-        return 1 if failures else 0
+        return 1 if failures or strict_failures else 0
     finally:
         shutil.rmtree(BASE, ignore_errors=True)
 

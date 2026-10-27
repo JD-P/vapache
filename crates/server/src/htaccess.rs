@@ -795,7 +795,12 @@ fn parse_block(
                                 crate::expr::parse(&args.join(" "))
                                     .map_err(|e| format!("line {}: {e}", *i))?
                             } else {
-                                let path = args.get(1).cloned().unwrap_or_default();
+                                // SectionStart.args excludes the <IfFile> tag
+                                // itself, so the operator path is the first
+                                // argument.  A second word is a no-op count
+                                // operand like in mod_rewrite's <If>/<IfFile>
+                                // grammar; Apache tests the first word too.
+                                let path = args.first().cloned().unwrap_or_default();
                                 crate::expr::Expr::FileTest(
                                     "-F".into(),
                                     Box::new(crate::expr::Expr::Str(path)),
@@ -2001,6 +2006,53 @@ fn apply_options(scope: &mut Scope, args: &[String]) -> Result<(), String> {
         scope.options.push_set(Options::empty().0);
         return Ok(());
     }
+    // Apache resets the effective set to exactly the listed words when a
+    // directive carries signless options, discarding anything inherited
+    // (including the compiled FollowSymLinks default). Collect them first so
+    // the reset lands before the +/- words of the same directive.
+    let mut reset_mask = Options::empty().0;
+    let mut resets = false;
+    for a in args {
+        if a.starts_with('+') || a.starts_with('-') {
+            continue;
+        }
+        match a.to_ascii_lowercase().as_str() {
+            "indexes" => {
+                reset_mask |= Options::INDEXES;
+                resets = true;
+            }
+            "followsymlinks" => {
+                reset_mask |= Options::FOLLOW_SYMLINKS;
+                resets = true;
+            }
+            "symlinksifownermatch" => {
+                reset_mask |= Options::SYMLINKS_IF_OWNER_MATCH;
+                resets = true;
+            }
+            "execcgi" => {
+                reset_mask |= Options::EXEC_CGI;
+                resets = true;
+            }
+            "includes" => {
+                reset_mask |= Options::INCLUDES;
+                resets = true;
+            }
+            "includesnoexec" => {
+                reset_mask |= Options::INCLUDES_NOEXEC;
+                resets = true;
+            }
+            "multiviews" => {
+                reset_mask |= Options::MULTIVIEWS;
+                resets = true;
+            }
+            // None/All keep their explicit push_set in the loop below.
+            _ => continue,
+        }
+    }
+    if resets {
+        scope.options.push_set(Options::empty().0);
+        scope.options.push_add(reset_mask);
+    }
     for a in args {
         let (sign, flag) = match a.as_bytes().first() {
             Some(b'+') => (1, &a[1..]),
@@ -2452,6 +2504,37 @@ mod tests {
         let p = parse_file(&cfg, &file, OverrideMode::All, "/").unwrap();
         assert_eq!(p.rules.len(), 1);
         assert_eq!(p.rules[0].nested.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn iffile_tests_the_operator_path_not_a_second_word() {
+        // SectionStart.args excludes the <IfFile> tag itself: with one word
+        // the named file is what <IfFile> tests, and the old args.get(1)
+        // bug made that argument empty (Always-true via the directory).
+        let dir = tempdir("iffile");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub/maintenance.flag"), "x").unwrap();
+        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let file = dir.join(".htaccess");
+        let shape = |text: &str| {
+            fs::write(&file, text).unwrap();
+            let mut p = parse_file(&cfg, &file, OverrideMode::All, "/sub").unwrap();
+            let expr = p.rules[0].condition.take().expect("condition");
+            match expr {
+                crate::expr::Expr::FileTest(test, inner) => match *inner {
+                    crate::expr::Expr::Str(path) => (test, path),
+                    other => panic!("unexpected operand {other:?}"),
+                },
+                other => panic!("unexpected condition {other:?}"),
+            }
+        };
+
+        let (test, path) = shape("<IfFile maintenance.flag>\nHeader set X-IfFile yes\n</IfFile>\n");
+        assert_eq!((test.as_str(), path.as_str()), ("-F", "maintenance.flag"));
+        // Two words: the first word is tested; the second word is ignored.
+        let (test, path) = shape("<IfFile a.txt ignored>\nHeader set X-IfFile yes\n</IfFile>\n");
+        assert_eq!((test.as_str(), path.as_str()), ("-F", "a.txt"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3499,8 +3582,9 @@ mod tests {
             ),
         );
         let canonical = admin.join("run.cgi");
-        let layers = collect_layers_with_root(&cfg, None, &canonical, "/admin/run.cgi", Some(&root))
-            .unwrap();
+        let layers =
+            collect_layers_with_root(&cfg, None, &canonical, "/admin/run.cgi", Some(&root))
+                .unwrap();
         assert!(
             layers.is_empty(),
             "a lexical AllowOverride None must suppress the canonical access file"

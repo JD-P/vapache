@@ -20,6 +20,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -1088,6 +1089,11 @@ pub const ETAG_INODE: u32 = 1;
 pub const ETAG_MTIME: u32 = 2;
 pub const ETAG_SIZE: u32 = 4;
 pub const ETAG_ALL: u32 = 7;
+
+/// Upper bound on any RewriteMap file loaded at startup (txt/rnd), mirroring
+/// the `.htaccess` size cap: parsing an unbounded file into memory is
+/// unbounded work a configuration error can avert.
+const MAX_REWRITEMAP: u64 = 1024 * 1024;
 
 #[cfg(debug_assertions)]
 #[derive(Debug, PartialEq, Eq)]
@@ -2508,6 +2514,75 @@ impl Compile {
         }
     }
 
+    /// Load one on-disk RewriteMap source (txt/rnd) fail-closed: a missing,
+    /// unreadable or oversized map file is a configuration error instead of
+    /// silently becoming an empty map (which would disable every rule gated
+    /// on `${map:...}` lookups).
+    fn load_rewritemap_file(
+        &mut self,
+        loc: &SourceLoc,
+        name: &str,
+        kind: &str,
+        path: &Path,
+    ) -> Option<String> {
+        let md = match std::fs::metadata(path) {
+            Ok(md) => md,
+            Err(e) => {
+                self.errors.push(ConfigError {
+                    file: loc.file.clone(),
+                    line: loc.line,
+                    msg: format!(
+                        "RewriteMap '{name}': cannot read {kind} map file {}: {e}",
+                        path.display()
+                    ),
+                });
+                return None;
+            }
+        };
+        if md.len() > MAX_REWRITEMAP {
+            self.errors.push(ConfigError {
+                file: loc.file.clone(),
+                line: loc.line,
+                msg: format!(
+                    "RewriteMap '{name}': {kind} map file {} exceeds the {MAX_REWRITEMAP} byte limit",
+                    path.display()
+                ),
+            });
+            return None;
+        }
+        match std::fs::read_to_string(path) {
+            Ok(data) => Some(data),
+            Err(e) => {
+                self.errors.push(ConfigError {
+                    file: loc.file.clone(),
+                    line: loc.line,
+                    msg: format!(
+                        "RewriteMap '{name}': cannot read {kind} map file {}: {e}",
+                        path.display()
+                    ),
+                });
+                None
+            }
+        }
+    }
+
+    /// Report a compatibility drop: an error under strict mode, a warning
+    /// otherwise.  The affected directive (or entry) is skipped either way,
+    /// but strict mode refuses to start when under-argument or unparsable
+    /// material would otherwise be silently dropped.
+    fn strict_failure(&mut self, loc: &SourceLoc, msg: impl Into<String>) {
+        let m = msg.into();
+        if self.strict {
+            self.errors.push(ConfigError {
+                file: loc.file.clone(),
+                line: loc.line,
+                msg: m,
+            });
+        } else {
+            self.warn(format!("{}:{}: {m} (ignored)", loc.file, loc.line));
+        }
+    }
+
     fn compile(mut self) -> Result<Config, ConfigError> {
         let mut scope = self.cfg.global.clone();
         let mut rules: Vec<ScopeRule> = Vec::new();
@@ -3242,6 +3317,56 @@ impl Compile {
                 if args.is_empty() {
                     scope.options.push_set(Options::empty().0);
                 }
+                // Apache resets the effective set to exactly the listed words
+                // when a directive carries signless options (verified against
+                // the local oracle: a child `Options Indexes` drops both an
+                // inherited +ExecCGI and the compiled FollowSymLinks default).
+                // Collect them first so the reset lands before the +/- words
+                // of the same directive apply in argument order.
+                let mut reset_mask = Options::empty().0;
+                let mut resets = false;
+                for a in args {
+                    if a.starts_with('+') || a.starts_with('-') {
+                        continue;
+                    }
+                    match a.to_ascii_lowercase().as_str() {
+                        "indexes" => {
+                            reset_mask |= Options::INDEXES;
+                            resets = true;
+                        }
+                        "followsymlinks" => {
+                            reset_mask |= Options::FOLLOW_SYMLINKS;
+                            resets = true;
+                        }
+                        "symlinksifownermatch" => {
+                            reset_mask |= Options::SYMLINKS_IF_OWNER_MATCH;
+                            resets = true;
+                        }
+                        "execcgi" => {
+                            reset_mask |= Options::EXEC_CGI;
+                            resets = true;
+                        }
+                        "includes" => {
+                            reset_mask |= Options::INCLUDES;
+                            resets = true;
+                        }
+                        "includesnoexec" => {
+                            reset_mask |= Options::INCLUDES_NOEXEC;
+                            resets = true;
+                        }
+                        "multiviews" => {
+                            reset_mask |= Options::MULTIVIEWS;
+                            resets = true;
+                        }
+                        // None/All keep their explicit push_set in the loop
+                        // below; unknown tokens stay warn-only (H8 promotes).
+                        _ => continue,
+                    }
+                }
+                if resets {
+                    scope.options.push_set(Options::empty().0);
+                    scope.options.push_add(reset_mask);
+                }
                 for a in args {
                     let (sign, flag) = match a.as_bytes().first() {
                         Some(b'+') => (1, &a[1..]),
@@ -3259,10 +3384,7 @@ impl Compile {
                         "includesnoexec" => Some(Options(Options::INCLUDES_NOEXEC)),
                         "multiviews" => Some(Options(Options::MULTIVIEWS)),
                         _ => {
-                            self.warn(format!(
-                                "{}:{}: unsupported Options flag '{a}' (ignored)",
-                                loc.file, loc.line
-                            ));
+                            self.strict_failure(loc, format!("unsupported Options flag '{a}'"));
                             None
                         }
                     };
@@ -3640,6 +3762,11 @@ impl Compile {
             }
             "rewritemap" => {
                 if args.len() < 2 {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "RewriteMap requires a name and a map source".into(),
+                    });
                     return;
                 }
                 let name = args[0].clone();
@@ -3651,7 +3778,9 @@ impl Compile {
                         } else {
                             self.cfg.server_root.join(source)
                         };
-                        let data = std::fs::read_to_string(path).unwrap_or_default();
+                        let Some(data) = self.load_rewritemap_file(loc, &name, "txt", &path) else {
+                            return;
+                        };
                         let mut map = HashMap::new();
                         for line in data.lines() {
                             let line = line.trim();
@@ -3674,7 +3803,9 @@ impl Compile {
                         } else {
                             self.cfg.server_root.join(source)
                         };
-                        let data = std::fs::read_to_string(path).unwrap_or_default();
+                        let Some(data) = self.load_rewritemap_file(loc, &name, "rnd", &path) else {
+                            return;
+                        };
                         let mut map = HashMap::new();
                         for line in data.lines() {
                             let line = line.trim();
@@ -3698,16 +3829,68 @@ impl Compile {
                             .push((name, RewriteMap::Rnd(map)));
                     }
                     "prg" => {
+                        // Resolve a relative program against ServerRoot at
+                        // load time and require an existing executable regular
+                        // file; PATH lookup at spawn time would surface every
+                        // miss as an empty map value instead of a config
+                        // error.
+                        let (program, args_rest) = match source.split_once(char::is_whitespace) {
+                            Some((p, r)) => (p, Some(r.trim_start().to_string())),
+                            None => (source, None),
+                        };
+                        let prog_path = if program.starts_with('/') {
+                            PathBuf::from(program)
+                        } else {
+                            self.cfg.server_root.join(program)
+                        };
+                        let check = match std::fs::metadata(&prog_path) {
+                            Ok(md) if !md.is_file() => Some("is not a regular file".to_string()),
+                            Ok(md) if md.mode() & 0o111 == 0 => {
+                                Some("is not executable".to_string())
+                            }
+                            Err(e) => Some(format!("cannot stat: {e}")),
+                            _ => None,
+                        };
+                        if let Some(problem) = check {
+                            self.errors.push(ConfigError {
+                                file: loc.file.clone(),
+                                line: loc.line,
+                                msg: format!(
+                                    "RewriteMap '{name}': prg program {} {problem}",
+                                    prog_path.display()
+                                ),
+                            });
+                            return;
+                        }
+                        let resolved = prog_path.to_string_lossy().into_owned();
+                        let stored = match args_rest {
+                            Some(rest) => format!("{resolved} {rest}"),
+                            None => resolved,
+                        };
                         scope
                             .rewrite_policy
                             .rewrite_maps
-                            .push((name, RewriteMap::Prg(source.to_string())));
+                            .push((name, RewriteMap::Prg(stored)));
                     }
                     "int" => {
+                        let function = source.to_ascii_lowercase();
+                        if !matches!(
+                            function.as_str(),
+                            "tolower" | "toupper" | "escape" | "unescape"
+                        ) {
+                            self.errors.push(ConfigError {
+                                file: loc.file.clone(),
+                                line: loc.line,
+                                msg: format!(
+                                    "unsupported RewriteMap int function '{source}' (expected tolower, toupper, escape or unescape)"
+                                ),
+                            });
+                            return;
+                        }
                         scope
                             .rewrite_policy
                             .rewrite_maps
-                            .push((name, RewriteMap::Int(source.to_ascii_lowercase())));
+                            .push((name, RewriteMap::Int(function)));
                     }
                     _ => self.errors.push(ConfigError {
                         file: loc.file.clone(),
@@ -3744,6 +3927,14 @@ impl Compile {
                 let base = scope.rewrite_policy.rewrite_base.as_deref().unwrap_or("/");
                 match parse_rewrite_rule(args, base, false) {
                     Ok(mut rule) => {
+                        // Deliberately inert since the F32 remediation; accepted
+                        // for Apache compatibility but must not be silent.
+                        if rule.flags.unsafe_prefix_stat {
+                            self.warn(format!(
+                                "{}:{}: [UnsafePrefixStat] is accepted for compatibility and has no effect",
+                                loc.file, loc.line
+                            ));
+                        }
                         rule.conditions =
                             std::mem::take(&mut scope.rewrite_policy.pending_rewrite_conds);
                         scope.rewrite_policy.rewrite_rules.push(rule);
@@ -3756,11 +3947,22 @@ impl Compile {
                 }
             }
             "rewriteoptions" => {
+                // Only RewriteOptions Inherit is implemented; every other
+                // option silently degraded Inherit to Off (Some(false)).
+                for a in args {
+                    if !a.eq_ignore_ascii_case("Inherit") {
+                        self.strict_failure(loc, format!("unsupported RewriteOptions flag '{a}'"));
+                    }
+                }
                 scope.rewrite_policy.rewrite_inherit =
                     Some(args.iter().any(|a| a.eq_ignore_ascii_case("Inherit")));
             }
             "addtype" => {
                 if args.len() < 2 {
+                    self.strict_failure(
+                        loc,
+                        "AddType requires a MIME-type and one or more extensions",
+                    );
                     return;
                 }
                 scope
@@ -3776,6 +3978,10 @@ impl Compile {
             }
             "addhandler" => {
                 if args.len() < 2 {
+                    self.strict_failure(
+                        loc,
+                        "AddHandler requires a handler-name and one or more extensions",
+                    );
                     return;
                 }
                 for ext in &args[1..] {
@@ -3844,6 +4050,7 @@ impl Compile {
                     idx = 1;
                 }
                 if args.len() < idx + 2 {
+                    self.strict_failure(loc, "Header requires an action and a header name");
                     return;
                 }
                 let action = args[idx].to_ascii_lowercase();
@@ -3873,12 +4080,17 @@ impl Compile {
                 scope.header_policy.expires_default = Some(joined());
             }
             "expiresbytype" => {
-                if args.len() >= 2 {
-                    scope
-                        .header_policy
-                        .expires_by_type
-                        .push((args[0].to_ascii_lowercase(), args[1..].join(" ")));
+                if args.len() < 2 {
+                    self.strict_failure(
+                        loc,
+                        "ExpiresByType requires a MIME-type and an expiry time",
+                    );
+                    return;
                 }
+                scope
+                    .header_policy
+                    .expires_by_type
+                    .push((args[0].to_ascii_lowercase(), args[1..].join(" ")));
             }
             "typesconfig" => {
                 let p = PathBuf::from(first());
@@ -3974,6 +4186,7 @@ impl Compile {
             }
             "proxypass" => {
                 if args.len() < 2 {
+                    self.strict_failure(loc, "ProxyPass requires a path and a backend URL");
                     return;
                 }
                 if args[1] == "!" || args[1].starts_with('!') {
@@ -4009,7 +4222,18 @@ impl Compile {
                     };
                     match key.to_ascii_lowercase().as_str() {
                         "stickysession" => rule.sticky_cookie = Some(value.to_string()),
-                        "failonstatus" => rule.fail_on_status = parse_status_list(value),
+                        "failonstatus" => {
+                            let (statuses, unparsable) = parse_status_list(value);
+                            if !unparsable.is_empty() {
+                                self.strict_failure(
+                                    loc,
+                                    format!(
+                                        "ProxyPass failonstatus contains non-numeric entries {unparsable:?}"
+                                    ),
+                                );
+                            }
+                            rule.fail_on_status = statuses;
+                        }
                         _ => {}
                     }
                 }
@@ -4603,7 +4827,16 @@ impl Compile {
                             self.cfg.balancers[i].sticky_sep = Some(value.to_string())
                         }
                         "failonstatus" => {
-                            self.cfg.balancers[i].fail_on_status = parse_status_list(value)
+                            let (statuses, unparsable) = parse_status_list(value);
+                            if !unparsable.is_empty() {
+                                self.strict_failure(
+                                    loc,
+                                    format!(
+                                        "ProxySet failonstatus contains non-numeric entries {unparsable:?}"
+                                    ),
+                                );
+                            }
+                            self.cfg.balancers[i].fail_on_status = statuses;
                         }
                         _ => {}
                     }
@@ -4766,11 +4999,25 @@ impl Compile {
     }
 }
 
-fn parse_status_list(value: &str) -> Vec<u16> {
-    value
-        .split(',')
-        .filter_map(|v| v.trim().parse::<u16>().ok())
-        .collect()
+/// Parse a comma-separated status list (ProxyPass/BalancerMember
+/// `failonstatus`).  Unparsable tokens are returned alongside the codes so
+/// callers can refuse them under strict mode instead of silently loading a
+/// shorter list (an entry like `failonstatus=500,lop` used to load as
+/// `[500]`).
+fn parse_status_list(value: &str) -> (Vec<u16>, Vec<String>) {
+    let mut statuses = Vec::new();
+    let mut unparsable = Vec::new();
+    for v in value.split(',') {
+        let v = v.trim();
+        if v.is_empty() {
+            continue;
+        }
+        match v.parse::<u16>() {
+            Ok(code) => statuses.push(code),
+            Err(_) => unparsable.push(v.to_string()),
+        }
+    }
+    (statuses, unparsable)
 }
 
 fn parse_request_read_timeout(
@@ -6686,6 +6933,135 @@ mod tests {
         );
         let _ = std::fs::remove_file(path);
         result
+    }
+
+    #[test]
+    fn strict_mode_refuses_silently_dropped_directives() {
+        // Compat mode keeps loading these with a warning only.
+        let promoted = [
+            "RewriteOptions bogus",
+            "Options +NoSuchOption",
+            "AddType text/plain",
+            "AddHandler handler",
+            "Header set",
+            "Header always",
+            "ExpiresByType image/png",
+            "ProxyPass /p",
+        ];
+        for text in &promoted {
+            assert!(
+                load_text(&format!("Listen 127.0.0.1:0\n{text}\n"), false).is_ok(),
+                "{text} must stay a compat warning in non-strict mode"
+            );
+            assert!(
+                load_text(&format!("Listen 127.0.0.1:0\n{text}\n"), true).is_err(),
+                "{text} must be refused in strict mode"
+            );
+        }
+        // failonstatus: unparsable entries shorten the list in compat mode
+        // with a warning, and refuse to start in strict mode; clean lists
+        // pass strict validation.
+        let config = |entries: &str| {
+            format!("Listen 127.0.0.1:0\nProxyPass /p http://127.0.0.1:9000 {entries}\n")
+        };
+        assert!(load_text(&config("failonstatus=500,lop"), false).is_ok());
+        assert!(load_text(&config("failonstatus=500,502"), true).is_ok());
+        assert!(load_text(&config("failonstatus=500,lop"), true).is_err());
+        assert_eq!(
+            load_text(&config("failonstatus=200,no"), false)
+                .unwrap()
+                .effective_scope(None, Path::new("/p"), "/p")
+                .proxy_policy
+                .proxy_passes
+                .first()
+                .map(|rule| rule.fail_on_status.clone())
+                .unwrap(),
+            vec![200]
+        );
+    }
+
+    #[test]
+    fn rewritemap_loading_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vapache-rewritemap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("good.txt"), "alpha one\n# comment\n\nbeta two\n").unwrap();
+        std::fs::write(
+            dir.join("big.txt"),
+            vec![b'#'; (MAX_REWRITEMAP + 1) as usize],
+        )
+        .unwrap();
+        std::fs::write(dir.join("bin/worker"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            dir.join("bin/worker"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(dir.join("plain.txt"), "x y\n").unwrap();
+        std::fs::set_permissions(
+            dir.join("plain.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let load_with_root = |config: &str| {
+            let path = dir.join("rmap-test.conf");
+            std::fs::write(&path, config).unwrap();
+            let r = Config::load(
+                &path,
+                dir.as_path(),
+                &HashMap::new(),
+                &HashMap::new(),
+                false,
+            );
+            let _ = std::fs::remove_file(&path);
+            r
+        };
+        let maps = |config: &str| {
+            let c = load_with_root(config).unwrap();
+            c.global.rewrite_policy.rewrite_maps
+        };
+
+        // Malformed directive: error in every mode, never a silent skip.
+        for strict in [false, true] {
+            assert!(
+                load_text("Listen 127.0.0.1:0\nRewriteMap onlyone\n", strict).is_err(),
+                "short RewriteMap must be an error (strict={strict})"
+            );
+        }
+        // txt: missing file, unreadable file and oversized file all error.
+        assert!(load_with_root("Listen 127.0.0.1:0\nRewriteMap m txt:missing.txt\n").is_err());
+        assert!(load_with_root(&format!(
+            "Listen 127.0.0.1:0\nRewriteMap big txt:{}\n",
+            dir.join("big.txt").display()
+        ))
+        .is_err());
+        let good = maps("Listen 127.0.0.1:0\nRewriteMap t txt:good.txt\n");
+        assert!(matches!(
+            good.as_slice(),
+            [(_, RewriteMap::Txt(m))] if m.get("alpha").map(String::as_str) == Some("one")
+        ));
+        // int: unknown functions are rejected at load; known ones register.
+        assert!(load_with_root("Listen 127.0.0.1:0\nRewriteMap ix int:nosuch\n").is_err());
+        let int_map = maps("Listen 127.0.0.1:0\nRewriteMap up int:toupper\n");
+        assert!(matches!(
+            int_map.as_slice(),
+            [(_, RewriteMap::Int(f))] if f == "toupper"
+        ));
+        // prg: a relative program is resolved against ServerRoot and must be
+        // an existing executable regular file.
+        let prg = maps("Listen 127.0.0.1:0\nRewriteMap w prg:bin/worker\n");
+        assert!(
+            matches!(
+                prg.as_slice(),
+                [(_, RewriteMap::Prg(p))] if p.ends_with("bin/worker")
+            ),
+            "{prg:?}"
+        );
+        assert!(load_with_root("Listen 127.0.0.1:0\nRewriteMap n prg:plain.txt\n").is_err());
+        assert!(load_with_root("Listen 127.0.0.1:0\nRewriteMap n prg:no-such-worker\n").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -8738,7 +9114,13 @@ ServerName localhost\n\
 
     #[test]
     fn coverage_parse_helper_edges() {
-        assert_eq!(parse_status_list("200, 404,no, 503"), vec![200, 404, 503]);
+        // Unparsable entries are reported instead of silently dropped; the
+        // codes still parse through.
+        assert_eq!(
+            parse_status_list("200, 404,no, 503"),
+            (vec![200, 404, 503], vec!["no".to_string()])
+        );
+        assert_eq!(parse_status_list("500,,404"), (vec![500, 404], Vec::new()));
         assert_eq!(
             parse_request_read_timeout("header=10-20, body=30-40 MinRate=99"),
             Some((
@@ -9440,7 +9822,6 @@ RemoteIPInternalProxy 192.0.2.5\n\
 ServerAlias at.example\n\
 ErrorDocument 404\n\
 Alias /onlyone\n\
-RewriteMap onlyone\n\
 AddType text/plain\n\
 AddHandler handler\n\
 Header set X\n\

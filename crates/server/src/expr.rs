@@ -277,7 +277,10 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
         "time_min" => format!("{mm:02}"),
         "time_sec" => format!("{ss:02}"),
         "request_method" => ctx.req.method.clone(),
-        "query_string" => String::from_utf8_lossy(&ctx.req.query).into_owned(),
+        // Raw request-target bytes may fail UTF-8; fail closed instead of
+        // conflating distinct byte strings through the replacement character.
+        "query_string" => String::from_utf8(ctx.req.query.clone())
+            .map_err(|_| "QUERY_STRING is not valid UTF-8".to_string())?,
         "request_uri" => ctx.url_path.to_string(),
         "request_scheme" => if request_is_https() { "https" } else { "http" }.into(),
         // Never trust X-Forwarded-Proto here.  Forwarded headers are only a
@@ -445,7 +448,14 @@ fn confined_expr_path(ctx: &Context<'_>, raw: &str, must_exist: bool) -> Option<
     }
     let root = std::fs::canonicalize(ctx.docroot).ok()?;
     let target = std::fs::canonicalize(&joined).ok()?;
-    if target.starts_with(&root) {
+    // Consume the same verified component-aware containment kernel as the
+    // rewrite, alias and FastCGI paths instead of a local `starts_with`:
+    // containment is one story (`path_under_base`) everywhere, and its
+    // reflexivity/transitivity lemmas hold for this check too.
+    if vapache_verified::path_under_base(
+        target.as_os_str().as_encoded_bytes(),
+        root.as_os_str().as_encoded_bytes(),
+    ) {
         Some(target)
     } else {
         None
@@ -650,14 +660,33 @@ fn base64_decode(s: &str) -> Vec<u8> {
         .unwrap_or_default()
 }
 
+/// Cap on parser recursion depth (`!`, `-`, `(` nesting). `primary()` and
+/// `unary()` recurse once per operator, so inputs nested deeper than this cap
+/// return `Err` instead of overflowing the stack — the parser stays total.
+/// `Expr::eval` needs no cap of its own because no expression tree deeper than
+/// the cap can be parsed.
+///
+/// The value is calibrated against the parser's smallest execution stack: the
+/// `primary → or → and → compare → concat → unary` descent chain costs several
+/// hundred bytes to ~2 KiB per frame on 2 MiB default `std::thread` stacks
+/// (request handlers spawn without `stack_size`), and a paren level costs
+/// 8 such frames. 64 keeps the reachable worst case around 1 MiB with margin
+/// while still accepting nesting far deeper than any real-world expression.
+const MAX_EXPR_DEPTH: usize = 64;
+
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+        Self {
+            input,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     fn skip(&mut self) {
@@ -742,7 +771,9 @@ impl<'a> Parser<'a> {
     }
 
     fn regex(&mut self) -> Result<(String, bool), String> {
-        let delim = self.input.as_bytes()[self.pos];
+        let Some(delim) = self.input.as_bytes().get(self.pos).copied() else {
+            return Err("expected a regex after =~".into());
+        };
         self.pos += 1;
         let mut out = String::new();
         while self.pos < self.input.len() {
@@ -770,6 +801,17 @@ impl<'a> Parser<'a> {
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            return Err("expression exceeds maximum parse depth".into());
+        }
+        let r = self.primary_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn primary_inner(&mut self) -> Result<Expr, String> {
         self.skip();
         let Some(c) = self.peek() else {
             return Err("unexpected end of expression".into());
@@ -882,6 +924,17 @@ impl<'a> Parser<'a> {
     }
 
     fn unary(&mut self) -> Result<Expr, String> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            return Err("expression exceeds maximum parse depth".into());
+        }
+        let r = self.unary_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn unary_inner(&mut self) -> Result<Expr, String> {
         self.skip();
         if self.peek() == Some(b'!') && self.input.as_bytes().get(self.pos + 1) != Some(&b'=') {
             self.pos += 1;
@@ -1107,6 +1160,26 @@ mod tests {
         let docroot = Path::new("/tmp");
         let mut c = Context::new(&r, &[], "127.0.0.1".parse().unwrap(), docroot, "/x");
         assert!(e.eval(&mut c).unwrap().truthy());
+    }
+
+    #[test]
+    fn query_string_variable_fails_closed_on_invalid_utf8() {
+        // Raw request-target bytes may fail UTF-8; from_utf8_lossy would
+        // conflate \xff and \xfe into one replacement character, so the
+        // variable is an evaluation error instead.
+        let mut r = req();
+        r.query = b"\xff\xfe".to_vec();
+        let mut c = Context::new(
+            &r,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            "/x",
+        );
+        let cond = parse("%{QUERY_STRING} == ''").unwrap();
+        assert!(cond.eval(&mut c).is_err());
+        assert!(expand("%{QUERY_STRING}", &c).is_err());
+        assert!(expand("%{QUERY_STRING}|x", &c).is_err());
     }
 
     #[test]
@@ -1398,5 +1471,49 @@ mod tests {
         assert!(parse("req()").is_ok());
         assert!(parse("req('x',)").is_ok());
         assert!(eval("-in == '-in'"));
+    }
+
+    #[test]
+    fn parser_is_total_at_regex_operator_boundary() {
+        // An expression ending right at =~ / !~ used to index past the end of
+        // the input and panic; reachable from main-config <If> and from
+        // attacker-writable .htaccess, it must be an error, not an abort.
+        assert!(parse("x =~").is_err());
+        assert!(parse("'a' !~").is_err());
+        assert!(parse("%{REQUEST_URI} =~").is_err());
+        assert!(parse("x =~  ").is_err());
+        // The delimiter still works normally at every position.
+        assert!(eval("'abc' =~ /bc/"));
+        // The unsupported-dialect case must stay a (parse-shaped) error.
+        assert!(eval_result("'a' =~ /(a)\\1/").is_err());
+    }
+
+    #[test]
+    fn parser_recursion_is_capped_not_a_stack_overflow() {
+        // Recursion depth is capped instead of overflowing the stack, so the
+        // deepest inputs Err cleanly even on small (2 MiB) request threads.
+        // Depth accounting: a `!` or `-` costs one primary/unary frame; a
+        // paren level costs two (unary + primary).
+        let deep_not = format!("{}true", "!".repeat(MAX_EXPR_DEPTH + 1));
+        assert!(parse(&deep_not).is_err());
+        // Inputs just under the cap still parse; semantics unchanged.
+        let ok_not = format!("{}true", "!".repeat(MAX_EXPR_DEPTH - 2));
+        assert_eq!(eval(&ok_not), true);
+        // Paren boundary: MAX_EXPR_DEPTH/2 - 1 levels sit exactly at the cap.
+        let ok_parens = format!(
+            "{}true{}",
+            "(".repeat(MAX_EXPR_DEPTH / 2 - 1),
+            ")".repeat(MAX_EXPR_DEPTH / 2 - 1)
+        );
+        assert!(parse(&ok_parens).is_ok());
+        let deep_parens = format!(
+            "{}true{}",
+            "(".repeat(MAX_EXPR_DEPTH / 2 + 1),
+            ")".repeat(MAX_EXPR_DEPTH / 2 + 1)
+        );
+        assert!(parse(&deep_parens).is_err());
+        // Mixed operator nesting is also bounded and erroring.
+        let deep_neg = format!("{}1", "-".repeat(MAX_EXPR_DEPTH + 1));
+        assert!(parse(&deep_neg).is_err());
     }
 }

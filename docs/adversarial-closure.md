@@ -39,7 +39,7 @@ returning through a different directive or dispatch path.
 | F29 | `IndexIgnore` accepted and ignored | `IndexIgnore` is part of `ContentPolicy` in both parsers and filters autoindex entries | I24 |
 | F30 | `DirectorySlash Off` let `/dir` bypass `<Location "/dir/">` | A no-slash directory target is reauthorized as its canonical trailing-slash URL before index or autoindex dispatch | I24 |
 | F31 | Regex alias fallback re-rooted a target outside its alias base | `map_path()` returns `None` when a regex expansion leaves `fs_path`; dispatch, WebSocket and cache callers fail closed instead of using `target.parent()` as a new root; admission consumes the verified component-aware `path_under_base` kernel | I25 |
-| F32 | `UnsafePrefixStat` rewrite changed the authorization base | `rewrite_filesystem_admit` admits only files below the current document/alias root; its `under_base` input comes from verified `path_under_base`; the flag is compatibility-only and cannot re-root at the target parent | I25 |
+| F32 | `UnsafePrefixStat` rewrite changed the authorization base | `rewrite_filesystem_admit` admits only files below the current document/alias root; its `under_base` input comes from verified `path_under_base`; the flag is compatibility-only and cannot re-root at the target parent, and the parser now logs a load-time `[UnsafePrefixStat]` warning ("... has no effect") for main-config rules while `.htaccess` rules still have no warning surface | I25 |
 | F33 | FastCGI script construction and `PATH_INFO` walk could escape the document root | `script_from_prefix` and `split_path_info` clean/canonicalize inside the configured prefix or docroot and consume verified `path_under_base`; the ancestor walk stops at that base and rejects symlink escapes | I25 |
 | F34 | Cache fingerprint omitted header-driven authorization inputs | The policy fingerprint hashes the complete request header set; a tenant/header branch therefore cannot share a cached representation | I26 |
 | F35 | Proxy request-line/forwarded-host text was interpolated without a final check | Backend hosts and `X-Forwarded-Host` are validated; `validate_proxy_head` consumes verified `proxy_request_line_admit` and `proxy_header_admit` immediately before `write_all` | I28 |
@@ -67,6 +67,8 @@ returning through a different directive or dispatch path.
 | F58 | Access-file rewrite rules above the alias/document-root mapping root had an impossible URL match base, so anchored `[F]`/`[G]` deny rules were silently skipped | Every parsed access-file rule carries its layer directory; `request_plan::layer_subject()` matches the selected filesystem target relative to that directory, exactly Apache's per-directory subject. `htaccess_rewrite_subject_admit` requires a derivable subject or fails closed. `request_plan::layer_url_mount()` is used only for relative substitutions and uses the filesystem-directory form for ancestor layers instead of an unmatchable URL fallback | I58, I59 |
 | F59 | A symlinked `DocumentRoot`/`Alias`/`ScriptAlias` root made `RequestPlan::from_fs_target()` walk `root.join(file_name)` instead of the canonical target, discarding every child `.htaccess` layer during target reauthorization; child `Options -ExecCGI`, `DirectoryIndex` CGI and `Options -Indexes` were bypassed | Explicit targets derive the access-file walk, layer identities and scope evaluation from the same target path. Canonical ancestors are walked even when the lexical mapping root contains a symlink, with `AllowOverride` policy inherited from the corresponding lexical directory; nonempty layers are always consumed and a layer set that does not belong to the target fails closed (`explicit_target_layer_admit`, `target_layer_consume_admit`) | I60 |
 | F60 / F60-A–E | Canonical-target reauthorization replaced the URL-mapped scope with the canonical target scope. A symlinked document root/alias, an attacker-created in-root symlink, or a rewrite-selected target lost child/ancestor `<Directory>` and `.htaccess` policy, enabling `Options -ExecCGI` bypass, `Options -Indexes` listings, `RemoveHandler` bypass, and uploaded `.htaccess` execution when lexical `AllowOverride None` failed to veto canonical `AllowOverride All` | Every target-changing transform computes `meet(scope(URL), scope(target))`: `Options` permissions meet (`options_conjoin`), handlers are granted only when both identities resolve to the same handler (`handler_conjoin_admit`), and `AllowOverride` categories meet with explicit `None` denying either identity (`override_categories_conjoin`, `OverridePolicy::conjoined_with`). Rewrite-selected filesystem/cache targets use the same meet and retain the original URL's non-handler policy; the verified `rewrite_scope_retained_admit` states the dual-scope obligation | I61 |
+| F67 | `[PT]` was parsed but never read, so an absolute rewrite substitution became a filesystem override and executed a host file where Apache passes the substitution through URL mapping | `[PT]` is honoured: `rewrite::process()` skips the filesystem promotion whenever `rule.flags.passthrough` is set, so the substituted URL re-enters URL mapping and cannot execute or leak the referenced file; the case still ends non-200 without the target's content. Covered by `F67PassthroughTargetTests` plus the H2 unit tests in `rewrite.rs` (mechanizing the flags/round state machine is deferred) | I25 |
+| F68 | The rewrite filesystem override was sticky across rules and rounds, so an earlier rule's absolute substitution executed after a later `[L]` URL-only rewrite mapped the request elsewhere | The per-rule filesystem override is replaced unconditionally on every rule and the dispatcher consumes the per-round value (`rewrite.rs`/`server.rs` `rewrite_filesystem`), so the last target-selection rule wins: a later URL-only `[L]` rewrite clears the stale file target instead of executing it. Covered by `F68StickyFilesystemOverrideTests` (sticky replacement plus an executable-target capability control) and H2 unit tests (deferred mechanization) | I61, I25 |
 | Additional | `Require not valid-user` dropped negation; non-HTTP control bytes passed header serialization; `close, keep-alive` re-enabled a connection; mmap allowed other-owner write races | Negation is carried into `Require::ValidUser`; header values admit only HTAB/SP/VCHAR/obs-text; `close` is sticky; mmap requires no owner/group/other write bits | I23, I33-adjacent |
 
 ## Additional hardening before the next pass
@@ -156,7 +158,7 @@ The closure is exercised by:
 - `tests/conformance.py`, `tests/config_semantics.py`,
   `tests/config_validity.py` and `tests/config_grammar.py`;
 - `tests/adversarial_regressions.py`, which starts fresh servers and replays
-  the F23–F60 exploit shapes (rewrite-to-proxy/redirect authorization, cache
+  the F23–F68 exploit shapes (rewrite-to-proxy/redirect authorization, cache
   reload plus PATH_INFO, relative and capture-only aliases, autoindex schemes,
   negated/env providers, `IndexIgnore`, `DirectorySlash Off`,
   `UnsafePrefixStat` re-rooting, header-selected cache entries,
@@ -168,11 +170,20 @@ The closure is exercised by:
   target, overlapping `Alias`/`ScriptAlias`/`AliasMatch` roots,
   `DirectoryIndex` cache-target/query/live-policy changes, canonical
   `REQUEST_URI` query/encoding/dot-segment policies, document-root/ancestor
-  rewrite subjects for alias and alias-match targets, and explicit-target
-  access-layer binding for symlinked document roots and aliases, plus the
-  pass-10 resolved-target/rewrite scope-conjunction cases for plain
+  rewrite subjects for alias and alias-match targets, explicit-target
+  access-layer binding for symlinked document roots and aliases,
+  the pass-10 resolved-target/rewrite scope-conjunction cases for plain
   `<Directory>` policy, in-root symlinks, ancestor access files,
-  `RemoveHandler`, `AllowOverride None`, and rewrite laundering);
+  `RemoveHandler`, `AllowOverride None`, and rewrite laundering, and the
+  H2 regressions: `[PT]` passthrough targets stay in URL space (F67), the
+  sticky per-round filesystem override is replaced by a later URL-only
+  `[L]` rewrite (F68), and `[UnsafePrefixStat]` logs its inertness warning
+  at load time);
+- `tests/config_validity.py` STRICT_CASES rows (H8: the promoted silent
+  drops — `AddType`/`AddHandler`/`Header`/`ExpiresByType`/`ProxyPass`
+  arities, unknown `Options` and `RewriteOptions` tokens, and unparsable
+  `ProxyPass`/`ProxySet` `failonstatus` lists — are refused under
+  `--strict-config` while Apache rejects them at `-t`);
 - operator replay harnesses that reproduce the Apache-versus-vapached
   differentials in `findings.md`.
 

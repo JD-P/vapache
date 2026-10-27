@@ -41,7 +41,10 @@ pub struct ResourceKey {
     pub proxy_url: Option<String>,
     pub cache_host: Option<String>,
     pub cache_path: Option<String>,
-    pub cache_query: Option<String>,
+    /// Raw request-query bytes, for resource identity only.  Distinct
+    /// invalid-UTF-8 byte strings must not conflate on the replacement
+    /// character, so this is deliberately bytes and not a lossy String.
+    pub cache_query: Option<Vec<u8>>,
     pub identity: Option<String>,
     pub file_dev: Option<u64>,
     pub file_ino: Option<u64>,
@@ -94,7 +97,7 @@ impl ResourceKey {
             proxy_url: None,
             cache_host: Some(host.to_string()),
             cache_path: Some(path.to_string()),
-            cache_query: Some(String::from_utf8_lossy(&req.query).into_owned()),
+            cache_query: Some(req.query.clone()),
             identity: None,
             file_dev: None,
             file_ino: None,
@@ -741,6 +744,40 @@ mod tests {
         assert_eq!(
             check(&s, &req("GET"), "11.1.2.3".parse().unwrap(), None, "/x"),
             Access::Allowed
+        );
+    }
+
+    #[test]
+    fn cache_keys_keep_invalid_utf8_query_bytes_distinct() {
+        // `from_utf8_lossy` maps both .FF and .FE to U+FFFD, which would
+        // conflate distinct requests into one cache-resource identity; the
+        // key therefore keeps the raw bytes.
+        let mut lossy_ff = req("GET");
+        lossy_ff.query = b"\xff".to_vec();
+        let mut lossy_fe = req("GET");
+        lossy_fe.query = b"\xfe".to_vec();
+        let mut ff_again = req("GET");
+        ff_again.query = b"\xff".to_vec();
+        let mut valid = req("GET");
+        valid.query = b"x=1".to_vec();
+
+        assert_ne!(
+            ResourceKey::cache(None, &lossy_ff, "h.test", "/p"),
+            ResourceKey::cache(None, &lossy_fe, "h.test", "/p")
+        );
+        assert_eq!(
+            ResourceKey::cache(None, &lossy_ff, "h.test", "/p"),
+            ResourceKey::cache(None, &ff_again, "h.test", "/p")
+        );
+        // Equal valid queries still share an identity, and a different
+        // query token remains distinct.
+        assert_eq!(
+            ResourceKey::cache(None, &valid, "h.test", "/p"),
+            ResourceKey::cache(None, &valid, "h.test", "/p")
+        );
+        assert_ne!(
+            ResourceKey::cache(None, &valid, "h.test", "/p"),
+            ResourceKey::cache(None, &lossy_ff, "h.test", "/p")
         );
     }
 

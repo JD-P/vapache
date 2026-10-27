@@ -88,6 +88,12 @@ def make_fixture():
     os.chmod(BASE / "logs", 0o777)
     (BASE / "apache").mkdir(exist_ok=True)
     (BASE / "apache" / "logs").mkdir(exist_ok=True)
+    # The <IfFile> flag file must be visible from both resolution roots:
+    # Apache resolves .htaccess-relative <IfFile> arguments against ServerRoot,
+    # vapached confines them against DocumentRoot (F45/I42).  A file existing
+    # under both trees lets the differential suite exercise the TRUE branch.
+    write(BASE / "ifflag.txt", "flag\n")
+    write(DOCROOT / "ifflag.txt", "flag\n")
     write(BASE / ".htpasswd", htpasswd_line("alice", "alicepw") + "\n")
     write(BASE / ".htgroup", "staff: alice\n")
     os.chmod(BASE / ".htpasswd", 0o644)
@@ -968,11 +974,7 @@ CASES = [
         "name": "htaccess-fileinfo-iffile-requires-all",
         "dir": "ht_fileinfo_iffile",
         "files": {
-            ".htaccess": (
-                f'<IfFile "{BASE}/www/ht_fileinfo_iffile/file.txt">\n'
-                "    Require all denied\n"
-                "</IfFile>\n"
-            )
+            ".htaccess": ('<IfFile "ifflag.txt">\n' "    Require all denied\n" "</IfFile>\n")
         },
         "config": [
             f'<Directory "{{dir}}">',
@@ -984,13 +986,7 @@ CASES = [
     {
         "name": "htaccess-all-iffile",
         "dir": "ht_all_iffile",
-        "files": {
-            ".htaccess": (
-                f'<IfFile "{BASE}/www/ht_all_iffile/file.txt">\n'
-                "    Require all denied\n"
-                "</IfFile>\n"
-            )
-        },
+        "files": {".htaccess": ('<IfFile "ifflag.txt">\n' "    Require all denied\n" "</IfFile>\n")},
         "config": [
             f'<Directory "{{dir}}">',
             "    AllowOverride All",
@@ -1070,11 +1066,7 @@ CASES = [
         "name": "htaccess-fileinfo-iffile-header",
         "dir": "ht_fileinfo_iffile_header",
         "files": {
-            ".htaccess": (
-                f'<IfFile "{BASE}/www/ht_fileinfo_iffile_header/file.txt">\n'
-                "    Header set X-IfFile yes\n"
-                "</IfFile>\n"
-            )
+            ".htaccess": ('<IfFile "ifflag.txt">\n' "    Header set X-IfFile yes\n" "</IfFile>\n")
         },
         "config": [
             f'<Directory "{{dir}}">',
@@ -1089,11 +1081,7 @@ CASES = [
         "name": "htaccess-all-iffile-header",
         "dir": "ht_all_iffile_header",
         "files": {
-            ".htaccess": (
-                f'<IfFile "{BASE}/www/ht_all_iffile_header/file.txt">\n'
-                "    Header set X-IfFile yes\n"
-                "</IfFile>\n"
-            )
+            ".htaccess": ('<IfFile "ifflag.txt">\n' "    Header set X-IfFile yes\n" "</IfFile>\n")
         },
         "config": [
             f'<Directory "{{dir}}">',
@@ -1103,6 +1091,25 @@ CASES = [
         "requests": [
             ("GET", "/ht_all_iffile_header/file.txt", None, {"x-iffile": ["yes"]}),
         ],
+    },
+    {
+        "name": "htaccess-all-iffile-absent",
+        "dir": "ht_all_iffile_absent",
+        # A .htaccess-relative <IfFile> argument neither engine resolves must
+        # skip the section on both sides (Apache looks under ServerRoot,
+        # vapached under the confined DocumentRoot root), so the negative
+        # branch is exercised without off-policy absolute-path probing.
+        "files": {
+            ".htaccess": (
+                '<IfFile "no-such-flag.txt">\n' "    Require all denied\n" "</IfFile>\n"
+            )
+        },
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    AllowOverride All",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/ht_all_iffile_absent/file.txt", None, {})],
     },
     {
         "name": "global-if-applied-last",

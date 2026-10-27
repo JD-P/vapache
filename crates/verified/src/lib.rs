@@ -493,6 +493,227 @@ pub fn rewrite_backref_no_qmark(value: &[u8]) -> (out: Vec<u8>)
     out
 }
 
+// ---------------------------------------------------------------------------
+// Generalized percent encoding
+// ---------------------------------------------------------------------------
+
+/// The encoding alphabet of `percent_encode`: the escape introducer `%`, the
+/// lower-case hex digits, and (only when `plus_space` is set) the form-style
+/// `+` that stands for an encoded space.
+pub open spec fn percent_alphabet_byte(b: u8, plus_space: bool) -> bool {
+    ||| b == b'%'
+    ||| (plus_space && b == b'+')
+    ||| (b >= b'0' && b <= b'9')
+    ||| (b >= b'a' && b <= b'f')
+}
+
+/// Percent-encode `input[start..]` under a 256-entry byte `mask`.  A masked
+/// byte is emitted as `%xx` (lower-case hex, matching Apache) or as `+` for
+/// a masked space when `plus_space` is set (the `x-www-form-urlencoded`
+/// convention used by the rewrite `int:escape` map and `[BNP]`-style
+/// backreference escaping); an unmasked byte is copied verbatim.
+///
+/// This is the one specification shared by the whole percent-escape family:
+/// rewrite backreference `[B]`/`[BNE]`/`[BCTLS]`/`[BNP]` escaping,
+/// redirect-`Location` escaping and the `int` map's escape.  The masks are
+/// runtime data; the encoding loop and its guarantees are proved once.  The
+/// recursion is indexed by `start` rather than `drop_first()` so the
+/// refinement below needs no sequence-slicing lemmas.
+pub open spec fn percent_encode_from(
+    input: Seq<u8>,
+    start: int,
+    mask: Seq<bool>,
+    plus_space: bool,
+) -> Seq<u8>
+    decreases input.len() - start,
+{
+    if input.len() <= start {
+        Seq::empty()
+    } else {
+        let b = input[start];
+        let rest = percent_encode_from(input, start + 1, mask, plus_space);
+        if mask[b as int] {
+            if plus_space && b == b' ' {
+                seq![b'+'] + rest
+            } else {
+                seq![b'%'] + hex_byte_spec(b) + rest
+            }
+        } else {
+            seq![b] + rest
+        }
+    }
+}
+
+/// Executable refinement of `percent_encode_from` over the whole input.
+pub fn percent_encode(input: &[u8], mask: &[bool], plus_space: bool) -> (out: Vec<u8>)
+    requires
+        mask@.len() == 256,
+    ensures
+        out@ == percent_encode_from(input@, 0, mask@, plus_space),
+        out@.len() <= input@.len() * 3,
+{
+    let mut out: Vec<u8> = Vec::new();
+    let mut i: usize = 0;
+    while i < input.len()
+        invariant
+            0 <= i <= input.len(),
+            mask@.len() == 256,
+            out@ + percent_encode_from(input@, i as int, mask@, plus_space)
+                == percent_encode_from(input@, 0, mask@, plus_space),
+            out@.len() <= (i as int) * 3,
+        decreases input.len() - i,
+    {
+        let b = input[i];
+        if mask[b as usize] {
+            if plus_space && b == b' ' {
+                out.push(b'+');
+            } else {
+                let hi = hex_digit(b / 16);
+                let lo = hex_digit(b % 16);
+                out.push(b'%');
+                out.push(hi);
+                out.push(lo);
+            }
+        } else {
+            out.push(b);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// Encoding is the identity on inputs with no masked byte: unmasked bytes
+/// are copied verbatim and in order.
+pub proof fn percent_encode_identity(input: Seq<u8>, mask: Seq<bool>, plus_space: bool)
+    requires
+        forall|k: int| 0 <= k < input.len() ==> !mask[input[k] as int],
+    ensures percent_encode_from(input, 0, mask, plus_space) == input,
+{
+    percent_encode_from_identity(input, 0, mask, plus_space);
+}
+
+/// Pointwise identity underlying `percent_encode_identity`: with no masked
+/// byte from `start` on, the encoded suffix has exactly the remaining length
+/// and copies every remaining byte in order.
+pub proof fn percent_encode_from_identity(
+    input: Seq<u8>,
+    start: int,
+    mask: Seq<bool>,
+    plus_space: bool,
+)
+    requires
+        0 <= start <= input.len(),
+        forall|k: int| start <= k < input.len() ==> !mask[input[k] as int],
+    ensures
+        percent_encode_from(input, start, mask, plus_space).len() == input.len() - start,
+        forall|j: int|
+            0 <= j < input.len() - start ==> #[trigger]
+                percent_encode_from(input, start, mask, plus_space)[j] == input[start + j],
+    decreases input.len() - start,
+{
+    let out = percent_encode_from(input, start, mask, plus_space);
+    if input.len() <= start {
+        assert(out == Seq::<u8>::empty());
+    } else {
+        let b = input[start];
+        let rest = percent_encode_from(input, start + 1, mask, plus_space);
+        percent_encode_from_identity(input, start + 1, mask, plus_space);
+        assert(!mask[b as int]);
+        assert(out == seq![b] + rest);
+        assert(out.len() == 1 + rest.len());
+        assert(out[0] == b);
+        assert forall|j: int| 1 <= j < out.len() implies #[trigger] out[j] == rest[j - 1] by {
+            assert((seq![b] + rest)[j] == rest[j - 1]);
+        }
+        assert forall|j: int|
+            0 <= j < input.len() - start implies #[trigger] out[j] == input[start + j] by {
+            if j == 0 {
+                assert(input.len() - start > 0);
+                assert(out[0] == b);
+            } else {
+                assert(rest[j - 1] == input[(start + 1) + (j - 1)]);
+            }
+        }
+    }
+}
+
+/// No masked byte survives into the output verbatim: every raw output byte
+/// is either unmasked or the form-style `+` standing for a masked space.  A
+/// caller whose mask does not mark any alphabet byte therefore cannot be
+/// re-interpreted through a raw occurrence of a byte it meant to escape.
+pub open spec fn no_masked_raw(s: Seq<u8>, mask: Seq<bool>, plus_space: bool) -> bool {
+    forall|k: int|
+        0 <= k < s.len() ==> !mask[s[k] as int] || (plus_space && s[k] == b'+')
+}
+
+pub proof fn percent_encode_no_masked_raw(
+    input: Seq<u8>,
+    start: int,
+    mask: Seq<bool>,
+    plus_space: bool,
+)
+    requires
+        0 <= start,
+        mask.len() == 256,
+        forall|b: u8| percent_alphabet_byte(b, plus_space) ==> !mask[b as int],
+    ensures
+        no_masked_raw(percent_encode_from(input, start, mask, plus_space), mask, plus_space),
+    decreases input.len() - start,
+{
+    let out = percent_encode_from(input, start, mask, plus_space);
+    if input.len() <= start {
+        assert(out == Seq::<u8>::empty());
+        assert(no_masked_raw(out, mask, plus_space));
+    } else {
+        let b = input[start];
+        let rest = percent_encode_from(input, start + 1, mask, plus_space);
+        percent_encode_no_masked_raw(input, start + 1, mask, plus_space);
+        if mask[b as int] {
+            if plus_space && b == b' ' {
+                assert(out == seq![b'+'] + rest);
+                assert(!mask[b'+' as int]);
+                assert(out.len() == 1 + rest.len());
+                assert(out[0] == b'+');
+                assert forall|k: int|
+                    1 <= k < out.len() implies #[trigger] out[k] == rest[k - 1] by {
+                    assert((seq![b'+'] + rest)[k] == rest[k - 1]);
+                }
+                assert(no_masked_raw(out, mask, plus_space));
+            } else {
+                assert(out == seq![b'%'] + hex_byte_spec(b) + rest);
+                assert(hex_byte_spec(b).len() == 2);
+                assert(hex_byte_spec(b)[0] == hex_digit_char(b / 16));
+                assert(hex_byte_spec(b)[1] == hex_digit_char(b % 16));
+                assert(percent_alphabet_byte(hex_byte_spec(b)[0], plus_space));
+                assert(percent_alphabet_byte(hex_byte_spec(b)[1], plus_space));
+                assert(percent_alphabet_byte(b'%', plus_space));
+                assert(!mask[b'%' as int]);
+                assert(!mask[hex_byte_spec(b)[0] as int]);
+                assert(!mask[hex_byte_spec(b)[1] as int]);
+                assert(out.len() == 3 + rest.len());
+                assert(out[0] == b'%');
+                assert(out[1] == hex_byte_spec(b)[0]);
+                assert(out[2] == hex_byte_spec(b)[1]);
+                assert forall|k: int|
+                    3 <= k < out.len() implies #[trigger] out[k] == rest[k - 3] by {
+                    assert((seq![b'%'] + hex_byte_spec(b) + rest)[k] == rest[k - 3]);
+                }
+                assert(no_masked_raw(out, mask, plus_space));
+            }
+        } else {
+            assert(out == seq![b] + rest);
+            assert(!mask[b as int]);
+            assert(out.len() == 1 + rest.len());
+            assert(out[0] == b);
+            assert forall|k: int|
+                1 <= k < out.len() implies #[trigger] out[k] == rest[k - 1] by {
+                assert((seq![b] + rest)[k] == rest[k - 1]);
+            }
+            assert(no_masked_raw(out, mask, plus_space));
+        }
+    }
+}
+
 /// ASCII-case-insensitive prefix predicate used for rewrite URL schemes.
 pub open spec fn starts_with_ignore_ascii_case_spec(
     s: Seq<u8>,
@@ -819,6 +1040,87 @@ pub fn path_under_base(target: &[u8], base: &[u8]) -> (ok: bool)
     target[base.len()] == b'/'
 }
 
+/// Containment reflexivity: every nonempty base contains itself.  Callers
+/// that re-bind a target to the same root can state the containment fact for
+/// the new identity without re-deriving it.
+pub proof fn path_under_base_reflexive(base: &[u8])
+    requires base.len() > 0,
+    ensures path_under_base_spec(base@, base@),
+{
+    assert(base@.len() > 0);
+    assert(base@.len() >= base@.len());
+    assert forall|k: int|
+        0 <= k < base@.len() implies #[trigger] base@.subrange(0, base@.len() as int)[k]
+            == base@[k] by {};
+    assert(base@.subrange(0, base@.len() as int) == base@);
+    assert(base@.len() == base@.len());
+}
+
+/// Containment composes: if `target` lies beneath `mid` and `mid` lies
+/// beneath `base`, then `target` lies beneath `base`.  This is the lemma a
+/// multi-identity walk (URL scope, canonical target, rewrite round, cache
+/// target) needs to keep one containment argument instead of re-proving each
+/// hop; the `canonicalize`-stability half of the composition argument remains
+/// the documented filesystem assumption.
+pub proof fn path_under_base_transitive(target: &[u8], mid: &[u8], base: &[u8])
+    requires
+        path_under_base_spec(target@, mid@),
+        path_under_base_spec(mid@, base@),
+        mid@.len() > 0,
+    ensures path_under_base_spec(target@, base@),
+{
+    let t = target@;
+    let m = mid@;
+    let b = base@;
+    // Prefix facts from both hypotheses.
+    assert(t.subrange(0, m.len() as int) == m);
+    assert(m.subrange(0, b.len() as int) == b);
+    assert(m.len() <= t.len());
+    assert(b.len() <= m.len());
+    // Byte equality under the respective prefixes.
+    assert forall|k: int| 0 <= k < m.len() implies #[trigger] t[k] == m[k] by {
+        assert(t.subrange(0, m.len() as int)[k] == m[k]);
+    }
+    assert forall|k: int| 0 <= k < b.len() implies #[trigger] m[k] == b[k] by {
+        assert(m.subrange(0, b.len() as int)[k] == b[k]);
+    }
+    // The target prefix of base length equals base.
+    assert forall|k: int| 0 <= k < b.len() implies #[trigger] t[k] == b[k] by {
+        assert(t[k] == m[k]);
+    }
+    assert(t.subrange(0, b.len() as int) == b);
+    // Boundary: the target/base boundary disjunct of the goal.  The lengths
+    // already give target.len() >= base.len(); it remains to derive one of
+    // `target.len() == base.len()`, `base` ends with '/' or `target`
+    // continues with '/' at the base boundary.
+    if t.len() == m.len() {
+        // Equal-length prefixes are equal sequences; the mid/base boundary
+        // disjuncts rewrite directly into the goal.
+        assert(t == m);
+    } else {
+        assert(m.len() < t.len());
+        if b.len() == m.len() {
+            // The last byte of base is the last byte of mid.
+            if m[m.len() as int - 1] == b'/' {
+                assert(b[b.len() as int - 1] == b'/');
+            } else {
+                // H1's boundary reduces to the target continuing with '/'.
+                assert(t[m.len() as int] == b'/');
+                assert(t[b.len() as int] == b'/');
+            }
+        } else {
+            assert(b.len() < m.len());
+            if !(b[b.len() as int - 1] == b'/') {
+                // H2's boundary reduces to mid continuing with '/' at the
+                // base boundary, which the target prefix shares.
+                assert(m[b.len() as int] == b'/');
+                assert(t[b.len() as int] == m[b.len() as int]);
+                assert(t[b.len() as int] == b'/');
+            }
+        }
+    }
+}
+
 /// F46/I43: a `<RequireNone>` group with any granted child denies; a denied
 /// sibling cannot neutralize the positive hit.
 pub fn require_none_multi_result(
@@ -1066,19 +1368,80 @@ pub fn target_layer_consume_admit(
     override_may_apply || has_access_layers
 }
 
+// ---------------------------------------------------------------------------
+// Generalized policy bit meet
+// ---------------------------------------------------------------------------
+
+/// The meet of two policy bit-vectors: a permission bit survives only when
+/// every identity grants it.  This is the single shape shared by the `Options`
+/// conjoin and the `AllowOverride` category conjoin (F60/I61); the named specs
+/// below are aliases of this one so every caller states the same obligation
+/// and the algebraic facts are proved once, generically.
+pub open spec fn bits_meet(url_bits: u32, target_bits: u32) -> u32 {
+    url_bits & target_bits
+}
+
+pub fn bits_meet_exec(url_bits: u32, target_bits: u32) -> (out: u32)
+    ensures out == bits_meet(url_bits, target_bits),
+{
+    url_bits & target_bits
+}
+
+/// A meet never grants a bit that either input lacks (no-broadening).
+pub proof fn bits_meet_never_grants(url_bits: u32, target_bits: u32)
+    ensures
+        bits_meet(url_bits, target_bits) & url_bits == bits_meet(url_bits, target_bits),
+        bits_meet(url_bits, target_bits) & target_bits == bits_meet(url_bits, target_bits),
+{
+    assert(bits_meet(url_bits, target_bits) & url_bits == bits_meet(url_bits, target_bits))
+        by (bit_vector);
+    assert(bits_meet(url_bits, target_bits) & target_bits == bits_meet(url_bits, target_bits))
+        by (bit_vector);
+}
+
+/// The meet is a bounded meet: commutative, associative and idempotent.  A
+/// conjoin of any number of path identities (URL scope, canonical target,
+/// rewrite rounds, cache target) therefore computes the same bit vector in
+/// any order, and repeating an identity adds nothing.
+pub proof fn bits_meet_commutative(a: u32, b: u32)
+    ensures bits_meet(a, b) == bits_meet(b, a),
+{
+    assert(bits_meet(a, b) == bits_meet(b, a)) by (bit_vector);
+}
+
+pub proof fn bits_meet_associative(a: u32, b: u32, c: u32)
+    ensures bits_meet(bits_meet(a, b), c) == bits_meet(a, bits_meet(b, c)),
+{
+    assert(bits_meet(bits_meet(a, b), c) == bits_meet(a, bits_meet(b, c))) by (bit_vector);
+}
+
+pub proof fn bits_meet_idempotent(a: u32)
+    ensures bits_meet(a, a) == a,
+{
+    assert(bits_meet(a, a) == a) by (bit_vector);
+}
+
+/// Monotone: conjoining an extra identity can only remove bits.
+pub proof fn bits_meet_narrowing(a: u32, b: u32)
+    ensures bits_meet(bits_meet(a, b), b) == bits_meet(a, b),
+{
+    bits_meet_associative(a, b, b);
+    bits_meet_idempotent(b);
+}
+
 /// F60/I61: the effective `Options` set for a resolved target is the meet of
 /// the URL-mapped scope and the canonical target scope.  A permission bit is
 /// present only when both scopes grant it, so resolving a symlink (or any
 /// other target-changing transform) can never add `ExecCGI`, `Indexes` or
 /// `FollowSymLinks`.
 pub open spec fn options_conjoin_spec(url_bits: u32, target_bits: u32) -> u32 {
-    url_bits & target_bits
+    bits_meet(url_bits, target_bits)
 }
 
 pub fn options_conjoin(url_bits: u32, target_bits: u32) -> (out: u32)
     ensures out == options_conjoin_spec(url_bits, target_bits),
 {
-    url_bits & target_bits
+    bits_meet_exec(url_bits, target_bits)
 }
 
 /// The meet contains no permission bit that either input scope lacks.
@@ -1089,14 +1452,7 @@ pub proof fn options_conjoin_never_grants(url_bits: u32, target_bits: u32)
         options_conjoin_spec(url_bits, target_bits) & target_bits
             == options_conjoin_spec(url_bits, target_bits),
 {
-    assert(
-        options_conjoin_spec(url_bits, target_bits) & url_bits
-            == options_conjoin_spec(url_bits, target_bits)
-    ) by (bit_vector);
-    assert(
-        options_conjoin_spec(url_bits, target_bits) & target_bits
-            == options_conjoin_spec(url_bits, target_bits)
-    ) by (bit_vector);
+    bits_meet_never_grants(url_bits, target_bits);
 }
 
 /// F60/I61: a handler is usable only when both the URL-mapped and canonical
@@ -1134,10 +1490,12 @@ pub proof fn handler_conjoin_requires_both(
 }
 
 /// F60/I61: component-aware intersection for `AllowOverride` categories.
+/// This is the same generalized bit meet as `options_conjoin`; the algebraic
+/// facts (`bits_meet_*`) apply to it unchanged.
 pub fn override_categories_conjoin(url_bits: u32, target_bits: u32) -> (out: u32)
-    ensures out == (url_bits & target_bits),
+    ensures out == bits_meet(url_bits, target_bits),
 {
-    url_bits & target_bits
+    bits_meet_exec(url_bits, target_bits)
 }
 
 /// F60/I61: whenever the opened target differs from the URL-mapped path, the
