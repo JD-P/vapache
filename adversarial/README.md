@@ -15,11 +15,13 @@ prevents re-deriving them from scratch.
 | `findings_p11.md` | Pass 11 write-ups (F61–F66, F69, F70; F66 was the only fixed survivor) |
 | `findings_p12.md` | Pass 12 write-ups (P12-A–P12-F): trailing-slash `ProxyPass` auth bypass/local RCE, dotless-basename CGI execution, ScriptAlias PATH_INFO gate bypass, HTTP/2 body-window stall, plus secondary findings |
 | `findings_p13.md` | Pass 13 write-ups (P13-A–P13-C): F69 closure incomplete — FastCGI and CGI `PATH_INFO` still classify by the canonical symlink-target basename, and a canonical `<Files>`/`<FilesMatch>` `SetHandler` force overrides the lexical name; PHP RCE and `execve` of `<Location>`-denied CGIs through a symlink |
+| `findings_p14.md` | Pass 14 write-ups (P14-A–P14-E): `<Files>`/`<FilesMatch>` phase order lets an ancestor `.htaccess` override a deeper config section (RCE/auth bypass), `[P]` authority guard misses `\1`/`%1` (SSRF), `Require expr` file tests fall back to `/` without `DocumentRoot`, duplicate field lines defeat header guards, and `[C]` chain breaks skip one rule instead of the chain |
 | `p11/exploit_p11.py` | Pass-11 differential exploit battery: 13 micro-apps run against Apache 2.4.69 and vapached, one per finding row |
 | `p11/case01-F61-A` … `case13-F61-C` | Captured case dossiers (rendered `apache.conf` / `vp.conf`, fixture tree, server logs, `ap.strace`) |
 | `p11/f70_accessfilename.py` | F70 probe (dead finding: Apache rejects the configuration) |
 | `p12/exploit_p12.py` | Pass-12 differential battery (P12-A–C/E/F vs Apache 2.4.69 on sibling loopback ports; P12-D single-server h2 body check) |
 | `p13/exploit_p13.py` | Pass-13 differential battery (P13-A FastCGI symlink classification, P13-B CGI `PATH_INFO` symlink classification) |
+| `p14/exploit_p14.py` | Pass-14 differential battery (P14-A `<Files>` phase order, P14-B `[P]` SSRF, P14-C expr file-test root, P14-D duplicate headers, P14-E `[C]` chain) |
 
 ## Running the pass-11 battery
 
@@ -93,3 +95,29 @@ vapache `execve`, no global `AddHandler`); **C2** the same with a
 loopback ports; group A needs `php-fpm8.4`/`php-fpm`, otherwise a private fake
 FastCGI responder records the `SCRIPT_FILENAME` vapache sends.  Fixtures are
 built under `/tmp/opencode/p13-harness` unless `--keep` is given.
+
+## Running the pass-14 battery
+
+```sh
+cargo build --release -p vapached
+python3 adversarial/p14/exploit_p14.py            # all cases (8/8 differential verdicts)
+python3 adversarial/p14/exploit_p14.py A B        # selected groups
+python3 adversarial/p14/exploit_p14.py --keep     # keep dossiers
+```
+
+Pass-14 cases: **A1** deeper config `<Files "run.cgi"> Require all denied` /
+`<Files "upload.txt"> SetHandler default-handler` vs an ancestor `.htaccess`
+grant/force (Apache 403 and static source vs vapache 200 CGI execution);
+**A2** the same with a deeper `<Files>` Basic-auth guard (Apache 401,
+anonymous vapache execution); **B** `RewriteRule ... "http://\1/" [P]` and
+`"%1" [P]` authority/substitution backreferences that the load-time
+`proxy_template_authority_safe` guard misses (Apache 400/Apache-compatible
+expansions vs attacker-controlled vapache upstream = SSRF); **C**
+`Require expr "file('etc/passwd') =~ /^root/"` in `.htaccess` with no
+`DocumentRoot` directive (filesystem-root fallback, single-server check);
+**D** duplicate `User-Agent` field lines skipping a `RewriteCond ... [F]`
+guard (Apache 403 vs vapache 200); **E** a failing `[C]` gate that fails to
+skip the whole chain (Apache 404 vs vapache 200 privileged `[PT]` rewrite).
+The Apache oracle runs `-X` on sibling loopback ports with a separate pid file
+for each server.  Fixtures are built under `/tmp/opencode/p14-harness` unless
+`--keep` is given.
