@@ -14,10 +14,12 @@ prevents re-deriving them from scratch.
 | `findings_p10.md` | Pass 10 write-ups (F60–F69) |
 | `findings_p11.md` | Pass 11 write-ups (F61–F66, F69, F70; F66 was the only fixed survivor) |
 | `findings_p12.md` | Pass 12 write-ups (P12-A–P12-F): trailing-slash `ProxyPass` auth bypass/local RCE, dotless-basename CGI execution, ScriptAlias PATH_INFO gate bypass, HTTP/2 body-window stall, plus secondary findings |
+| `findings_p13.md` | Pass 13 write-ups (P13-A–P13-C): F69 closure incomplete — FastCGI and CGI `PATH_INFO` still classify by the canonical symlink-target basename, and a canonical `<Files>`/`<FilesMatch>` `SetHandler` force overrides the lexical name; PHP RCE and `execve` of `<Location>`-denied CGIs through a symlink |
 | `p11/exploit_p11.py` | Pass-11 differential exploit battery: 13 micro-apps run against Apache 2.4.69 and vapached, one per finding row |
 | `p11/case01-F61-A` … `case13-F61-C` | Captured case dossiers (rendered `apache.conf` / `vp.conf`, fixture tree, server logs, `ap.strace`) |
 | `p11/f70_accessfilename.py` | F70 probe (dead finding: Apache rejects the configuration) |
 | `p12/exploit_p12.py` | Pass-12 differential battery (P12-A–C/E/F vs Apache 2.4.69 on sibling loopback ports; P12-D single-server h2 body check) |
+| `p13/exploit_p13.py` | Pass-13 differential battery (P13-A FastCGI symlink classification, P13-B CGI `PATH_INFO` symlink classification) |
 
 ## Running the pass-11 battery
 
@@ -68,3 +70,26 @@ Fixtures are built under `/tmp/opencode/p12-harness` unless `--keep` is given.
 Both batteries now use separate per-server pidfiles (`<case>/logs/{apache,vapache}.pid`)
 and single-process Apache (`-X`), so neither can trip over the other's
 startup.
+
+## Running the pass-13 battery
+
+```sh
+cargo build --release -p vapached
+python3 adversarial/p13/exploit_p13.py            # all cases
+python3 adversarial/p13/exploit_p13.py A          # FastCGI symlink classification
+python3 adversarial/p13/exploit_p13.py B          # CGI PATH_INFO symlink classification
+python3 adversarial/p13/exploit_p13.py --keep     # keep dossiers
+```
+
+Pass-13 cases: **A1** `SetHandler "proxy:…|fcgi://…"` + `pub/link.txt -> secret/app.php`
+(Apache source vs vapache PHP-FPM execution); **A2** the same with a
+`<Location "/secret/">` Basic-auth guard on the script (anonymous vapache
+execution); **B1** `AddHandler cgi-script` + the same symlink requested as
+`/pub/link.txt/x` (Apache 404 vs vapache `execve`); **B2** the same with a
+`<Location "/secret/">` deny guard; **C1** canonical `<FilesMatch "\.cgi$">
+SetHandler cgi-script` + the same symlink requested directly (Apache source vs
+vapache `execve`, no global `AddHandler`); **C2** the same with a
+`<Location "/secret/">` deny guard.  The Apache oracle runs `-X` on sibling
+loopback ports; group A needs `php-fpm8.4`/`php-fpm`, otherwise a private fake
+FastCGI responder records the `SCRIPT_FILENAME` vapache sends.  Fixtures are
+built under `/tmp/opencode/p13-harness` unless `--keep` is given.
