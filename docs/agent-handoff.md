@@ -21,7 +21,7 @@ cargo build --release                                  # python suites run targe
 cargo test -p vapached
 python3 tests/verification_status.py --run-verus       # proof-debt gate: must print "gate: pass"
 python3 tests/conformance.py                           # 165 cases vs local Apache
-python3 tests/config_semantics.py                      # 205 generated cases vs local Apache
+python3 tests/config_semantics.py                      # 235 fixed cases vs local Apache
 python3 tests/config_validity.py
 python3 tests/config_grammar.py
 python3 tests/adversarial_regressions.py              # replays the F23–F60 exploit shapes

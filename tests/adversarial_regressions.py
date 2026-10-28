@@ -699,14 +699,16 @@ AliasMatch "^/escape(.*)$" "$1"
         )
         self.assertEqual(status, 403, body[:200])
 
-    def test_f28_htaccess_setenv_and_setenvif_feed_authorization(self):
+    def test_f28_htaccess_environment_respects_authorization_phase(self):
         status, _, body = request(self.port, "/env/secret.txt")
         self.assertEqual(status, 200, body[:200])
         status, _, body = request(self.port, "/env/secret.txt", {"X-Block": "yes"})
         self.assertEqual(status, 403, body[:200])
         status, _, body = request(self.port, "/env/allowed.txt")
-        self.assertEqual(status, 200, body[:200])
-        self.assertIn(b"WALLET-SETENV-ALLOWED", body)
+        # mod_env's SetEnv hook runs in fixups, after authorization. It remains
+        # effective for handlers/CGI but cannot satisfy Require env.
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"WALLET-SETENV-ALLOWED", body)
 
     def test_f29_indexignore_hides_matching_entries(self):
         for path in ("/indexignore/", "/indexignore-main/"):

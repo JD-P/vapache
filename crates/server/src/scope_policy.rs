@@ -562,10 +562,21 @@ mod header_tests {
     }
 }
 
-/// Environment/SetEnv policy.  All four fields are append-only; child entries
-/// retain order after the inherited entries.
+/// Environment policy split by Apache request phase. `SetEnvIf` and
+/// server-scope rewrite `[E]` effects exist before authorization;
+/// per-directory rewrite and mod_env's `SetEnv`/`PassEnv`/`UnsetEnv`
+/// directives run in the later fixups hook and must not influence `Require
+/// env`, `<If>` or ACL-phase `RewriteCond` decisions.
 #[derive(Debug, Clone, Default)]
 pub struct EnvironmentPolicy {
+    /// Early environment effects produced by completed rewrite rounds.
+    pub rewrite_env: Vec<(String, String)>,
+    pub rewrite_unset_env: Vec<String>,
+    /// Per-directory/htaccess rewrite `[E]` effects run in fixups, after
+    /// authorization but before mod_env's SetEnv overlay.
+    pub rewrite_late_env: Vec<(String, String)>,
+    pub rewrite_late_unset_env: Vec<String>,
+    /// Late mod_env configuration, visible to CGI/FastCGI but not ACLs.
     pub set_env: Vec<(String, String)>,
     pub unset_env: Vec<String>,
     pub pass_env: Vec<String>,
@@ -574,6 +585,13 @@ pub struct EnvironmentPolicy {
 
 impl EnvironmentPolicy {
     pub fn merge_child(&mut self, child: &EnvironmentPolicy) {
+        crate::verified::append_vec(&mut self.rewrite_env, &child.rewrite_env);
+        crate::verified::append_vec(&mut self.rewrite_unset_env, &child.rewrite_unset_env);
+        crate::verified::append_vec(&mut self.rewrite_late_env, &child.rewrite_late_env);
+        crate::verified::append_vec(
+            &mut self.rewrite_late_unset_env,
+            &child.rewrite_late_unset_env,
+        );
         crate::verified::append_vec(&mut self.set_env, &child.set_env);
         crate::verified::append_vec(&mut self.unset_env, &child.unset_env);
         crate::verified::append_vec(&mut self.pass_env, &child.pass_env);
@@ -588,8 +606,11 @@ mod environment_tests {
     #[test]
     fn environment_lists_append_in_order() {
         let mut parent = EnvironmentPolicy::default();
+        parent.rewrite_env.push(("EARLY".into(), "1".into()));
         parent.set_env.push(("A".into(), "1".into()));
         let mut child = EnvironmentPolicy::default();
+        child.rewrite_unset_env.push("OLD_EARLY".into());
+        child.rewrite_late_env.push(("LATE".into(), "2".into()));
         child.set_env.push(("B".into(), "2".into()));
         child.unset_env.push("OLD".into());
         parent.merge_child(&child);
@@ -598,6 +619,9 @@ mod environment_tests {
             vec![("A".into(), "1".into()), ("B".into(), "2".into())]
         );
         assert_eq!(parent.unset_env, vec!["OLD".to_string()]);
+        assert_eq!(parent.rewrite_env, vec![("EARLY".into(), "1".into())]);
+        assert_eq!(parent.rewrite_unset_env, vec!["OLD_EARLY".to_string()]);
+        assert_eq!(parent.rewrite_late_env, vec![("LATE".into(), "2".into())]);
     }
 }
 

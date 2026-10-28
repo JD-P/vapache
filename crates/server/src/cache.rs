@@ -2041,6 +2041,24 @@ AddHandler cgi-script .cgi\n\
             ("environment.set_env", |s| {
                 s.environment_policy.set_env.push(("A".into(), "1".into()))
             }),
+            ("environment.rewrite_env", |s| {
+                s.environment_policy
+                    .rewrite_env
+                    .push(("EARLY".into(), "1".into()))
+            }),
+            ("environment.rewrite_unset_env", |s| {
+                s.environment_policy.rewrite_unset_env.push("EARLY".into())
+            }),
+            ("environment.rewrite_late_env", |s| {
+                s.environment_policy
+                    .rewrite_late_env
+                    .push(("LATE".into(), "1".into()))
+            }),
+            ("environment.rewrite_late_unset_env", |s| {
+                s.environment_policy
+                    .rewrite_late_unset_env
+                    .push("LATE".into())
+            }),
             ("environment.unset_env", |s| {
                 s.environment_policy.unset_env.push("A".into())
             }),

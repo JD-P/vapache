@@ -21,7 +21,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
 APACHE = shutil.which("apache2") or "/usr/sbin/apache2"
-MODDIR = Path("/usr/lib/apache2/modules")
+MODDIR = Path(
+    os.environ.get(
+        "APACHE_MODDIR",
+        "/usr/lib/apache2/modules"
+        if Path("/usr/lib/apache2/modules").is_dir()
+        else "/workspace/.vapache-setup/sysroot/usr/lib/apache2/modules",
+    )
+)
 BASE = Path(tempfile.mkdtemp(prefix="vapache-config-validity-"))
 DOCROOT = BASE / "www"
 PORT = 18190
@@ -211,6 +218,44 @@ CASES = [
     (
         "valid Directory AllowOverride",
         f'<Directory "{DOCROOT}/ok">\n    AllowOverride All\n</Directory>\n',
+    ),
+    (
+        "Require all rejects extra operands",
+        f'<Directory "{DOCROOT}">\n    Require all granted denied\n</Directory>\n',
+    ),
+    (
+        "negative Require is invalid in implicit RequireAny",
+        f'<Directory "{DOCROOT}">\n    Require not ip 192.0.2.1\n</Directory>\n',
+    ),
+    (
+        "RequireAny rejects a negative provider",
+        f'<Directory "{DOCROOT}">\n    <RequireAny>\n'
+        "        Require not ip 192.0.2.1\n"
+        "    </RequireAny>\n</Directory>\n",
+    ),
+    (
+        "RequireAll rejects only-negative providers",
+        f'<Directory "{DOCROOT}">\n    <RequireAll>\n'
+        "        Require not ip 192.0.2.1\n"
+        "    </RequireAll>\n</Directory>\n",
+    ),
+    (
+        "RequireNone cannot independently authorize",
+        f'<Directory "{DOCROOT}">\n    <RequireNone>\n'
+        "        Require ip 192.0.2.1\n"
+        "    </RequireNone>\n</Directory>\n",
+    ),
+    (
+        "unknown conditional section is not transparent",
+        f'<Directory "{DOCROOT}">\n    <DefinitelyMissingSection>\n'
+        "        Require all granted\n"
+        "    </DefinitelyMissingSection>\n</Directory>\n",
+    ),
+    (
+        "IfModule requires an operand",
+        f'<Directory "{DOCROOT}">\n    <IfModule>\n'
+        "        Require all granted\n"
+        "    </IfModule>\n</Directory>\n",
     ),
 ]
 

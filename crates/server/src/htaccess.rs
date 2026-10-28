@@ -7,9 +7,10 @@
 
 use crate::config::{
     normalize_rewrite_base, parse_filter_tokens, parse_ip_net, parse_require, parse_rewrite_cond,
-    parse_rewrite_rule, AlterEtag, AuthMerging, CompressionRule, ConditionBranch, Config, ErrorDoc,
-    HostSpec, MatchKind, MethodSet, NonfatalMode, Options, Order, OverrideCategories,
-    OverrideCategory, OverrideMode, Require, RequireNode, Satisfy, Scope, ScopeRule, VHost,
+    parse_rewrite_rule, require_is_negated, require_node_is_negative, AlterEtag, AuthMerging,
+    CompressionRule, ConditionBranch, Config, ErrorDoc, HostSpec, MatchKind, MethodSet,
+    NonfatalMode, Options, Order, OverrideCategories, OverrideCategory, OverrideMode, Require,
+    RequireNode, Satisfy, Scope, ScopeRule, VHost,
 };
 use crate::config_frontend::{logical_lines, tokenize_config};
 use std::collections::HashMap;
@@ -899,6 +900,10 @@ fn parse_block(
                             | "requireany"
                             | "requirenone"
                             | "ifmodule"
+                            | "ifdefine"
+                            | "ifdirective"
+                            | "ifsection"
+                            | "ifversion"
                     )
                 {
                     return Err(format!(
@@ -1039,11 +1044,32 @@ fn parse_block(
                             nodes.push(entry.node);
                         }
                         if !nodes.is_empty() {
+                            let invalid_negative = match name.as_str() {
+                                "requireall" => {
+                                    !nodes.iter().any(|node| !require_node_is_negative(node))
+                                }
+                                "requireany" | "requirenone" => {
+                                    nodes.iter().any(require_node_is_negative)
+                                }
+                                _ => false,
+                            };
+                            if invalid_negative {
+                                return Err(format!(
+                                    "line {}: <{name}> contains no positive authorization provider",
+                                    *i
+                                ));
+                            }
                             let node = match name.as_str() {
                                 "requireall" => RequireNode::All(nodes),
                                 "requireany" => RequireNode::Any(nodes),
                                 _ => RequireNode::None(nodes),
                             };
+                            if !require_only && require_node_is_negative(&node) {
+                                return Err(format!(
+                                    "line {}: <{name}> has no effect in <RequireAny>",
+                                    *i
+                                ));
+                            }
                             scope.add_require(node, limit);
                         }
                     }
@@ -1148,7 +1174,7 @@ fn parse_block(
                         });
                     }
                     "ifmodule" => {
-                        let active = ifmodule_active(&args);
+                        let active = ifmodule_active(cfg, &args)?;
                         if active {
                             parse_block(
                                 cfg,
@@ -1169,13 +1195,85 @@ fn parse_block(
                         }
                     }
                     "ifdefine" => {
-                        // The configuration parser only exposes definitions to
-                        // the main config.  Refuse rather than risk applying a
-                        // conditional access rule in the wrong environment.
-                        return Err(format!(
-                            "line {}: <IfDefine> is not supported in .htaccess",
-                            *i
-                        ));
+                        let active =
+                            named_condition_active(&args, |name| cfg.config_defines.contains(name))
+                                .map_err(|e| format!("line {}: {e}", *i))?;
+                        if active {
+                            parse_block(
+                                cfg,
+                                lines,
+                                i,
+                                scope,
+                                rules,
+                                mode,
+                                allow_list,
+                                nonfatal,
+                                Some(&name),
+                                require_only,
+                                next_chain,
+                                limit,
+                            )?;
+                        } else {
+                            skip_section(lines, i, &name)?;
+                        }
+                    }
+                    "ifdirective" | "ifsection" => {
+                        let active = named_condition_active(&args, |candidate| {
+                            if name == "ifdirective" {
+                                cfg.directive_exists(candidate).unwrap_or(false)
+                            } else {
+                                cfg.section_exists(candidate)
+                            }
+                        })
+                        .map_err(|e| format!("line {}: {e}", *i))?;
+                        if name == "ifdirective" {
+                            let candidate = args
+                                .first()
+                                .map(|arg| arg.trim_start_matches('!'))
+                                .unwrap_or("");
+                            cfg.directive_exists(candidate)
+                                .map_err(|e| format!("line {}: {e}", *i))?;
+                        }
+                        if active {
+                            parse_block(
+                                cfg,
+                                lines,
+                                i,
+                                scope,
+                                rules,
+                                mode,
+                                allow_list,
+                                nonfatal,
+                                Some(&name),
+                                require_only,
+                                next_chain,
+                                limit,
+                            )?;
+                        } else {
+                            skip_section(lines, i, &name)?;
+                        }
+                    }
+                    "ifversion" => {
+                        let active = crate::config::ifversion_matches(&args)
+                            .map_err(|e| format!("line {}: {e}", *i))?;
+                        if active {
+                            parse_block(
+                                cfg,
+                                lines,
+                                i,
+                                scope,
+                                rules,
+                                mode,
+                                allow_list,
+                                nonfatal,
+                                Some(&name),
+                                require_only,
+                                next_chain,
+                                limit,
+                            )?;
+                        } else {
+                            skip_section(lines, i, &name)?;
+                        }
                     }
                     _ => {
                         match vapache_verified::htaccess_gate_admit(
@@ -1239,7 +1337,7 @@ fn parse_block(
                     }
                     _ => {}
                 }
-                apply_directive(cfg, scope, &name, &args, limit)
+                apply_directive(cfg, scope, &name, &args, limit, require_only)
                     .map_err(|e| format!("line {}: {e}", *i))?;
             }
         }
@@ -1279,86 +1377,29 @@ fn skip_section(lines: &[String], i: &mut usize, name: &str) -> Result<(), Strin
     Err(format!("missing closing </{name}>"))
 }
 
-/// `.htaccess` cannot see `LoadModule` state, so a positive `<IfModule>`
-/// must not silently hide directives that the server actually implements.
-/// Parse the block for every module name; unknown modules inside such a block
-/// still fail closed if their directives are unsupported.  For a negated
-/// module, only skip the block when the module is one of the built-ins below
-/// (treating an unknown, possibly-loaded module as present is the
-/// conservative choice for access rules).
-fn ifmodule_active(args: &[String]) -> bool {
-    let Some(name) = args.first() else {
-        return false;
+fn named_condition_active(
+    args: &[String],
+    exists: impl FnOnce(&str) -> bool,
+) -> Result<bool, String> {
+    let Some(raw) = args.first() else {
+        return Err("conditional section requires an argument".into());
     };
-    let (negated, name) = match name.strip_prefix('!') {
-        Some(n) => (true, n),
-        None => (false, name.as_str()),
-    };
-    let builtin = [
-        "mod_authz_core.c",
-        "authz_core_module",
-        "mod_authz_user.c",
-        "authz_user_module",
-        "mod_authz_groupfile.c",
-        "authz_groupfile_module",
-        "mod_authn_core.c",
-        "authn_core_module",
-        "mod_authz_host.c",
-        "authz_host_module",
-        "mod_access_compat.c",
-        "access_compat_module",
-        "mod_auth_basic.c",
-        "auth_basic_module",
-        "mod_authn_file.c",
-        "authn_file_module",
-        "mod_alias.c",
-        "alias_module",
-        "mod_dir.c",
-        "dir_module",
-        "mod_mime.c",
-        "mime_module",
-        "mod_headers.c",
-        "headers_module",
-        "mod_setenvif.c",
-        "setenvif_module",
-        "mod_rewrite.c",
-        "rewrite_module",
-        "mod_cgi.c",
-        "cgi_module",
-        "mod_autoindex.c",
-        "autoindex_module",
-        "mod_deflate.c",
-        "deflate_module",
-        "mod_brotli.c",
-        "brotli_module",
-        "mod_filter.c",
-        "filter_module",
-        "mod_expires.c",
-        "expires_module",
-        "mod_env.c",
-        "env_module",
-        "mod_remoteip.c",
-        "remoteip_module",
-        "mod_proxy.c",
-        "proxy_module",
-        "mod_proxy_http.c",
-        "proxy_http_module",
-        "mod_proxy_fcgi.c",
-        "proxy_fcgi_module",
-        "mod_cache.c",
-        "cache_module",
-        "mod_cache_disk.c",
-        "cache_disk_module",
-        "mod_ssl.c",
-        "ssl_module",
-    ]
-    .iter()
-    .any(|m| m.eq_ignore_ascii_case(name));
-    if negated {
-        !builtin
-    } else {
-        true
+    if raw.is_empty() {
+        return Err("conditional section requires an argument".into());
     }
+    let (negated, name) = match raw.strip_prefix('!') {
+        Some(name) => (true, name),
+        None => (false, raw.as_str()),
+    };
+    let found = exists(name);
+    Ok(if negated { !found } else { found })
+}
+
+/// Access files are parsed with the compiled main configuration available, so
+/// use its exact linked/LoadModule set. Activating every positive condition
+/// made `<IfModule missing> Require all granted` an unconditional grant.
+fn ifmodule_active(cfg: &Config, args: &[String]) -> Result<bool, String> {
+    named_condition_active(args, |name| cfg.module_loaded(name))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1825,6 +1866,7 @@ fn apply_directive(
     name: &str,
     args: &[String],
     limit: Option<&MethodSet>,
+    require_only: bool,
 ) -> Result<(), String> {
     let Some(spec) = directive_spec(name) else {
         return Err(format!("unsupported .htaccess directive '{name}'"));
@@ -1849,6 +1891,9 @@ fn apply_directive(
                 if crate::config::require_syntax_error(msg) {
                     return Err(msg.clone());
                 }
+            }
+            if !require_only && require_is_negated(&provider) {
+                return Err("negative Require directive has no effect in <RequireAny>".into());
             }
             scope.add_require(RequireNode::Provider(provider), limit);
         }
@@ -2432,7 +2477,10 @@ mod tests {
     #[test]
     fn parses_access_auth_and_media_directives() {
         let dir = tempdir("directives");
-        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let cfg = config(
+            &dir,
+            "Listen 127.0.0.1:0\nLoadModule authz_core_module /unused/mod_authz_core.so\n",
+        );
         let file = dir.join(".htaccess");
         fs::write(
             &file,
@@ -2544,7 +2592,7 @@ mod tests {
             framing: crate::verified::BodyFraming::None,
         };
         req.headers.push("X-Block", "yes");
-        let env = p.scope.request_env(&req, "/");
+        let env = p.scope.request_env(&req, "/", "127.0.0.1".parse().unwrap());
         assert!(env.iter().any(|(n, v)| n == "STATIC" && v == "yes"));
         assert!(env.iter().any(|(n, v)| n == "BLOCK" && v == "1"));
         let _ = fs::remove_dir_all(&dir);
@@ -2576,12 +2624,13 @@ mod tests {
         fs::write(
             &file,
             concat!(
-                "<RequireAny>\n",
-                "Require ip 127.0.0.1\n",
-                "<RequireNone>\n",
+                "<RequireAll>\n",
                 "Require all granted\n",
+                "<RequireNone>\n",
+                "Require ip 10.0.0.0/8\n",
+                "Require ip 192.0.2.0/24\n",
                 "</RequireNone>\n",
-                "</RequireAny>\n",
+                "</RequireAll>\n",
                 "<Files \"secret.txt\">\n",
                 "Require all denied\n",
                 "</Files>\n",
@@ -2604,7 +2653,12 @@ mod tests {
     #[test]
     fn ifmodule_skips_unknown_but_parses_supported() {
         let dir = tempdir("ifmodule");
-        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let cfg = config(
+            &dir,
+            "Listen 127.0.0.1:0\n\
+             LoadModule rewrite_module /unused/mod_rewrite.so\n\
+             LoadModule authz_core_module /unused/mod_authz_core.so\n",
+        );
         let file = dir.join(".htaccess");
         fs::write(
             &file,
@@ -2638,7 +2692,6 @@ mod tests {
         for text in [
             "RewriteMap example txt:/tmp/map.txt\n",
             "<Limit GET>\nOptions +Indexes\n</Limit>\n",
-            "<IfDefine FOO>\nRequire all granted\n</IfDefine>\n",
             "<Files \"x\">\n",
             "Require all granted\n</Nope>\n",
             "<Limit BOGUS>\nRequire all granted\n</Limit>\n",
@@ -3236,7 +3289,6 @@ mod tests {
             "<Directory /srv>\nRequire all denied\n</Directory>\n",
             "<Location />\nRequire all denied\n</Location>\n",
             "<Proxy http://example.test/>\nRequire all denied\n</Proxy>\n",
-            "<IfDefine PROD>\nRequire all denied\n</IfDefine>\n",
         ] {
             fs::write(&file, line).unwrap();
             match parse_file(&cfg, &file, OverrideMode::All, "/dir/") {
@@ -3247,6 +3299,9 @@ mod tests {
                 ),
             }
         }
+        fs::write(&file, "<IfDefine PROD>\nRequire all denied\n</IfDefine>\n").unwrap();
+        let parsed = parse_file(&cfg, &file, OverrideMode::All, "/dir/").unwrap();
+        assert!(parsed.scope.authorization.requires.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3594,7 +3649,7 @@ mod tests {
             "127.0.0.1".parse().unwrap(),
         )
         .unwrap();
-        let env = scope.request_env(&req, "/x");
+        let env = scope.request_env(&req, "/x", "127.0.0.1".parse().unwrap());
         for expected in ["ROOT", "SUB"] {
             assert!(
                 env.iter().any(|(name, _)| name == expected),
@@ -3950,7 +4005,10 @@ mod tests {
     #[test]
     fn parser_section_and_directive_error_branches() {
         let dir = tempdir("coverage-parse-errors");
-        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let cfg = config(
+            &dir,
+            "Listen 127.0.0.1:0\nLoadModule authz_core_module /unused/mod_authz_core.so\n",
+        );
         let file = dir.join(".htaccess");
         let parse = |text: &str, mode: OverrideMode, nonfatal: NonfatalMode, allow: &[String]| {
             fs::write(&file, text).unwrap();
@@ -4001,7 +4059,7 @@ mod tests {
                 "<IfModule !mod_rewrite.c>\nRequire all denied\n</IfModule>\n",
                 true,
             ),
-            ("<IfModule>\nRequire all denied\n</IfModule>\n", true),
+            ("<IfModule>\nRequire all denied\n</IfModule>\n", false),
             (
                 "<IfModule !mod_not_builtin.c>\nRequire all denied\n</IfModule>\n",
                 true,
@@ -4414,9 +4472,15 @@ mod tests {
     fn direct_directive_errors_and_unknown_specs() {
         let dir = tempdir("coverage-directive-errors");
         let cfg = config(&dir, "Listen 127.0.0.1:0\n");
-        assert!(
-            apply_directive(&cfg, &mut Scope::default(), "definitely-unknown", &[], None,).is_err()
-        );
+        assert!(apply_directive(
+            &cfg,
+            &mut Scope::default(),
+            "definitely-unknown",
+            &[],
+            None,
+            false,
+        )
+        .is_err());
         let file = dir.join(".htaccess");
         let parse = |text: &str| {
             fs::write(&file, text).unwrap();

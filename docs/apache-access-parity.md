@@ -48,6 +48,54 @@ The FastCGI behavior is pinned to Apache 2.4.69
 Expression parity is checked against Apache's PCRE implementation rather than
 approximating PCRE with Rust's regular-expression dialect.
 
+## Apache 2.4.69 configuration and authorization source audit
+
+The post-P15 audit was performed against the checksum-verified Apache 2.4.69
+source and the matching Debian binary oracle. It followed the configuration
+from parse-time condition selection through directory/location/file walks,
+authorization provider evaluation, rewrite phases and environment hooks. The
+reviewed implementation surface was:
+
+- `server/config.c`, `server/core.c` and `server/request.c` for configuration
+  parsing, execute-on-read containers and request-scope merge order;
+- `modules/aaa/mod_authz_core.c`, `mod_authz_host.c`, `mod_authz_user.c`,
+  `mod_authz_groupfile.c`, `mod_auth_basic.c` and `mod_access_compat.c` for
+  provider parsing, negation and authorization combination;
+- `modules/metadata/mod_env.c`, `mod_setenvif.c`, `mod_remoteip.c` and
+  `mod_version.c` for hook timing and conditional configuration;
+- `modules/mappers/mod_rewrite.c`, `mod_alias.c` and `mod_dir.c` for
+  configuration that changes the resource or environment seen by ACLs.
+
+That audit closed these additional refinement failures:
+
+- `<IfModule>`, `<IfFile>`, `<IfDirective>`, `<IfSection>` and numeric
+  `<IfVersion>` now select their branch while configuration is read. Linked-in
+  modules are seeded before `LoadModule`, conditions use the loaded-module
+  registry, and access files use the same registry instead of activating every
+  positive `<IfModule>`. Unknown sections are configuration errors rather than
+  transparent containers.
+- Environment state is split by Apache hook phase. `SetEnvIf` and server-scope
+  rewrite `[E]` are authorization-visible; directory/access-file rewrite
+  `[E]`, followed by `SetEnv`/`PassEnv`/`UnsetEnv`, is visible only in fixups
+  and CGI/FastCGI. A late variable can no longer grant `Require env`.
+- `SetEnvIf` implements the `Remote_Addr`, `Request_URI`, `Request_Method` and
+  `Request_Protocol` attributes, prior-environment fallback, capture expansion
+  and Apache's default value `1`. Unsupported `Remote_Host`, `Server_Addr` and
+  regex header-name modes are rejected at load time instead of being modeled
+  as an empty header.
+- `Require env` evaluates every operand with APR table's case-insensitive key
+  semantics; host operands use Apache's exact label-boundary suffix rule and
+  supported string-result expansions; malformed
+  `Require all`, negative providers in OR contexts and authorization sections
+  containing only negative providers are rejected like Apache.
+
+`tests/config_semantics.py` contains 235 fixed paired cases after this audit,
+including 23 source-derived additions, and `tests/config_validity.py` pins the
+corresponding load-time rejection rules. Unsupported expression forms or
+directive ownership that cannot be represented exactly fail configuration
+loading; they are not converted into a false condition that negation could
+turn into access.
+
 ## Extracted Apache models
 
 The proposed Apache extractor would help.  A source-derived transition system,

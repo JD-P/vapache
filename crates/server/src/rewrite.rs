@@ -77,8 +77,11 @@ impl<'a> Context<'a> {
 /// them to the effective scope of the *final* target after all rewrite rounds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Effects {
-    /// `[E=NAME:VALUE]` / `[E=!NAME]`; `None` means unset.
+    /// Server-scope `[E=NAME:VALUE]` / `[E=!NAME]`, visible before authz.
     pub env: Vec<(String, Option<String>)>,
+    /// Directory/htaccess rewrite environment, produced in fixups after
+    /// authorization. `None` means unset in both vectors.
+    pub late_env: Vec<(String, Option<String>)>,
     /// Fully constructed `Set-Cookie` header values from `[CO=...]`.
     pub cookies: Vec<String>,
     /// `[H=handler]`
@@ -93,6 +96,7 @@ pub struct Effects {
 impl Effects {
     pub fn is_empty(&self) -> bool {
         self.env.is_empty()
+            && self.late_env.is_empty()
             && self.cookies.is_empty()
             && self.handler.is_none()
             && self.content_type.is_none()
@@ -101,6 +105,7 @@ impl Effects {
 
     pub fn merge(&mut self, other: Effects) {
         self.env.extend(other.env);
+        self.late_env.extend(other.late_env);
         self.cookies.extend(other.cookies);
         if other.handler.is_some() {
             self.handler = other.handler;
@@ -321,7 +326,11 @@ fn rule_effects(
             )?),
             None => None,
         };
-        effects.env.push((name, value));
+        if rule.per_dir {
+            effects.late_env.push((name, value));
+        } else {
+            effects.env.push((name, value));
+        }
     }
     for cookie in &rule.flags.cookies {
         let cookie = expand_backrefs(
@@ -410,7 +419,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
     let mut cond_caps: Vec<String> = Vec::new();
     let mut effects = Effects::default();
     let mut filesystem_override: Option<PathBuf> = None;
-    let mut env: Vec<(String, String)> = scope.request_env(req, ctx.url_path);
+    let mut env: Vec<(String, String)> = scope.authorization_env(req, ctx.url_path, ctx.peer);
     let mut vary: Vec<String> = Vec::new();
     let mut idx = 0usize;
     let chain_flags: Vec<bool> = scope
@@ -495,8 +504,8 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             &env,
         ) {
             Ok(e) => {
-                for (name, value) in &e.env {
-                    env.retain(|(n, _)| n != name);
+                for (name, value) in e.env.iter().chain(&e.late_env) {
+                    env.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
                     if let Some(value) = value {
                         env.push((name.clone(), value.clone()));
                     }

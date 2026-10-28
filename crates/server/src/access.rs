@@ -329,7 +329,7 @@ fn check_requires(
     let Some(policy) = &scope.authorization.requires else {
         return Access::Allowed;
     };
-    let env = scope.request_env(req, url_path);
+    let env = scope.authorization_env(req, url_path, peer);
     match eval_policy(
         policy, req, peer, identity, &env, true, docroot, url_path, fs_path,
     ) {
@@ -526,6 +526,63 @@ fn eval_require(
             PolicyResult::Denied
         }
     }
+    fn expand_operand(
+        operand: &str,
+        req: &Request,
+        env: &[(String, String)],
+        peer: IpAddr,
+        url_path: &str,
+    ) -> Result<String, ()> {
+        let mut out = String::new();
+        let mut rest = operand;
+        while let Some(start) = rest.find("%{") {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 2..];
+            let end = after.find('}').ok_or(())?;
+            let variable = &after[..end];
+            let upper = variable.to_ascii_uppercase();
+            let value = match upper.as_str() {
+                "HTTP_HOST" => req.header_str("host").unwrap_or_default().to_string(),
+                "REMOTE_ADDR" => peer.to_string(),
+                "REQUEST_URI" => url_path.to_string(),
+                "REQUEST_METHOD" => req.method.clone(),
+                _ if upper.starts_with("HTTP:") => req
+                    .header_str(&variable[5..])
+                    .unwrap_or_default()
+                    .to_string(),
+                _ if upper.starts_with("ENV:") => env
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&variable[4..]))
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default(),
+                _ => return Err(()),
+            };
+            out.push_str(&value);
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        Ok(out)
+    }
+
+    fn expanded_words(
+        operands: &[String],
+        req: &Request,
+        env: &[(String, String)],
+        peer: IpAddr,
+        url_path: &str,
+    ) -> Result<Vec<String>, ()> {
+        let mut words = Vec::new();
+        for operand in operands {
+            // mod_authz_host/user/groupfile evaluate the string expression
+            // and then consume its result with ap_getword_conf(), not a
+            // whitespace-only split. Reuse the configuration-word tokenizer
+            // so quoted dynamic results have the same operand boundaries.
+            let expanded = expand_operand(operand, req, env, peer, url_path)?;
+            words.extend(crate::config_frontend::tokenize(&expanded).map_err(|_| ())?);
+        }
+        Ok(words)
+    }
     match r {
         Require::AllGranted => PolicyResult::Granted,
         Require::AllDenied => PolicyResult::Denied,
@@ -534,7 +591,12 @@ fn eval_require(
             decide(hit, *negate)
         }
         Require::Local { negate } => decide(canonical_ip(peer).is_loopback(), *negate),
-        Require::Host { negate, names } => decide(reverse_dns_matches(peer, names), *negate),
+        Require::Host { negate, names } => {
+            let Ok(names) = expanded_words(names, req, env, peer, url_path) else {
+                return PolicyResult::Denied;
+            };
+            decide(reverse_dns_matches(peer, &names), *negate)
+        }
         Require::Method { negate, methods } => {
             decide(methods.iter().any(|m| same_method(m, &req.method)), *negate)
         }
@@ -555,28 +617,32 @@ fn eval_require(
             let Some(identity) = identity else {
                 return PolicyResult::AuthRequired;
             };
+            let Ok(names) = expanded_words(names, req, env, peer, url_path) else {
+                return PolicyResult::Denied;
+            };
             decide(names.iter().any(|n| n == &identity.user), *negate)
         }
         Require::Group { negate, names } => {
             let Some(identity) = identity else {
                 return PolicyResult::AuthRequired;
             };
+            let Ok(names) = expanded_words(names, req, env, peer, url_path) else {
+                return PolicyResult::Denied;
+            };
             decide(
                 identity.groups.iter().any(|g| names.iter().any(|n| n == g)),
                 *negate,
             )
         }
-        Require::Env {
-            negate,
-            name,
-            value,
-        } => {
-            let hit = env
-                .iter()
-                .rev()
-                .find(|(n, _)| n == name)
-                .map(|(_, v)| value.as_ref().map(|want| v == want).unwrap_or(true))
-                .unwrap_or(false);
+        Require::Env { negate, names } => {
+            // mod_authz_core grants the provider when any listed variable is
+            // present. This remains one provider result, so negation applies
+            // to the aggregate rather than only the first operand.
+            let hit = names.iter().any(|name| {
+                env.iter()
+                    .rev()
+                    .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
+            });
             decide(hit, *negate)
         }
         Require::Expr { negate, expr } => {
@@ -641,21 +707,26 @@ fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
     let Ok(host) = reverse_dns(ip) else {
         return false;
     };
-    let host_l = host.to_ascii_lowercase();
-    let name_ok = names.iter().any(|n| {
-        let n = n.to_ascii_lowercase();
-        if let Some(suffix) = n.strip_prefix('.') {
-            host_l == suffix || host_l.ends_with(&format!(".{suffix}"))
-        } else if let Some(suffix) = n.strip_prefix("*.") {
-            host_l.ends_with(&format!(".{suffix}"))
-        } else {
-            host_l == n
-        }
-    });
+    let name_ok = names.iter().any(|domain| hostname_in_domain(domain, &host));
     if !name_ok {
         return false;
     }
     forward_dns_confirms(&host, ip)
+}
+
+/// Exact port of mod_authz_host's `in_domain()`: operands are
+/// case-insensitive suffixes, but a longer host must meet the suffix at a DNS
+/// label boundary. A leading dot excludes the bare host and `*.` has no
+/// wildcard meaning.
+fn hostname_in_domain(domain: &str, host: &str) -> bool {
+    let domain = domain.to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+    if host.len() < domain.len() || !host.ends_with(&domain) {
+        return false;
+    }
+    host.len() == domain.len()
+        || domain.starts_with('.')
+        || host.as_bytes()[host.len() - domain.len() - 1] == b'.'
 }
 
 fn forward_dns_confirms(host: &str, ip: IpAddr) -> bool {
@@ -1057,7 +1128,6 @@ mod tests {
 
     #[test]
     fn head_configured_for_get_and_host_provider_reverse_dns() {
-        let r = req("GET");
         assert!(same_method("HEAD", "GET"));
         assert!(same_method("GET", "HEAD"));
         assert!(!same_method("POST", "GET"));
@@ -1065,7 +1135,7 @@ mod tests {
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         let host = reverse_dns(ip).expect("reverse localhost");
         assert!(reverse_dns_matches(ip, &[host.clone()]));
-        assert!(reverse_dns_matches(ip, &[format!(".{host}")]));
+        assert!(!reverse_dns_matches(ip, &[format!(".{host}")]));
         assert!(!reverse_dns_matches(
             ip,
             &[format!("*.not-{host}"), "definitely.invalid".into()]
@@ -1088,6 +1158,17 @@ mod tests {
         }]);
         let result = check(&s, &req("GET"), ip, None, "/x", None);
         assert!(matches!(result, Access::Allowed | Access::Denied));
+    }
+
+    #[test]
+    fn apache_host_domain_matching_uses_dns_label_boundaries() {
+        assert!(hostname_in_domain("example.test", "example.test"));
+        assert!(hostname_in_domain("example.test", "WWW.Example.Test"));
+        assert!(!hostname_in_domain("example.test", "notexample.test"));
+        assert!(!hostname_in_domain(".example.test", "example.test"));
+        assert!(hostname_in_domain(".example.test", "www.example.test"));
+        assert!(!hostname_in_domain("*.example.test", "www.example.test"));
+        assert!(hostname_in_domain("*.example.test", "*.example.test"));
     }
 
     #[test]
@@ -1387,6 +1468,43 @@ mod tests {
                 None,
             ),
             PolicyResult::Neutral
+        );
+    }
+
+    #[test]
+    fn require_env_uses_apr_table_case_insensitive_names() {
+        let request = req("GET");
+        let peer = "127.0.0.1".parse().unwrap();
+        let env = vec![("UPPER_GATE".to_string(), "1".to_string())];
+        let provider = |negate| Require::Env {
+            negate,
+            names: vec!["upper_gate".into()],
+        };
+        assert_eq!(
+            eval_require(
+                &provider(false),
+                &request,
+                peer,
+                None,
+                &env,
+                Path::new("/"),
+                "/x",
+                None,
+            ),
+            PolicyResult::Granted
+        );
+        assert_eq!(
+            eval_require(
+                &provider(true),
+                &request,
+                peer,
+                None,
+                &env,
+                Path::new("/"),
+                "/x",
+                None,
+            ),
+            PolicyResult::Denied
         );
     }
 

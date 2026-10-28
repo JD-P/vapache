@@ -299,7 +299,7 @@ documented rather than re-derived.
 Security-sensitive configuration semantics are checked separately:
 
 ```sh
-python3 tests/config_semantics.py  # 212 generated differential cases
+python3 tests/config_semantics.py  # 235 fixed differential cases
 python3 tests/config_semantics.py --random 300 --seed 7  # deterministic randomized matrix
 python3 tests/config_validity.py  # context acceptance matrix (Apache -t vs vapached -t)
 python3 tests/config_grammar.py   # finite valid/invalid grammar matrix
@@ -375,8 +375,8 @@ Delimiter-only lines and narrowly documented unreachable invariants, external
 failure races and privileged-kernel failures are excluded from that metric.
 
 Latest snapshot: **18,913/18,913 executable server production lines (100%)**.
-The current suite is 446 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
-integration tests, 165 conformance tests and 212 generated configuration cases.
+The current suite is 448 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
+integration tests, 165 conformance tests and 235 fixed configuration cases.
 The separate Verus gate proves 433 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 

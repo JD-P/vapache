@@ -41,7 +41,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
 APACHE = shutil.which("apache2") or "/usr/sbin/apache2"
-MODDIR = Path("/usr/lib/apache2/modules")
+MODDIR = Path(
+    os.environ.get(
+        "APACHE_MODDIR",
+        "/usr/lib/apache2/modules"
+        if Path("/usr/lib/apache2/modules").is_dir()
+        else "/workspace/.vapache-setup/sysroot/usr/lib/apache2/modules",
+    )
+)
 BASE = Path(tempfile.mkdtemp(prefix="vapache-config-semantics-"))
 DOCROOT = BASE / "www"
 AP_PORT = int(os.environ.get("VAPACHE_SEM_AP_PORT", "18180"))
@@ -60,6 +67,7 @@ APACHE_MODULES = [
     "allowmethods_module",
     "headers_module",
     "setenvif_module",
+    "env_module",
     "auth_basic_module",
     "authn_core_module",
     "authn_file_module",
@@ -2309,6 +2317,327 @@ def generated_cases():
 CASES.extend(generated_cases())
 
 
+# Cases derived directly from Apache 2.4.69's execute-on-read containers,
+# mod_authz_core/mod_authz_host providers and mod_setenvif/mod_env hook order.
+CASES.extend(
+    [
+        {
+            "name": "core-ifmodule-prelinked-denial",
+            "dir": "src_ifmodule_core",
+            "config": [
+                "<IfModule core_module>",
+                f'    <Directory "{{dir}}">',
+                "        Require all denied",
+                "    </Directory>",
+                "</IfModule>",
+            ],
+            "requests": [("GET", "/src_ifmodule_core/file.txt", None, {})],
+        },
+        {
+            "name": "ifdirective-false-skips-grant",
+            "dir": "src_ifdirective_false",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    Require all denied",
+                "    <IfDirective DefinitelyMissingDirective>",
+                "        Require all granted",
+                "    </IfDirective>",
+                "</Directory>",
+            ],
+            "requests": [("GET", "/src_ifdirective_false/file.txt", None, {})],
+        },
+        {
+            "name": "ifdirective-true-applies-grant",
+            "dir": "src_ifdirective_true",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    Require all denied",
+                "    <IfDirective Require>",
+                "        Require all granted",
+                "    </IfDirective>",
+                "</Directory>",
+            ],
+            "requests": [("GET", "/src_ifdirective_true/file.txt", None, {})],
+        },
+        {
+            "name": "ifsection-false-skips-grant",
+            "dir": "src_ifsection_false",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    Require all denied",
+                "    <IfSection DefinitelyMissingSection>",
+                "        Require all granted",
+                "    </IfSection>",
+                "</Directory>",
+            ],
+            "requests": [("GET", "/src_ifsection_false/file.txt", None, {})],
+        },
+        {
+            "name": "iffile-is-frozen-at-config-read",
+            "dir": "src_iffile_frozen",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    Require all denied",
+                '    <IfFile "{dir}/late.flag">',
+                "        Require all granted",
+                "    </IfFile>",
+                "</Directory>",
+            ],
+            "post_start_files": {"late.flag": "late\n"},
+            "requests": [("GET", "/src_iffile_frozen/file.txt", None, {})],
+        },
+        {
+            "name": "setenv-is-not-visible-to-require-env",
+            "dir": "src_setenv_late",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    SetEnv LATE_ALLOW yes",
+                "    Require env LATE_ALLOW",
+                "</Directory>",
+            ],
+            "requests": [("GET", "/src_setenv_late/file.txt", None, {})],
+        },
+        {
+            "name": "unsetenv-is-not-visible-to-require-env",
+            "dir": "src_unsetenv_late",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    SetEnvIf X-Block yes BLOCK_ME",
+                "    UnsetEnv BLOCK_ME",
+                "    <RequireAll>",
+                "        Require all granted",
+                "        Require not env BLOCK_ME",
+                "    </RequireAll>",
+                "</Directory>",
+            ],
+            "requests": [
+                ("GET", "/src_unsetenv_late/file.txt", {"X-Block": "yes"}, {})
+            ],
+        },
+        {
+            "name": "setenvif-remote-addr-is-not-an-empty-header",
+            "dir": "src_setenvif_remote_addr",
+            "config": [
+                f'<Directory "{{dir}}">',
+                '    SetEnvIf Remote_Addr "^$" EMPTY_REMOTE',
+                "    Require env EMPTY_REMOTE",
+                "</Directory>",
+            ],
+            "requests": [("GET", "/src_setenvif_remote_addr/file.txt", None, {})],
+        },
+        {
+            "name": "setenvif-bare-action-has-value-one",
+            "dir": "src_setenvif_default_value",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    SetEnvIf X-Gate yes GATE",
+                "    Require expr \"env('GATE') == '1'\"",
+                "</Directory>",
+            ],
+            "requests": [
+                ("GET", "/src_setenvif_default_value/file.txt", {"X-Gate": "yes"}, {})
+            ],
+        },
+        {
+            "name": "require-env-tests-every-operand",
+            "dir": "src_require_env_operands",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    SetEnvIf X-Block yes SECOND_BLOCK",
+                "    <RequireAll>",
+                "        Require all granted",
+                "        Require not env FIRST_BLOCK SECOND_BLOCK",
+                "    </RequireAll>",
+                "</Directory>",
+            ],
+            "requests": [
+                ("GET", "/src_require_env_operands/file.txt", {"X-Block": "yes"}, {})
+            ],
+        },
+        {
+            "name": "require-env-name-is-case-insensitive",
+            "dir": "src_require_env_case",
+            "config": [
+                f'<Directory "{{dir}}">',
+                '    SetEnvIf Remote_Addr "^127\\." UPPER_GATE',
+                "    Require env upper_gate",
+                "</Directory>",
+            ],
+            "requests": [("GET", "/src_require_env_case/file.txt", None, {})],
+        },
+        {
+            "name": "negated-require-env-name-is-case-insensitive",
+            "dir": "src_require_env_case_negated",
+            "config": [
+                f'<Directory "{{dir}}">',
+                '    SetEnvIf Remote_Addr "^127\\." UPPER_BLOCK',
+                "    <RequireAll>",
+                "        Require all granted",
+                "        Require not env upper_block",
+                "    </RequireAll>",
+                "</Directory>",
+            ],
+            "requests": [
+                ("GET", "/src_require_env_case_negated/file.txt", None, {})
+            ],
+        },
+        {
+            "name": "require-host-leading-dot-excludes-bare-host",
+            "dir": "src_require_host_dot",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    Require host .localhost",
+                "</Directory>",
+            ],
+            "requests": [("GET", "/src_require_host_dot/file.txt", None, {})],
+        },
+        {
+            "name": "htaccess-ifmodule-missing-skips-grant",
+            "dir": "src_htaccess_ifmodule_missing",
+            "files": {
+                ".htaccess": (
+                    "Require all denied\n"
+                    "<IfModule definitely_missing_module>\n"
+                    "    Require all granted\n"
+                    "</IfModule>\n"
+                )
+            },
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    AllowOverride All",
+                "</Directory>",
+            ],
+            "requests": [
+                ("GET", "/src_htaccess_ifmodule_missing/file.txt", None, {})
+            ],
+        },
+        {
+            "name": "ifdirective-unloaded-module-skips-grant",
+            "dir": "src_ifdirective_unloaded",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    Require all denied",
+                "    <IfDirective SSLProtocol>",
+                "        Require all granted",
+                "    </IfDirective>",
+                "</Directory>",
+            ],
+            "requests": [("GET", "/src_ifdirective_unloaded/file.txt", None, {})],
+        },
+        {
+            "name": "ifversion-false-skips-grant",
+            "dir": "src_ifversion_false",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    Require all denied",
+                "    <IfVersion 99.0>",
+                "        Require all granted",
+                "    </IfVersion>",
+                "</Directory>",
+            ],
+            "requests": [("GET", "/src_ifversion_false/file.txt", None, {})],
+        },
+        {
+            "name": "setenvif-chains-through-prior-environment",
+            "dir": "src_setenvif_chain",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    SetEnvIf X-First yes FIRST=token",
+                "    SetEnvIf FIRST ^token$ CHAINED",
+                "    <RequireAll>",
+                "        Require all granted",
+                "        Require not env CHAINED",
+                "    </RequireAll>",
+                "</Directory>",
+            ],
+            "requests": [
+                ("GET", "/src_setenvif_chain/file.txt", {"X-First": "yes"}, {})
+            ],
+        },
+        {
+            "name": "setenvif-expands-captures-before-authz",
+            "dir": "src_setenvif_capture",
+            "config": [
+                f'<Directory "{{dir}}">',
+                '    SetEnvIf X-User "^(.+)$" BLOCKED=$1',
+                "    <RequireAll>",
+                "        Require all granted",
+                '        Require not expr "env(\'BLOCKED\') == \'alice\'"',
+                "    </RequireAll>",
+                "</Directory>",
+            ],
+            "requests": [
+                ("GET", "/src_setenvif_capture/file.txt", {"X-User": "alice"}, {})
+            ],
+        },
+        {
+            "name": "setenvif-request-protocol-is-special",
+            "dir": "src_setenvif_protocol",
+            "config": [
+                f'<Directory "{{dir}}">',
+                '    SetEnvIf Request_Protocol "^$" EMPTY_PROTOCOL',
+                "    Require env EMPTY_PROTOCOL",
+                "</Directory>",
+            ],
+            "requests": [("GET", "/src_setenvif_protocol/file.txt", None, {})],
+        },
+        {
+            "name": "require-host-expands-string-expression",
+            "dir": "src_require_host_expr",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    <RequireAll>",
+                "        Require all granted",
+                '        Require not host "%{HTTP_HOST}"',
+                "    </RequireAll>",
+                "</Directory>",
+            ],
+            "requests": [
+                ("GET", "/src_require_host_expr/file.txt", {"Host": "localhost"}, {})
+            ],
+        },
+        {
+            "name": "setenv-is-not-visible-to-if-grant",
+            "dir": "src_setenv_if_late",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    SetEnv LATE_ALLOW yes",
+                "    Require all denied",
+                '    <If "env(\'LATE_ALLOW\') == \'yes\'">',
+                "        Require all granted",
+                "    </If>",
+                "</Directory>",
+            ],
+            "requests": [("GET", "/src_setenv_if_late/file.txt", None, {})],
+        },
+        {
+            "name": "directory-rewrite-env-authz-phase",
+            "dir": "src_dir_rewrite_env",
+            "config": [
+                f'<Directory "{{dir}}">',
+                "    RewriteEngine On",
+                "    RewriteRule ^ - [E=EARLY_ALLOW:yes]",
+                "    Require env EARLY_ALLOW",
+                "</Directory>",
+            ],
+            "requests": [("GET", "/src_dir_rewrite_env/file.txt", None, {})],
+        },
+        {
+            "name": "server-rewrite-env-authz-phase",
+            "dir": "src_server_rewrite_env",
+            "config": [
+                "RewriteEngine On",
+                "RewriteRule ^/src_server_rewrite_env/ - [E=EARLY_ALLOW:yes]",
+                f'<Directory "{{dir}}">',
+                "    Require env EARLY_ALLOW",
+                "</Directory>",
+            ],
+            "requests": [("GET", "/src_server_rewrite_env/file.txt", None, {})],
+        },
+    ]
+)
+
+
 def random_cases(count: int, seed: int):
     """Deterministic randomized matrix over security-relevant merge shapes."""
     rng = random.Random(seed)
@@ -2491,6 +2820,12 @@ def main():
                 if p.exists():
                     print(p.read_text()[-8000:])
             return 1
+
+        # EXEC_ON_READ sections are fixed while each configuration is parsed.
+        # Create these probes only after both servers have completed startup.
+        for case in CASES:
+            for rel, content in case.get("post_start_files", {}).items():
+                case_file(case, rel, content)
 
         failures = 0
         for case in CASES:

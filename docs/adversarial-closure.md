@@ -2,7 +2,7 @@
 
 This document records how the `adversarial/findings.md` adversarial pass is reflected in
 the implementation and the security model.  The numbered findings are the
-source of the regression classes; the invariants (`I9`–`I61` in
+source of the regression classes; the invariants (`I9`–`I71` in
 `docs/config-semantics.md`) are the properties that prevent the class from
 returning through a different directive or dispatch path.
 
@@ -17,7 +17,7 @@ returning through a different directive or dispatch path.
 | F7 | Cache key omitted listener/vhost/target | Key includes scheme, listener address/port, vhost, Host, canonical URL, query, resolved target and policy fingerprint | I10, I12 |
 | F8 | Disk fallback ignored `Vary` | `cache_lookup_admit` receives the real `vary_match` result on disk reload; a mismatch is neither served nor inserted | I12 |
 | F9 | `<Proxy balancer://...>` never matched; failover reused the first grant | Proxy sections match both the logical balancer URL and the concrete member; failover re-runs proxy authorization and rebinds the member target | I8 |
-| F10 | `.htaccess` `<IfModule>` allowlist skipped security blocks | Positive `<IfModule>` blocks are parsed for every module name; unknown directives inside still fail closed. Negated blocks only skip known built-ins | I9 |
+| F10 | `.htaccess` `<IfModule>` allowlist skipped security blocks | Access files now consult the compiled configuration's exact linked/loaded module registry. Positive blocks for missing modules are skipped like Apache, while present modules are parsed normally; the old unconditional-positive behavior could activate a grant Apache never selected | I9, I71 |
 | F11 | `SymLinksIfOwnerMatch` followed all links | Owner-only mode checks each symlink owner against its resolved target and returns `403` on mismatch; unconditional `FollowSymLinks` retains the previous behavior | I11 |
 | F12 | Unsafe methods left disk entries stale | Invalidation removes persisted body/meta files as well as memory entries | I12 |
 | F13 | `Header always`/`unset` ignored; child `set` duplicated | `always`/`onsuccess` are separate lists, `unset` runs after set/add, and child `set` replaces inherited same-name fields | Scope-merge header rule |
@@ -35,7 +35,7 @@ returning through a different directive or dispatch path.
 | F25 | Relative `AliasMatch` target skipped its target-tree `.htaccess` | Relative regex replacement roots are resolved against `ServerRoot` at parse time, matching `map_path()` and the access-file walk | I10, I21 |
 | F26 | Autoindex emitted executable `javascript:`/scheme-relative links | Autoindex hrefs are built by `safe_relative_href`, which always prefixes `./` before URL encoding | I22 |
 | F27 | `Require not env` parsed the wrong operand; `Require not expr` lost negation | `parse_require` consumes `rest.first()`/`rest.join(" ")`, and `Require::Expr` carries its negation into evaluation | I23 |
-| F28 | `.htaccess` `SetEnv`/`SetEnvIf` silently ignored | Both `.htaccess` and main config use one environment-rule parser and populate `EnvironmentPolicy`; `UnsetEnv`/`PassEnv` are modeled too | I23 |
+| F28 | `.htaccess` `SetEnv`/`SetEnvIf` silently ignored | Both `.htaccess` and main config use one environment-rule parser and populate `EnvironmentPolicy`; `SetEnvIf` is authorization-visible, while per-directory rewrite environment and `SetEnv`/`UnsetEnv`/`PassEnv` retain Apache's later fixups timing | I23, I71 |
 | F29 | `IndexIgnore` accepted and ignored | `IndexIgnore` is part of `ContentPolicy` in both parsers and filters autoindex entries | I24 |
 | F30 | `DirectorySlash Off` let `/dir` bypass `<Location "/dir/">` | A no-slash directory target is reauthorized as its canonical trailing-slash URL before index or autoindex dispatch | I24 |
 | F31 | Regex alias fallback re-rooted a target outside its alias base | `map_path()` returns `None` when a regex expansion leaves `fs_path`; dispatch, WebSocket and cache callers fail closed instead of using `target.parent()` as a new root; admission consumes the verified component-aware `path_under_base` kernel | I25 |
@@ -375,7 +375,7 @@ The closure is exercised by:
 
 Any new directive that changes a request-to-resource mapping, cache key,
 handler selection, authorization identity or inherited descriptor must state
-which of I9–I70 it preserves.  A directive that is recognized but not
+which of I9–I71 it preserves.  A directive that is recognized but not
 implemented is not allowed to pass as “inert” unless that disposition is
 explicit and local to the directive (a `Location` pattern that cannot be
 represented is a configuration error, never an inert literal scope);

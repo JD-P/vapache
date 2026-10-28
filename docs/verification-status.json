@@ -494,7 +494,7 @@
   },
   "adversarial": {
     "conformance": 165,
-    "semantics": 212,
+    "semantics": 235,
     "random": 300,
     "cve_replay_cases": 29,
     "unexplained_replay_failures": 0,

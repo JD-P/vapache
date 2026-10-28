@@ -3367,7 +3367,7 @@ fn run_fastcgi(
         server_name,
         host: server_name,
         follow_symlinks: true,
-        env: &scope.request_env(req, url_path),
+        env: &scope.request_env(req, url_path, peer.ip()),
         remote_user,
         auth_type,
         script_file: None,
@@ -3480,7 +3480,7 @@ fn run_cgi(
         server_name,
         host: server_name,
         follow_symlinks: follow,
-        env: &scope.request_env(req, url_path),
+        env: &scope.request_env(req, url_path, peer.ip()),
         remote_user,
         auth_type,
         script_file: Some(script_file),
@@ -3493,14 +3493,43 @@ fn run_cgi(
 
 fn apply_rewrite_effects(scope: &mut crate::config::Scope, effects: &crate::rewrite::Effects) {
     for (name, value) in &effects.env {
-        scope.environment_policy.set_env.retain(|(n, _)| n != name);
-        scope.environment_policy.unset_env.retain(|n| n != name);
+        scope
+            .environment_policy
+            .rewrite_env
+            .retain(|(n, _)| n != name);
+        scope
+            .environment_policy
+            .rewrite_unset_env
+            .retain(|n| n != name);
         match value {
             Some(value) => scope
                 .environment_policy
-                .set_env
+                .rewrite_env
                 .push((name.clone(), value.clone())),
-            None => scope.environment_policy.unset_env.push(name.clone()),
+            None => scope
+                .environment_policy
+                .rewrite_unset_env
+                .push(name.clone()),
+        }
+    }
+    for (name, value) in &effects.late_env {
+        scope
+            .environment_policy
+            .rewrite_late_env
+            .retain(|(n, _)| n != name);
+        scope
+            .environment_policy
+            .rewrite_late_unset_env
+            .retain(|n| n != name);
+        match value {
+            Some(value) => scope
+                .environment_policy
+                .rewrite_late_env
+                .push((name.clone(), value.clone())),
+            None => scope
+                .environment_policy
+                .rewrite_late_unset_env
+                .push(name.clone()),
         }
     }
     for name in &effects.vary {
@@ -4142,6 +4171,7 @@ mod tests {
                 ("GONE".into(), Some("3".into())),
                 ("NEW".into(), None),
             ],
+            late_env: vec![("LATE".into(), Some("4".into()))],
             cookies: vec!["a=1".into(), "b=2".into()],
             handler: Some("new".into()),
             content_type: Some("text/plain".into()),
@@ -4151,7 +4181,7 @@ mod tests {
         assert_eq!(
             scope
                 .environment_policy
-                .set_env
+                .rewrite_env
                 .iter()
                 .find(|(n, _)| n == "OLD")
                 .unwrap()
@@ -4160,13 +4190,18 @@ mod tests {
         );
         assert!(scope
             .environment_policy
-            .unset_env
+            .rewrite_unset_env
             .contains(&"NEW".to_string()));
         assert!(scope
             .environment_policy
-            .set_env
+            .rewrite_env
             .iter()
             .any(|(n, v)| n == "GONE" && v == "3"));
+        assert!(scope
+            .environment_policy
+            .rewrite_late_env
+            .iter()
+            .any(|(n, v)| n == "LATE" && v == "4"));
         assert_eq!(scope.header_policy.vary, vec!["Accept", "X-Test"]);
         assert_eq!(scope.header_policy.cookies, vec!["a=1", "b=2"]);
         assert!(scope

@@ -609,21 +609,25 @@ separate text-context operation.
 ### I23 — Provider operands and directive effects
 
 ```text
-parse("Require not env NAME")   -> Env { negate: true, name: NAME }
-parse("Require not env NAME=V") -> Env { negate: true, name: NAME, value: V }
-parse("Require not expr E")     -> Expr { negate: true, expr: E }
+parse("Require not env A B") -> Env { negate: true, names: [A, B] }
+eval(Require env A B)         -> present_ci(A) || present_ci(B)
+parse("Require not expr E")  -> Expr { negate: true, expr: E }
 
 Accepted(.htaccess) ==> every directive is modeled or fails closed
 ```
 
 Negation shifts the operand with the provider; it does not read the literal
-`env`/`expr` token.  Environment and autoindex directives are not
+`env`/`expr` token. Every `Require env` operand participates in the one
+provider result; `NAME=VALUE` comparisons are not implemented and fail
+configuration loading. Names use APR table's case-insensitive key semantics.
+Environment and autoindex directives are not
 "accepted but inert": `SetEnv`, `SetEnvIf`, `UnsetEnv`, `PassEnv` and
 `IndexIgnore` populate the same `EnvironmentPolicy`/`ContentPolicy` fields in
-the main configuration and `.htaccess` parsers.  A directive that feeds
-`Require env`, `Require expr`, autoindex or response policy counts as
-effectful.  The exhaustive disposition registry and effect matrix for every
-recognized `.htaccess` directive are specified in I29.
+the main configuration and `.htaccess` parsers. Only the authorization-phase
+environment in I71 feeds `Require env`/`Require expr`; late mod_env directives
+remain effectful for CGI/FastCGI without becoming ACL inputs. The exhaustive
+disposition registry and effect matrix for every recognized `.htaccess`
+directive are specified in I29.
 
 ### I24 — Canonical directory URL and autoindex policy
 
@@ -790,11 +794,12 @@ conversion:
 | WebSocket rewrite/proxy | rewritten proxy target | rewrite gate, proxy authorization, backend binding |
 
 The original-URL gate deliberately uses the **original request context** and
-applies the accumulated rewrite effects before evaluating the original scope.
+applies the accumulated mapping effects before evaluating the original scope.
 A rewrite that changes only the query string or only `[E=...]` environment
-state therefore still rechecks the original URL policy; it cannot use the
-rewritten query or environment to escape it.  The final target scope uses the
-current rewritten request context.
+state therefore still rechecks the original URL policy. Environment effects
+are admitted according to I71: server-scope `[E]` is already visible, while
+per-directory `[E]` remains fixups-late and cannot influence either ACL gate.
+The final target scope uses the current rewritten request context.
 
 ### I31 — CGI/FastCGI execution boundary
 
@@ -1341,6 +1346,28 @@ from the lexical view, so canonical Files access restrictions remain active.
 `handler_identity_lexical_admit` guards selection and
 `handler_scope_lexical_admit` proves the Files-scope obligation.
 
+### I71 — Configuration and environment phase identity
+
+```text
+read-time branch = IfModule/IfDefine/IfFile/IfDirective/IfSection/IfVersion
+authz_env = SetEnvIf + server-scope RewriteRule [E]
+fixups_env = authz_env + directory/access-file [E] + SetEnv/PassEnv - UnsetEnv
+ACL input == authz_env
+```
+
+Apache's core conditional sections select their branch while configuration is
+read; `<IfFile>` is not a request-time filesystem oracle, and linked modules
+exist in the `<IfModule>` registry before any `LoadModule`. Access files use
+the compiled configuration's same module/directive/section registry. Unknown
+sections and conditional ownership that cannot be represented are rejected
+rather than made transparent.
+
+Environment visibility follows hook order. `SetEnvIf` and server-scope
+rewrite environment effects exist before authorization. Per-directory and
+access-file rewrite effects run during fixups, followed by mod_env's
+`SetEnv`/`PassEnv`/`UnsetEnv`, so those values may reach CGI/FastCGI but can
+never satisfy `Require env`, change `Require expr`, or select an ACL `<If>`.
+
 ### I51 — Cache key byte identity
 
 ```text
@@ -1813,7 +1840,8 @@ The first `ScopePolicy` slice now exists in
   decision and child-presence inheritance;
 - `HeaderPolicy` owns header add/set/unset lists, expiration state,
   cookies and Vary, with append/child-presence merge rules;
-- `EnvironmentPolicy` owns `SetEnv`/`UnsetEnv`/`PassEnv`/`SetEnvIf` state;
+- `EnvironmentPolicy` owns phase-separated server rewrite, per-directory
+  rewrite, `SetEnvIf`, and late `SetEnv`/`UnsetEnv`/`PassEnv` state (I71);
 - `ContentPolicy` owns directory defaults, MIME add/remove/force types,
   ETag/sendfile/directory-slash and access-file names;
 - `MappingPolicy` owns aliases, redirects, handlers and unsupported filters;
@@ -1925,7 +1953,7 @@ subset, not a proof over arbitrary Apache syntax.
 The pre-proof suite is:
 
 - `tests/conformance.py` — 165 fixed Apache differential/conformance tests.
-- `tests/config_semantics.py` — 194 systematic generated cases, plus
+- `tests/config_semantics.py` — 235 fixed systematic cases, plus
   `--random N --seed S` deterministic randomized cases.
 - `tests/config_validity.py` — `apache2 -t` vs `vapached -t` context matrix.
 - `tests/config_grammar.py` — finite supported directive/context grammar,

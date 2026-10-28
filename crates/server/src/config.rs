@@ -291,8 +291,7 @@ pub enum Require {
     },
     Env {
         negate: bool,
-        name: String,
-        value: Option<String>,
+        names: Vec<String>,
     },
     Expr {
         negate: bool,
@@ -318,6 +317,29 @@ pub enum RequireNode {
     All(Vec<RequireNode>),
     Any(Vec<RequireNode>),
     None(Vec<RequireNode>),
+}
+
+pub(crate) fn require_is_negated(require: &Require) -> bool {
+    match require {
+        Require::Ip { negate, .. }
+        | Require::Local { negate }
+        | Require::Host { negate, .. }
+        | Require::Method { negate, .. }
+        | Require::ValidUser { negate }
+        | Require::Env { negate, .. }
+        | Require::Expr { negate, .. }
+        | Require::User { negate, .. }
+        | Require::Group { negate, .. } => *negate,
+        Require::AllGranted | Require::AllDenied | Require::Unsupported(_) => false,
+    }
+}
+
+pub(crate) fn require_node_is_negative(node: &RequireNode) -> bool {
+    match node {
+        RequireNode::Provider(require) => require_is_negated(require),
+        RequireNode::None(_) => true,
+        RequireNode::All(_) | RequireNode::Any(_) => false,
+    }
 }
 
 /// A set of HTTP methods used by `<Limit>` / `<LimitExcept>`.
@@ -1247,6 +1269,26 @@ pub(crate) fn parse_env_rule(name: &str, args: &[String]) -> Result<EnvRule, Str
     let Some(pattern) = args.get(pattern_idx) else {
         return Err(format!("{name} requires an attribute, pattern and action"));
     };
+    let attr_l = attribute.to_ascii_lowercase();
+    if matches!(attr_l.as_str(), "remote_host" | "server_addr") {
+        return Err(format!(
+            "{name} attribute '{attribute}' is not supported safely"
+        ));
+    }
+    if !matches!(
+        attr_l.as_str(),
+        "remote_addr" | "request_uri" | "request_method" | "request_protocol"
+    ) && !attribute
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        // Apache treats a non-simple attribute as a regex over header names.
+        // Refuse that mode until it is represented explicitly; treating the
+        // regex text as an absent header can turn `^$` into an ACL grant.
+        return Err(format!(
+            "{name} regex header attributes are not supported safely"
+        ));
+    }
     let pattern = if nocase {
         format!("(?i:{pattern})")
     } else {
@@ -1260,7 +1302,8 @@ pub(crate) fn parse_env_rule(name: &str, args: &[String]) -> Result<EnvRule, Str
         } else if let Some((k, v)) = action.split_once('=') {
             actions.push((k.to_string(), Some(v.to_string())));
         } else {
-            actions.push((action.to_string(), Some(String::new())));
+            // mod_setenvif assigns "1" to a bare environment action.
+            actions.push((action.to_string(), Some("1".into())));
         }
     }
     if actions.is_empty() {
@@ -1341,6 +1384,10 @@ struct ContainerSnapshot {
     always_set_headers: Vec<(String, u64)>,
     always_unset_headers: Vec<u64>,
     expires_by_type: Vec<u64>,
+    rewrite_env: Vec<u64>,
+    rewrite_unset_env: Vec<u64>,
+    rewrite_late_env: Vec<u64>,
+    rewrite_late_unset_env: Vec<u64>,
     set_env: Vec<u64>,
     unset_env: Vec<u64>,
     pass_env: Vec<u64>,
@@ -1402,6 +1449,10 @@ impl Scope {
                 .collect(),
             always_unset_headers: hash_vec(&self.header_policy.always_unset_headers),
             expires_by_type: hash_vec(&self.header_policy.expires_by_type),
+            rewrite_env: hash_vec(&self.environment_policy.rewrite_env),
+            rewrite_unset_env: hash_vec(&self.environment_policy.rewrite_unset_env),
+            rewrite_late_env: hash_vec(&self.environment_policy.rewrite_late_env),
+            rewrite_late_unset_env: hash_vec(&self.environment_policy.rewrite_late_unset_env),
             set_env: hash_vec(&self.environment_policy.set_env),
             unset_env: hash_vec(&self.environment_policy.unset_env),
             pass_env: hash_vec(&self.environment_policy.pass_env),
@@ -1472,6 +1523,13 @@ impl Scope {
             always_set_headers: merge_set(&parent.always_set_headers, &child.always_set_headers),
             always_unset_headers: append(&parent.always_unset_headers, &child.always_unset_headers),
             expires_by_type: append(&parent.expires_by_type, &child.expires_by_type),
+            rewrite_env: append(&parent.rewrite_env, &child.rewrite_env),
+            rewrite_unset_env: append(&parent.rewrite_unset_env, &child.rewrite_unset_env),
+            rewrite_late_env: append(&parent.rewrite_late_env, &child.rewrite_late_env),
+            rewrite_late_unset_env: append(
+                &parent.rewrite_late_unset_env,
+                &child.rewrite_late_unset_env,
+            ),
             set_env: append(&parent.set_env, &child.set_env),
             unset_env: append(&parent.unset_env, &child.unset_env),
             pass_env: append(&parent.pass_env, &child.pass_env),
@@ -1497,38 +1555,90 @@ impl Scope {
         self.error_policy.get(status)
     }
 
-    pub fn request_env(&self, req: &crate::http::Request, url_path: &str) -> Vec<(String, String)> {
-        let mut env = self.environment_policy.set_env.clone();
+    /// Environment visible before authentication/authorization. Apache runs
+    /// SetEnvIf during request/header parsing and server-scope rewrite `[E]`
+    /// before authz. Per-directory rewrite `[E]` and mod_env's
+    /// SetEnv/PassEnv/UnsetEnv hook run later in fixups.
+    pub fn authorization_env(
+        &self,
+        req: &crate::http::Request,
+        url_path: &str,
+        peer: IpAddr,
+    ) -> Vec<(String, String)> {
+        let mut env: Vec<(String, String)> = Vec::new();
         for rule in &self.environment_policy.set_env_if {
             let attr = rule.attribute.to_ascii_lowercase();
             let value = match attr.as_str() {
                 "request_method" | "request-method" => Some(req.method.clone()),
                 "request_uri" | "request-uri" => Some(url_path.to_string()),
+                "remote_addr" | "remote-addr" => Some(peer.to_string()),
+                "request_protocol" | "request-protocol" => Some(match req.version {
+                    crate::http::Version::Http10 => "HTTP/1.0".to_string(),
+                    crate::http::Version::Http11 => "HTTP/1.1".to_string(),
+                    crate::http::Version::Http2 => "HTTP/2.0".to_string(),
+                }),
                 "host" => req.header_str("host").map(str::to_string),
                 "user-agent" | "user_agent" => req.header_str("user-agent").map(str::to_string),
                 "referer" => req.header_str("referer").map(str::to_string),
                 "content-type" | "content_type" => {
                     req.header_str("content-type").map(str::to_string)
                 }
-                other => req.header_str(other).map(str::to_string),
+                other => req.header_str(other).map(str::to_string).or_else(|| {
+                    env.iter()
+                        .rev()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(other))
+                        .map(|(_, value)| value.clone())
+                }),
             }
             .unwrap_or_default();
-            let mut matches = rule.pattern.is_match(&value);
-            if rule.negate {
-                matches = !matches;
-            }
-            if !matches {
+            let captures = rule.pattern.captures(&value);
+            if captures.is_some() == rule.negate {
                 continue;
             }
             for (name, value) in &rule.actions {
                 match value {
                     Some(v) => {
-                        env.retain(|(n, _)| n != name);
-                        env.push((name.clone(), v.clone()));
+                        let mut expanded = String::new();
+                        if let Some(captures) = &captures {
+                            captures.expand(v, &mut expanded);
+                        } else {
+                            expanded.push_str(v);
+                        }
+                        env.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+                        env.push((name.clone(), expanded));
                     }
-                    None => env.retain(|(n, _)| n != name),
+                    None => env.retain(|(n, _)| !n.eq_ignore_ascii_case(name)),
                 }
             }
+        }
+        for (name, value) in &self.environment_policy.rewrite_env {
+            env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+            env.push((name.clone(), value.clone()));
+        }
+        for name in &self.environment_policy.rewrite_unset_env {
+            env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        }
+        env
+    }
+
+    /// Complete fixups/CGI environment, including late mod_env directives.
+    pub fn request_env(
+        &self,
+        req: &crate::http::Request,
+        url_path: &str,
+        peer: IpAddr,
+    ) -> Vec<(String, String)> {
+        let mut env = self.authorization_env(req, url_path, peer);
+        for (name, value) in &self.environment_policy.rewrite_late_env {
+            env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+            env.push((name.clone(), value.clone()));
+        }
+        for name in &self.environment_policy.rewrite_late_unset_env {
+            env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        }
+        for (name, value) in &self.environment_policy.set_env {
+            env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+            env.push((name.clone(), value.clone()));
         }
         for (name, value) in self
             .environment_policy
@@ -1536,11 +1646,11 @@ impl Scope {
             .iter()
             .filter_map(|name| std::env::var(name).ok().map(|value| (name, value)))
         {
-            env.retain(|(n, _)| n != name);
+            env.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
             env.push((name.clone(), value));
         }
         for name in &self.environment_policy.unset_env {
-            env.retain(|(n, _)| n != name);
+            env.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
         }
         env
     }
@@ -2180,6 +2290,9 @@ pub struct Config {
     pub log_formats: HashMap<String, String>,
     pub custom_logs: Vec<CustomLog>,
     pub modules: Vec<String>,
+    /// Final global `Define` set, used by execute-on-read sections in
+    /// request-parsed access files.
+    pub config_defines: HashSet<String>,
     pub warnings: Vec<String>,
     pub balancers: Vec<Balancer>,
     pub health_templates: HashMap<String, HealthTemplate>,
@@ -2210,6 +2323,39 @@ pub struct Config {
 }
 
 impl Config {
+    pub(crate) fn module_loaded(&self, name: &str) -> bool {
+        let wanted = norm_module(name);
+        prelinked_module_names().contains(&wanted)
+            || self
+                .modules
+                .iter()
+                .any(|module| norm_module(module) == wanted)
+    }
+
+    pub(crate) fn directive_exists(&self, name: &str) -> Result<bool, String> {
+        let name = name.to_ascii_lowercase();
+        if core_directive_exists(&name) {
+            return Ok(true);
+        }
+        if let Some(owner) = directive_owner(&name) {
+            return Ok(self.module_loaded(owner));
+        }
+        if !known_directives().contains(name.as_str()) {
+            return Ok(false);
+        }
+        Err(format!(
+            "cannot safely determine module ownership for <IfDirective {name}>"
+        ))
+    }
+
+    pub(crate) fn section_exists(&self, name: &str) -> bool {
+        match config_section_owner(&name.to_ascii_lowercase()) {
+            Some(None) => true,
+            Some(Some(owner)) => self.module_loaded(owner),
+            None => false,
+        }
+    }
+
     pub fn load(
         path: &Path,
         server_root: &Path,
@@ -2221,7 +2367,7 @@ impl Config {
             events: Vec::new(),
             section_stack: Vec::new(),
             modules: HashSet::new(),
-            module_names: HashSet::new(),
+            module_names: prelinked_module_names(),
             defines: defines.clone(),
             env: env.clone(),
             depth: 0,
@@ -2303,6 +2449,189 @@ fn norm_module(name: &str) -> String {
     let n = n.strip_prefix("mod_").unwrap_or(n);
     let n = n.strip_suffix("_module").unwrap_or(n);
     n.to_ascii_lowercase()
+}
+
+fn prelinked_module_names() -> HashSet<String> {
+    // Apache 2.4.69's linked-in modules (`apache2 -l`). `http_core.c`
+    // declares `http_module`, so retain both accepted spellings.
+    [
+        "core",
+        "so",
+        "watchdog",
+        "http",
+        "http_core",
+        "log_config",
+        "logio",
+        "version",
+        "unixd",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn module_name_is_loaded(names: &HashSet<String>, name: &str) -> bool {
+    names.contains(&norm_module(name))
+}
+
+fn core_directive_exists(name: &str) -> bool {
+    matches!(
+        name,
+        "acceptpathinfo"
+            | "accessfilename"
+            | "adddefaultcharset"
+            | "allowencodedslashes"
+            | "allowoverride"
+            | "allowoverridelist"
+            | "define"
+            | "documentroot"
+            | "enablemmap"
+            | "enablesendfile"
+            | "errordocument"
+            | "errorlog"
+            | "errorlogformat"
+            | "fileetag"
+            | "forcetype"
+            | "hostnamelookups"
+            | "include"
+            | "includeoptional"
+            | "limitinternalrecursion"
+            | "limitrequestbody"
+            | "limitrequestfields"
+            | "limitrequestfieldsize"
+            | "limitrequestline"
+            | "limitxmlrequestbody"
+            | "loglevel"
+            | "maxrangeoverlaps"
+            | "maxranges"
+            | "options"
+            | "protocol"
+            | "protocols"
+            | "protocolshonororder"
+            | "rlimitcpu"
+            | "rlimitmem"
+            | "rlimitnproc"
+            | "serveradmin"
+            | "serveralias"
+            | "servername"
+            | "serverpath"
+            | "serverroot"
+            | "serversignature"
+            | "servertokens"
+            | "sethandler"
+            | "timeout"
+            | "traceenable"
+            | "undefine"
+            | "usecanonicalname"
+            | "usecanonicalphysicalport"
+    )
+}
+
+fn directive_owner(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "loadfile" | "loadmodule" => "so",
+        "require" | "authmerging" | "authzsendforbiddenonfailure" => "authz_core",
+        "allow" | "deny" | "order" | "satisfy" => "access_compat",
+        "allowmethods" => "allowmethods",
+        "authname"
+        | "authtype"
+        | "authbasicprovider"
+        | "authbasicauthoritative"
+        | "authbasicfake" => "auth_basic",
+        "authuserfile" => "authn_file",
+        "authgroupfile" => "authz_groupfile",
+        "alias" | "aliasmatch" | "redirect" | "redirectmatch" | "redirectpermanent"
+        | "redirecttemp" | "scriptalias" | "scriptaliasmatch" => "alias",
+        "directoryindex" | "directoryslash" | "fallbackresource" => "dir",
+        "addhandler" | "addtype" | "removetype" | "removehandler" | "typesconfig"
+        | "multiviewsmatch" => "mime",
+        "header" | "requestheader" => "headers",
+        "setenvif" | "setenvifnocase" | "setenvifexpr" | "browsermatch" | "browsermatchnocase" => {
+            "setenvif"
+        }
+        "setenv" | "unsetenv" | "passenv" => "env",
+        "rewritebase" | "rewritecond" | "rewriteengine" | "rewritemap" | "rewriteoptions"
+        | "rewriterule" => "rewrite",
+        "remoteipheader" | "remoteipinternalproxy" | "remoteiptrustedproxy" => "remoteip",
+        "proxybadheader" | "proxyblock" | "proxyerroroverride" | "proxypass" | "proxypassmatch"
+        | "proxypassreverse" | "proxypreservehost" | "proxyrequests" | "proxyset"
+        | "proxytimeout" => "proxy",
+        "cachedefaultexpire" | "cachedisable" | "cacheenable" | "cacheignoreheaders"
+        | "cachelock" | "cachemaxexpire" | "cachemaxfilesize" | "cachequickhandler"
+        | "cachestorenostore" | "cachestoreprivate" => "cache",
+        "cacheroot" | "cachedirlevels" | "cachedirlength" => "cache_disk",
+        "expiresactive" | "expiresbytype" | "expiresdefault" => "expires",
+        "addoutputfilterbytype" | "filterchain" | "filterdeclare" | "filterprovider" => "filter",
+        "deflatecompressionlevel" | "deflatefilternote" => "deflate",
+        "brotlicompressionquality" => "brotli",
+        "indexignore" | "indexoptions" | "readmename" | "headername" => "autoindex",
+        "sslengine"
+        | "sslprotocol"
+        | "sslciphersuite"
+        | "sslverifyclient"
+        | "sslverifydepth"
+        | "sslcertificatefile"
+        | "sslcertificatekeyfile"
+        | "sslcacertificatefile"
+        | "ssloptions"
+        | "sslrequiressl" => "ssl",
+        "listen" => "mpm_event",
+        "customlog" | "logformat" | "transferlog" => "log_config",
+        "user" | "group" => "unixd",
+        _ => return None,
+    })
+}
+
+fn config_section_owner(name: &str) -> Option<Option<&'static str>> {
+    Some(match name {
+        "directory" | "directorymatch" | "location" | "locationmatch" | "files" | "filesmatch"
+        | "virtualhost" | "limit" | "limitexcept" | "if" | "elseif" | "else" | "ifmodule"
+        | "ifdefine" | "iffile" | "ifdirective" | "ifsection" => None,
+        "ifversion" => Some("version"),
+        "requireall" | "requireany" | "requirenone" | "authzprovideralias" => Some("authz_core"),
+        "proxy" | "proxymatch" => Some("proxy"),
+        _ => return None,
+    })
+}
+
+fn parse_compat_version(value: &str) -> Result<(u32, u32, u32), String> {
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.is_empty() || parts.len() > 3 || parts.iter().any(|part| part.is_empty()) {
+        return Err("IfVersion requires major[.minor[.patch]]".into());
+    }
+    let mut out = [0u32; 3];
+    for (idx, part) in parts.iter().enumerate() {
+        out[idx] = part
+            .parse()
+            .map_err(|_| "IfVersion requires major[.minor[.patch]]".to_string())?;
+    }
+    Ok((out[0], out[1], out[2]))
+}
+
+pub(crate) fn ifversion_matches(args: &[String]) -> Result<bool, String> {
+    let (operator, version) = match args {
+        [version] => ("=", version.as_str()),
+        [operator, version] => (operator.as_str(), version.as_str()),
+        _ => return Err("<IfVersion> requires a version and optional operator".into()),
+    };
+    let (negated, operator) = match operator.strip_prefix('!') {
+        Some(operator) if !operator.is_empty() => (true, operator),
+        _ => (false, operator),
+    };
+    if operator == "~" || version.starts_with('/') {
+        return Err("<IfVersion> regex comparisons are not supported safely".into());
+    }
+    let configured = parse_compat_version(version)?;
+    let current = (2u32, 4u32, 69u32);
+    let matched = match operator {
+        "=" | "==" => current == configured,
+        ">" => current > configured,
+        ">=" => current >= configured,
+        "<" => current < configured,
+        "<=" => current <= configured,
+        _ => return Err(format!("unrecognized <IfVersion> operator '{operator}'")),
+    };
+    Ok(if negated { !matched } else { matched })
 }
 
 impl ParserState {
@@ -2442,7 +2771,15 @@ impl ParserState {
                     } else {
                         false
                     };
-                    let transparent = matches!(name.as_str(), "ifmodule" | "ifdefine");
+                    let transparent = matches!(
+                        name.as_str(),
+                        "ifmodule"
+                            | "ifdefine"
+                            | "iffile"
+                            | "ifdirective"
+                            | "ifsection"
+                            | "ifversion"
+                    );
                     self.events.push(Event::SectionStart {
                         name: name.clone(),
                         args: args.clone(),
@@ -2576,13 +2913,24 @@ impl ParserState {
     }
 
     fn eval_condition(&mut self, name: &str, args: &[String], loc: &SourceLoc) -> bool {
+        let argument = |this: &mut Self| {
+            let Some(raw) = args.first() else {
+                this.error(loc, format!("<{name}> requires an argument"));
+                return None;
+            };
+            if raw.is_empty() {
+                this.error(loc, format!("<{name}> requires an argument"));
+                return None;
+            }
+            Some(match raw.strip_prefix('!') {
+                Some(value) => (true, value),
+                None => (false, raw.as_str()),
+            })
+        };
         match name {
             "ifmodule" => {
-                let arg = args.first().cloned().unwrap_or_default();
-                let (neg, m) = if let Some(stripped) = arg.strip_prefix('!') {
-                    (true, stripped)
-                } else {
-                    (false, arg.as_str())
+                let Some((neg, m)) = argument(self) else {
+                    return false;
                 };
                 let want = norm_module(m);
                 let found = self.module_names.contains(&want)
@@ -2594,11 +2942,8 @@ impl ParserState {
                 }
             }
             "ifdefine" => {
-                let arg = args.first().cloned().unwrap_or_default();
-                let (neg, d) = if let Some(stripped) = arg.strip_prefix('!') {
-                    (true, stripped)
-                } else {
-                    (false, arg.as_str())
+                let Some((neg, d)) = argument(self) else {
+                    return false;
                 };
                 let found = self.defines.contains_key(d);
                 if neg {
@@ -2607,8 +2952,73 @@ impl ParserState {
                     found
                 }
             }
+            "iffile" => {
+                let Some((neg, file)) = argument(self) else {
+                    return false;
+                };
+                let path = Path::new(file);
+                let path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    self.server_root.join(path)
+                };
+                let found = std::fs::metadata(path).is_ok();
+                if neg {
+                    !found
+                } else {
+                    found
+                }
+            }
+            "ifdirective" => {
+                let Some((neg, directive)) = argument(self) else {
+                    return false;
+                };
+                let directive = directive.to_ascii_lowercase();
+                let found = if core_directive_exists(&directive) {
+                    true
+                } else if let Some(owner) = directive_owner(&directive) {
+                    module_name_is_loaded(&self.module_names, owner)
+                } else if !known_directives().contains(directive.as_str()) {
+                    false
+                } else {
+                    self.error(
+                        loc,
+                        format!(
+                            "cannot safely determine module ownership for <IfDirective {directive}>"
+                        ),
+                    );
+                    return false;
+                };
+                if neg {
+                    !found
+                } else {
+                    found
+                }
+            }
+            "ifsection" => {
+                let Some((neg, section)) = argument(self) else {
+                    return false;
+                };
+                let section = section.to_ascii_lowercase();
+                let found = match config_section_owner(&section) {
+                    Some(None) => true,
+                    Some(Some(owner)) => module_name_is_loaded(&self.module_names, owner),
+                    None => false,
+                };
+                if neg {
+                    !found
+                } else {
+                    found
+                }
+            }
+            "ifversion" => match ifversion_matches(args) {
+                Ok(matched) => matched,
+                Err(msg) => {
+                    self.error(loc, msg);
+                    false
+                }
+            },
             "if" => true,
-            "iffile" => true,
             _ => true,
         }
     }
@@ -2708,6 +3118,7 @@ struct Compile {
 impl Compile {
     fn new(p: ParserState, strict: bool) -> Self {
         let server_root = p.server_root.clone();
+        let config_defines: HashSet<String> = p.defines.keys().cloned().collect();
         let modules: Vec<String> = {
             let mut v: Vec<String> = p.modules.into_iter().collect();
             v.sort();
@@ -2751,6 +3162,7 @@ impl Compile {
             log_formats: HashMap::new(),
             custom_logs: Vec::new(),
             modules,
+            config_defines,
             warnings: Vec::new(),
             balancers: Vec::new(),
             health_templates: HashMap::new(),
@@ -3322,13 +3734,41 @@ impl Compile {
                                 }
                                 items.push(entry.node);
                             }
+                            let invalid_negative = match name.as_str() {
+                                "requireall" => {
+                                    !items.iter().any(|item| !require_node_is_negative(item))
+                                }
+                                "requireany" | "requirenone" => {
+                                    items.iter().any(require_node_is_negative)
+                                }
+                                _ => false,
+                            };
+                            if invalid_negative {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!(
+                                        "<{name}> contains an authorization section with no positive provider"
+                                    ),
+                                });
+                                continue;
+                            }
                             let has_items = !items.is_empty();
                             let node = match name.as_str() {
                                 "requireall" => RequireNode::All(items),
                                 "requireany" => RequireNode::Any(items),
                                 _ => RequireNode::None(items),
                             };
-                            if has_items {
+                            if has_items
+                                && section != SectionKind::Require
+                                && require_node_is_negative(&node)
+                            {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!("<{name}> has no effect in <RequireAny>"),
+                                });
+                            } else if has_items {
                                 scope.add_require(node, limit);
                             } else {
                                 self.errors.push(ConfigError {
@@ -3470,11 +3910,16 @@ impl Compile {
                                 self.skip_section();
                                 continue;
                             }
-                            self.warn(format!(
-                                "{}:{}: unsupported section <{name}> treated as transparent",
-                                loc.file, loc.line
-                            ));
-                            self.walk(scope, rules, inside_vhost, in_directory, None, section);
+                            // Inventing transparent semantics for an unknown
+                            // container can turn its conditional grant into an
+                            // unconditional one. Apache refuses unknown
+                            // sections, so fail the configuration too.
+                            self.errors.push(ConfigError {
+                                file: loc.file.clone(),
+                                line: loc.line,
+                                msg: format!("unsupported section <{name}>"),
+                            });
+                            self.skip_section();
                         }
                     }
                 }
@@ -3903,6 +4348,14 @@ impl Compile {
                         });
                         return;
                     }
+                }
+                if section != SectionKind::Require && require_is_negated(&provider) {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "negative Require directive has no effect in <RequireAny>".into(),
+                    });
+                    return;
                 }
                 scope.add_require(RequireNode::Provider(provider), limit);
             }
@@ -5845,7 +6298,7 @@ fn apply_conditional_rule(
     fname: &str,
     chain_state: &mut HashMap<usize, bool>,
 ) {
-    let env = s.request_env(req, url_path);
+    let env = s.authorization_env(req, url_path, peer);
     let matched = rule_condition_result(
         rule,
         req,
@@ -6120,8 +6573,38 @@ pub(crate) fn require_syntax_error(msg: &str) -> bool {
         || msg.starts_with("Require env requires")
         || msg.starts_with("empty Require env variable")
         || msg.starts_with("Require env does not support")
+        || msg.starts_with("Require host dynamic")
+        || msg.starts_with("Require user dynamic")
+        || msg.starts_with("Require group dynamic")
         || msg.starts_with("bad Require expr")
         || msg.starts_with("unknown Require provider")
+}
+
+fn authz_string_operands_supported(operands: &[String]) -> bool {
+    operands.iter().all(|operand| {
+        let mut rest = operand.as_str();
+        while let Some(start) = rest.find("%{") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find('}') else {
+                return false;
+            };
+            let variable = &after[..end];
+            let known = matches!(
+                variable.to_ascii_uppercase().as_str(),
+                "HTTP_HOST" | "REMOTE_ADDR" | "REQUEST_URI" | "REQUEST_METHOD"
+            ) || variable
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("HTTP:"))
+                || variable
+                    .get(..4)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ENV:"));
+            if !known {
+                return false;
+            }
+            rest = &after[end + 1..];
+        }
+        true
+    })
 }
 
 pub(crate) fn parse_require(args: &[String]) -> Require {
@@ -6141,17 +6624,9 @@ pub(crate) fn parse_require(args: &[String]) -> Require {
     let rest = &args[idx + 1..];
     match kind.as_str() {
         "all" if !negate => {
-            if rest
-                .first()
-                .map(|s| s.eq_ignore_ascii_case("granted"))
-                .unwrap_or(false)
-            {
+            if rest.len() == 1 && rest[0].eq_ignore_ascii_case("granted") {
                 Require::AllGranted
-            } else if rest
-                .first()
-                .map(|s| s.eq_ignore_ascii_case("denied"))
-                .unwrap_or(false)
-            {
+            } else if rest.len() == 1 && rest[0].eq_ignore_ascii_case("denied") {
                 Require::AllDenied
             } else {
                 Require::Unsupported("Require all needs granted/denied".into())
@@ -6171,10 +6646,17 @@ pub(crate) fn parse_require(args: &[String]) -> Require {
             Require::Ip { negate, nets }
         }
         "local" => Require::Local { negate },
-        "host" => Require::Host {
-            negate,
-            names: rest.to_vec(),
-        },
+        "host" => {
+            if !authz_string_operands_supported(rest) {
+                return Require::Unsupported(
+                    "Require host dynamic expressions are not supported safely".into(),
+                );
+            }
+            Require::Host {
+                negate,
+                names: rest.to_vec(),
+            }
+        }
         "method" => {
             let methods: Vec<String> = rest.to_vec();
             if !vapache_verified::require_method_operand_admit(
@@ -6186,27 +6668,24 @@ pub(crate) fn parse_require(args: &[String]) -> Require {
             Require::Method { negate, methods }
         }
         "env" => {
-            // Use the operand after the provider token (and after `not`).
-            // Reading `args[1]` made `Require not env BLOCK` test a variable
-            // literally named `env`.
-            let Some(item) = rest.first() else {
+            if rest.is_empty() {
                 return Require::Unsupported("Require env requires a variable".into());
-            };
-            let has_equals = item.contains('=');
-            let name = item.split_once('=').map(|(name, _)| name).unwrap_or(item);
-            if !vapache_verified::require_env_operand_admit(!name.is_empty(), has_equals) {
-                if has_equals {
-                    return Require::Unsupported(
-                        "Require env does not support NAME=VALUE comparisons".into(),
-                    );
+            }
+            let mut names = Vec::with_capacity(rest.len());
+            for item in rest {
+                let has_equals = item.contains('=');
+                let name = item.split_once('=').map(|(name, _)| name).unwrap_or(item);
+                if !vapache_verified::require_env_operand_admit(!name.is_empty(), has_equals) {
+                    if has_equals {
+                        return Require::Unsupported(
+                            "Require env does not support NAME=VALUE comparisons".into(),
+                        );
+                    }
+                    return Require::Unsupported("empty Require env variable".into());
                 }
-                return Require::Unsupported("empty Require env variable".into());
+                names.push(name.to_string());
             }
-            Require::Env {
-                negate,
-                name: name.to_string(),
-                value: None,
-            }
+            Require::Env { negate, names }
         }
         "expr" => {
             let text = rest.join(" ");
@@ -6223,14 +6702,28 @@ pub(crate) fn parse_require(args: &[String]) -> Require {
             }
         }
         "valid-user" => Require::ValidUser { negate },
-        "user" => Require::User {
-            negate,
-            names: rest.to_vec(),
-        },
-        "group" => Require::Group {
-            negate,
-            names: rest.to_vec(),
-        },
+        "user" => {
+            if !authz_string_operands_supported(rest) {
+                return Require::Unsupported(
+                    "Require user dynamic expressions are not supported safely".into(),
+                );
+            }
+            Require::User {
+                negate,
+                names: rest.to_vec(),
+            }
+        }
+        "group" => {
+            if !authz_string_operands_supported(rest) {
+                return Require::Unsupported(
+                    "Require group dynamic expressions are not supported safely".into(),
+                );
+            }
+            Require::Group {
+                negate,
+                names: rest.to_vec(),
+            }
+        }
         "dbm" | "dbd" | "ldap" | "file" => {
             Require::Unsupported("this authentication provider is not implemented".into())
         }
@@ -7214,17 +7707,20 @@ mod tests {
         // (which is the literal word `env`).
         let r = parse_require(&["not".into(), "env".into(), "BLOCK".into()]);
         match r {
-            Require::Env {
-                negate,
-                name,
-                value,
-            } => {
+            Require::Env { negate, names } => {
                 assert!(negate);
-                assert_eq!(name, "BLOCK");
-                assert_eq!(value, None);
+                assert_eq!(names, vec!["BLOCK"]);
             }
             _ => panic!(),
         }
+        match parse_require(&["env".into(), "FIRST".into(), "SECOND".into()]) {
+            Require::Env { names, .. } => assert_eq!(names, vec!["FIRST", "SECOND"]),
+            _ => panic!(),
+        }
+        assert!(matches!(
+            parse_require(&["all".into(), "granted".into(), "denied".into()]),
+            Require::Unsupported(_)
+        ));
         assert!(matches!(
             parse_require(&["not".into(), "env".into(), "BLOCK=1".into()]),
             Require::Unsupported(_)
@@ -8495,7 +8991,7 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
     }
 
     #[test]
-    fn iffile_section_is_applied_per_request() {
+    fn iffile_section_is_frozen_when_configuration_is_read() {
         let file = std::env::temp_dir().join(format!("vapache-iffile-{}", std::process::id()));
         std::fs::write(&file, "x").unwrap();
         let cfg = format!(
@@ -8528,7 +9024,19 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
             .set_headers
             .iter()
             .any(|(n, _)| n == "X-IfFile"));
-        let _ = std::fs::remove_file(file);
+        std::fs::remove_file(file).unwrap();
+        let still_selected = c.effective_scope_req(
+            None,
+            Path::new("/srv/y"),
+            "/y",
+            &req,
+            "127.0.0.1".parse().unwrap(),
+        );
+        assert!(still_selected
+            .header_policy
+            .set_headers
+            .iter()
+            .any(|(n, _)| n == "X-IfFile"));
     }
 
     #[test]
@@ -9059,7 +9567,7 @@ ServerName localhost\n\
         assert_eq!(env_rule.actions.len(), 3);
         assert_eq!(env_rule.actions[0], ("A".into(), Some("1".into())));
         assert_eq!(env_rule.actions[1], ("REMOVE".into(), None));
-        assert_eq!(env_rule.actions[2], ("PLAIN".into(), Some(String::new())));
+        assert_eq!(env_rule.actions[2], ("PLAIN".into(), Some("1".into())));
         let nocase = parse_env_rule(
             "setenvifnocase",
             &["Host".into(), "EXAMPLE".into(), "X=1".into()],
@@ -9074,6 +9582,14 @@ ServerName localhost\n\
             .environment_policy
             .set_env
             .push(("BASE".into(), "1".into()));
+        scope
+            .environment_policy
+            .rewrite_env
+            .push(("SERVER_REWRITE".into(), "early".into()));
+        scope
+            .environment_policy
+            .rewrite_late_env
+            .push(("DIRECTORY_REWRITE".into(), "late".into()));
         let mut rule = parse_env_rule(
             "setenvif",
             &[
@@ -9101,9 +9617,18 @@ ServerName localhost\n\
         let mut req = test_request("GET");
         req.target = b"/x?q=1".to_vec();
         req.headers.insert("content-type", b"text/plain".to_vec());
-        let env = scope.request_env(&req, "/x");
+        let peer = "127.0.0.1".parse().unwrap();
+        let auth_env = scope.authorization_env(&req, "/x", peer);
+        assert!(auth_env.contains(&("HIT".into(), "yes".into())));
+        assert!(auth_env.contains(&("SERVER_REWRITE".into(), "early".into())));
+        assert!(!auth_env.iter().any(|(k, _)| k == "DIRECTORY_REWRITE"));
+        assert!(!auth_env.iter().any(|(k, _)| k == "BASE"));
+        assert!(!auth_env.iter().any(|(k, _)| k == "VAPACHE_TEST_ENV"));
+        let env = scope.request_env(&req, "/x", peer);
         assert!(env.contains(&("HIT".into(), "yes".into())));
-        assert!(!env.iter().any(|(k, _)| k == "BASE"));
+        assert!(env.contains(&("SERVER_REWRITE".into(), "early".into())));
+        assert!(env.contains(&("DIRECTORY_REWRITE".into(), "late".into())));
+        assert!(env.contains(&("BASE".into(), "1".into())));
         assert!(env.contains(&("VAPACHE_TEST_ENV".into(), "passed".into())));
         assert!(!env.iter().any(|(k, _)| k == "DROP"));
         std::env::remove_var("VAPACHE_TEST_ENV");
@@ -9528,7 +10053,12 @@ ServerName localhost\n\
         assert!(!p.eval_condition("ifmodule", &["!test_module".into()], &loc));
         assert!(p.eval_condition("ifmodule", &["!other".into()], &loc));
         assert!(p.eval_condition("if", &[], &loc));
-        assert!(p.eval_condition("iffile", &[], &loc));
+        assert!(!p.eval_condition("iffile", &[], &loc));
+        assert!(p
+            .errors
+            .iter()
+            .any(|error| error.msg.contains("<iffile> requires an argument")));
+        p.errors.clear();
         assert!(p.eval_condition("unknown", &[], &loc));
 
         assert!(p.active());
@@ -10594,9 +11124,8 @@ Require all granted\n\
         let ok = "<Directory /x>\n<RequireAny>\nRequire all granted\n<If true>\nOptions Indexes\n</If>\n</RequireAny>\n</Directory>\n";
         let c = load_text(ok, false).unwrap();
         assert!(c.warnings.iter().any(|w| w.contains("nested sections")));
-        let ok = "<UnknownSection>\nServerName unknown.test\n</UnknownSection>\n";
-        let c = load_text(ok, false).unwrap();
-        assert!(c.warnings.iter().any(|w| w.contains("unsupported section")));
+        let invalid = "<UnknownSection>\nServerName unknown.test\n</UnknownSection>\n";
+        assert!(load_text(invalid, false).is_err());
         let ok = concat!(
             "Listen 127.0.0.1:0\n",
             "<If true>\n",
@@ -11939,7 +12468,7 @@ impl Config {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
         let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
-        let env = base.request_env(req, url_path);
+        let env = base.authorization_env(req, url_path, peer);
         let docroot = self.documentation_root_for(vhost);
         let mut chain_state = HashMap::new();
         let mut out = Vec::new();
