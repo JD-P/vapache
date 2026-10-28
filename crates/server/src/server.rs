@@ -539,14 +539,27 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 }
             };
             let norm = match normalize_uri_path(&decoded) {
-                Some(n) if is_canonical_path(&n) => n,
+                Some(n)
+                    if vapache_verified::canonical_path_text_admit(
+                        is_canonical_path(&n),
+                        std::str::from_utf8(&n).is_ok(),
+                    ) =>
+                {
+                    n
+                }
                 _ => {
                     let _ = write_ws_error(stream, &cfg, 400, b"bad request path");
                     return Ok(());
                 }
             };
             let trailing_slash = decoded.len() > 1 && decoded.ends_with(b"/");
-            let mut url_path = String::from_utf8_lossy(&norm).into_owned();
+            let mut url_path = match String::from_utf8(norm.clone()) {
+                Ok(path) => path,
+                Err(_) => {
+                    let _ = write_ws_error(stream, &cfg, 400, b"request path is not UTF-8");
+                    return Ok(());
+                }
+            };
             if trailing_slash && url_path != "/" {
                 url_path.push('/');
             }
@@ -1249,7 +1262,25 @@ fn dispatch_inner_request(
     let server_name_for_cache = server_name_for(cfg, req, local_ip, local_port);
     let _server_name_guard = crate::expr::set_server_name(&server_name_for_cache);
     let allow_encoded = cfg.encoded_slashes == EncodedSlashes::On;
-    let initial_plan = RequestPlan::from_request(cfg, vhost, req, allow_encoded).ok();
+    let initial_plan = match RequestPlan::from_request(cfg, vhost, req, allow_encoded) {
+        Ok(plan) => Some(plan),
+        Err(crate::request_plan::CanonicalErrorOrPlan::Canonical(error)) => {
+            return error_response(
+                cfg,
+                vhost,
+                vhost.map(|v| &v.scope).unwrap_or(&cfg.global),
+                error.status(),
+                req,
+                &path,
+                local_port,
+                &server_name_for_cache,
+                peer.ip(),
+                local_ip,
+            );
+        }
+        // Preserve the dispatcher's detailed mapping/access-file response.
+        Err(crate::request_plan::CanonicalErrorOrPlan::Plan(_)) => None,
+    };
     let invalidation_path = initial_plan
         .as_ref()
         .map(|plan| plan.url_path().to_string());
@@ -3056,7 +3087,7 @@ pub fn map_path(
             .regex
             .as_ref()
             .expect("regex alias was checked before the prefix branch");
-        let Some(caps) = regex.captures(&url) else {
+        let Some(caps) = regex.captures(url.as_bytes()) else {
             continue;
         };
         let Some(template) = &a.target_template else {
@@ -3064,8 +3095,11 @@ pub fn map_path(
         };
         let mut expanded = template.clone();
         for i in (0..caps.len()).rev() {
-            let value = caps.get(i).map(|m| m.as_str()).unwrap_or("");
-            expanded = expanded.replace(&format!("${i}"), value);
+            let value = caps
+                .get(i)
+                .map(|m| String::from_utf8_lossy(m.as_bytes()))
+                .unwrap_or_default();
+            expanded = expanded.replace(&format!("${i}"), &value);
         }
         let target = PathBuf::from(&expanded);
         let target = if target.is_absolute() {
@@ -3160,13 +3194,16 @@ fn match_redirect<'a>(
     // first-match behavior (a later overlapping redirect is unreachable).
     for r in &scope.mapping_policy.redirects {
         if let Some(regex) = &r.regex {
-            let Some(caps) = regex.captures(url) else {
+            let Some(caps) = regex.captures(url.as_bytes()) else {
                 continue;
             };
             let mut location = r.to.clone();
             for i in (0..caps.len()).rev() {
-                let value = caps.get(i).map(|m| m.as_str()).unwrap_or("");
-                location = location.replace(&format!("${i}"), value);
+                let value = caps
+                    .get(i)
+                    .map(|m| String::from_utf8_lossy(m.as_bytes()))
+                    .unwrap_or_default();
+                location = location.replace(&format!("${i}"), &value);
             }
             return Some((r, location));
         }
@@ -3367,7 +3404,7 @@ fn run_fastcgi(
         server_name,
         host: server_name,
         follow_symlinks: true,
-        env: &scope.request_env(req, url_path, peer.ip()),
+        env: &scope.fastcgi_env(req, url_path, peer.ip()),
         remote_user,
         auth_type,
         script_file: None,
@@ -3496,40 +3533,50 @@ fn apply_rewrite_effects(scope: &mut crate::config::Scope, effects: &crate::rewr
         scope
             .environment_policy
             .rewrite_env
-            .retain(|(n, _)| n != name);
+            .retain(|entry| entry.value.0 != *name);
         scope
             .environment_policy
             .rewrite_unset_env
-            .retain(|n| n != name);
+            .retain(|entry| entry.value != *name);
         match value {
             Some(value) => scope
                 .environment_policy
                 .rewrite_env
-                .push((name.clone(), value.clone())),
+                .push(crate::scope_policy::Originated::main((
+                    name.clone(),
+                    value.clone(),
+                ))),
             None => scope
                 .environment_policy
                 .rewrite_unset_env
-                .push(name.clone()),
+                .push(crate::scope_policy::Originated::main(name.clone())),
         }
     }
-    for (name, value) in &effects.late_env {
+    for effect in &effects.late_env {
+        let (name, value) = &effect.value;
         scope
             .environment_policy
             .rewrite_late_env
-            .retain(|(n, _)| n != name);
+            .retain(|entry| entry.value.0 != *name || entry.origin != effect.origin);
         scope
             .environment_policy
             .rewrite_late_unset_env
-            .retain(|n| n != name);
+            .retain(|entry| entry.value != *name || entry.origin != effect.origin);
         match value {
             Some(value) => scope
                 .environment_policy
                 .rewrite_late_env
-                .push((name.clone(), value.clone())),
+                .push(crate::scope_policy::Originated {
+                    origin: effect.origin,
+                    value: (name.clone(), value.clone()),
+                }),
             None => scope
                 .environment_policy
                 .rewrite_late_unset_env
-                .push(name.clone()),
+                .push(crate::scope_policy::Originated {
+                    origin: effect.origin,
+                    value: name.clone(),
+                }),
         }
     }
     for name in &effects.vary {
@@ -4157,8 +4204,11 @@ mod tests {
         scope
             .environment_policy
             .set_env
-            .push(("OLD".into(), "1".into()));
-        scope.environment_policy.unset_env.push("GONE".into());
+            .push(crate::scope_policy::Originated::main(("OLD".into(), "1".into())));
+        scope
+            .environment_policy
+            .unset_env
+            .push(crate::scope_policy::Originated::main("GONE".into()));
         scope.header_policy.vary.push("Accept".into());
         scope.header_policy.cookies.push("a=1".into());
         scope
@@ -4167,11 +4217,14 @@ mod tests {
             .push(crate::config::Handler::add("*".into(), "old".into()));
         let effects = crate::rewrite::Effects {
             env: vec![
-                ("OLD".into(), Some("2".into())),
-                ("GONE".into(), Some("3".into())),
+                ("OLD".into(), Some(b"2".to_vec())),
+                ("GONE".into(), Some(b"3".to_vec())),
                 ("NEW".into(), None),
             ],
-            late_env: vec![("LATE".into(), Some("4".into()))],
+            late_env: vec![crate::scope_policy::Originated::main((
+                "LATE".into(),
+                Some(b"4".to_vec()),
+            ))],
             cookies: vec!["a=1".into(), "b=2".into()],
             handler: Some("new".into()),
             content_type: Some("text/plain".into()),
@@ -4183,25 +4236,27 @@ mod tests {
                 .environment_policy
                 .rewrite_env
                 .iter()
-                .find(|(n, _)| n == "OLD")
+                .find(|entry| entry.value.0 == "OLD")
                 .unwrap()
+                .value
                 .1,
-            "2"
+            b"2"
         );
         assert!(scope
             .environment_policy
             .rewrite_unset_env
-            .contains(&"NEW".to_string()));
+            .iter()
+            .any(|entry| entry.value == "NEW"));
         assert!(scope
             .environment_policy
             .rewrite_env
             .iter()
-            .any(|(n, v)| n == "GONE" && v == "3"));
+            .any(|entry| entry.value.0 == "GONE" && entry.value.1 == b"3"));
         assert!(scope
             .environment_policy
             .rewrite_late_env
             .iter()
-            .any(|(n, v)| n == "LATE" && v == "4"));
+            .any(|entry| entry.value.0 == "LATE" && entry.value.1 == b"4"));
         assert_eq!(scope.header_policy.vary, vec!["Accept", "X-Test"]);
         assert_eq!(scope.header_policy.cookies, vec!["a=1", "b=2"]);
         assert!(scope
@@ -4353,6 +4408,28 @@ mod tests {
             result.unwrap();
             assert_eq!(cov_status(&text), 400, "{path}: {text}");
         }
+        let mut raw_ws = b"GET /".to_vec();
+        raw_ws.push(0xff);
+        raw_ws.extend_from_slice(
+            b" HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
+              Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        );
+        let mut raw_conn = ScriptConn::new(&raw_ws);
+        handle_connection(
+            &cfg,
+            &logger,
+            &mut raw_conn,
+            cov_peer(),
+            "127.0.0.1",
+            80,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            cov_status(&String::from_utf8_lossy(&raw_conn.output)),
+            400
+        );
 
         let map_cfg = cov_config(&dir, "AliasMatch \"^/escape(.*)$\" \"$1\"\n");
         let (text, result) = cov_run_conn(&map_cfg, &cov_ws_request("/escape/tmp/elsewhere"), 80);
@@ -4463,6 +4540,18 @@ mod tests {
             200 | 403 | 404
         ));
         assert_eq!(cov_dispatch(&cfg, "GET", "/%zz").status, 404);
+        let mut non_utf8 = cov_req("GET", "/");
+        non_utf8.target = b"/\xff".to_vec();
+        non_utf8.raw_path = b"/\xff".to_vec();
+        assert_eq!(
+            dispatch(&cfg, &non_utf8, cov_peer(), "127.0.0.1", 80).status,
+            400
+        );
+        non_utf8.method = "BREW".into();
+        assert_eq!(
+            dispatch(&cfg, &non_utf8, cov_peer(), "127.0.0.1", 80).status,
+            400
+        );
         assert_eq!(cov_dispatch(&cfg, "GET", "/redir").status, 302);
         assert_eq!(cov_dispatch(&cfg, "GET", "/redir/x").status, 302);
         assert_eq!(cov_dispatch(&cfg, "GET", "/gone").status, 404);

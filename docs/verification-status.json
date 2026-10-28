@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-10-28",
   "verus": {
-    "verified_functions": 433,
+    "verified_functions": 446,
     "errors": 0
   },
   "obligations": [
@@ -11,7 +11,7 @@
       "title": "field-wise Scope merge",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "auth_merge_kind, option_child_wins/option_child_presence, options_apply and append_vec are mechanized/used; append-only container/list fields merge through the verified helper; Header set uses ordered child replacement audited by the debug container snapshot; ErrorDocument and RewriteMap are list-backed with reverse child-wins lookup; parser and Options-list construction remain outside this obligation"
+      "evidence": "auth_merge_kind, option_child_wins/option_child_presence, options_apply and append_vec are mechanized/used; append-only container/list fields merge through the verified helper; environment_origin_merge_preserves_tags models every environment value and its main/access origin as one tuple, matching runtime Originated<T>, so append cannot detach or upgrade provenance; Header set uses ordered child replacement audited by the debug container snapshot; ErrorDocument and RewriteMap are list-backed with reverse child-wins lookup; parser and Options-list construction remain outside this obligation"
     },
     {
       "id": "phase_order",
@@ -587,6 +587,9 @@
     "Rewrite expansion-token, matched-action and bounded program-counter state machine",
     "Recursive configuration kind/phase/deferred-slot/order decisions",
     "Exact config/access provenance and depth in the Directory/Files evaluation plan",
-    "Config-before-access conditional source plan with independent chain state"
+    "Config-before-access conditional source plan with independent chain state",
+    "Apache-compatible byte-oriented directive-regex mode with default and inline Unicode classes excluded and exact raw-header byte projection",
+    "Canonical path text admission: normalized path bytes must be valid UTF-8 and invalid input is rejected without lossy projection",
+    "FastCGI environment provenance admission and tagged merge: main configuration allowed, access-file origin rejected without origin upgrades"
   ]
 }

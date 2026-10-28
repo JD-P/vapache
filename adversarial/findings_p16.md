@@ -1,5 +1,12 @@
 # Pass 16 — adversarial break of HEAD `8454631` ("Remove h2 because uh, why?")
 
+> Remediation status (2026-10-28): fixed in the current tree. Access-file
+> environment provenance is excluded from FastCGI parameters; directive
+> regexes use ASCII-default byte semantics; header guards match raw bytes; and
+> the P16-D SetEnvIf semantics are regression-pinned. The retained harness now
+> requires Apache/vapache parity instead of reproducing the differentials, and
+> its FastCGI cases use a built-in protocol mock so PHP-FPM is not required.
+
 - **Date:** 2026-10-28
 - **Subject:** `target/release/vapached` built at HEAD `8454631`. No product source was edited. The only retained additions for this pass are `adversarial/p16/exploit_p16.py`, this write-up and the `adversarial/README.md` index entry.
 - **Build note:** `vendor/h2-0.4.20` is an intentional upstream patch: public `h2` 0.4.20 accepts a `:path` containing a `#` fragment and lets `http::uri::PathAndQuery` truncate it before vapache can validate the pseudo-header. HEAD `8454631` deletes that tree but leaves the `[patch.crates-io] h2 = { path = "vendor/h2-0.4.20" }` entry, so a clean checkout cannot build. The directory was restored from the parent commit with `git checkout 6b781ea -- vendor/h2-0.4.20`; this restores the intended patched dependency and does not participate in any finding.
@@ -435,7 +442,7 @@ Expected final line:
 36/36 differential verdicts
 ```
 
-The harness builds its fixture under `/tmp/opencode/p16-harness`, binds Apache and vapached to sibling loopback ports, starts a **fresh PHP-FPM per FastCGI case** (so `auto_prepend_file` state cannot leak between A cases), and kills only its own process groups. It requires `php-fpm8.4`, `php-fpm8.2` or `php-fpm` for the A groups; the B, C and D groups need only Apache's `mod_cgi`/`mod_rewrite`/`mod_setenvif` and `mod_authz_core`.
+The retained remediation harness builds its fixture under `/tmp/opencode/p16-harness`, binds Apache and vapached to sibling loopback ports, starts a fresh built-in FastCGI Unix-socket mock per A case, and kills only its own process groups. The mock reports whether `PHP_VALUE` or `PHP_ADMIN_VALUE` reached the backend, so PHP-FPM is no longer a test dependency. The B, C and D groups need Apache's `mod_cgi`/`mod_rewrite`/`mod_setenvif` and `mod_authz_core`.
 
 The full observed row set:
 

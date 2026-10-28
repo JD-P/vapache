@@ -601,7 +601,7 @@ pub fn trace_access_files_with_root(
 fn rule_matches(kind: &MatchKind, fname: &str, url_path: &str) -> bool {
     match kind {
         MatchKind::Always => true,
-        MatchKind::Files(re) | MatchKind::FilesMatch(re) => re.is_match(fname),
+        MatchKind::Files(re) | MatchKind::FilesMatch(re) => re.is_match(fname.as_bytes()),
         MatchKind::FilesGlob(pattern) => {
             vapache_verified::fnmatch_match(pattern.as_bytes(), fname.as_bytes(), false)
         }
@@ -615,9 +615,9 @@ fn rule_matches(kind: &MatchKind, fname: &str, url_path: &str) -> bool {
         MatchKind::LocationGlob(pattern) => {
             vapache_verified::fnmatch_match(pattern.as_bytes(), url_path.as_bytes(), true)
         }
-        MatchKind::LocationMatch(re) => re.is_match(url_path),
+        MatchKind::LocationMatch(re) => re.is_match(url_path.as_bytes()),
         MatchKind::Directory(p) => Path::new(url_path).starts_with(p),
-        MatchKind::DirectoryMatch(re) => re.is_match(url_path),
+        MatchKind::DirectoryMatch(re) => re.is_match(url_path.as_bytes()),
     }
 }
 
@@ -2123,6 +2123,7 @@ fn apply_directive(
                 .as_deref()
                 .unwrap_or(match_base);
             let mut rule = parse_rewrite_rule(args, match_base, true)?;
+            rule.access_file = true;
             rule.base = normalize_rewrite_base(subst_base);
             rule.conditions = std::mem::take(&mut scope.rewrite_policy.pending_rewrite_conds);
             scope.rewrite_policy.rewrite_rules.push(rule);
@@ -2180,21 +2181,34 @@ fn apply_directive(
             scope
                 .environment_policy
                 .set_env
-                .push((name.clone(), args[1..].join(" ")));
+                .push(crate::scope_policy::Originated::access((
+                    name.clone(),
+                    args[1..].join(" "),
+                )));
         }
         "unsetenv" => scope
             .environment_policy
             .unset_env
-            .extend(args.iter().cloned()),
+            .extend(
+                args.iter()
+                    .cloned()
+                    .map(crate::scope_policy::Originated::access),
+            ),
         "passenv" => scope
             .environment_policy
             .pass_env
-            .extend(args.iter().cloned()),
+            .extend(
+                args.iter()
+                    .cloned()
+                    .map(crate::scope_policy::Originated::access),
+            ),
         "setenvif" | "setenvifnocase" | "browsermatch" | "browsermatchnocase" => {
             scope
                 .environment_policy
                 .set_env_if
-                .push(crate::config::parse_env_rule(name, args)?);
+                .push(crate::scope_policy::Originated::access(
+                    crate::config::parse_env_rule(name, args)?,
+                ));
         }
         "indexignore" => {
             scope
@@ -2566,6 +2580,8 @@ mod tests {
             concat!(
                 "SetEnv STATIC yes\n",
                 "SetEnvIf X-Block yes BLOCK=1\n",
+                "RewriteEngine On\n",
+                "RewriteRule ^ - [E=ACCESS_REWRITE:yes]\n",
                 "<Files \"secret.txt\">\n",
                 "Require expr \"%{ENV:BLOCK} == ''\"\n",
                 "</Files>\n",
@@ -2573,11 +2589,18 @@ mod tests {
         )
         .unwrap();
         let p = parse_file(&cfg, &file, OverrideMode::All, "/").unwrap();
+        assert_eq!(p.scope.environment_policy.set_env[0].value,
+            ("STATIC".to_string(), "yes".to_string()));
         assert_eq!(
-            p.scope.environment_policy.set_env,
-            vec![("STATIC".to_string(), "yes".to_string())]
+            p.scope.environment_policy.set_env[0].origin,
+            vapache_verified::EnvironmentOrigin::AccessFile
         );
         assert_eq!(p.scope.environment_policy.set_env_if.len(), 1);
+        assert_eq!(
+            p.scope.environment_policy.set_env_if[0].origin,
+            vapache_verified::EnvironmentOrigin::AccessFile
+        );
+        assert!(p.scope.rewrite_policy.rewrite_rules[0].access_file);
         let mut req = crate::http::Request {
             method: "GET".into(),
             target: b"/secret.txt".to_vec(),
@@ -2593,8 +2616,10 @@ mod tests {
         };
         req.headers.push("X-Block", "yes");
         let env = p.scope.request_env(&req, "/", "127.0.0.1".parse().unwrap());
-        assert!(env.iter().any(|(n, v)| n == "STATIC" && v == "yes"));
-        assert!(env.iter().any(|(n, v)| n == "BLOCK" && v == "1"));
+        assert!(env.iter().any(|(n, v)| n == "STATIC" && v == b"yes"));
+        assert!(env.iter().any(|(n, v)| n == "BLOCK" && v == b"1"));
+        let fastcgi = p.scope.fastcgi_env(&req, "/", "127.0.0.1".parse().unwrap());
+        assert!(!fastcgi.iter().any(|(n, _)| n == "STATIC" || n == "BLOCK"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3882,7 +3907,7 @@ mod tests {
         );
         assert_eq!(access_root_for(&cfg, None, &dir.join("other")), www);
 
-        let re = |p: &str| regex::Regex::new(p).unwrap();
+        let re = |p: &str| regex::bytes::Regex::new(p).unwrap();
         assert!(rule_matches(&MatchKind::Always, "x", "/x"));
         assert!(rule_matches(&MatchKind::Files(re("x")), "x", "/x"));
         assert!(rule_matches(&MatchKind::FilesMatch(re("x")), "x", "/x"));

@@ -13,9 +13,14 @@
 
 use crate::scope_policy::{
     AuthorizationPolicy, CompressionPolicy, ContentPolicy, EnvironmentPolicy, ErrorDocumentPolicy,
-    HeaderPolicy, MappingPolicy, OptionsPolicy, OverridePolicy, ProxyPolicy, RewriteCachePolicy,
+    HeaderPolicy, MappingPolicy, OptionsPolicy, Originated, OverridePolicy, ProxyPolicy,
+    RewriteCachePolicy,
 };
-use regex::Regex;
+// Apache's directive regexes operate on request bytes and use ASCII character
+// classes unless UTF mode was explicitly requested.  Keeping one byte-regex
+// type for every directive surface prevents Unicode `\w`/`\b` semantics and
+// lossy UTF-8 conversion from silently changing an ACL decision.
+use regex::bytes::Regex;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -24,6 +29,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -724,6 +730,10 @@ pub struct RewriteRule {
     /// the URL-mapping root and targets deeper than the URL mount (F58/I58).
     pub subject_dir: Option<PathBuf>,
     pub per_dir: bool,
+    /// True only for rules parsed from an access file.  Directory-context
+    /// rules in the trusted main configuration are also `per_dir`, so phase
+    /// alone is not a sufficient provenance boundary for FastCGI.
+    pub access_file: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1255,6 +1265,12 @@ pub struct EnvRule {
     pub actions: Vec<(String, Option<String>)>,
 }
 
+/// Byte-exact request environment used by authorization, rewrite evaluation,
+/// CGI and FastCGI. Text conversion is deferred until a consumer explicitly
+/// requires UTF-8, so chained captures cannot collapse attacker-controlled
+/// bytes through the replacement character.
+pub type RequestEnvironment = Vec<(String, Vec<u8>)>;
+
 /// Parse `SetEnvIf`, `SetEnvIfNoCase`, `BrowserMatch` and
 /// `BrowserMatchNoCase` uniformly.  `.htaccess` and the main configuration
 /// must share this parser: silently dropping or mis-indexing an environment
@@ -1559,38 +1575,58 @@ impl Scope {
     /// SetEnvIf during request/header parsing and server-scope rewrite `[E]`
     /// before authz. Per-directory rewrite `[E]` and mod_env's
     /// SetEnv/PassEnv/UnsetEnv hook run later in fixups.
-    pub fn authorization_env(
-        &self,
+    fn apply_set_env_if_rules(
+        rules: &[Originated<EnvRule>],
         req: &crate::http::Request,
         url_path: &str,
         peer: IpAddr,
-    ) -> Vec<(String, String)> {
-        let mut env: Vec<(String, String)> = Vec::new();
-        for rule in &self.environment_policy.set_env_if {
-            let attr = rule.attribute.to_ascii_lowercase();
-            let value = match attr.as_str() {
-                "request_method" | "request-method" => Some(req.method.clone()),
-                "request_uri" | "request-uri" => Some(url_path.to_string()),
-                "remote_addr" | "remote-addr" => Some(peer.to_string()),
-                "request_protocol" | "request-protocol" => Some(match req.version {
-                    crate::http::Version::Http10 => "HTTP/1.0".to_string(),
-                    crate::http::Version::Http11 => "HTTP/1.1".to_string(),
-                    crate::http::Version::Http2 => "HTTP/2.0".to_string(),
-                }),
-                "host" => req.header_str("host").map(str::to_string),
-                "user-agent" | "user_agent" => req.header_str("user-agent").map(str::to_string),
-                "referer" => req.header_str("referer").map(str::to_string),
-                "content-type" | "content_type" => {
-                    req.header_str("content-type").map(str::to_string)
-                }
-                other => req.header_str(other).map(str::to_string).or_else(|| {
-                    env.iter()
-                        .rev()
-                        .find(|(name, _)| name.eq_ignore_ascii_case(other))
-                        .map(|(_, value)| value.clone())
-                }),
+        fastcgi: bool,
+        env: &mut RequestEnvironment,
+    ) {
+        for entry in rules {
+            if fastcgi
+                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
+            {
+                continue;
             }
-            .unwrap_or_default();
+            let rule = &entry.value;
+            let attr = rule.attribute.to_ascii_lowercase();
+            let value: Vec<u8> = match attr.as_str() {
+                "request_method" | "request-method" => req.method.as_bytes().to_vec(),
+                "request_uri" | "request-uri" => url_path.as_bytes().to_vec(),
+                "remote_addr" | "remote-addr" => peer.to_string().into_bytes(),
+                "request_protocol" | "request-protocol" => match req.version {
+                    crate::http::Version::Http10 => b"HTTP/1.0".to_vec(),
+                    crate::http::Version::Http11 => b"HTTP/1.1".to_vec(),
+                    crate::http::Version::Http2 => b"HTTP/2.0".to_vec(),
+                },
+                "host" => req
+                    .header("host")
+                    .map(vapache_verified::guard_header_bytes)
+                    .unwrap_or_default(),
+                "user-agent" | "user_agent" => req
+                    .header("user-agent")
+                    .map(vapache_verified::guard_header_bytes)
+                    .unwrap_or_default(),
+                "referer" => req
+                    .header("referer")
+                    .map(vapache_verified::guard_header_bytes)
+                    .unwrap_or_default(),
+                "content-type" | "content_type" => req
+                    .header("content-type")
+                    .map(vapache_verified::guard_header_bytes)
+                    .unwrap_or_default(),
+                other => req
+                    .header(other)
+                    .map(vapache_verified::guard_header_bytes)
+                    .or_else(|| {
+                        env.iter()
+                            .rev()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(other))
+                            .map(|(_, value)| value.clone())
+                    })
+                    .unwrap_or_default(),
+            };
             let captures = rule.pattern.captures(&value);
             if captures.is_some() == rule.negate {
                 continue;
@@ -1598,11 +1634,11 @@ impl Scope {
             for (name, value) in &rule.actions {
                 match value {
                     Some(v) => {
-                        let mut expanded = String::new();
+                        let mut expanded = Vec::new();
                         if let Some(captures) = &captures {
-                            captures.expand(v, &mut expanded);
+                            captures.expand(v.as_bytes(), &mut expanded);
                         } else {
-                            expanded.push_str(v);
+                            expanded.extend_from_slice(v.as_bytes());
                         }
                         env.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
                         env.push((name.clone(), expanded));
@@ -1611,48 +1647,139 @@ impl Scope {
                 }
             }
         }
-        for (name, value) in &self.environment_policy.rewrite_env {
+    }
+
+    fn authorization_environment(
+        &self,
+        req: &crate::http::Request,
+        url_path: &str,
+        peer: IpAddr,
+        fastcgi: bool,
+    ) -> RequestEnvironment {
+        let mut env = RequestEnvironment::new();
+        Self::apply_set_env_if_rules(
+            &self.environment_policy.set_env_if,
+            req,
+            url_path,
+            peer,
+            fastcgi,
+            &mut env,
+        );
+        for entry in &self.environment_policy.rewrite_env {
+            if fastcgi
+                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
+            {
+                continue;
+            }
+            let (name, value) = &entry.value;
             env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
             env.push((name.clone(), value.clone()));
         }
-        for name in &self.environment_policy.rewrite_unset_env {
+        for entry in &self.environment_policy.rewrite_unset_env {
+            if fastcgi
+                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
+            {
+                continue;
+            }
+            let name = &entry.value;
             env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
         }
         env
     }
 
-    /// Complete fixups/CGI environment, including late mod_env directives.
+    pub fn authorization_env(
+        &self,
+        req: &crate::http::Request,
+        url_path: &str,
+        peer: IpAddr,
+    ) -> RequestEnvironment {
+        self.authorization_environment(req, url_path, peer, false)
+    }
+
+    fn complete_environment(
+        &self,
+        req: &crate::http::Request,
+        url_path: &str,
+        peer: IpAddr,
+        fastcgi: bool,
+    ) -> RequestEnvironment {
+        let mut env = self.authorization_environment(req, url_path, peer, fastcgi);
+        for entry in &self.environment_policy.rewrite_late_env {
+            if fastcgi
+                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
+            {
+                continue;
+            }
+            let (name, value) = &entry.value;
+            env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+            env.push((name.clone(), value.clone()));
+        }
+        for entry in &self.environment_policy.rewrite_late_unset_env {
+            if fastcgi
+                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
+            {
+                continue;
+            }
+            let name = &entry.value;
+            env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        }
+        for entry in &self.environment_policy.set_env {
+            if fastcgi
+                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
+            {
+                continue;
+            }
+            let (name, value) = &entry.value;
+            env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+            env.push((name.clone(), value.as_bytes().to_vec()));
+        }
+        for entry in &self.environment_policy.pass_env {
+            if fastcgi
+                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
+            {
+                continue;
+            }
+            let name = &entry.value;
+            let Some(value) = std::env::var_os(name) else {
+                continue;
+            };
+            env.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+            env.push((name.clone(), value.as_os_str().as_bytes().to_vec()));
+        }
+        for entry in &self.environment_policy.unset_env {
+            if fastcgi
+                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
+            {
+                continue;
+            }
+            let name = &entry.value;
+            env.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        }
+        env
+    }
+
+    /// Complete fixups environment for a local CGI process. Access-file
+    /// environment mutations are intentionally supported here, matching
+    /// Apache's local CGI behavior.
     pub fn request_env(
         &self,
         req: &crate::http::Request,
         url_path: &str,
         peer: IpAddr,
-    ) -> Vec<(String, String)> {
-        let mut env = self.authorization_env(req, url_path, peer);
-        for (name, value) in &self.environment_policy.rewrite_late_env {
-            env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
-            env.push((name.clone(), value.clone()));
-        }
-        for name in &self.environment_policy.rewrite_late_unset_env {
-            env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
-        }
-        for (name, value) in &self.environment_policy.set_env {
-            env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
-            env.push((name.clone(), value.clone()));
-        }
-        for (name, value) in self
-            .environment_policy
-            .pass_env
-            .iter()
-            .filter_map(|name| std::env::var(name).ok().map(|value| (name, value)))
-        {
-            env.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
-            env.push((name.clone(), value));
-        }
-        for name in &self.environment_policy.unset_env {
-            env.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
-        }
-        env
+    ) -> RequestEnvironment {
+        self.complete_environment(req, url_path, peer, false)
+    }
+
+    /// Environment forwarded as FastCGI parameters. Apache does not promote
+    /// `.htaccess` environment mutations into proxy/FastCGI parameters; keep
+    /// that trust boundary by provenance, independently of variable names.
+    pub fn fastcgi_env(
+        &self,
+        req: &crate::http::Request,
+        url_path: &str,
+        peer: IpAddr,
+    ) -> RequestEnvironment {
+        self.complete_environment(req, url_path, peer, true)
     }
 
     pub fn add_require(&mut self, node: RequireNode, limit: Option<&MethodSet>) {
@@ -1994,7 +2121,7 @@ impl VHost {
                 // Invalid patterns are rejected at config load; this is a
                 // defensive fallback and must never grant a match.
                 return compile_regex(re)
-                    .map(|r| r.is_match(&lower))
+                    .map(|r| r.is_match(lower.as_bytes()))
                     .unwrap_or(false);
             }
             crate::verified::host_pattern_matches(host.as_bytes(), pat.as_bytes())
@@ -5205,20 +5332,23 @@ impl Compile {
                     scope
                         .environment_policy
                         .set_env
-                        .push((name.clone(), args[1..].join(" ")));
+                        .push(Originated::main((name.clone(), args[1..].join(" "))));
                 }
             }
             "unsetenv" => scope
                 .environment_policy
                 .unset_env
-                .extend(args.iter().cloned()),
+                .extend(args.iter().cloned().map(Originated::main)),
             "passenv" => scope
                 .environment_policy
                 .pass_env
-                .extend(args.iter().cloned()),
+                .extend(args.iter().cloned().map(Originated::main)),
             "setenvif" | "setenvifnocase" | "browsermatch" | "browsermatchnocase" => {
                 match parse_env_rule(name, args) {
-                    Ok(rule) => scope.environment_policy.set_env_if.push(rule),
+                    Ok(rule) => scope
+                        .environment_policy
+                        .set_env_if
+                        .push(Originated::main(rule)),
                     Err(e) => self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
@@ -5875,7 +6005,7 @@ fn clean_path(p: &Path) -> PathBuf {
 pub(crate) fn rule_condition_result(
     rule: &ScopeRule,
     req: &crate::http::Request,
-    env: &[(String, String)],
+    env: &[(String, Vec<u8>)],
     peer: IpAddr,
     docroot: &Path,
     url_path: &str,
@@ -5922,7 +6052,7 @@ pub(crate) fn rule_condition_result(
 fn rule_condition_matches(
     rule: &ScopeRule,
     req: &crate::http::Request,
-    env: &[(String, String)],
+    env: &[(String, Vec<u8>)],
     peer: IpAddr,
     docroot: &Path,
     url_path: &str,
@@ -6021,8 +6151,8 @@ fn rule_kind_matches(kind: &MatchKind, fs_path: &Path, url_path: &str, fname: &s
                 path_has_prefix(fs_path, p)
             }
         }
-        MatchKind::DirectoryMatch(re) => re.is_match(&fs_path.to_string_lossy()),
-        MatchKind::Files(re) | MatchKind::FilesMatch(re) => re.is_match(fname),
+        MatchKind::DirectoryMatch(re) => re.is_match(fs_path.as_os_str().as_encoded_bytes()),
+        MatchKind::Files(re) | MatchKind::FilesMatch(re) => re.is_match(fname.as_bytes()),
         MatchKind::FilesGlob(pattern) => {
             vapache_verified::fnmatch_match(pattern.as_bytes(), fname.as_bytes(), false)
         }
@@ -6044,7 +6174,7 @@ fn rule_kind_matches(kind: &MatchKind, fs_path: &Path, url_path: &str, fname: &s
         MatchKind::LocationGlob(pattern) => {
             vapache_verified::fnmatch_match(pattern.as_bytes(), url_path.as_bytes(), true)
         }
-        MatchKind::LocationMatch(re) => re.is_match(url_path),
+        MatchKind::LocationMatch(re) => re.is_match(url_path.as_bytes()),
     }
 }
 
@@ -6407,6 +6537,15 @@ pub(crate) fn parse_allow_methods(args: &[String]) -> Result<AllowMethods, Strin
 /// regular subset; PCRE-only constructs are rejected at load time rather than
 /// silently changing meaning.
 pub(crate) fn guard_regex(pattern: &str) -> Result<(), String> {
+    let inline_unicode_classes = directive_regex_enables_unicode(pattern);
+    if !vapache_verified::directive_regex_pattern_admit(
+        true,
+        false,
+        inline_unicode_classes,
+    ) {
+        return Err("unsupported regex mode: inline Unicode classes are not Apache-compatible"
+            .into());
+    }
     if vapache_verified::regex_dialect_admit(pattern.as_bytes()) {
         Ok(())
     } else {
@@ -6414,9 +6553,65 @@ pub(crate) fn guard_regex(pattern: &str) -> Result<(), String> {
     }
 }
 
+/// `RegexBuilder::unicode(false)` sets only the default: Rust's regex syntax
+/// can turn Unicode classes back on with `(?u)`, `(?iu:...)` or `(?i-u:...)`.
+/// PCRE does not use that option spelling, so accepting it both violates the
+/// Apache dialect and reopens P16-B. Ignore escaped text and character classes
+/// while examining inline option groups.
+fn directive_regex_enables_unicode(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    let mut in_class = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i = (i + 2).min(bytes.len()),
+            b'[' if !in_class => {
+                in_class = true;
+                i += 1;
+            }
+            b']' if in_class => {
+                in_class = false;
+                i += 1;
+            }
+            b'(' if !in_class && bytes.get(i + 1) == Some(&b'?') => {
+                let mut j = i + 2;
+                let mut option_group = false;
+                while let Some(&flag) = bytes.get(j) {
+                    if matches!(flag, b':' | b')') {
+                        break;
+                    }
+                    if !matches!(flag, b'i' | b'm' | b's' | b'R' | b'U' | b'u' | b'x' | b'-') {
+                        break;
+                    }
+                    option_group = true;
+                    if flag == b'u' {
+                        return true;
+                    }
+                    j += 1;
+                }
+                i += if option_group { 2 } else { 1 };
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 pub(crate) fn compile_regex(pattern: &str) -> Result<Regex, String> {
+    compile_regex_flags(pattern, false)
+}
+
+pub(crate) fn compile_regex_flags(pattern: &str, nocase: bool) -> Result<Regex, String> {
     guard_regex(pattern)?;
-    Regex::new(pattern).map_err(|e| e.to_string())
+    let unicode_classes = false;
+    if !vapache_verified::directive_regex_mode_admit(true, unicode_classes) {
+        return Err("directive regex mode is not Apache-compatible".into());
+    }
+    regex::bytes::RegexBuilder::new(pattern)
+        .unicode(unicode_classes)
+        .case_insensitive(nocase)
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 /// True when the string contains one of the shell wildcard characters that
@@ -6908,11 +7103,8 @@ pub(crate) fn parse_rewrite_cond(args: &[String]) -> Result<RewriteCond, String>
         None
     } else {
         {
-            guard_regex(stripped)?;
             Some(Arc::new(
-                regex::RegexBuilder::new(stripped)
-                    .case_insensitive(flags.nocase)
-                    .build()
+                compile_regex_flags(stripped, flags.nocase)
                     .map_err(|e| format!("invalid RewriteCond pattern: {e}"))?,
             ))
         }
@@ -6952,10 +7144,7 @@ pub(crate) fn parse_rewrite_rule(
         Some(p) => (true, p),
         None => (false, raw_pattern.as_str()),
     };
-    guard_regex(pattern)?;
-    let pattern = regex::RegexBuilder::new(pattern)
-        .case_insensitive(flags.nocase)
-        .build()
+    let pattern = compile_regex_flags(pattern, flags.nocase)
         .map_err(|e| format!("invalid RewriteRule pattern: {e}"))?;
     Ok(RewriteRule {
         pattern: Arc::new(pattern),
@@ -6967,6 +7156,7 @@ pub(crate) fn parse_rewrite_rule(
         match_base: normalize_rewrite_base(base),
         subject_dir: None,
         per_dir,
+        access_file: false,
     })
 }
 
@@ -8793,7 +8983,7 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
         .unwrap();
         let redirect = cfg.global.mapping_policy.redirects.first().unwrap();
         assert_eq!(redirect.status, 404);
-        assert!(redirect.regex.as_ref().unwrap().is_match("/.env"));
+        assert!(redirect.regex.as_ref().unwrap().is_match(b"/.env"));
         assert!(cfg
             .global
             .mapping_policy
@@ -8879,7 +9069,7 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
         parent
             .environment_policy
             .set_env
-            .push(("PARENT".into(), "1".into()));
+            .push(Originated::main(("PARENT".into(), "1".into())));
 
         let mut child = Scope::default();
         child
@@ -8893,7 +9083,7 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
         child
             .environment_policy
             .set_env
-            .push(("CHILD".into(), "2".into()));
+            .push(Originated::main(("CHILD".into(), "2".into())));
         child.content_policy.document_root = Some("/child".into());
 
         parent.merge(&child);
@@ -9581,15 +9771,21 @@ ServerName localhost\n\
         scope
             .environment_policy
             .set_env
-            .push(("BASE".into(), "1".into()));
+            .push(Originated::main(("BASE".into(), "1".into())));
         scope
             .environment_policy
             .rewrite_env
-            .push(("SERVER_REWRITE".into(), "early".into()));
+            .push(Originated::main((
+                "SERVER_REWRITE".into(),
+                b"early".to_vec(),
+            )));
         scope
             .environment_policy
             .rewrite_late_env
-            .push(("DIRECTORY_REWRITE".into(), "late".into()));
+            .push(Originated::main((
+                "DIRECTORY_REWRITE".into(),
+                b"late".to_vec(),
+            )));
         let mut rule = parse_env_rule(
             "setenvif",
             &[
@@ -9600,38 +9796,182 @@ ServerName localhost\n\
             ],
         )
         .unwrap();
-        scope.environment_policy.set_env_if.push(rule.clone());
+        scope
+            .environment_policy
+            .set_env_if
+            .push(Originated::main(rule.clone()));
         rule.attribute = "Content-Type".into();
         rule.negate = true;
-        scope.environment_policy.set_env_if.push(rule);
+        scope
+            .environment_policy
+            .set_env_if
+            .push(Originated::main(rule));
         scope
             .environment_policy
             .pass_env
-            .push("VAPACHE_TEST_ENV".into());
-        scope.environment_policy.unset_env.push("DROP".into());
+            .push(Originated::main("VAPACHE_TEST_ENV".into()));
+        scope
+            .environment_policy
+            .unset_env
+            .push(Originated::main("DROP".into()));
         scope
             .environment_policy
             .set_env
-            .push(("DROP".into(), "x".into()));
+            .push(Originated::main(("DROP".into(), "x".into())));
         std::env::set_var("VAPACHE_TEST_ENV", "passed");
         let mut req = test_request("GET");
         req.target = b"/x?q=1".to_vec();
         req.headers.insert("content-type", b"text/plain".to_vec());
         let peer = "127.0.0.1".parse().unwrap();
         let auth_env = scope.authorization_env(&req, "/x", peer);
-        assert!(auth_env.contains(&("HIT".into(), "yes".into())));
-        assert!(auth_env.contains(&("SERVER_REWRITE".into(), "early".into())));
+        assert!(auth_env.contains(&("HIT".into(), b"yes".to_vec())));
+        assert!(auth_env.contains(&("SERVER_REWRITE".into(), b"early".to_vec())));
         assert!(!auth_env.iter().any(|(k, _)| k == "DIRECTORY_REWRITE"));
         assert!(!auth_env.iter().any(|(k, _)| k == "BASE"));
         assert!(!auth_env.iter().any(|(k, _)| k == "VAPACHE_TEST_ENV"));
         let env = scope.request_env(&req, "/x", peer);
-        assert!(env.contains(&("HIT".into(), "yes".into())));
-        assert!(env.contains(&("SERVER_REWRITE".into(), "early".into())));
-        assert!(env.contains(&("DIRECTORY_REWRITE".into(), "late".into())));
-        assert!(env.contains(&("BASE".into(), "1".into())));
-        assert!(env.contains(&("VAPACHE_TEST_ENV".into(), "passed".into())));
+        assert!(env.contains(&("HIT".into(), b"yes".to_vec())));
+        assert!(env.contains(&("SERVER_REWRITE".into(), b"early".to_vec())));
+        assert!(env.contains(&("DIRECTORY_REWRITE".into(), b"late".to_vec())));
+        assert!(env.contains(&("BASE".into(), b"1".to_vec())));
+        assert!(env.contains(&("VAPACHE_TEST_ENV".into(), b"passed".to_vec())));
         assert!(!env.iter().any(|(k, _)| k == "DROP"));
         std::env::remove_var("VAPACHE_TEST_ENV");
+    }
+
+    #[test]
+    fn p16_regex_header_bytes_and_fastcgi_environment_provenance() {
+        // Apache's directive PCRE mode is byte-oriented and ASCII by default.
+        // Pin both the deny-guard and positive-gate directions at the shared
+        // compiler used by SetEnvIf, rewrite and match containers.
+        assert!(!compile_regex(r"^\w+$").unwrap().is_match("é".as_bytes()));
+        assert!(!compile_regex(r"^\d+$").unwrap().is_match("١٢٣".as_bytes()));
+        assert!(!compile_regex(r"^\s+$")
+            .unwrap()
+            .is_match("\u{a0}".as_bytes()));
+        assert!(compile_regex(r"\badmin\b")
+            .unwrap()
+            .is_match("éadmin".as_bytes()));
+        assert!(compile_regex(r"^\W+$").unwrap().is_match("é".as_bytes()));
+        assert!(compile_regex(r"^\D+$").unwrap().is_match("١٢٣".as_bytes()));
+        assert!(compile_regex(r"^\S+$")
+            .unwrap()
+            .is_match("\u{a0}".as_bytes()));
+        assert!(compile_regex(r"^\w+$").unwrap().is_match(b"admin_1"));
+        assert!(compile_regex(r"^\d+$").unwrap().is_match(b"123"));
+        assert!(compile_regex(r"^\s+$").unwrap().is_match(b" \t"));
+        assert!(!compile_regex(r"\badmin\b").unwrap().is_match(b"xadminx"));
+        assert!(compile_regex(r"(?u)^\w+$").is_err());
+        assert!(compile_regex(r"(?iu:^\w+$)").is_err());
+
+        let mut scope = Scope::default();
+        scope
+            .environment_policy
+            .set_env
+            .push(Originated::main(("PHP_VALUE".into(), "main=allowed".into())));
+        scope
+            .environment_policy
+            .set_env
+            .push(Originated::access((
+                "PHP_VALUE".into(),
+                "auto_prepend_file=/tmp/pwn".into(),
+            )));
+        scope.environment_policy.set_env.push(Originated::access((
+            "PHP_ADMIN_VALUE".into(),
+            "auto_prepend_file=/tmp/pwn".into(),
+        )));
+        scope
+            .environment_policy
+            .rewrite_late_env
+            .push(Originated::main(("MAIN_REWRITE".into(), b"yes".to_vec())));
+        scope
+            .environment_policy
+            .rewrite_late_env
+            .push(Originated::access((
+                "ACCESS_REWRITE".into(),
+                b"yes".to_vec(),
+            )));
+
+        // Raw obs-text must stay visible to SetEnvIf matching. The action is
+        // access-file-originated so it participates in ACLs/local CGI but is
+        // never promoted into FastCGI parameters.
+        scope.environment_policy.set_env_if.push(Originated::access(
+            parse_env_rule(
+                "setenvif",
+                &["X-Scan".into(), "sqlmap".into(), "ACCESS_BLOCK=1".into()],
+            )
+            .unwrap(),
+        ));
+        scope.environment_policy.set_env_if.push(Originated::access(
+            parse_env_rule(
+                "setenvif",
+                &[
+                    "X-Capture".into(),
+                    "^(.)sqlmap$".into(),
+                    "RAW_BYTE=$1".into(),
+                ],
+            )
+            .unwrap(),
+        ));
+        scope.environment_policy.set_env_if.push(Originated::access(
+            parse_env_rule(
+                "setenvif",
+                &["RAW_BYTE".into(), "^.$".into(), "RAW_BLOCK=1".into()],
+            )
+            .unwrap(),
+        ));
+
+        // Pin the P16-D semantics at the same time: bare action => 1, prior
+        // environment chaining, and capture expansion.
+        scope.environment_policy.set_env_if.push(Originated::main(
+            parse_env_rule(
+                "setenvif",
+                &[
+                    "User-Agent".into(),
+                    "^([a-z]+)$".into(),
+                    "BAD".into(),
+                    "ID=$1".into(),
+                ],
+            )
+            .unwrap(),
+        ));
+        scope.environment_policy.set_env_if.push(Originated::main(
+            parse_env_rule("setenvif", &["BAD".into(), "^1$".into(), "DENY".into()]).unwrap(),
+        ));
+
+        let mut req = test_request("GET");
+        req.headers
+            .insert("x-scan", [vec![0xff], b"sqlmap".to_vec()].concat());
+        req.headers
+            .insert("x-capture", [vec![0xff], b"sqlmap".to_vec()].concat());
+        req.headers.insert("user-agent", b"scanner".to_vec());
+        let peer = "127.0.0.1".parse().unwrap();
+
+        let auth = scope.authorization_env(&req, "/index.php", peer);
+        assert!(auth.contains(&("ACCESS_BLOCK".into(), b"1".to_vec())));
+        assert!(auth.contains(&("RAW_BYTE".into(), vec![0xff])));
+        assert!(auth.contains(&("RAW_BLOCK".into(), b"1".to_vec())));
+        assert!(auth.contains(&("BAD".into(), b"1".to_vec())));
+        assert!(auth.contains(&("DENY".into(), b"1".to_vec())));
+        assert!(auth.contains(&("ID".into(), b"scanner".to_vec())));
+
+        let local = scope.request_env(&req, "/index.php", peer);
+        assert!(local.contains(&(
+            "PHP_VALUE".into(),
+            b"auto_prepend_file=/tmp/pwn".to_vec()
+        )));
+        assert!(local.contains(&(
+            "PHP_ADMIN_VALUE".into(),
+            b"auto_prepend_file=/tmp/pwn".to_vec()
+        )));
+        assert!(local.contains(&("ACCESS_REWRITE".into(), b"yes".to_vec())));
+
+        let fastcgi = scope.fastcgi_env(&req, "/index.php", peer);
+        assert!(fastcgi.contains(&("PHP_VALUE".into(), b"main=allowed".to_vec())));
+        assert!(fastcgi.contains(&("MAIN_REWRITE".into(), b"yes".to_vec())));
+        for forbidden in ["PHP_ADMIN_VALUE", "ACCESS_REWRITE", "ACCESS_BLOCK"] {
+            assert!(!fastcgi.iter().any(|(name, _)| name == forbidden));
+        }
     }
 
     #[test]
@@ -10820,7 +11160,11 @@ SetEnv DIR yes\n\
             Some("access plus 1 day")
         );
         assert!(s.header_policy.expires_active.unwrap());
-        assert!(s.environment_policy.set_env.iter().any(|(n, _)| n == "DIR"));
+        assert!(s
+            .environment_policy
+            .set_env
+            .iter()
+            .any(|entry| entry.value.0 == "DIR"));
 
         let vhost = format!(
             "<VirtualHost *:443>\n\
@@ -12139,7 +12483,7 @@ impl Config {
                         proxy_url.starts_with(pattern.as_str())
                     }
                 }
-                ProxyMatchKind::Regex(re) => re.is_match(proxy_url),
+                ProxyMatchKind::Regex(re) => re.is_match(proxy_url.as_bytes()),
             });
             if !matched {
                 continue;
@@ -12329,7 +12673,7 @@ impl Config {
             let MatchKind::DirectoryMatch(re) = &rule.kind else {
                 continue;
             };
-            if !re.is_match(&fs_path.to_string_lossy()) {
+            if !re.is_match(fs_path.as_os_str().as_encoded_bytes()) {
                 continue;
             }
             merge_rule_delta(scope, rule, fs_path, url_path);
@@ -12479,7 +12823,7 @@ impl Config {
             url_path: &str,
             fname: &str,
             req: &crate::http::Request,
-            env: &[(String, String)],
+            env: &[(String, Vec<u8>)],
             peer: std::net::IpAddr,
             docroot: &Path,
             chain_state: &mut HashMap<usize, bool>,

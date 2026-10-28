@@ -20,13 +20,16 @@ pub enum CanonicalError {
     Decode,
     /// The decoded path was relative, malformed, or could not be normalized.
     Normalize,
+    /// Mapping and policy operate on one textual URL identity; invalid UTF-8
+    /// is rejected rather than conflated through U+FFFD.
+    Utf8,
 }
 
 impl CanonicalError {
     pub fn status(self) -> u16 {
         match self {
             CanonicalError::Decode => 404,
-            CanonicalError::Normalize => 400,
+            CanonicalError::Normalize | CanonicalError::Utf8 => 400,
         }
     }
 }
@@ -53,12 +56,19 @@ impl CanonicalTarget {
         let decoded = percent_decode_path(raw_path, allow_encoded).ok_or(CanonicalError::Decode)?;
         let trailing_slash = decoded.len() > 1 && decoded.ends_with(b"/");
         let norm = normalize_uri_path(&decoded).ok_or(CanonicalError::Normalize)?;
-        if !crate::util::is_canonical_path(&norm) {
+        let canonical = crate::util::is_canonical_path(&norm);
+        if !canonical {
             // normalize_uri_path() proves this property; keep the guard as
             // defense in depth for non-verified callers.
             return Err(CanonicalError::Normalize); // coverage:ignore-line
         }
-        let mut url_path = String::from_utf8_lossy(&norm).into_owned();
+        if !vapache_verified::canonical_path_text_admit(
+            canonical,
+            std::str::from_utf8(&norm).is_ok(),
+        ) {
+            return Err(CanonicalError::Utf8);
+        }
+        let mut url_path = String::from_utf8(norm.clone()).map_err(|_| CanonicalError::Utf8)?;
         if trailing_slash && url_path != "/" {
             url_path.push('/');
         }
@@ -546,14 +556,28 @@ mod tests {
         let target = CanonicalTarget::from_raw_path(b"/dir/", false).unwrap();
         assert_eq!(target.url_path, "/dir/");
         assert_eq!(target.norm, b"/dir");
+
+        let target = CanonicalTarget::from_raw_path("/café".as_bytes(), false).unwrap();
+        assert_eq!(target.url_path, "/café");
+        let target = CanonicalTarget::from_raw_path(b"/caf%c3%a9", false).unwrap();
+        assert_eq!(target.url_path, "/café");
     }
 
     #[test]
     fn canonical_errors_are_fail_closed() {
         assert_eq!(CanonicalError::Decode.status(), 404);
         assert_eq!(CanonicalError::Normalize.status(), 400);
+        assert_eq!(CanonicalError::Utf8.status(), 400);
         assert!(CanonicalTarget::from_raw_path(b"relative", false).is_err());
         assert!(CanonicalTarget::from_raw_path(b"/%zz", false).is_err());
+        assert_eq!(
+            CanonicalTarget::from_raw_path(b"/\xff", false),
+            Err(CanonicalError::Utf8)
+        );
+        assert_eq!(
+            CanonicalTarget::from_raw_path(b"/%ff", false),
+            Err(CanonicalError::Utf8)
+        );
         assert!(CanonicalTarget::from_url_path("relative").is_none());
         let identity =
             LayerIdentity::with_url_mount(Path::new("/srv/www"), Path::new("/srv/www"), "sub");

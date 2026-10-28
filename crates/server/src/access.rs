@@ -349,7 +349,7 @@ fn eval_policy(
     req: &Request,
     peer: IpAddr,
     identity: Option<&Identity>,
-    env: &[(String, String)],
+    env: &[(String, Vec<u8>)],
     parent_and: bool,
     docroot: &Path,
     url_path: &str,
@@ -451,7 +451,7 @@ fn eval_node(
     req: &Request,
     peer: IpAddr,
     identity: Option<&Identity>,
-    env: &[(String, String)],
+    env: &[(String, Vec<u8>)],
     docroot: &Path,
     url_path: &str,
     fs_path: Option<&Path>,
@@ -506,7 +506,7 @@ fn eval_require(
     req: &Request,
     peer: IpAddr,
     identity: Option<&Identity>,
-    env: &[(String, String)],
+    env: &[(String, Vec<u8>)],
     docroot: &Path,
     url_path: &str,
     fs_path: Option<&Path>,
@@ -529,27 +529,30 @@ fn eval_require(
     fn expand_operand(
         operand: &str,
         req: &Request,
-        env: &[(String, String)],
+        env: &[(String, Vec<u8>)],
         peer: IpAddr,
         url_path: &str,
-    ) -> Result<String, ()> {
-        let mut out = String::new();
+    ) -> Result<Vec<u8>, ()> {
+        let mut out = Vec::new();
         let mut rest = operand;
         while let Some(start) = rest.find("%{") {
-            out.push_str(&rest[..start]);
+            out.extend_from_slice(rest[..start].as_bytes());
             let after = &rest[start + 2..];
             let end = after.find('}').ok_or(())?;
             let variable = &after[..end];
             let upper = variable.to_ascii_uppercase();
-            let value = match upper.as_str() {
-                "HTTP_HOST" => req.header_str("host").unwrap_or_default().to_string(),
-                "REMOTE_ADDR" => peer.to_string(),
-                "REQUEST_URI" => url_path.to_string(),
-                "REQUEST_METHOD" => req.method.clone(),
+            let value: Vec<u8> = match upper.as_str() {
+                "HTTP_HOST" => req
+                    .header("host")
+                    .map(vapache_verified::guard_header_bytes)
+                    .unwrap_or_default(),
+                "REMOTE_ADDR" => peer.to_string().into_bytes(),
+                "REQUEST_URI" => url_path.as_bytes().to_vec(),
+                "REQUEST_METHOD" => req.method.as_bytes().to_vec(),
                 _ if upper.starts_with("HTTP:") => req
-                    .header_str(&variable[5..])
-                    .unwrap_or_default()
-                    .to_string(),
+                    .header(&variable[5..].to_ascii_lowercase())
+                    .map(vapache_verified::guard_header_bytes)
+                    .unwrap_or_default(),
                 _ if upper.starts_with("ENV:") => env
                     .iter()
                     .rev()
@@ -558,17 +561,17 @@ fn eval_require(
                     .unwrap_or_default(),
                 _ => return Err(()),
             };
-            out.push_str(&value);
+            out.extend_from_slice(&value);
             rest = &after[end + 1..];
         }
-        out.push_str(rest);
+        out.extend_from_slice(rest.as_bytes());
         Ok(out)
     }
 
     fn expanded_words(
         operands: &[String],
         req: &Request,
-        env: &[(String, String)],
+        env: &[(String, Vec<u8>)],
         peer: IpAddr,
         url_path: &str,
     ) -> Result<Vec<String>, ()> {
@@ -578,7 +581,8 @@ fn eval_require(
             // and then consume its result with ap_getword_conf(), not a
             // whitespace-only split. Reuse the configuration-word tokenizer
             // so quoted dynamic results have the same operand boundaries.
-            let expanded = expand_operand(operand, req, env, peer, url_path)?;
+            let expanded = String::from_utf8(expand_operand(operand, req, env, peer, url_path)?)
+                .map_err(|_| ())?;
             words.extend(crate::config_frontend::tokenize(&expanded).map_err(|_| ())?);
         }
         Ok(words)
@@ -1475,7 +1479,7 @@ mod tests {
     fn require_env_uses_apr_table_case_insensitive_names() {
         let request = req("GET");
         let peer = "127.0.0.1".parse().unwrap();
-        let env = vec![("UPPER_GATE".to_string(), "1".to_string())];
+        let env = vec![("UPPER_GATE".to_string(), b"1".to_vec())];
         let provider = |negate| Require::Env {
             negate,
             names: vec!["upper_gate".into()],

@@ -8,9 +8,10 @@
 //! The properties proved here are deliberately stated as *security*
 //! postconditions, not merely functional ones:
 //!
-//! * `percent_decode_path`: output is printable ASCII, contains no NUL, no
+//! * `percent_decode_path`: output contains no controls, DEL, NUL or
 //!   backslash, and (when encoded separators are disabled, the Apache default)
-//!   no slash can be introduced via percent-encoding.
+//!   no slash can be introduced via percent-encoding. Non-ASCII bytes remain
+//!   byte-exact for the subsequent fail-closed UTF-8 admission gate.
 //! * `normalize_uri_path`: output is an absolute path with no `.`/`..`
 //!   segments, no duplicate slashes, and no traversal bytes.  Consequently
 //!   joining it beneath a document root cannot escape that root in the string
@@ -34,12 +35,14 @@ verus! {
 // Shared specs
 // ---------------------------------------------------------------------------
 
-/// Bytes that may appear in a decoded URI path: printable ASCII except `\`.
-/// A space is permitted after percent-decoding (`%20`), matching Apache, and
-/// cannot appear literally in a request target because the request-line
-/// parser splits on spaces.  Control bytes, DEL and `\` remain rejected.
+/// Bytes that may appear in a decoded URI path before UTF-8 validation:
+/// visible ASCII except `\`, plus non-ASCII bytes. A space is permitted after
+/// percent-decoding (`%20`), matching Apache, and cannot appear literally in
+/// a request target because the request-line parser splits on spaces.
+/// Control bytes, DEL and `\` remain rejected. The runtime then admits only a
+/// well-formed UTF-8 sequence, without replacement-character projection.
 pub open spec fn is_path_byte(b: u8) -> bool {
-    b >= 0x20 && b <= 0x7e && b != 0x5c
+    b >= 0x20 && b != 0x7f && b != 0x5c
 }
 
 pub open spec fn all_path_bytes(s: Seq<u8>) -> bool {
@@ -84,7 +87,7 @@ spec fn hex_pair(hi: u8, lo: u8) -> Option<u8> {
 fn path_byte_ok(b: u8) -> (ok: bool)
     ensures ok == is_path_byte(b),
 {
-    b >= 0x20 && b <= 0x7e && b != 0x5c
+    b >= 0x20 && b != 0x7f && b != 0x5c
 }
 
 fn hex_val_exec(b: u8) -> (v: Option<u8>)
@@ -385,8 +388,9 @@ proof fn lemma_append_segment(s: Seq<u8>, seg: Seq<u8>)
 /// Returns `None` when the path is relative, contains unsafe bytes, or climbs
 /// above the root.  On success the result satisfies `is_canonical_path`:
 /// absolute, no `.`/`..`/empty segments, no duplicate or trailing slashes, and
-/// only printable ASCII except backslash.  The runtime uses this verified
-/// function directly before any filesystem lookup.
+/// only admitted path bytes. The runtime uses this verified function directly
+/// and separately proves the normalized byte sequence passed its UTF-8 gate
+/// before any filesystem lookup.
 pub fn normalize_uri_path(input: &[u8]) -> (out: Option<Vec<u8>>)
     ensures
         match out {
@@ -463,6 +467,25 @@ pub fn normalize_uri_path(input: &[u8]) -> (out: Option<Vec<u8>>)
         k = k + 1;
     }
     Some(out)
+}
+
+/// A normalized path becomes a textual routing/ACL identity only when both
+/// properties hold. `valid_utf8` is supplied by Rust's standard-library UTF-8
+/// validator; keeping it explicit here prevents a caller from treating lossy
+/// decoding as successful admission.
+pub open spec fn canonical_path_text_spec(canonical: bool, valid_utf8: bool) -> bool {
+    canonical && valid_utf8
+}
+
+pub fn canonical_path_text_admit(canonical: bool, valid_utf8: bool) -> (admit: bool)
+    ensures admit == canonical_path_text_spec(canonical, valid_utf8),
+{
+    canonical && valid_utf8
+}
+
+pub proof fn canonical_path_text_rejects_invalid_utf8(canonical: bool)
+    ensures !canonical_path_text_spec(canonical, false),
+{
 }
 
 /// Encode a rewrite backreference or variable value for a URL substitution.
@@ -5090,6 +5113,126 @@ pub fn regex_dialect_admit(pattern: &[u8]) -> (admit: bool)
     true
 }
 
+/// P16-B: every configuration-directive regex is compiled over bytes with
+/// Unicode character classes disabled.  This is Apache/PCRE's default mode:
+/// `\w`, `\d`, `\s` and word boundaries classify only ASCII bytes.
+pub open spec fn directive_regex_mode_spec(
+    byte_oriented: bool,
+    unicode_classes: bool,
+) -> bool {
+    byte_oriented && !unicode_classes
+}
+
+pub fn directive_regex_mode_admit(
+    byte_oriented: bool,
+    unicode_classes: bool,
+) -> (admit: bool)
+    ensures admit == directive_regex_mode_spec(byte_oriented, unicode_classes),
+{
+    byte_oriented && !unicode_classes
+}
+
+/// The engine default is not sufficient by itself because Rust regex syntax
+/// can re-enable Unicode classes inside the pattern with `(?u)` or a scoped
+/// option group. The parser reports that structural fact and this gate makes
+/// inline enablement an explicit rejection condition.
+pub open spec fn directive_regex_pattern_spec(
+    byte_oriented: bool,
+    unicode_classes: bool,
+    inline_unicode_classes: bool,
+) -> bool {
+    byte_oriented && !unicode_classes && !inline_unicode_classes
+}
+
+pub fn directive_regex_pattern_admit(
+    byte_oriented: bool,
+    unicode_classes: bool,
+    inline_unicode_classes: bool,
+) -> (admit: bool)
+    ensures admit == directive_regex_pattern_spec(
+        byte_oriented,
+        unicode_classes,
+        inline_unicode_classes,
+    ),
+{
+    byte_oriented && !unicode_classes && !inline_unicode_classes
+}
+
+pub proof fn directive_regex_pattern_rejects_inline_unicode(
+    byte_oriented: bool,
+    unicode_classes: bool,
+)
+    ensures !directive_regex_pattern_spec(byte_oriented, unicode_classes, true),
+{
+}
+
+/// P16-C: policy regexes receive an exact byte-for-byte copy of a request
+/// field value.  In particular, obs-text is never projected through UTF-8 or
+/// replaced with an empty string before an ACL decision.
+pub fn guard_header_bytes(input: &[u8]) -> (out: Vec<u8>)
+    ensures out@ == input@,
+{
+    let mut out = Vec::with_capacity(input.len());
+    let mut i: usize = 0;
+    while i < input.len()
+        invariant
+            i <= input.len(),
+            out@ == input@.subrange(0, i as int),
+        decreases input.len() - i,
+    {
+        out.push(input[i]);
+        i = i + 1;
+    }
+    assert(input@.subrange(0, input@.len() as int) == input@);
+    out
+}
+
+pub proof fn directive_regex_mode_rejects_unicode(
+    byte_oriented: bool,
+    unicode_classes: bool,
+)
+    ensures
+        directive_regex_mode_spec(byte_oriented, unicode_classes)
+            ==> byte_oriented && !unicode_classes,
+{
+}
+
+/// P16-A: access-file environment mutations are useful to local CGI, but are
+/// not trusted configuration inputs for a proxied FastCGI backend.  Keeping
+/// origin as a sum type prevents a new directive from being admitted merely
+/// because its variable name was not added to a denylist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvironmentOrigin {
+    MainConfig,
+    AccessFile,
+}
+
+pub open spec fn fastcgi_environment_origin_spec(origin: EnvironmentOrigin) -> bool {
+    match origin {
+        EnvironmentOrigin::MainConfig => true,
+        EnvironmentOrigin::AccessFile => false,
+    }
+}
+
+pub fn fastcgi_environment_origin_admit(origin: EnvironmentOrigin) -> (admit: bool)
+    ensures admit == fastcgi_environment_origin_spec(origin),
+{
+    match origin {
+        EnvironmentOrigin::MainConfig => true,
+        EnvironmentOrigin::AccessFile => false,
+    }
+}
+
+pub proof fn access_file_environment_never_reaches_fastcgi()
+    ensures !fastcgi_environment_origin_spec(EnvironmentOrigin::AccessFile),
+{
+}
+
+pub proof fn main_environment_remains_available_to_fastcgi()
+    ensures fastcgi_environment_origin_spec(EnvironmentOrigin::MainConfig),
+{
+}
+
 /// P15-C: request-time regex failures are not boolean non-matches. Keeping
 /// the error as `None` prevents negation (`!~` / `Require not expr`) from
 /// turning an engine failure into an authorization success.
@@ -6868,10 +7011,17 @@ pub struct ContainerModel {
     pub set_headers: Seq<u64>,
     pub add_headers: Seq<u64>,
     pub unset_headers: Seq<u64>,
-    pub set_env: Seq<u64>,
-    pub unset_env: Seq<u64>,
-    pub pass_env: Seq<u64>,
-    pub set_env_if: Seq<u64>,
+    /// Environment entries carry provenance on each value. This mirrors the
+    /// runtime `Originated<T>` representation: there is no untagged access
+    /// list whose contents can accidentally be appended into a trusted list.
+    pub rewrite_env: Seq<(EnvironmentOrigin, u64)>,
+    pub rewrite_unset_env: Seq<(EnvironmentOrigin, u64)>,
+    pub rewrite_late_env: Seq<(EnvironmentOrigin, u64)>,
+    pub rewrite_late_unset_env: Seq<(EnvironmentOrigin, u64)>,
+    pub set_env: Seq<(EnvironmentOrigin, u64)>,
+    pub unset_env: Seq<(EnvironmentOrigin, u64)>,
+    pub pass_env: Seq<(EnvironmentOrigin, u64)>,
+    pub set_env_if: Seq<(EnvironmentOrigin, u64)>,
     pub cookies: Seq<u64>,
     pub vary: Seq<u64>,
     pub rewrite_rules: Seq<u64>,
@@ -6897,6 +7047,10 @@ pub open spec fn merge_containers(
         set_headers: parent.set_headers + child.set_headers,
         add_headers: parent.add_headers + child.add_headers,
         unset_headers: parent.unset_headers + child.unset_headers,
+        rewrite_env: parent.rewrite_env + child.rewrite_env,
+        rewrite_unset_env: parent.rewrite_unset_env + child.rewrite_unset_env,
+        rewrite_late_env: parent.rewrite_late_env + child.rewrite_late_env,
+        rewrite_late_unset_env: parent.rewrite_late_unset_env + child.rewrite_late_unset_env,
         set_env: parent.set_env + child.set_env,
         unset_env: parent.unset_env + child.unset_env,
         pass_env: parent.pass_env + child.pass_env,
@@ -6910,6 +7064,25 @@ pub open spec fn merge_containers(
         proxy_reverses: parent.proxy_reverses + child.proxy_reverses,
         rewrite_maps: parent.rewrite_maps + child.rewrite_maps,
     }
+}
+
+/// P16-A: merging configuration layers appends the complete tagged entries.
+/// Since origin and value are one tuple, no merge transition can upgrade an
+/// access-file value to main-config origin or detach provenance from data.
+pub proof fn environment_origin_merge_preserves_tags(
+    parent: ContainerModel,
+    child: ContainerModel,
+)
+    ensures
+        merge_containers(parent, child).set_env
+            == parent.set_env + child.set_env,
+        merge_containers(parent, child).rewrite_late_env
+            == parent.rewrite_late_env + child.rewrite_late_env,
+        merge_containers(parent, child).set_env_if
+            == parent.set_env_if + child.set_env_if,
+        merge_containers(parent, child).pass_env
+            == parent.pass_env + child.pass_env,
+{
 }
 
 /// Appending a child container never reorders or drops the parent prefix.

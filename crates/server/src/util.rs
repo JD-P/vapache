@@ -243,7 +243,7 @@ pub fn comma_list(v: &[u8]) -> Vec<Vec<u8>> {
 
 #[inline]
 fn is_safe_path_byte(b: u8) -> bool {
-    (0x20..=0x7e).contains(&b) && b != b'\\'
+    b >= 0x20 && b != 0x7f && b != b'\\'
 }
 
 /// Independent runtime checker for the canonical-path invariant.

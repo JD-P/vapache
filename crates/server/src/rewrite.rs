@@ -19,8 +19,11 @@
 //! `[UnsafePrefixStat]` remains parsed and deliberately inert (the F32
 //! remediation), with a load-time warning in the main config.
 
-use crate::config::{RewriteCond, RewriteMap, RewriteProgram, RewriteRule, Scope};
+use crate::config::{
+    RequestEnvironment, RewriteCond, RewriteMap, RewriteProgram, RewriteRule, Scope,
+};
 use crate::http::Request;
+use crate::scope_policy::Originated;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::IpAddr;
@@ -78,10 +81,11 @@ impl<'a> Context<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Effects {
     /// Server-scope `[E=NAME:VALUE]` / `[E=!NAME]`, visible before authz.
-    pub env: Vec<(String, Option<String>)>,
+    pub env: Vec<(String, Option<Vec<u8>>)>,
     /// Directory/htaccess rewrite environment, produced in fixups after
-    /// authorization. `None` means unset in both vectors.
-    pub late_env: Vec<(String, Option<String>)>,
+    /// authorization. The origin tag survives merging and final sink
+    /// filtering; `None` means unset.
+    pub late_env: Vec<Originated<(String, Option<Vec<u8>>)>>,
     /// Fully constructed `Set-Cookie` header values from `[CO=...]`.
     pub cookies: Vec<String>,
     /// `[H=handler]`
@@ -152,7 +156,7 @@ fn escape_spec(flags: &crate::config::RewriteFlags) -> Option<EscapeSpec> {
     })
 }
 
-fn escape_backref_value(value: &str, spec: &EscapeSpec) -> String {
+fn escape_backref_value(value: &[u8], spec: &EscapeSpec) -> Vec<u8> {
     // The [B]/[BNE]/[BCTLS]/[BNP] family all refine to the one verified
     // percent-encoding loop: build the escape mask from the flag set
     // (custom chars, control bytes, preserved chars) and encode.  A masked
@@ -170,8 +174,7 @@ fn escape_backref_value(value: &str, spec: &EscapeSpec) -> String {
         };
         mask[b as usize] = escaped;
     }
-    let out = vapache_verified::percent_encode(value.as_bytes(), &mask, !spec.no_plus);
-    String::from_utf8_lossy(&out).into_owned()
+    vapache_verified::percent_encode(value, &mask, !spec.no_plus)
 }
 
 /// Build an Apache-shaped `Set-Cookie` value for `[CO=name:value:domain:
@@ -303,14 +306,14 @@ fn is_cookie_value(value: &str) -> bool {
 
 fn rule_effects(
     rule: &RewriteRule,
-    caps: &[String],
-    cond_caps: &[String],
+    caps: &[Vec<u8>],
+    cond_caps: &[Vec<u8>],
     req: &Request,
     ctx: &Context<'_>,
     path: &str,
     query: &[u8],
     maps: &[(String, RewriteMap)],
-    env: &[(String, String)],
+    env: &[(String, Vec<u8>)],
 ) -> Result<Effects, String> {
     let mut effects = Effects::default();
     for (name, value) in &rule.flags.env {
@@ -321,13 +324,17 @@ fn rule_effects(
             return Err("RewriteRule [E] has an empty variable name".into());
         }
         let value = match value {
-            Some(v) => Some(expand_backrefs(
+            Some(v) => Some(expand_backrefs_bytes(
                 v, caps, cond_caps, req, ctx, path, query, maps, env, true, None,
             )?),
             None => None,
         };
         if rule.per_dir {
-            effects.late_env.push((name, value));
+            effects.late_env.push(if rule.access_file {
+                Originated::access((name, value))
+            } else {
+                Originated::main((name, value))
+            });
         } else {
             effects.env.push((name, value));
         }
@@ -416,10 +423,10 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
     let mut query = ctx.query.to_vec();
     let mut changed = false;
     let mut final_pass = false;
-    let mut cond_caps: Vec<String> = Vec::new();
+    let mut cond_caps: Vec<Vec<u8>> = Vec::new();
     let mut effects = Effects::default();
     let mut filesystem_override: Option<PathBuf> = None;
-    let mut env: Vec<(String, String)> = scope.authorization_env(req, ctx.url_path, ctx.peer);
+    let mut env: RequestEnvironment = scope.authorization_env(req, ctx.url_path, ctx.peer);
     let mut vary: Vec<String> = Vec::new();
     let mut idx = 0usize;
     let chain_flags: Vec<bool> = scope
@@ -467,8 +474,8 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             idx = rewrite_no_match_index(&chain_flags, idx, rule);
             continue;
         }
-        let caps = rule.pattern.captures(subject.as_ref());
-        let cap_strings: Vec<String> = if rule.negated {
+        let caps = rule.pattern.captures(subject.as_bytes());
+        let cap_strings: Vec<Vec<u8>> = if rule.negated {
             if caps.is_some() {
                 idx = rewrite_no_match_index(&chain_flags, idx, rule);
                 continue;
@@ -478,7 +485,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             match caps {
                 Some(c) => c
                     .iter()
-                    .map(|m| m.map(|m| m.as_str().to_string()).unwrap_or_default())
+                    .map(|m| m.map(|m| m.as_bytes().to_vec()).unwrap_or_default())
                     .collect(),
                 None => {
                     idx = rewrite_no_match_index(&chain_flags, idx, rule);
@@ -504,7 +511,14 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             &env,
         ) {
             Ok(e) => {
-                for (name, value) in e.env.iter().chain(&e.late_env) {
+                for (name, value) in &e.env {
+                    env.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+                    if let Some(value) = value {
+                        env.push((name.clone(), value.clone()));
+                    }
+                }
+                for entry in &e.late_env {
+                    let (name, value) = &entry.value;
                     env.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
                     if let Some(value) = value {
                         env.push((name.clone(), value.clone()));
@@ -797,9 +811,9 @@ fn conditions_match(
     ctx: &Context<'_>,
     path: &str,
     query: &[u8],
-    cond_caps: &mut Vec<String>,
+    cond_caps: &mut Vec<Vec<u8>>,
     maps: &[(String, RewriteMap)],
-    env: &[(String, String)],
+    env: &[(String, Vec<u8>)],
     vary: &mut Vec<String>,
 ) -> Result<bool, String> {
     if rule.conditions.is_empty() {
@@ -833,7 +847,7 @@ fn conditions_match(
             ors.push(cond.flags.or);
             continue;
         }
-        let value = expand_vars(&cond.test, req, ctx, path, query, cond_caps, maps, env)?;
+        let value = expand_vars_bytes(&cond.test, req, ctx, path, query, cond_caps, maps, env)?;
         let r = eval_cond(cond, &value, ctx, cond_caps)?;
         if r {
             if let Some(name) = condition_header(&cond.test) {
@@ -899,45 +913,52 @@ fn condition_header(test: &str) -> Option<String> {
 
 fn eval_cond(
     cond: &RewriteCond,
-    value: &str,
+    value: impl AsRef<[u8]>,
     ctx: &Context<'_>,
-    cond_caps: &mut Vec<String>,
+    cond_caps: &mut Vec<Vec<u8>>,
 ) -> Result<bool, String> {
+    let value = value.as_ref();
     let (negated, pattern) = match cond.pattern.strip_prefix('!') {
         Some(p) => (true, p),
         None => (false, cond.pattern.as_str()),
     };
+    let text_value = || {
+        std::str::from_utf8(value)
+            .map_err(|_| "non-UTF-8 RewriteCond input is only valid for regex matching".to_string())
+    };
     let result = if let Some(rest) = pattern.strip_prefix("-f") {
-        rest.is_empty() && file_test(value, ctx, |_, real| real.is_file())
+        rest.is_empty() && file_test(text_value()?, ctx, |_, real| real.is_file())
     } else if let Some(rest) = pattern.strip_prefix("-d") {
-        rest.is_empty() && file_test(value, ctx, |_, real| real.is_dir())
+        rest.is_empty() && file_test(text_value()?, ctx, |_, real| real.is_dir())
     } else if let Some(rest) = pattern.strip_prefix("-s") {
         rest.is_empty()
-            && file_test(value, ctx, |_, real| {
+            && file_test(text_value()?, ctx, |_, real| {
                 fs::metadata(real).map(|m| m.len() > 0).unwrap_or(false)
             })
     } else if let Some(rest) = pattern.strip_prefix("-l") {
         rest.is_empty()
-            && file_test(value, ctx, |p, _| {
+            && file_test(text_value()?, ctx, |p, _| {
                 fs::symlink_metadata(p)
                     .map(|m| m.file_type().is_symlink())
                     .unwrap_or(false)
             })
     } else if let Some(rest) = pattern.strip_prefix(">=") {
-        compare_cond(value, rest, cond.flags.nocase) != std::cmp::Ordering::Less
+        compare_cond(text_value()?, rest, cond.flags.nocase) != std::cmp::Ordering::Less
     } else if let Some(rest) = pattern.strip_prefix("<=") {
-        compare_cond(value, rest, cond.flags.nocase) != std::cmp::Ordering::Greater
+        compare_cond(text_value()?, rest, cond.flags.nocase) != std::cmp::Ordering::Greater
     } else if let Some(rest) = pattern.strip_prefix('>') {
-        compare_cond(value, rest, cond.flags.nocase) == std::cmp::Ordering::Greater
+        compare_cond(text_value()?, rest, cond.flags.nocase) == std::cmp::Ordering::Greater
     } else if let Some(rest) = pattern.strip_prefix('<') {
-        compare_cond(value, rest, cond.flags.nocase) == std::cmp::Ordering::Less
+        compare_cond(text_value()?, rest, cond.flags.nocase) == std::cmp::Ordering::Less
     } else if let Some(rest) = pattern.strip_prefix('=') {
+        let value = text_value()?;
         if cond.flags.nocase {
             value.eq_ignore_ascii_case(rest)
         } else {
             value == rest
         }
     } else if let Some(rest) = pattern.strip_prefix('!') {
+        let value = text_value()?;
         if cond.flags.nocase {
             !value.eq_ignore_ascii_case(rest)
         } else {
@@ -948,11 +969,11 @@ fn eval_cond(
             .regex
             .as_ref()
             .ok_or_else(|| "internal error: RewriteCond regex was not compiled".to_string())?;
-        let caps: Vec<String> = re
+        let caps: Vec<Vec<u8>> = re
             .captures(value)
             .map(|c| {
                 c.iter()
-                    .map(|m| m.map(|m| m.as_str().to_string()).unwrap_or_default())
+                    .map(|m| m.map(|m| m.as_bytes().to_vec()).unwrap_or_default())
                     .collect()
             })
             .unwrap_or_default();
@@ -1019,32 +1040,39 @@ fn file_test(value: &str, ctx: &Context<'_>, test: impl Fn(&Path, &Path) -> bool
     test(&p, &real)
 }
 
-fn expand_vars(
+fn expand_vars_bytes(
     test: &str,
     req: &Request,
     ctx: &Context<'_>,
     path: &str,
     query: &[u8],
-    cond_caps: &[String],
+    cond_caps: &[Vec<u8>],
     maps: &[(String, RewriteMap)],
-    env: &[(String, String)],
-) -> Result<String, String> {
-    let mut out = String::with_capacity(test.len());
+    env: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(test.len());
     let mut i = 0;
     let bytes = test.as_bytes();
     while i < bytes.len() {
         match vapache_verified::rewrite_expand_token(bytes, i) {
             vapache_verified::RewriteExpandToken::Variable => {
                 if let Some(end) = test[i + 2..].find('}') {
-                    let name = expand_caps(&test[i + 2..i + 2 + end], &[], cond_caps);
-                    out.push_str(&variable_value(&name, req, ctx, path, query, maps, env)?);
+                    let name = String::from_utf8(expand_caps_bytes(
+                        &test[i + 2..i + 2 + end],
+                        &[],
+                        cond_caps,
+                    ))
+                    .map_err(|_| "RewriteCond variable name is not valid UTF-8".to_string())?;
+                    out.extend_from_slice(&variable_value_bytes(
+                        &name, req, ctx, path, query, maps, env,
+                    )?);
                     i += 2 + end + 1;
                     continue;
                 }
             }
             vapache_verified::RewriteExpandToken::ConditionCapture { index } => {
                 if let Some(v) = cond_caps.get(index as usize) {
-                    out.push_str(v);
+                    out.extend_from_slice(v);
                 }
                 i += 2;
                 continue;
@@ -1052,11 +1080,69 @@ fn expand_vars(
             vapache_verified::RewriteExpandToken::Literal
             | vapache_verified::RewriteExpandToken::RuleCapture { .. } => {}
         }
-        let ch = test[i..].chars().next().unwrap_or('\u{fffd}');
-        out.push(ch);
-        i += ch.len_utf8();
+        out.push(bytes[i]);
+        i += 1;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+fn expand_vars(
+    test: &str,
+    req: &Request,
+    ctx: &Context<'_>,
+    path: &str,
+    query: &[u8],
+    cond_caps: &[Vec<u8>],
+    maps: &[(String, RewriteMap)],
+    env: &[(String, Vec<u8>)],
+) -> Result<String, String> {
+    String::from_utf8(expand_vars_bytes(
+        test, req, ctx, path, query, cond_caps, maps, env,
+    )?)
+    .map_err(|_| "expanded RewriteCond value is not valid UTF-8".to_string())
+}
+
+fn variable_value_bytes(
+    name: &str,
+    req: &Request,
+    ctx: &Context<'_>,
+    path: &str,
+    query: &[u8],
+    maps: &[(String, RewriteMap)],
+    env: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>, String> {
+    if let Some(raw) = name.strip_prefix("ENV:") {
+        return Ok(env
+            .iter()
+            .rev()
+            .find(|(key, _)| key.eq_ignore_ascii_case(raw))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default());
+    }
+    if name == "QUERY_STRING" {
+        return Ok(query.to_vec());
+    }
+    if name == "HTTP_HOST" {
+        return Ok(req
+            .header("host")
+            .map(vapache_verified::guard_header_bytes)
+            .unwrap_or_else(|| ctx.server_name.as_bytes().to_vec()));
+    }
+    if let Some(raw) = name.strip_prefix("HTTP_") {
+        let header = raw.replace('_', "-").to_ascii_lowercase();
+        return Ok(req
+            .header(&header)
+            .map(vapache_verified::guard_header_bytes)
+            .unwrap_or_default());
+    }
+    if let Some(raw) = name.strip_prefix("HTTP:") {
+        return Ok(req
+            .header(&raw.to_ascii_lowercase())
+            .map(vapache_verified::guard_header_bytes)
+            .unwrap_or_default());
+    }
+    Ok(variable_value(name, req, ctx, path, query, maps, env)?.into_bytes())
 }
 
 /// Reverse lookup gives the child map precedence after merge appended child
@@ -1091,15 +1177,17 @@ fn variable_value(
     path: &str,
     query: &[u8],
     maps: &[(String, RewriteMap)],
-    env: &[(String, String)],
+    env: &[(String, Vec<u8>)],
 ) -> Result<String, String> {
     Ok(match name {
-        n if n.starts_with("ENV:") => env
-            .iter()
-            .rev()
-            .find(|(k, _)| k.eq_ignore_ascii_case(&n[4..]))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default(),
+        n if n.starts_with("ENV:") => String::from_utf8(
+            env.iter()
+                .rev()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&n[4..]))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default(),
+        )
+        .map_err(|_| format!("environment variable '{}' is not valid UTF-8", &n[4..]))?,
         // Apache's REQUEST_URI is the canonical URL path (r->uri).  The query
         // string is a separate variable and must never be appended here;
         // `path` is the dispatcher's decoded, normalized rewrite path (F57).
@@ -1110,10 +1198,11 @@ fn variable_value(
         // conflating distinct byte strings through the replacement character.
         "QUERY_STRING" => String::from_utf8(query.to_vec())
             .map_err(|_| "QUERY_STRING is not valid UTF-8".to_string())?,
-        "HTTP_HOST" => req
-            .header_str("host")
-            .unwrap_or(ctx.server_name)
-            .to_string(),
+        "HTTP_HOST" => match req.header("host") {
+            Some(value) => String::from_utf8(value.to_vec())
+                .map_err(|_| "Host header is not valid UTF-8".to_string())?,
+            None => ctx.server_name.to_string(),
+        },
         "REMOTE_ADDR" => ctx.peer.to_string(),
         "SERVER_PORT" => ctx.port.to_string(),
         "HTTPS" => if ctx.https { "on" } else { "off" }.to_string(),
@@ -1123,12 +1212,14 @@ fn variable_value(
         "SERVER_PROTOCOL" => req.version.as_str().to_string(),
         n if n.starts_with("HTTP_") => {
             let header = n[5..].replace('_', "-").to_ascii_lowercase();
-            req.header_str(&header).unwrap_or("").to_string()
+            String::from_utf8(req.header(&header).unwrap_or_default().to_vec())
+                .map_err(|_| format!("header '{header}' is not valid UTF-8"))?
         }
-        n if n.starts_with("HTTP:") => req
-            .header_str(&n[5..].to_ascii_lowercase())
-            .unwrap_or("")
-            .to_string(),
+        n if n.starts_with("HTTP:") => {
+            let header = n[5..].to_ascii_lowercase();
+            String::from_utf8(req.header(&header).unwrap_or_default().to_vec())
+                .map_err(|_| format!("header '{header}' is not valid UTF-8"))?
+        }
         n if n.contains(':')
             && rewrite_map_lookup(maps, n.split_once(':').unwrap().0).is_some() =>
         {
@@ -1138,7 +1229,8 @@ fn variable_value(
         "THE_REQUEST" => format!(
             "{} {} {}",
             req.method,
-            String::from_utf8_lossy(&req.target),
+            String::from_utf8(req.target.clone())
+                .map_err(|_| "request target is not valid UTF-8".to_string())?,
             req.version.as_str()
         ),
         _ => return Err(format!("unsupported mod_rewrite variable '%{{{name}}}'")),
@@ -1323,8 +1415,8 @@ fn read_prg_line(mut input: impl Read) -> (Vec<u8>, bool) {
     (line, complete)
 }
 
-fn expand_caps(name: &str, caps: &[String], cond_caps: &[String]) -> String {
-    let mut out = String::new();
+fn expand_caps_bytes(name: &str, caps: &[Vec<u8>], cond_caps: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
     let b = name.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -1341,47 +1433,50 @@ fn expand_caps(name: &str, caps: &[String], cond_caps: &[String]) -> String {
                 caps
             };
             if let Some(v) = pool.get(index as usize) {
-                out.push_str(v);
+                out.extend_from_slice(v);
             }
             i += 2;
         } else {
-            let ch = name[i..].chars().next().unwrap_or('\u{fffd}');
-            out.push(ch);
-            i += ch.len_utf8();
+            out.push(b[i]);
+            i += 1;
         }
     }
     out
 }
 
-fn expand_backrefs(
+fn expand_backrefs_bytes(
     s: &str,
-    caps: &[String],
-    cond_caps: &[String],
+    caps: &[Vec<u8>],
+    cond_caps: &[Vec<u8>],
     req: &Request,
     ctx: &Context<'_>,
     path: &str,
     query: &[u8],
     maps: &[(String, RewriteMap)],
-    env: &[(String, String)],
+    env: &[(String, Vec<u8>)],
     allow_3f: bool,
     escape: Option<&EscapeSpec>,
-) -> Result<String, String> {
-    let mut out = String::with_capacity(s.len());
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         match vapache_verified::rewrite_expand_token(bytes, i) {
             vapache_verified::RewriteExpandToken::Variable => {
                 if let Some(end) = s[i + 2..].find('}') {
-                    let name = expand_caps(&s[i + 2..i + 2 + end], caps, cond_caps);
-                    let value = variable_value(&name, req, ctx, path, query, maps, env)?;
+                    let name = String::from_utf8(expand_caps_bytes(
+                        &s[i + 2..i + 2 + end],
+                        caps,
+                        cond_caps,
+                    ))
+                    .map_err(|_| "rewrite variable name is not valid UTF-8".to_string())?;
+                    let value = variable_value_bytes(&name, req, ctx, path, query, maps, env)?;
                     if let Some(spec) = escape {
-                        out.push_str(&escape_backref_value(&value, spec));
+                        out.extend_from_slice(&escape_backref_value(&value, spec));
                     } else if allow_3f {
-                        out.push_str(&value);
+                        out.extend_from_slice(&value);
                     } else {
-                        let encoded = vapache_verified::rewrite_backref_no_qmark(value.as_bytes());
-                        out.push_str(&String::from_utf8_lossy(&encoded));
+                        out.extend_from_slice(&vapache_verified::rewrite_backref_no_qmark(&value));
                     }
                     i += 2 + end + 1;
                     continue;
@@ -1398,12 +1493,11 @@ fn expand_backrefs(
                 };
                 if let Some(v) = pool.get(index as usize) {
                     if let Some(spec) = escape {
-                        out.push_str(&escape_backref_value(v, spec));
+                        out.extend_from_slice(&escape_backref_value(v, spec));
                     } else if !allow_3f {
-                        let encoded = vapache_verified::rewrite_backref_no_qmark(v.as_bytes());
-                        out.push_str(&String::from_utf8_lossy(&encoded));
+                        out.extend_from_slice(&vapache_verified::rewrite_backref_no_qmark(v));
                     } else {
-                        out.push_str(v);
+                        out.extend_from_slice(v);
                     }
                 }
                 i += 2;
@@ -1411,11 +1505,29 @@ fn expand_backrefs(
             }
             vapache_verified::RewriteExpandToken::Literal => {}
         }
-        let ch = s[i..].chars().next().unwrap_or('\u{fffd}');
-        out.push(ch);
-        i += ch.len_utf8();
+        out.push(bytes[i]);
+        i += 1;
     }
     Ok(out)
+}
+
+fn expand_backrefs(
+    s: &str,
+    caps: &[Vec<u8>],
+    cond_caps: &[Vec<u8>],
+    req: &Request,
+    ctx: &Context<'_>,
+    path: &str,
+    query: &[u8],
+    maps: &[(String, RewriteMap)],
+    env: &[(String, Vec<u8>)],
+    allow_3f: bool,
+    escape: Option<&EscapeSpec>,
+) -> Result<String, String> {
+    String::from_utf8(expand_backrefs_bytes(
+        s, caps, cond_caps, req, ctx, path, query, maps, env, allow_3f, escape,
+    )?)
+    .map_err(|_| "rewrite expansion is not valid UTF-8".to_string())
 }
 
 fn escape_redirect_location(value: &str) -> String {
@@ -1531,10 +1643,37 @@ mod tests {
             Outcome::Internal { path, effects, .. } => {
                 assert_eq!(path, "/mapped");
                 assert_eq!(effects.env[0].0, "MAPTYPE");
-                assert_eq!(effects.env[0].1.as_deref(), Some("abc"));
+                assert_eq!(effects.env[0].1.as_deref(), Some(b"abc".as_slice()));
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn rewrite_condition_backrefs_preserve_raw_header_bytes() {
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        let mut rule =
+            parse_rewrite_rule(&["^/old$".into(), "-".into(), "[F]".into()], "/", false)
+                .unwrap();
+        rule.conditions.push(
+            parse_rewrite_cond(&["%{HTTP:X-Test}".into(), "^(.)sqlmap$".into()]).unwrap(),
+        );
+        // This second condition only matches if %1 is the exact 0xff byte;
+        // replacement-character or empty-string projections both fail it.
+        rule.conditions
+            .push(parse_rewrite_cond(&["%1".into(), "^.$".into()]).unwrap());
+        scope.rewrite_policy.rewrite_rules.push(rule);
+
+        let mut request = req();
+        request
+            .headers
+            .insert("x-test", b"\xffsqlmap".to_vec());
+        let root = Path::new("/tmp");
+        assert!(matches!(
+            process(&scope, &request, &ctx("/old", &root.join("old"), root)),
+            Outcome::Forbidden
+        ));
     }
 
     #[test]
@@ -1873,7 +2012,7 @@ mod tests {
         // same replacement string; the engine instead fails the request.
         assert!(matches!(
             process(&scope, &r, &c),
-            Outcome::Error(ref e) if e == "QUERY_STRING is not valid UTF-8"
+            Outcome::Error(ref e) if e.contains("not valid UTF-8")
         ));
     }
 
@@ -2815,14 +2954,14 @@ mod tests {
         flags.escape_backrefs = true;
         flags.noescape_backrefs = true;
         let spec = escape_spec(&flags).unwrap();
-        assert_eq!(escape_backref_value("a&b c", &spec), "a&b+c");
+        assert_eq!(escape_backref_value(b"a&b c", &spec), b"a&b+c");
 
         flags.noescape_backrefs = false;
         flags.escape_controls = true;
         flags.escape_chars = " .".into();
         flags.backref_no_plus = true;
         let spec = escape_spec(&flags).unwrap();
-        assert_eq!(escape_backref_value("a b.c", &spec), "a%20b%2ec");
+        assert_eq!(escape_backref_value(b"a b.c", &spec), b"a%20b%2ec");
 
         // The whole backreference-escape family refines to the verified
         // percent_encode loop; the [BNP] plus-suppression and [B] custom
@@ -2830,7 +2969,7 @@ mod tests {
         let mut flags = crate::config::RewriteFlags::default();
         flags.escape_backrefs = true;
         let spec = escape_spec(&flags).unwrap();
-        assert_eq!(escape_backref_value("a b.c", &spec), "a+b%2ec");
+        assert_eq!(escape_backref_value(b"a b.c", &spec), b"a+b%2ec");
 
         // Redirect Location escaping is the same verified loop and now
         // percent-encodes non-ASCII bytes instead of emitting Latin-1
@@ -3023,8 +3162,26 @@ mod tests {
         assert!(!eval_cond(&double_ne_nc, "abd", &c, &mut caps).unwrap());
         let regex = parse_rewrite_cond(&["x".into(), "^(a)(b)$".into()]).unwrap();
         assert!(eval_cond(&regex, "ab", &c, &mut caps).unwrap());
-        assert_eq!(caps, vec!["ab", "a", "b"]);
+        assert_eq!(caps, vec![b"ab".to_vec(), b"a".to_vec(), b"b".to_vec()]);
         assert!(!eval_cond(&regex, "zz", &c, &mut caps).unwrap());
+
+        // P16-B/C: RewriteCond regexes use Apache's ASCII class semantics and
+        // receive raw header bytes, including obs-text that is not UTF-8.
+        let boundary = parse_rewrite_cond(&["%{HTTP:X-Test}".into(), r"\badmin\b".into()]).unwrap();
+        assert!(eval_cond(&boundary, "éadmin".as_bytes(), &c, &mut caps).unwrap());
+        let raw = parse_rewrite_cond(&["%{HTTP:X-Test}".into(), "sqlmap".into()]).unwrap();
+        assert!(eval_cond(&raw, b"\xffsqlmap", &c, &mut caps).unwrap());
+        let allow = parse_rewrite_cond(&["%{HTTP:X-Test}".into(), r"^\w+$".into()]).unwrap();
+        assert!(!eval_cond(&allow, "é".as_bytes(), &c, &mut caps).unwrap());
+        let mut raw_req = req();
+        raw_req
+            .headers
+            .insert("x-test", [vec![0xff], b"sqlmap".to_vec()].concat());
+        assert_eq!(
+            expand_vars_bytes("%{HTTP:X-Test}", &raw_req, &c, "/path", b"", &[], &[], &[],)
+                .unwrap(),
+            b"\xffsqlmap"
+        );
         assert!(caps.is_empty());
 
         assert_eq!(compare_cond("10", "9", false), std::cmp::Ordering::Greater);
@@ -3079,7 +3236,7 @@ mod tests {
                 &c,
                 "/path",
                 b"q=1",
-                &["zero".to_string(), "cap".to_string()],
+                &[b"zero".to_vec(), b"cap".to_vec()],
                 &[],
                 &[],
             )
@@ -3282,11 +3439,11 @@ mod tests {
         let _ = fs::remove_file(timeout_script);
         let _ = fs::remove_file(overflow_script);
 
-        let caps = vec!["zero".to_string(), "one".to_string()];
-        let cond = vec!["condzero".to_string(), "cond".to_string()];
+        let caps = vec![b"zero".to_vec(), b"one".to_vec()];
+        let cond = vec![b"condzero".to_vec(), b"cond".to_vec()];
         assert_eq!(
-            expand_caps("$0/$1/%0/\\1/$9", &caps, &cond),
-            "zero/one/condzero/one/"
+            expand_caps_bytes("$0/$1/%0/\\1/$9", &caps, &cond),
+            b"zero/one/condzero/one/"
         );
         assert_eq!(
             expand_backrefs(

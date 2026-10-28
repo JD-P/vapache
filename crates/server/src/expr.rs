@@ -85,6 +85,7 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Str(String),
+    Bytes(Vec<u8>),
     List(Vec<Value>),
 }
 
@@ -106,6 +107,12 @@ impl Value {
                 0,
                 s.len() as u64,
             ),
+            Value::Bytes(bytes) => vapache_verified::expr_value_truthy(
+                vapache_verified::ExprValueKind::Str,
+                false,
+                0,
+                bytes.len() as u64,
+            ),
             Value::List(v) => vapache_verified::expr_value_truthy(
                 vapache_verified::ExprValueKind::List,
                 false,
@@ -120,6 +127,7 @@ impl Value {
             Value::Bool(b) => if *b { "true" } else { "false" }.into(),
             Value::Int(i) => i.to_string(),
             Value::Str(s) => s.clone(),
+            Value::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
             Value::List(v) => v.iter().map(Value::string).collect::<Vec<_>>().join(","),
         }
     }
@@ -128,8 +136,16 @@ impl Value {
         match self {
             Value::Int(i) => Some(*i),
             Value::Str(s) => s.trim().parse().ok(),
+            Value::Bytes(bytes) => std::str::from_utf8(bytes).ok()?.trim().parse().ok(),
             Value::Bool(b) => Some(if *b { 1 } else { 0 }),
             Value::List(_) => None,
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        match self {
+            Value::Bytes(bytes) => bytes.clone(),
+            _ => self.string().into_bytes(),
         }
     }
 }
@@ -192,7 +208,7 @@ fn request_port() -> u16 {
 
 pub struct Context<'a> {
     pub req: &'a Request,
-    pub env: &'a [(String, String)],
+    pub env: &'a [(String, Vec<u8>)],
     pub peer: IpAddr,
     pub docroot: &'a Path,
     /// The dispatcher-selected canonical URL path: percent-decoded,
@@ -205,13 +221,13 @@ pub struct Context<'a> {
     /// an empty string that would make a guard silently pass or fail in the
     /// attacker's favor.
     pub fs_path: Option<&'a Path>,
-    pub captures: Vec<String>,
+    pub captures: Vec<Vec<u8>>,
 }
 
 impl<'a> Context<'a> {
     pub fn new(
         req: &'a Request,
-        env: &'a [(String, String)],
+        env: &'a [(String, Vec<u8>)],
         peer: IpAddr,
         docroot: &'a Path,
         url_path: &'a str,
@@ -296,17 +312,23 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
     }
     let lower = name.to_ascii_lowercase();
     if let Some(header) = lower.strip_prefix("req:") {
-        return Ok(Value::Str(
-            ctx.req.header_str(header).unwrap_or("").to_string(),
+        return Ok(Value::Bytes(
+            ctx.req
+                .header(header)
+                .map(vapache_verified::guard_header_bytes)
+                .unwrap_or_default(),
         ));
     }
     if let Some(header) = lower.strip_prefix("http:") {
-        return Ok(Value::Str(
-            ctx.req.header_str(header).unwrap_or("").to_string(),
+        return Ok(Value::Bytes(
+            ctx.req
+                .header(header)
+                .map(vapache_verified::guard_header_bytes)
+                .unwrap_or_default(),
         ));
     }
     if let Some(env_name) = lower.strip_prefix("env:") {
-        return Ok(Value::Str(
+        return Ok(Value::Bytes(
             ctx.env
                 .iter()
                 .rev()
@@ -317,8 +339,11 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
     }
     if let Some(header) = lower.strip_prefix("http_") {
         let header = header.replace('_', "-");
-        return Ok(Value::Str(
-            ctx.req.header_str(&header).unwrap_or("").to_string(),
+        return Ok(Value::Bytes(
+            ctx.req
+                .header(&header)
+                .map(vapache_verified::guard_header_bytes)
+                .unwrap_or_default(),
         ));
     }
     let now = crate::util::unix_now();
@@ -511,8 +536,8 @@ pub fn validate_vars(expr: &Expr) -> Result<(), String> {
     walk(expr)
 }
 
-fn expand(text: &str, ctx: &Context<'_>) -> Result<String, String> {
-    let mut out = String::new();
+fn expand_bytes(text: &str, ctx: &Context<'_>) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
     let b = text.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -531,25 +556,38 @@ fn expand(text: &str, ctx: &Context<'_>) -> Result<String, String> {
                 return Err("unterminated %{...} expression".into());
             }
             let inner = &text[i + 2..j - 1];
-            if let Some((func, arg)) = inner.split_once(':') {
+            if let Some((func, arg)) = inner.split_once(':').filter(|(func, _)| {
+                matches!(
+                    func.to_ascii_lowercase().as_str(),
+                    "toupper" | "tolower" | "escape" | "unescape"
+                )
+            }) {
                 let value = Value::Str(function_arg(ctx, arg)?);
-                out.push_str(&match func.to_ascii_lowercase().as_str() {
-                    "toupper" => value.string().to_ascii_uppercase(),
-                    "tolower" => value.string().to_ascii_lowercase(),
-                    "escape" => percent_encode(&value.string()),
-                    "unescape" => percent_decode(&value.string()),
-                    _ => return Err(format!("unknown expression function '{func}'")),
-                });
+                out.extend_from_slice(
+                    match func.to_ascii_lowercase().as_str() {
+                        "toupper" => value.string().to_ascii_uppercase(),
+                        "tolower" => value.string().to_ascii_lowercase(),
+                        "escape" => percent_encode(&value.string()),
+                        "unescape" => percent_decode(&value.string()),
+                        _ => return Err(format!("unknown expression function '{func}'")),
+                    }
+                    .as_bytes(),
+                );
             } else {
-                out.push_str(&var(ctx, inner)?.string());
+                out.extend_from_slice(&var(ctx, inner)?.bytes());
             }
             i = j;
         } else {
-            out.push(b[i] as char);
+            out.push(b[i]);
             i += 1;
         }
     }
     Ok(out)
+}
+
+fn expand(text: &str, ctx: &Context<'_>) -> Result<String, String> {
+    String::from_utf8(expand_bytes(text, ctx)?)
+        .map_err(|_| "expanded expression value is not valid UTF-8".to_string())
 }
 
 fn percent_encode(s: &str) -> String {
@@ -621,9 +659,9 @@ fn cmp(left: &Value, op: &str, right: &Value) -> bool {
             right.int().unwrap_or_default(),
         );
     }
-    let a = left.string();
-    let b = right.string();
-    vapache_verified::expr_compare_strs(kind, a.as_bytes(), b.as_bytes())
+    let a = left.bytes();
+    let b = right.bytes();
+    vapache_verified::expr_compare_strs(kind, &a, &b)
 }
 
 /// Resolve an expression file argument beneath the document root.  `.htaccess`
@@ -667,17 +705,17 @@ impl Expr {
     pub fn eval(&self, ctx: &mut Context<'_>) -> Result<Value, String> {
         Ok(match self {
             Expr::Bool(b) => Value::Bool(*b),
-            Expr::Str(s) => Value::Str(expand(s, ctx)?),
+            Expr::Str(s) => Value::Bytes(expand_bytes(s, ctx)?),
             Expr::Int(i) => Value::Int(*i),
             Expr::Var(v) => var(ctx, v)?,
-            Expr::Capture(i) => Value::Str(ctx.captures.get(*i).cloned().unwrap_or_default()),
-            Expr::Concat(parts) => Value::Str(
-                parts
-                    .iter()
-                    .map(|p| p.eval(ctx).map(|v| v.string()))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(""),
-            ),
+            Expr::Capture(i) => Value::Bytes(ctx.captures.get(*i).cloned().unwrap_or_default()),
+            Expr::Concat(parts) => {
+                let mut out = Vec::new();
+                for part in parts {
+                    out.extend_from_slice(&part.eval(ctx)?.bytes());
+                }
+                Value::Bytes(out)
+            }
             Expr::Not(e) => Value::Bool(!e.eval(ctx)?.truthy()),
             Expr::Neg(e) => Value::Int(-e.eval(ctx)?.int().ok_or("unary - needs a number")?),
             Expr::And(es) => {
@@ -698,8 +736,8 @@ impl Expr {
             }
             Expr::Compare(l, op, r) => Value::Bool(cmp(&l.eval(ctx)?, op, &r.eval(ctx)?)),
             Expr::Regex(l, regex, negate) => {
-                let text = l.eval(ctx)?.string();
-                let (caps, eval_error) = match regex.compiled.captures(text.as_bytes()) {
+                let text = l.eval(ctx)?.bytes();
+                let (caps, eval_error) = match regex.compiled.captures(&text) {
                     Ok(captures) => (captures, None),
                     Err(error) => (None, Some(error.to_string())),
                 };
@@ -715,25 +753,21 @@ impl Expr {
                 ctx.captures = caps
                     .map(|c| {
                         (0..regex.compiled.captures_len())
-                            .map(|i| {
-                                c.get(i)
-                                    .map(|m| String::from_utf8_lossy(m.as_bytes()).into_owned())
-                                    .unwrap_or_default()
-                            })
+                            .map(|i| c.get(i).map(|m| m.as_bytes().to_vec()).unwrap_or_default())
                             .collect()
                     })
                     .unwrap_or_default();
                 Value::Bool(result)
             }
             Expr::In(l, list) => {
-                let needle = l.eval(ctx)?.string();
+                let needle = l.eval(ctx)?.bytes();
                 Value::Bool(
                     list.iter()
-                        .any(|e| e.eval(ctx).map(|v| v.string() == needle).unwrap_or(false)),
+                        .any(|e| e.eval(ctx).map(|v| v.bytes() == needle).unwrap_or(false)),
                 )
             }
             Expr::StrTest(e, nonempty) => {
-                let s = e.eval(ctx)?.string();
+                let s = e.eval(ctx)?.bytes();
                 Value::Bool(if *nonempty {
                     !s.is_empty()
                 } else {
@@ -803,10 +837,13 @@ impl Expr {
                     args.iter().map(|a| a.eval(ctx)).collect::<Result<_, _>>()?;
                 let arg = |i: usize| vals.get(i).map(Value::string).unwrap_or_default();
                 match name.to_ascii_lowercase().as_str() {
-                    "req" | "http" => {
-                        Value::Str(ctx.req.header_str(&arg(0)).unwrap_or("").to_string())
-                    }
-                    "env" => Value::Str(
+                    "req" | "http" => Value::Bytes(
+                        ctx.req
+                            .header(&arg(0))
+                            .map(vapache_verified::guard_header_bytes)
+                            .unwrap_or_default(),
+                    ),
+                    "env" => Value::Bytes(
                         ctx.env
                             .iter()
                             .rev()
@@ -1503,6 +1540,8 @@ mod tests {
         assert_eq!(Value::Bool(false).int(), Some(0));
         assert_eq!(Value::List(Vec::new()).int(), None);
         assert_eq!(Value::Str(" 42 ".into()).int(), Some(42));
+        assert!(Value::Bytes(vec![0xff]).truthy());
+        assert_eq!(Value::Bytes(b" 42 ".to_vec()).int(), Some(42));
 
         assert!(!request_is_https());
         assert_eq!(request_port(), 80);
@@ -1535,11 +1574,50 @@ mod tests {
     }
 
     #[test]
+    fn p16_expression_regex_matches_raw_header_bytes_with_ascii_classes() {
+        let mut r = req();
+        r.headers
+            .insert("x-user", [vec![0xff], b"sqlmap".to_vec()].concat());
+        r.headers.insert("x-word", "é".as_bytes().to_vec());
+        r.headers.insert("x-boundary", "éadmin".as_bytes().to_vec());
+        let mut c = Context::new(
+            &r,
+            &[],
+            "127.0.0.1".parse().unwrap(),
+            Path::new("/tmp"),
+            "/x",
+        );
+        assert!(parse("%{HTTP:X-User} =~ /sqlmap/")
+            .unwrap()
+            .eval(&mut c)
+            .unwrap()
+            .truthy());
+        assert!(!parse(r"%{HTTP:X-Word} =~ /^\w+$/")
+            .unwrap()
+            .eval(&mut c)
+            .unwrap()
+            .truthy());
+        assert!(parse(r"%{HTTP:X-Boundary} =~ /\badmin\b/")
+            .unwrap()
+            .eval(&mut c)
+            .unwrap()
+            .truthy());
+
+        // String interpolation must preserve the same bytes, not project an
+        // invalid header to an empty or replacement-character string.
+        assert!(parse("'%{HTTP:X-User}' =~ /sqlmap/")
+            .unwrap()
+            .eval(&mut c)
+            .unwrap()
+            .truthy());
+    }
+
+    #[test]
     fn var_expand_and_encoding_edge_paths() {
         let mut r = req();
         r.headers.push("X-Test", "Header");
         r.headers.push("Host", "example.test:8080");
-        let env = vec![("FOO".to_string(), "bar".to_string())];
+        let env = vec![("FOO".to_string(), b"bar".to_vec())];
         let mut c = Context::new(
             &r,
             &env,

@@ -739,17 +739,28 @@ fn request_allows_lookup(cfg: &Config, req: &Request) -> bool {
     if cfg.cache.ignore_cache_control {
         return true;
     }
-    if let Some(pragma) = req.header_str("pragma") {
-        if pragma.to_ascii_lowercase().contains("no-cache") {
+    if let Some(pragma) = req.header("pragma") {
+        if pragma
+            .windows(b"no-cache".len())
+            .any(|window| window.eq_ignore_ascii_case(b"no-cache"))
+        {
             return false;
         }
     }
-    let Some(cc) = req.header_str("cache-control") else {
+    let Some(cc) = req.header("cache-control") else {
         return true;
     };
-    !cc.split(',').any(|v| {
-        let v = v.trim().to_ascii_lowercase();
-        v == "no-cache" || v == "no-store" || v == "max-age=0"
+    !cc.split(|byte| *byte == b',').any(|value| {
+        let mut value = value;
+        while value.first().is_some_and(u8::is_ascii_whitespace) {
+            value = &value[1..];
+        }
+        while value.last().is_some_and(u8::is_ascii_whitespace) {
+            value = &value[..value.len() - 1];
+        }
+        value.eq_ignore_ascii_case(b"no-cache")
+            || value.eq_ignore_ascii_case(b"no-store")
+            || value.eq_ignore_ascii_case(b"max-age=0")
     })
 }
 
@@ -2039,39 +2050,90 @@ AddHandler cgi-script .cgi\n\
                     .push(404, crate::config::ErrorDoc::Text("missing".into()))
             }),
             ("environment.set_env", |s| {
-                s.environment_policy.set_env.push(("A".into(), "1".into()))
+                s.environment_policy
+                    .set_env
+                    .push(crate::scope_policy::Originated::main(("A".into(), "1".into())))
             }),
             ("environment.rewrite_env", |s| {
                 s.environment_policy
                     .rewrite_env
-                    .push(("EARLY".into(), "1".into()))
+                    .push(crate::scope_policy::Originated::main((
+                        "EARLY".into(),
+                        b"1".to_vec(),
+                    )))
             }),
             ("environment.rewrite_unset_env", |s| {
-                s.environment_policy.rewrite_unset_env.push("EARLY".into())
+                s.environment_policy
+                    .rewrite_unset_env
+                    .push(crate::scope_policy::Originated::main("EARLY".into()))
             }),
             ("environment.rewrite_late_env", |s| {
                 s.environment_policy
                     .rewrite_late_env
-                    .push(("LATE".into(), "1".into()))
+                    .push(crate::scope_policy::Originated::main((
+                        "LATE".into(),
+                        b"1".to_vec(),
+                    )))
             }),
             ("environment.rewrite_late_unset_env", |s| {
                 s.environment_policy
                     .rewrite_late_unset_env
-                    .push("LATE".into())
+                    .push(crate::scope_policy::Originated::main("LATE".into()))
+            }),
+            ("environment.access_rewrite_env", |s| {
+                s.environment_policy
+                    .rewrite_late_env
+                    .push(crate::scope_policy::Originated::access((
+                        "ACCESS".into(),
+                        b"1".to_vec(),
+                    )))
+            }),
+            ("environment.access_rewrite_unset_env", |s| {
+                s.environment_policy
+                    .rewrite_late_unset_env
+                    .push(crate::scope_policy::Originated::access("ACCESS".into()))
             }),
             ("environment.unset_env", |s| {
-                s.environment_policy.unset_env.push("A".into())
+                s.environment_policy
+                    .unset_env
+                    .push(crate::scope_policy::Originated::main("A".into()))
             }),
             ("environment.pass_env", |s| {
-                s.environment_policy.pass_env.push("PATH".into())
+                s.environment_policy
+                    .pass_env
+                    .push(crate::scope_policy::Originated::main("PATH".into()))
             }),
             ("environment.set_env_if", |s| {
                 s.environment_policy.set_env_if.push(
-                    crate::config::parse_env_rule(
+                    crate::scope_policy::Originated::main(crate::config::parse_env_rule(
                         "SetEnvIf",
                         &["X-Test".into(), "yes".into(), "A=1".into()],
                     )
-                    .unwrap(),
+                    .unwrap()),
+                )
+            }),
+            ("environment.access_set_env", |s| {
+                s.environment_policy
+                    .set_env
+                    .push(crate::scope_policy::Originated::access(("A".into(), "1".into())))
+            }),
+            ("environment.access_unset_env", |s| {
+                s.environment_policy
+                    .unset_env
+                    .push(crate::scope_policy::Originated::access("A".into()))
+            }),
+            ("environment.access_pass_env", |s| {
+                s.environment_policy
+                    .pass_env
+                    .push(crate::scope_policy::Originated::access("PATH".into()))
+            }),
+            ("environment.access_set_env_if", |s| {
+                s.environment_policy.set_env_if.push(
+                    crate::scope_policy::Originated::access(crate::config::parse_env_rule(
+                        "SetEnvIf",
+                        &["X-Test".into(), "yes".into(), "A=1".into()],
+                    )
+                    .unwrap()),
                 )
             }),
             ("rewrite.engine", |s| {
@@ -2140,7 +2202,7 @@ AddHandler cgi-script .cgi\n\
             }),
             ("proxy.rules", |s| {
                 s.proxy_policy.proxy_rules.push(crate::config::ProxyRule {
-                    pattern: std::sync::Arc::new(regex::Regex::new("^/x$").unwrap()),
+                    pattern: std::sync::Arc::new(regex::bytes::Regex::new("^/x$").unwrap()),
                     backend: "http://127.0.0.1:9000/".into(),
                     route_order: 0,
                 })
@@ -3312,6 +3374,13 @@ CacheIgnoreQueryString On\n\
         req.headers = Default::default();
         req.headers
             .insert("cache-control", b"private, max-age=0".to_vec());
+        assert!(!request_allows_lookup(&cfg, &req));
+        req.headers
+            .insert("cache-control", b"public, \xff, no-cache".to_vec());
+        assert!(!request_allows_lookup(&cfg, &req));
+        req.headers = Default::default();
+        req.headers
+            .insert("pragma", b"extension=\xff, NO-CACHE".to_vec());
         assert!(!request_allows_lookup(&cfg, &req));
         cfg.cache.ignore_cache_control = true;
         assert!(request_allows_lookup(&cfg, &req));

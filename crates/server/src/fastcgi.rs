@@ -344,7 +344,7 @@ pub fn match_proxy(scope: &Scope, url_path: &str, root: &Path) -> Option<Target>
         }
     }
     for rule in &scope.proxy_policy.proxy_rules {
-        let caps = match rule.pattern.captures(url_path) {
+        let caps = match rule.pattern.captures(url_path.as_bytes()) {
             Some(c) => c,
             None => continue,
         };
@@ -355,9 +355,9 @@ pub fn match_proxy(scope: &Scope, url_path: &str, root: &Path) -> Option<Target>
         let rel_text = caps
             .get(1)
             .or_else(|| caps.get(0))
-            .map(|m| m.as_str())
-            .unwrap_or(url_path)
-            .trim_start_matches('/');
+            .map(|m| String::from_utf8_lossy(m.as_bytes()).into_owned())
+            .unwrap_or_else(|| url_path.to_string());
+        let rel_text = rel_text.trim_start_matches('/');
         let rel_capture = PathBuf::from(rel_text);
         let Some((script_filename, base)) = script_from_prefix(&backend, root, &rel_capture) else {
             continue;
@@ -367,13 +367,12 @@ pub fn match_proxy(scope: &Scope, url_path: &str, root: &Path) -> Option<Target>
         else {
             continue;
         };
-        let logical_url = rule.backend.replace(
-            "$1",
-            caps.get(1)
-                .or_else(|| caps.get(0))
-                .map(|m| m.as_str())
-                .unwrap_or(url_path),
-        );
+        let capture = caps
+            .get(1)
+            .or_else(|| caps.get(0))
+            .map(|m| String::from_utf8_lossy(m.as_bytes()).into_owned())
+            .unwrap_or_else(|| url_path.to_string());
+        let logical_url = rule.backend.replace("$1", &capture);
         let candidate = Target {
             backend,
             script_filename,
@@ -1394,7 +1393,7 @@ mod tests {
                 .proxy_policy
                 .proxy_rules
                 .push(crate::config::ProxyRule {
-                    pattern: std::sync::Arc::new(regex::Regex::new(pattern).unwrap()),
+                    pattern: std::sync::Arc::new(regex::bytes::Regex::new(pattern).unwrap()),
                     backend: backend.into(),
                     route_order: order,
                 });

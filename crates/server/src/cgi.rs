@@ -124,7 +124,7 @@ pub struct CgiContext<'a> {
     pub server_name: &'a str,
     pub host: &'a str,
     pub follow_symlinks: bool,
-    pub env: &'a [(String, String)],
+    pub env: &'a [(String, Vec<u8>)],
     /// Authenticated user from the access grant, exported as `REMOTE_USER`.
     pub remote_user: Option<&'a str>,
     /// Authentication scheme (for example `Basic`) exported as `AUTH_TYPE`.
@@ -272,7 +272,10 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
             continue;
         }
         env.retain(|(n, _)| n != k.as_str());
-        env.push((OsString::from(k), OsString::from(v)));
+        if v.contains(&0) {
+            continue;
+        }
+        env.push((OsString::from(k), OsString::from_vec(v.clone())));
     }
     env
 }
@@ -1404,10 +1407,10 @@ mod tests {
         let mut req = request("/cgi-bin/env.sh?x=1", Vec::new());
         req.query = b"x=1".to_vec();
         let extra = vec![
-            ("REQUEST_METHOD".into(), "POST".into()),
-            ("HTTP_HOST".into(), "evil.test".into()),
-            ("SCRIPT_FILENAME".into(), "/etc/passwd".into()),
-            ("CUSTOM_VALUE".into(), "ok".into()),
+            ("REQUEST_METHOD".into(), b"POST".to_vec()),
+            ("HTTP_HOST".into(), b"evil.test".to_vec()),
+            ("SCRIPT_FILENAME".into(), b"/etc/passwd".to_vec()),
+            ("CUSTOM_VALUE".into(), b"ok".to_vec()),
         ];
         let ctx = CgiContext {
             cfg: &cfg,
@@ -1455,8 +1458,8 @@ mod tests {
         let cfg = config(&dir);
         let req = request("/cgi-bin/who.sh", Vec::new());
         let extra = vec![
-            ("REMOTE_USER".into(), "attacker".into()),
-            ("AUTH_TYPE".into(), "None".into()),
+            ("REMOTE_USER".into(), b"attacker".to_vec()),
+            ("AUTH_TYPE".into(), b"None".to_vec()),
         ];
         let ctx = CgiContext {
             cfg: &cfg,

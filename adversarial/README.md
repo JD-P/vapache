@@ -24,7 +24,7 @@ prevents re-deriving them from scratch.
 | `p12/exploit_p12.py` | Pass-12 differential battery (P12-A–C/E/F vs Apache 2.4.69 on sibling loopback ports; P12-D single-server h2 body check) |
 | `p13/exploit_p13.py` | Pass-13 differential battery (P13-A FastCGI symlink classification, P13-B CGI `PATH_INFO` symlink classification) |
 | `p14/exploit_p14.py` | Pass-14 differential battery (P14-A `<Files>` phase order, P14-B `[P]` SSRF, P14-C expr file-test root, P14-D duplicate headers, P14-E `[C]` chain) |
-| `p16/exploit_p16.py` | Pass-16 differential battery (P16-A `.htaccess` env → FastCGI `PHP_VALUE`/`PHP_ADMIN_VALUE`, P16-B Rust Unicode vs Apache PCRE directive-regex guards plus `SetEnvIf`/`Require env` over-grant, P16-C invalid-UTF-8 header deny-guard bypass, P16-D `SetEnvIf` value/chaining/backreference deny bypass; 36 verdicts with A6/B1/B2/C1-C3/D1-D3 controls) |
+| `p16/exploit_p16.py` | Pass-16 remediation battery: requires Apache/vapache parity for access-file FastCGI environment provenance, ASCII-default directive regexes, raw-byte header guards, and `SetEnvIf` value/chaining/backreference semantics (36 verdicts with A6/B1/B2/C1-C3/D1-D3 controls; A uses a portable built-in FastCGI parameter mock, not PHP-FPM) |
 
 ## Running the pass-11 battery
 
@@ -192,49 +192,44 @@ benchmark `ProxyPassMatch` shape with `AllowOverride All` (or `FileInfo`):
 the attacker writes a `.htaccess` containing
 `SetEnv PHP_VALUE "auto_prepend_file=<uploads>/avatar.txt"` (also
 `PHP_ADMIN_VALUE` and `SetEnvIf` variants, and a nested-directory variant)
-and uploads a non-PHP file containing PHP.  Apache returns 200 without
-executing the file; vapache's FastCGI request carries the access-file
-`PHP_VALUE`, PHP-FPM prepends `avatar.txt`, and the marker is written.  **A6**
-controls: no `.htaccess`, a harmless `SetEnv APP_ENV`, `AllowOverride None`,
-and a main-config `SetEnv PHP_VALUE` positive control that executes on both
-servers.
+and uploads a non-PHP file containing PHP. The retained remediation harness
+uses a built-in FastCGI protocol mock that reports `PREPEND` whenever either
+dangerous parameter reaches the backend. Access-file cases must report no
+parameter on both servers; the main-config `SetEnv PHP_VALUE` positive control
+must report it on both. **A6** also covers no `.htaccess`, harmless
+`SetEnv APP_ENV`, and `AllowOverride None`.
 
 Pass-16 case **P16-B** — directive-regex dialect.  A `RewriteCond
 %{HTTP:X-User} \badmin\b` + `RewriteRule ^ - [F]` deny guard around a CGI is
 tested with `éadmin`, `^\W+$`/`é`, `^\D+$`/`١٢٣` and `^\S+$`/U+00A0.
-Apache's ASCII PCRE denies (`403`, no `EXEC-P16B`); vapache's Unicode-aware
-Rust `regex` misses and executes the CGI (`200`, `EXEC-P16B`).  Controls:
+Both Apache and remediated vapache must apply ASCII-class semantics and deny
+(`403`, no `EXEC-P16B`). Controls:
 ASCII `admin` denied by both, `xadminx` allowed by both, and the `<If>` PCRE
 form denied by both.
 
 Pass-16 case **P16-B (B2)** — the over-grant direction at the same compiler.
 `SetEnvIf User-Agent ^\w+$ TRUSTED` plus `Require env TRUSTED` admits the CGI
-for `User-Agent: é` on vapache (Unicode `\w`) but denies it on Apache (ASCII
-`\w`).  Controls: `abc` admitted/executing on both, `abc def` denied on both.
+for `User-Agent: é` on neither server (ASCII `\w`). Controls: `abc`
+admitted/executing on both, `abc def` denied on both.
 
 Pass-16 case **P16-C** — invalid UTF-8 in a guarded header.  A `SetEnvIf
 User-Agent sqlmap BLOCK` + `Require not env BLOCK`, a `RewriteCond
 %{HTTP:X-User} sqlmap` + `[F]`, and an `<If "%{HTTP:X-User} =~ /sqlmap/">`
 deny are each tested with a raw signature prefix (`User-Agent: \xFFsqlmap`
 for C1, `X-User: \xFFsqlmap` for C2/C3).  Apache matches the raw bytes and
-denies (`403`, no `EXEC-P16C`); vapache's `header_str` conversion turns the
-whole value into the empty string, the deny misses, and the CGI executes
-(`200`, `EXEC-P16C`).  Controls: ASCII `sqlmap` denied by all three guards on
-both, benign `curl/8` allowed on both, `\xFF` alone allowed on both, and valid
-UTF-8 `ÿsqlmap` denied on both.
+denies (`403`, no `EXEC-P16C`); remediated vapache now matches those exact raw
+bytes and must return the same result. Controls: ASCII `sqlmap` denied by all
+three guards on both, benign `curl/8` allowed on both, `\xFF` alone allowed on
+both, and valid UTF-8 `ÿsqlmap` denied on both.
 
 Pass-16 case **P16-D** — `SetEnvIf` action/attribute semantics.  **D1**
 `SetEnvIf ... BLOCK` (valueless) plus `Require not expr "%{env:BLOCK} ==
-'1'"` denies on Apache (`BLOCK=1`) but allows/executes on vapache (`BLOCK=""`).
-**D2** `SetEnvIf ... BAD` then `SetEnvIf BAD "1" DENY` plus `Require not env
-DENY` denies on Apache but allows on vapache because the prior variable is not
-testable.  **D3** `SetEnvIf User-Agent "^([a-z]+)$" ID=$1` plus an
-`env:ID == 'sqlmap'` test denies on Apache but allows on vapache, which stores
-the literal `$1`.  Controls: explicit `BLOCK=1`, a single `DENY=1` rule, a
-non-matching `curl` capture, and benign requests keep the guards live.
+'1'"`, **D2** chained `BAD`/`DENY`, and **D3** `$1` action expansion must all
+deny on both servers. Controls covering explicit values, direct rules,
+non-matching captures and benign requests keep each guard live.
 
-Each FastCGI case starts and stops its own PHP-FPM under
-`/tmp/opencode/p16-harness/case-*/fpm`, so per-request `PHP_VALUE` state
-cannot leak between cases.  The Apache oracle runs `-X` on sibling loopback
-ports with separate pid files; fixtures are removed unless `--keep` is given.
+Each FastCGI case starts and stops its own built-in Unix-socket mock under
+`/tmp/opencode/p16-harness/case-*/fpm`; no PHP installation is required. The
+Apache oracle runs `-X` on sibling loopback ports with separate pid files;
+fixtures are removed unless `--keep` is given.
 

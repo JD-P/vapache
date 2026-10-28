@@ -196,7 +196,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **433 verified functions, 0 errors** (percent-decoding,
+Current result: **446 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -229,7 +229,13 @@ The latest kernels also model the universal transform capability carried from
 authorization to each protected sink, prove its inode/backend/cache-policy
 requirements, validate descriptor snapshots used for access-file parsing, and
 pin P15's fail-closed expression result, Apache-compatible RemoteIP proxy-class
-transition, and dual lexical/canonical FastCGI script identity.
+transition, and dual lexical/canonical FastCGI script identity. P16 adds
+executable proofs that directive regexes are byte-oriented with default and
+inline Unicode classes disabled, header policy input preserves every raw byte,
+normalized path bytes require valid UTF-8 before becoming a routing/ACL
+identity, and access-file-origin environment entries can never be admitted to
+the FastCGI parameter environment or detached from their origin during scope
+merges.
 
 Function count is not the progress metric. The verification ledger tracks
 security obligations and proof debt:
@@ -244,7 +250,7 @@ Current ledger: **53.1% weighted obligations**, **6/6 proof debt**,
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **106 adversarial replay cases** covering the findings classes,
-and **433 Verus functions with 0 errors** (including the I3 fast-path
+and **446 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -375,9 +381,9 @@ Delimiter-only lines and narrowly documented unreachable invariants, external
 failure races and privileged-kernel failures are excluded from that metric.
 
 Latest snapshot: **18,913/18,913 executable server production lines (100%)**.
-The current suite is 448 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
+The current suite is 451 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
 integration tests, 165 conformance tests and 235 fixed configuration cases.
-The separate Verus gate proves 433 functions with 0 errors; proof-only code is
+The separate Verus gate proves 446 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

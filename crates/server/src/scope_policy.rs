@@ -567,20 +567,42 @@ mod header_tests {
 /// per-directory rewrite and mod_env's `SetEnv`/`PassEnv`/`UnsetEnv`
 /// directives run in the later fixups hook and must not influence `Require
 /// env`, `<If>` or ACL-phase `RewriteCond` decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Originated<T> {
+    pub origin: vapache_verified::EnvironmentOrigin,
+    pub value: T,
+}
+
+impl<T> Originated<T> {
+    pub fn main(value: T) -> Self {
+        Self {
+            origin: vapache_verified::EnvironmentOrigin::MainConfig,
+            value,
+        }
+    }
+
+    pub fn access(value: T) -> Self {
+        Self {
+            origin: vapache_verified::EnvironmentOrigin::AccessFile,
+            value,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EnvironmentPolicy {
     /// Early environment effects produced by completed rewrite rounds.
-    pub rewrite_env: Vec<(String, String)>,
-    pub rewrite_unset_env: Vec<String>,
+    pub rewrite_env: Vec<Originated<(String, Vec<u8>)>>,
+    pub rewrite_unset_env: Vec<Originated<String>>,
     /// Per-directory/htaccess rewrite `[E]` effects run in fixups, after
     /// authorization but before mod_env's SetEnv overlay.
-    pub rewrite_late_env: Vec<(String, String)>,
-    pub rewrite_late_unset_env: Vec<String>,
+    pub rewrite_late_env: Vec<Originated<(String, Vec<u8>)>>,
+    pub rewrite_late_unset_env: Vec<Originated<String>>,
     /// Late mod_env configuration, visible to CGI/FastCGI but not ACLs.
-    pub set_env: Vec<(String, String)>,
-    pub unset_env: Vec<String>,
-    pub pass_env: Vec<String>,
-    pub set_env_if: Vec<crate::config::EnvRule>,
+    pub set_env: Vec<Originated<(String, String)>>,
+    pub unset_env: Vec<Originated<String>>,
+    pub pass_env: Vec<Originated<String>>,
+    pub set_env_if: Vec<Originated<crate::config::EnvRule>>,
 }
 
 impl EnvironmentPolicy {
@@ -606,22 +628,41 @@ mod environment_tests {
     #[test]
     fn environment_lists_append_in_order() {
         let mut parent = EnvironmentPolicy::default();
-        parent.rewrite_env.push(("EARLY".into(), "1".into()));
-        parent.set_env.push(("A".into(), "1".into()));
+        parent
+            .rewrite_env
+            .push(Originated::main(("EARLY".into(), b"1".to_vec())));
+        parent
+            .set_env
+            .push(Originated::main(("A".into(), "1".into())));
         let mut child = EnvironmentPolicy::default();
-        child.rewrite_unset_env.push("OLD_EARLY".into());
-        child.rewrite_late_env.push(("LATE".into(), "2".into()));
-        child.set_env.push(("B".into(), "2".into()));
-        child.unset_env.push("OLD".into());
+        child
+            .rewrite_unset_env
+            .push(Originated::main("OLD_EARLY".into()));
+        child
+            .rewrite_late_env
+            .push(Originated::main(("LATE".into(), b"2".to_vec())));
+        child
+            .set_env
+            .push(Originated::access(("ACCESS".into(), "3".into())));
+        child
+            .set_env
+            .push(Originated::main(("B".into(), "2".into())));
+        child.unset_env.push(Originated::main("OLD".into()));
         parent.merge_child(&child);
+        assert_eq!(parent.set_env[0].value, ("A".into(), "1".into()));
+        assert_eq!(parent.set_env[1].value, ("ACCESS".into(), "3".into()));
+        assert_eq!(parent.set_env[2].value, ("B".into(), "2".into()));
+        assert_eq!(parent.unset_env[0].value, "OLD");
+        assert_eq!(parent.rewrite_env[0].value, ("EARLY".into(), b"1".to_vec()));
+        assert_eq!(parent.rewrite_unset_env[0].value, "OLD_EARLY");
         assert_eq!(
-            parent.set_env,
-            vec![("A".into(), "1".into()), ("B".into(), "2".into())]
+            parent.rewrite_late_env[0].value,
+            ("LATE".into(), b"2".to_vec())
         );
-        assert_eq!(parent.unset_env, vec!["OLD".to_string()]);
-        assert_eq!(parent.rewrite_env, vec![("EARLY".into(), "1".into())]);
-        assert_eq!(parent.rewrite_unset_env, vec!["OLD_EARLY".to_string()]);
-        assert_eq!(parent.rewrite_late_env, vec![("LATE".into(), "2".into())]);
+        assert_eq!(
+            parent.set_env[1].origin,
+            vapache_verified::EnvironmentOrigin::AccessFile
+        );
     }
 }
 

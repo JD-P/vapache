@@ -372,28 +372,42 @@ fn sticky_route(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
-    let cookie = req?.header_str("cookie")?;
-    for pair in cookie.split(';') {
-        let pair = pair.trim();
-        let Some((name, value)) = pair.split_once('=') else {
+    let cookie = req?.header("cookie")?;
+    for pair in cookie.split(|byte| *byte == b';') {
+        let pair = trim_ascii_bytes(pair);
+        let Some(eq) = pair.iter().position(|byte| *byte == b'=') else {
             continue;
         };
+        let name = trim_ascii_bytes(&pair[..eq]);
+        let value = trim_ascii_bytes(&pair[eq + 1..]);
         if !cookie_names
             .iter()
-            .any(|candidate| name.trim().eq_ignore_ascii_case(candidate))
+            .any(|candidate| name.eq_ignore_ascii_case(candidate.as_bytes()))
         {
             continue;
         }
-        let value = value.trim();
         let sep = balancer.sticky_sep.as_deref().unwrap_or(".");
         if !sep.is_empty() {
-            if let Some((_, route)) = value.rsplit_once(sep) {
-                return Some(route.to_string());
+            if let Some(at) = value
+                .windows(sep.len())
+                .rposition(|window| window == sep.as_bytes())
+            {
+                return String::from_utf8(value[at + sep.len()..].to_vec()).ok();
             }
         }
-        return Some(value.to_string());
+        return String::from_utf8(value.to_vec()).ok();
     }
     None
+}
+
+fn trim_ascii_bytes(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 fn next_balancer_member(
@@ -527,7 +541,7 @@ pub fn balancer_unavailable(cfg: &Config, scope: &Scope, url_path: &str) -> bool
         }
     }
     for rule in &scope.proxy_policy.proxy_rules {
-        if !rule.pattern.is_match(url_path) {
+        if !rule.pattern.is_match(url_path.as_bytes()) {
             continue;
         }
         if rule.backend.trim_start().starts_with("balancer://")
@@ -555,7 +569,7 @@ pub fn matches_route(scope: &Scope, url_path: &str) -> bool {
             .proxy_policy
             .proxy_rules
             .iter()
-            .any(|rule| rule.pattern.is_match(url_path))
+            .any(|rule| rule.pattern.is_match(url_path.as_bytes()))
 }
 
 pub fn match_target_req(
@@ -615,15 +629,15 @@ pub fn match_target_req(
         }
     }
     for rule in &scope.proxy_policy.proxy_rules {
-        let Some(caps) = rule.pattern.captures(url_path) else {
+        let Some(caps) = rule.pattern.captures(url_path.as_bytes()) else {
             continue;
         };
         let captured = caps
             .get(1)
             .or_else(|| caps.get(0))
-            .map(|m| m.as_str())
-            .unwrap_or(url_path)
-            .trim_start_matches('/');
+            .map(|m| String::from_utf8_lossy(m.as_bytes()).into_owned())
+            .unwrap_or_else(|| url_path.to_string());
+        let captured = captured.trim_start_matches('/');
         let replaces = rule.backend.contains("$1");
         let raw = if replaces {
             rule.backend.replace("$1", captured)
@@ -788,19 +802,19 @@ fn forwarded_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("x-real-ip")
 }
 
-fn connection_tokens(value: &str) -> Vec<String> {
+fn connection_tokens(value: &[u8]) -> Vec<String> {
     value
-        .split(',')
-        .map(str::trim)
-        .filter(|token| crate::verified::valid_token(token.as_bytes()))
-        .map(|token| token.to_ascii_lowercase())
+        .split(|byte| *byte == b',')
+        .map(trim_ascii_bytes)
+        .filter(|token| crate::verified::valid_token(token))
+        .filter_map(|token| String::from_utf8(token.to_ascii_lowercase()).ok())
         .collect()
 }
 
 fn request_connection_tokens(req: &Request) -> Vec<String> {
     let mut tokens = Vec::new();
     for name in ["connection", "proxy-connection"] {
-        if let Some(value) = req.header_str(name) {
+        if let Some(value) = req.header(name) {
             tokens.extend(connection_tokens(value));
         }
     }
@@ -911,30 +925,30 @@ pub fn is_websocket(req: &Request) -> bool {
         return false;
     }
     let upgrade = req
-        .header_str("upgrade")
-        .map(|v| {
-            v.split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("websocket"))
-        })
+        .header("upgrade")
+        .map(|v| v.split(|b| *b == b',').any(|token| {
+            trim_ascii_bytes(token).eq_ignore_ascii_case(b"websocket")
+        }))
         .unwrap_or(false);
     let connection = req
-        .header_str("connection")
+        .header("connection")
         .map(|v| {
-            v.split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            v.split(|b| *b == b',')
+                .any(|token| trim_ascii_bytes(token).eq_ignore_ascii_case(b"upgrade"))
         })
         .unwrap_or(false);
     let version_ok = req
-        .header_str("sec-websocket-version")
-        .map(str::trim)
-        .map(|v| v == "13")
+        .header("sec-websocket-version")
+        .map(trim_ascii_bytes)
+        .map(|v| v == b"13")
         .unwrap_or(false);
     let key_len = req
-        .header_str("sec-websocket-key")
+        .header("sec-websocket-key")
+        .map(trim_ascii_bytes)
         .and_then(|key| {
             STANDARD
-                .decode(key.trim())
-                .or_else(|_| STANDARD_NO_PAD.decode(key.trim()))
+                .decode(key)
+                .or_else(|_| STANDARD_NO_PAD.decode(key))
                 .ok()
         })
         .map(|key| key.len() == 16)
@@ -1447,7 +1461,7 @@ fn proxy_once(
             continue;
         }
         if name == "connection" {
-            connection_header_tokens.extend(connection_tokens(value));
+            connection_header_tokens.extend(connection_tokens(value.as_bytes()));
             continue;
         }
         if hop_by_hop(&name) {
@@ -2748,7 +2762,7 @@ mod more_tests {
             .proxy_policy
             .proxy_rules
             .push(crate::config::ProxyRule {
-                pattern: std::sync::Arc::new(regex::Regex::new("^/(.*\\.php)$").unwrap()),
+                pattern: std::sync::Arc::new(regex::bytes::Regex::new("^/(.*\\.php)$").unwrap()),
                 backend: "http://127.0.0.1:9000/$1".into(),
                 route_order: 0,
             });
@@ -2778,7 +2792,7 @@ mod more_tests {
             .proxy_policy
             .proxy_rules
             .push(crate::config::ProxyRule {
-                pattern: std::sync::Arc::new(regex::Regex::new("^/app/(.*)$").unwrap()),
+                pattern: std::sync::Arc::new(regex::bytes::Regex::new("^/app/(.*)$").unwrap()),
                 backend: "http://127.0.0.1:9002/$1".into(),
                 route_order: 0,
             });
@@ -3191,7 +3205,11 @@ mod coverage_tests {
         assert!(forwarded_header("Forwarded"));
         assert!(!forwarded_header("x-test"));
         assert_eq!(
-            connection_tokens("keep-alive, X-Hop, bad token"),
+            connection_tokens(b"keep-alive, X-Hop, bad token"),
+            vec!["keep-alive", "x-hop"]
+        );
+        assert_eq!(
+            connection_tokens(b"keep-alive, \xff, X-Hop"),
             vec!["keep-alive", "x-hop"]
         );
         assert!(valid_backend_host("[::1]:80"));
@@ -3214,6 +3232,9 @@ mod coverage_tests {
         r.headers.push("Sec-WebSocket-Version", "13");
         r.headers
             .push("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+        assert!(is_websocket(&r));
+        r.headers
+            .insert("connection", b"keep-alive, \xff, Upgrade".to_vec());
         assert!(is_websocket(&r));
     }
 
@@ -3253,6 +3274,13 @@ mod coverage_tests {
         assert_eq!(
             sticky_route(&balancer, Some(&r), None).as_deref(),
             Some("1")
+        );
+        r.headers = Headers::default();
+        r.headers
+            .insert("cookie", b"bad=\xff; route=node.2".to_vec());
+        assert_eq!(
+            sticky_route(&balancer, Some(&r), None).as_deref(),
+            Some("2")
         );
         assert_eq!(sticky_route(&balancer, None, None), None);
 
