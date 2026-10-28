@@ -825,8 +825,9 @@ fn parse_access_bytes(
     nonfatal: NonfatalMode,
     identity: &crate::request_plan::LayerIdentity,
 ) -> Result<Parsed, String> {
-    let text = String::from_utf8_lossy(&data);
-    let lines = logical_lines(&text);
+    let text = std::str::from_utf8(data)
+        .map_err(|_| format!("{}: access file is not valid UTF-8", path.display()))?;
+    let lines = logical_lines(text);
     let mut scope = Scope::default();
     let mut rules = Vec::new();
     scope.rewrite_policy.rewrite_base = Some(identity.url_mount.clone());
@@ -2810,6 +2811,19 @@ mod tests {
         fs::write(&file, "AuthMerging And\nRequire all granted\n").unwrap();
         let p = parse_file(&cfg, &file, OverrideMode::All, "/").unwrap();
         assert_eq!(p.scope.authorization.auth_merging, Some(AuthMerging::And));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn access_files_reject_invalid_utf8() {
+        let dir = tempdir("invalid-utf8");
+        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let file = dir.join(".htaccess");
+        fs::write(&file, b"Require all granted\n#\xff\n").unwrap();
+        match parse_file(&cfg, &file, OverrideMode::All, "/") {
+            Ok(_) => panic!("invalid UTF-8 access file was accepted"),
+            Err(error) => assert!(error.contains("not valid UTF-8")),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -488,6 +488,24 @@ pub proof fn canonical_path_text_rejects_invalid_utf8(canonical: bool)
 {
 }
 
+/// Configuration and filesystem policy identities are textual.  Their
+/// canonicality is established by the caller; this gate records the separate
+/// requirement that the identity was decoded without replacement characters.
+pub open spec fn text_identity_spec(valid_utf8: bool) -> bool {
+    valid_utf8
+}
+
+pub fn text_identity_admit(valid_utf8: bool) -> (admit: bool)
+    ensures admit == text_identity_spec(valid_utf8),
+{
+    valid_utf8
+}
+
+pub proof fn text_identity_rejects_invalid_utf8()
+    ensures !text_identity_spec(false),
+{
+}
+
 /// Encode a rewrite backreference or variable value for a URL substitution.
 /// The adapter uses this by default so a capture containing `?` cannot turn
 /// the remainder into a query-string injection.  `UnsafeAllow3F` is an

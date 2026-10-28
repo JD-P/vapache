@@ -11,7 +11,8 @@ use crate::config::{
 use crate::http::{Body, Request, Response};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
-use rustls::pki_types::ServerName;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConnection, RootCertStore, StreamOwned};
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
@@ -342,7 +343,8 @@ fn check_health_stream(
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
         backend.host, backend.port
-    );
+    )
+    .into_bytes();
     let Ok(head) = ValidatedProxyHead::new(request, backend, None) else {
         return false;
     };
@@ -351,12 +353,11 @@ fn check_health_stream(
     }
     let mut reader = BufReader::new(stream);
     match read_line(&mut reader) {
-        Ok(line) => line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse::<u16>().ok())
-            .map(|s| (200..400).contains(&s))
-            .unwrap_or(false),
+        Ok(line) => std::str::from_utf8(&line)
+            .ok()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|status| status.parse::<u16>().ok())
+            .is_some_and(|status| (200..400).contains(&status)),
         Err(_) => false,
     }
 }
@@ -401,10 +402,10 @@ fn sticky_route(
 }
 
 fn trim_ascii_bytes(mut value: &[u8]) -> &[u8] {
-    while value.first().is_some_and(u8::is_ascii_whitespace) {
+    while value.first().is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
         value = &value[1..];
     }
-    while value.last().is_some_and(u8::is_ascii_whitespace) {
+    while value.last().is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
         value = &value[..value.len() - 1];
     }
     value
@@ -635,7 +636,7 @@ pub fn match_target_req(
         let captured = caps
             .get(1)
             .or_else(|| caps.get(0))
-            .map(|m| String::from_utf8_lossy(m.as_bytes()).into_owned())
+            .and_then(|m| std::str::from_utf8(m.as_bytes()).ok().map(str::to_owned))
             .unwrap_or_else(|| url_path.to_string());
         let captured = captured.trim_start_matches('/');
         let replaces = rule.backend.contains("$1");
@@ -711,37 +712,64 @@ fn encode_proxy_path(path: &str) -> String {
 /// Final serialization gate for an upstream request head.  Every value that
 /// can come from configuration, a rewrite or a request is checked with the
 /// same token/header predicates used for native responses before `write_all`.
-fn validate_proxy_head(head: &str) -> std::io::Result<()> {
+fn validate_proxy_head(head: &[u8]) -> std::io::Result<()> {
     let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "unsafe proxy head");
-    let mut lines = head.split("\r\n");
-    let request = lines.next().ok_or_else(invalid)?;
-    let mut parts = request.split(' ');
+    if !head.ends_with(b"\r\n\r\n") {
+        return Err(invalid());
+    }
+    let mut raw_lines = head.split(|byte| *byte == b'\n').peekable();
+    let request = raw_lines
+        .next()
+        .and_then(|line| line.strip_suffix(b"\r"))
+        .ok_or_else(invalid)?;
+    let mut parts = request.split(|byte| *byte == b' ');
     let method = parts.next().ok_or_else(invalid)?;
     let target = parts.next().ok_or_else(invalid)?;
     let version = parts.next().ok_or_else(invalid)?;
     if parts.next().is_some()
-        || !crate::verified::proxy_request_line_admit(
-            method.as_bytes(),
-            target.as_bytes(),
-            version.as_bytes(),
-        )
+        || !crate::verified::proxy_request_line_admit(method, target, version)
     {
         return Err(invalid());
     }
-    for line in lines {
+    let mut terminated = false;
+    while let Some(raw_line) = raw_lines.next() {
+        // split() yields one empty element after the final LF. It is valid
+        // only after the one header terminator; an earlier lone LF or a field
+        // after the terminator would give the backend a different message
+        // boundary than the validator.
+        if raw_line.is_empty() {
+            if terminated && raw_lines.peek().is_none() {
+                continue;
+            }
+            return Err(invalid());
+        }
+        let line = raw_line.strip_suffix(b"\r").ok_or_else(invalid)?;
         if line.is_empty() {
+            if terminated {
+                return Err(invalid());
+            }
+            terminated = true;
             continue;
         }
-        let (name, value) = line.split_once(':').ok_or_else(invalid)?;
-        if !crate::verified::proxy_header_admit(name.as_bytes(), value.as_bytes()) {
+        if terminated {
+            return Err(invalid());
+        }
+        let colon = line.iter().position(|byte| *byte == b':').ok_or_else(invalid)?;
+        let (name, rest) = line.split_at(colon);
+        let value = &rest[1..];
+        if !crate::verified::proxy_header_admit(name, value) {
             return Err(invalid());
         }
     }
-    Ok(())
+    if terminated {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
 }
 
 /// A proxy head that passed the verified serialization gate.  Upstream write
-/// sites take this type rather than a raw `String`, so the "validate before
+/// sites take this type rather than raw bytes, so the "validate before
 /// every write" rule is visible at the call site and cannot be skipped by
 /// accident when a new path is added.
 struct ValidatedProxyHead(Vec<u8>);
@@ -753,7 +781,7 @@ impl ValidatedProxyHead {
     /// looks like an ordinary additional header.  The component checks make
     /// that shape unrepresentable even if a future parser/rewrite supplies it.
     fn new(
-        head: String,
+        head: Vec<u8>,
         backend: &HttpBackend,
         forwarded_host: Option<&str>,
     ) -> std::io::Result<Self> {
@@ -772,12 +800,19 @@ impl ValidatedProxyHead {
             }
         }
         validate_proxy_head(&head)?;
-        Ok(Self(head.into_bytes()))
+        Ok(Self(head))
     }
 
     fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+}
+
+fn append_proxy_header(head: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    head.extend_from_slice(name);
+    head.extend_from_slice(b": ");
+    head.extend_from_slice(value);
+    head.extend_from_slice(b"\r\n");
 }
 
 fn hop_by_hop(name: &str) -> bool {
@@ -821,7 +856,7 @@ fn request_connection_tokens(req: &Request) -> Vec<String> {
     tokens
 }
 
-fn read_line(reader: &mut impl BufRead) -> std::io::Result<String> {
+fn read_line(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
     let mut line = Vec::new();
     let n = reader.read_until(b'\n', &mut line)?;
     if n == 0 {
@@ -836,15 +871,21 @@ fn read_line(reader: &mut impl BufRead) -> std::io::Result<String> {
             "proxy line too long",
         ));
     }
-    while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
-        line.pop();
+    if !line.ends_with(b"\r\n") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "proxy line is not CRLF terminated",
+        ));
     }
-    Ok(String::from_utf8_lossy(&line).into_owned())
+    line.truncate(line.len() - 2);
+    Ok(line)
 }
 
 fn read_chunked(reader: &mut impl BufRead, out: &mut Vec<u8>) -> std::io::Result<()> {
     loop {
         let line = read_line(reader)?;
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk"))?;
         let size = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk"))?;
         if size == 0 {
@@ -888,17 +929,20 @@ fn read_chunked(reader: &mut impl BufRead, out: &mut Vec<u8>) -> std::io::Result
     }
 }
 
-fn rewrite_location(location: &mut String, reverse: &[ProxyReverseRule]) {
+fn rewrite_location(location: &mut Vec<u8>, reverse: &[ProxyReverseRule]) {
     for rule in reverse {
-        let backend = rule.backend.trim_end_matches('/');
+        let backend = rule.backend.trim_end_matches('/').as_bytes();
         if location.starts_with(backend) {
-            let rest = &location[backend.len()..];
-            let front = rule.front.trim_end_matches('/');
+            let rest = location[backend.len()..].to_vec();
+            let mut rewritten = rule.front.trim_end_matches('/').as_bytes().to_vec();
             if rest.is_empty() {
-                *location = format!("{front}/");
-            } else if rest.starts_with('/') {
-                *location = format!("{front}{rest}");
+                rewritten.push(b'/');
+            } else if rest.starts_with(b"/") {
+                rewritten.extend_from_slice(&rest);
+            } else {
+                return;
             }
+            *location = rewritten;
             return;
         }
     }
@@ -972,11 +1016,14 @@ fn websocket_accept(key: &str) -> Option<String> {
     Some(STANDARD.encode(hasher.finalize()))
 }
 
-fn response_header<'a>(head: &'a [u8], name: &str) -> Option<&'a str> {
-    let text = std::str::from_utf8(head).ok()?;
-    text.split("\r\n").skip(1).find_map(|line| {
-        let (n, v) = line.split_once(':')?;
-        n.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+fn response_header<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    head.split(|byte| *byte == b'\n').skip(1).find_map(|line| {
+        let line = line.strip_suffix(b"\r")?;
+        let colon = line.iter().position(|byte| *byte == b':')?;
+        let field_name = trim_ascii_bytes(&line[..colon]);
+        field_name
+            .eq_ignore_ascii_case(name)
+            .then(|| trim_ascii_bytes(&line[colon + 1..]))
     })
 }
 
@@ -1079,14 +1126,19 @@ where
     }
     let timeout = cfg.timeout.max(Duration::from_secs(5));
     let mut upstream = connect_async(&target.backend, scope, timeout).await?;
-    let mut path = target.path.clone();
+    let mut path = target.path.as_bytes().to_vec();
     if !req.query.is_empty() {
-        path.push('?');
-        path.push_str(&String::from_utf8_lossy(&req.query));
+        path.push(b'?');
+        path.extend_from_slice(&req.query);
     }
-    let mut head = format!(
-        "GET {} HTTP/1.1\r\nHost: {}:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n",
-        path, target.backend.host, target.backend.port
+    let mut head = b"GET ".to_vec();
+    head.extend_from_slice(&path);
+    head.extend_from_slice(
+        format!(
+            " HTTP/1.1\r\nHost: {}:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n",
+            target.backend.host, target.backend.port
+        )
+        .as_bytes(),
     );
     let request_tokens = request_connection_tokens(req);
     for (name, value) in req.headers.iter() {
@@ -1099,29 +1151,28 @@ where
         {
             continue;
         }
-        head.push_str(name);
-        head.push_str(": ");
-        head.push_str(&String::from_utf8_lossy(value));
-        head.push_str("\r\n");
+        append_proxy_header(&mut head, name.as_bytes(), value);
     }
-    head.push_str(&format!("X-Forwarded-For: {}\r\n", peer.ip()));
-    head.push_str(&format!(
-        "X-Forwarded-Proto: {}\r\n",
-        if https { "https" } else { "http" }
-    ));
+    append_proxy_header(
+        &mut head,
+        b"X-Forwarded-For",
+        peer.ip().to_string().as_bytes(),
+    );
+    append_proxy_header(
+        &mut head,
+        b"X-Forwarded-Proto",
+        if https { b"https" } else { b"http" },
+    );
     if !host.is_empty() && !valid_forwarded_host(host) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "unsafe X-Forwarded-Host",
         ));
     }
-    let forwarded_host = if host.is_empty() {
-        String::new()
-    } else {
-        format!("X-Forwarded-Host: {host}\r\n")
-    };
-    head.push_str(&forwarded_host);
-    head.push_str("\r\n");
+    if !host.is_empty() {
+        append_proxy_header(&mut head, b"X-Forwarded-Host", host.as_bytes());
+    }
+    head.extend_from_slice(b"\r\n");
     let head = ValidatedProxyHead::new(
         head,
         &target.backend,
@@ -1129,10 +1180,11 @@ where
     )?;
     upstream.write_all(head.as_bytes()).await?;
     let response = read_async_head(&mut upstream).await?;
-    let status_line = String::from_utf8_lossy(&response);
-    let status = status_line
-        .lines()
+    let status = response
+        .split(|byte| *byte == b'\n')
         .next()
+        .and_then(|line| line.strip_suffix(b"\r"))
+        .and_then(|line| std::str::from_utf8(line).ok())
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
@@ -1144,20 +1196,20 @@ where
                 "invalid WebSocket client key",
             )
         })?;
-        let upgrade_ok = response_header(&response, "upgrade")
+        let upgrade_ok = response_header(&response, b"upgrade")
             .map(|v| {
-                v.split(',')
-                    .any(|t| t.trim().eq_ignore_ascii_case("websocket"))
+                v.split(|byte| *byte == b',')
+                    .any(|token| trim_ascii_bytes(token).eq_ignore_ascii_case(b"websocket"))
             })
             .unwrap_or(false);
-        let connection_ok = response_header(&response, "connection")
+        let connection_ok = response_header(&response, b"connection")
             .map(|v| {
-                v.split(',')
-                    .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+                v.split(|byte| *byte == b',')
+                    .any(|token| trim_ascii_bytes(token).eq_ignore_ascii_case(b"upgrade"))
             })
             .unwrap_or(false);
-        let accept_ok = response_header(&response, "sec-websocket-accept")
-            .map(|v| v.eq_ignore_ascii_case(&expected))
+        let accept_ok = response_header(&response, b"sec-websocket-accept")
+            .map(|v| v.eq_ignore_ascii_case(expected.as_bytes()))
             .unwrap_or(false);
         if !upgrade_ok || !connection_ok || !accept_ok {
             return Err(std::io::Error::new(
@@ -1182,8 +1234,7 @@ fn client_config(scope: &Scope) -> std::io::Result<Arc<rustls::ClientConfig>> {
     let mut roots = RootCertStore::empty();
     if let Some(path) = &scope.proxy_policy.proxy_ca_file {
         let data = std::fs::read(path)?;
-        let mut cursor = Cursor::new(data);
-        for cert in rustls_pemfile::certs(&mut cursor) {
+        for cert in CertificateDer::pem_slice_iter(&data) {
             let cert = cert.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             roots
                 .add(cert)
@@ -1297,18 +1348,29 @@ fn proxy_once(
     https: bool,
     host: &str,
 ) -> std::io::Result<(Response, Option<Box<dyn ReadWrite>>)> {
-    let mut path = encode_proxy_path(&target.path);
+    let mut path = encode_proxy_path(&target.path).into_bytes();
     if !req.query.is_empty() {
-        path.push('?');
-        path.push_str(&String::from_utf8_lossy(&req.query));
+        path.push(b'?');
+        path.extend_from_slice(&req.query);
     }
-    let mut head = format!(
-        "{} {} HTTP/1.1\r\nHost: {}:{}\r\nConnection: keep-alive\r\n",
-        req.method, path, target.backend.host, target.backend.port
+    let mut head = Vec::new();
+    head.extend_from_slice(req.method.as_bytes());
+    head.push(b' ');
+    head.extend_from_slice(&path);
+    head.extend_from_slice(
+        format!(
+            " HTTP/1.1\r\nHost: {}:{}\r\nConnection: keep-alive\r\n",
+            target.backend.host, target.backend.port
+        )
+        .as_bytes(),
     );
     let body_len = req.body_len();
     if body_len > 0 {
-        head.push_str(&format!("Content-Length: {body_len}\r\n"));
+        append_proxy_header(
+            &mut head,
+            b"Content-Length",
+            body_len.to_string().as_bytes(),
+        );
     }
     let request_tokens = request_connection_tokens(req);
     for (name, value) in req.headers.iter() {
@@ -1321,29 +1383,28 @@ fn proxy_once(
         {
             continue;
         }
-        head.push_str(name);
-        head.push_str(": ");
-        head.push_str(&String::from_utf8_lossy(value));
-        head.push_str("\r\n");
+        append_proxy_header(&mut head, name.as_bytes(), value);
     }
-    head.push_str(&format!("X-Forwarded-For: {}\r\n", peer.ip()));
-    head.push_str(&format!(
-        "X-Forwarded-Proto: {}\r\n",
-        if https { "https" } else { "http" }
-    ));
+    append_proxy_header(
+        &mut head,
+        b"X-Forwarded-For",
+        peer.ip().to_string().as_bytes(),
+    );
+    append_proxy_header(
+        &mut head,
+        b"X-Forwarded-Proto",
+        if https { b"https" } else { b"http" },
+    );
     if !host.is_empty() && !valid_forwarded_host(host) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "unsafe X-Forwarded-Host",
         ));
     }
-    let forwarded_host = if host.is_empty() {
-        String::new()
-    } else {
-        format!("X-Forwarded-Host: {host}\r\n")
-    };
-    head.push_str(&forwarded_host);
-    head.push_str("\r\n");
+    if !host.is_empty() {
+        append_proxy_header(&mut head, b"X-Forwarded-Host", host.as_bytes());
+    }
+    head.extend_from_slice(b"\r\n");
     let head = ValidatedProxyHead::new(
         head,
         &target.backend,
@@ -1359,7 +1420,9 @@ fn proxy_once(
 
     let mut reader = BufReader::new(stream);
     let status_line = read_line(&mut reader)?;
-    let mut bits = status_line.split_whitespace();
+    let status_text = std::str::from_utf8(&status_line)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad status"))?;
+    let mut bits = status_text.split_whitespace();
     let _version = bits
         .next()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad status"))?
@@ -1411,20 +1474,26 @@ fn proxy_once(
                 "proxy headers too large",
             ));
         }
-        let Some((name, value)) = line.split_once(':') else {
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "malformed proxy response header",
             ));
         };
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim();
-        if !crate::verified::valid_token(name.as_bytes()) {
+        let name = trim_ascii_bytes(&line[..colon]);
+        let value = trim_ascii_bytes(&line[colon + 1..]);
+        if !crate::verified::valid_token(name) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "invalid proxy response header name",
             ));
         }
+        let name = String::from_utf8(name.to_ascii_lowercase()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid proxy response header name",
+            )
+        })?;
         if name == "content-length" {
             if saw_content_length {
                 return Err(std::io::Error::new(
@@ -1433,6 +1502,12 @@ fn proxy_once(
                 ));
             }
             saw_content_length = true;
+            let value = std::str::from_utf8(value).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bad Content-Length from proxy",
+                )
+            })?;
             content_length = Some(value.parse().map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1449,9 +1524,9 @@ fn proxy_once(
                 ));
             }
             saw_transfer_encoding = true;
-            let mut encodings = value.split(',').map(str::trim);
-            let first = encodings.next().unwrap_or("");
-            if !first.eq_ignore_ascii_case("chunked") || encodings.next().is_some() {
+            let mut encodings = value.split(|byte| *byte == b',').map(trim_ascii_bytes);
+            let first = encodings.next().unwrap_or(b"");
+            if !first.eq_ignore_ascii_case(b"chunked") || encodings.next().is_some() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "unsupported Transfer-Encoding from proxy",
@@ -1461,25 +1536,24 @@ fn proxy_once(
             continue;
         }
         if name == "connection" {
-            connection_header_tokens.extend(connection_tokens(value.as_bytes()));
+            connection_header_tokens.extend(connection_tokens(value));
             continue;
         }
         if hop_by_hop(&name) {
             continue;
         }
         if name == "location" {
-            let Some(clean) = crate::verified::sanitize_header_value(value.as_bytes()) else {
+            let Some(mut clean) = crate::verified::sanitize_header_value(value) else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "invalid proxy Location header value",
                 ));
             };
-            let mut loc = String::from_utf8_lossy(&clean).into_owned();
-            rewrite_location(&mut loc, &target.reverse);
-            headers.push((name, loc.into_bytes()));
+            rewrite_location(&mut clean, &target.reverse);
+            headers.push((name, clean));
             continue;
         }
-        let Some(clean) = crate::verified::sanitize_header_value(value.as_bytes()) else {
+        let Some(clean) = crate::verified::sanitize_header_value(value) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "invalid proxy response header value",
@@ -1501,9 +1575,7 @@ fn proxy_once(
     if (300..400).contains(&status) {
         // Apache's proxy reverse rules also cover relative Location values.
         if let Some((_, value)) = headers.iter_mut().find(|(n, _)| n == "location") {
-            let mut loc = String::from_utf8_lossy(value).into_owned();
-            rewrite_location(&mut loc, &target.reverse);
-            *value = loc.into_bytes();
+            rewrite_location(value, &target.reverse);
         }
     }
     let no_body =
@@ -2911,22 +2983,25 @@ mod more_tests {
         assert!(parse_http_url("http://127.0.0.1:9000/").is_some());
 
         let safe =
-            "GET /path HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Forwarded-Host: example.test\r\n\r\n";
+            b"GET /path HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Forwarded-Host: example.test\r\n\r\n";
         assert!(validate_proxy_head(safe).is_ok());
         assert!(valid_forwarded_host("example.test:8443"));
         assert!(!valid_forwarded_host("evil\r\nX-Injected: yes"));
         assert!(!valid_forwarded_host("evil\nX-Injected: yes"));
-        let bad_value = "GET /path HTTP/1.1\r\nHost: x\r\nX-Test: evil\rInjected\r\n\r\n";
+        let bad_value = b"GET /path HTTP/1.1\r\nHost: x\r\nX-Test: evil\rInjected\r\n\r\n";
         assert!(validate_proxy_head(bad_value).is_err());
-        let bad_target = "GET /path\r\nInjected HTTP/1.1\r\nHost: x\r\n\r\n";
+        let bad_target = b"GET /path\r\nInjected HTTP/1.1\r\nHost: x\r\n\r\n";
         assert!(validate_proxy_head(bad_target).is_err());
-        assert!(validate_proxy_head("GET /path HTTP/1.0\r\nHost: x\r\n\r\n").is_err());
-        assert!(validate_proxy_head("GE T /path HTTP/1.1\r\nHost: x\r\n\r\n").is_err());
-        assert!(validate_proxy_head("GET /path HTTP/1.1\r\nBad Name: x\r\n\r\n").is_err());
-        assert!(validate_proxy_head("GET /path HTTP/1.1\r\nX-Test: a\0b\r\n\r\n").is_err());
+        assert!(validate_proxy_head(b"GET /path HTTP/1.1\r\n\r\nX-Late: y\r\n\r\n").is_err());
+        assert!(validate_proxy_head(b"GET /path HTTP/1.1\r\n\nX-Late: y\r\n\r\n").is_err());
+        assert!(validate_proxy_head(b"GET /path HTTP/1.0\r\nHost: x\r\n\r\n").is_err());
+        assert!(validate_proxy_head(b"GE T /path HTTP/1.1\r\nHost: x\r\n\r\n").is_err());
+        assert!(validate_proxy_head(b"GET /path HTTP/1.1\r\nBad Name: x\r\n\r\n").is_err());
+        assert!(validate_proxy_head(b"GET /path HTTP/1.1\r\nX-Test: a\0b\r\n\r\n").is_err());
         // HTAB is legal inside all header values; the verified predicate must
         // preserve it while still rejecting CTLs.
-        assert!(validate_proxy_head("GET /path HTTP/1.1\r\nX-Test: a\tb\r\n\r\n").is_ok());
+        assert!(validate_proxy_head(b"GET /path HTTP/1.1\r\nX-Test: a\tb\r\n\r\n").is_ok());
+        assert!(validate_proxy_head(b"GET /raw?x=\xff HTTP/1.1\r\nX-Test: a\xffb\r\n\r\n").is_ok());
         assert!(vapache_verified::proxy_request_line_admit(
             b"GET",
             b"/path",
@@ -2952,13 +3027,13 @@ mod more_tests {
             }
         }
 
-        let safe = "GET /path HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\n".to_string();
+        let safe = b"GET /path HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\n".to_vec();
         let validated =
             ValidatedProxyHead::new(safe.clone(), &backend("127.0.0.1"), Some("example.test"))
                 .unwrap();
-        assert_eq!(validated.as_bytes(), safe.as_bytes());
+        assert_eq!(validated.as_bytes(), safe.as_slice());
         assert!(ValidatedProxyHead::new(
-            "GET /path HTTP/1.1\r\nHost: [::1]:9000\r\n\r\n".to_string(),
+            b"GET /path HTTP/1.1\r\nHost: [::1]:9000\r\n\r\n".to_vec(),
             &backend("[::1]"),
             None,
         )
@@ -2969,12 +3044,12 @@ mod more_tests {
         // only the component check can reject it.
         let injected_host = "evil\r\nX-Injected: yes";
         let head = format!("GET /path HTTP/1.1\r\nHost: {injected_host}:9000\r\n\r\n");
-        assert!(validate_proxy_head(&head).is_ok());
-        assert!(ValidatedProxyHead::new(head, &backend(injected_host), None).is_err());
+        assert!(validate_proxy_head(head.as_bytes()).is_ok());
+        assert!(ValidatedProxyHead::new(head.into_bytes(), &backend(injected_host), None).is_err());
         for bad_backend in ["evil host", "evil/path", "evil\r\nX: y", ""] {
             assert!(
                 ValidatedProxyHead::new(
-                    "GET /path HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+                    b"GET /path HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(),
                     &backend(bad_backend),
                     None,
                 )
@@ -2985,7 +3060,7 @@ mod more_tests {
         for bad_forwarded in ["evil\r\nX-Injected: yes", "evil\nX: y", "evil host", ""] {
             assert!(
                 ValidatedProxyHead::new(
-                    "GET /path HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\n".to_string(),
+                    b"GET /path HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\n".to_vec(),
                     &backend("127.0.0.1"),
                     Some(bad_forwarded),
                 )
@@ -3004,7 +3079,8 @@ mod more_tests {
             "GET /path HTTP/1.1\r\nHost: x\r\n X-Folded: yes\r\n\r\n",
         ] {
             assert!(
-                ValidatedProxyHead::new(injected.to_string(), &backend("127.0.0.1"), None).is_err(),
+                ValidatedProxyHead::new(injected.as_bytes().to_vec(), &backend("127.0.0.1"), None)
+                    .is_err(),
                 "{injected:?}"
             );
         }
@@ -3154,7 +3230,21 @@ mod coverage_tests {
             std::io::ErrorKind::UnexpectedEof
         );
         let mut line = Cursor::new(b"a\r\n".to_vec());
-        assert_eq!(read_line(&mut line).unwrap(), "a");
+        assert_eq!(read_line(&mut line).unwrap(), b"a");
+        let mut raw = Cursor::new(b"a\xffb\r\n".to_vec());
+        assert_eq!(read_line(&mut raw).unwrap(), b"a\xffb");
+        let mut extra_cr = Cursor::new(b"a\r\r\n".to_vec());
+        assert_eq!(read_line(&mut extra_cr).unwrap(), b"a\r");
+        let mut bare_lf = Cursor::new(b"a\n".to_vec());
+        assert_eq!(
+            read_line(&mut bare_lf).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let mut only_lf = Cursor::new(b"\n".to_vec());
+        assert_eq!(
+            read_line(&mut only_lf).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
 
         let mut out = Vec::new();
         let mut chunked = Cursor::new(b"4\r\nWiki\r\n0\r\n\r\n".to_vec());
@@ -3177,15 +3267,18 @@ mod coverage_tests {
             front: "/api".into(),
             backend: "http://b:1".into(),
         }];
-        let mut exact = "http://b:1".to_string();
+        let mut exact = b"http://b:1".to_vec();
         rewrite_location(&mut exact, &reverse);
-        assert_eq!(exact, "/api/");
-        let mut child = "http://b:1/x".to_string();
+        assert_eq!(exact, b"/api/");
+        let mut child = b"http://b:1/x".to_vec();
         rewrite_location(&mut child, &reverse);
-        assert_eq!(child, "/api/x");
-        let mut other = "http://other/x".to_string();
+        assert_eq!(child, b"/api/x");
+        let mut raw_child = b"http://b:1/a\xff".to_vec();
+        rewrite_location(&mut raw_child, &reverse);
+        assert_eq!(raw_child, b"/api/a\xff");
+        let mut other = b"http://other/x".to_vec();
         rewrite_location(&mut other, &reverse);
-        assert_eq!(other, "http://other/x");
+        assert_eq!(other, b"http://other/x");
     }
 
     #[test]
@@ -3195,9 +3288,13 @@ mod coverage_tests {
         assert!(websocket_accept("dGhlIHNhbXBsZSBub25jZQ==").is_some());
 
         let head = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
-        assert_eq!(response_header(head, "upgrade"), Some("websocket"));
-        assert_eq!(response_header(head, "missing"), None);
-        assert_eq!(response_header(b"HTTP/1.1 101 \xff\r\n", "x"), None);
+        assert_eq!(response_header(head, b"upgrade"), Some(b"websocket".as_slice()));
+        assert_eq!(response_header(head, b"missing"), None);
+        assert_eq!(response_header(b"HTTP/1.1 101 \xff\r\n", b"x"), None);
+        assert_eq!(
+            response_header(b"HTTP/1.1 101 OK\r\nX-Raw: a\xffb\r\n\r\n", b"x-raw"),
+            Some(b"a\xffb".as_slice())
+        );
 
         assert_eq!(encode_proxy_path("/a b%\u{7f}?#"), "/a%20b%25%7F%3F%23");
         assert!(hop_by_hop("Proxy-Authorization"));
@@ -3918,7 +4015,9 @@ mod coverage_tests {
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let accept = websocket_accept(key).unwrap();
         let (port, upstream) = spawn_upstream(ws_101(&accept), true).await;
-        let r = ws_request(key);
+        let mut r = ws_request(key);
+        r.query = b"x=\xff".to_vec();
+        r.headers.insert("x-raw", b"a\xffb".to_vec());
         let (cfg, scope, r, target, grant, resource) = ws_context(port, &r);
         let initial = b"hello".to_vec();
         let (mut client, server) = tokio::io::duplex(64 * 1024);
@@ -3951,9 +4050,13 @@ mod coverage_tests {
             .unwrap();
         assert!(result.is_ok());
         let request = upstream.await.unwrap();
-        let text = String::from_utf8_lossy(&request);
-        assert!(text.contains("GET /ws?x=1 HTTP/1.1"));
-        assert!(text.ends_with("hello"));
+        assert!(request
+            .windows(b"GET /ws?x=\xff HTTP/1.1".len())
+            .any(|window| window == b"GET /ws?x=\xff HTTP/1.1"));
+        assert!(request
+            .windows(b"x-raw: a\xffb\r\n".len())
+            .any(|window| window == b"x-raw: a\xffb\r\n"));
+        assert!(request.ends_with(b"hello"));
     }
 
     #[tokio::test]

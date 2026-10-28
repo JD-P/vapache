@@ -288,6 +288,31 @@ generated ACL cases in the normal coverage gate. The broader parity process and
 the import boundary for a future extracted Apache model are documented in
 `docs/apache-access-parity.md`.
 
+## Post-P16 pre-pass hardening
+
+The four follow-up hardening items are closed before the next adversarial pass:
+
+- HTTP and WebSocket upstream request heads and response headers remain byte
+  vectors through validation and serialization. Raw query and obs-text header
+  bytes are forwarded exactly; no proxy boundary uses lossy UTF-8. CGI exports
+  the raw query as a Unix byte-string environment value as well.
+- Main configuration, included configuration, `TypesConfig`, access-file
+  contents and every filesystem identity admitted to a `RequestPlan` must be
+  valid UTF-8. Invalid bytes fail configuration loading or request planning;
+  access control never operates on a replacement-character projection.
+- Canonical/rewrite target scope restriction now carries content and tagged
+  environment policies from both the selected target and the URL identity,
+  with the URL policy applied last. Symlink differential fixtures pin content
+  type and authorization-visible environment behavior.
+- SHA-1 and MD5 moved to their maintained 0.11 digest stack, eliminating the
+  vulnerable `block-buffer` 0.10 line, and TLS PEM loading moved to
+  `rustls-pki-types`, removing the unmaintained `rustls-pemfile` dependency.
+
+The new textual-identity executable gate and rejection lemma are verified by
+Verus. Runtime regressions cover invalid UTF-8 config, MIME, access-file and
+filesystem identities, byte-exact proxy/WebSocket forwarding, CGI query bytes,
+and the cross-identity scope merge.
+
 ## Transform-to-sink and filesystem-race closure
 
 The two pre-review hardening items after Pass 14 are now runtime-enforced

@@ -403,7 +403,12 @@ pub fn cache_path(
     let key = response_key(chain, force_url);
     let mut hasher = Sha1::new();
     hasher.update(&key);
-    dir.join(format!("{:x}.ocsp", hasher.finalize()))
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    dir.join(format!("{digest}.ocsp"))
 }
 
 pub fn load_cached(path: &std::path::Path) -> Option<Vec<u8>> {

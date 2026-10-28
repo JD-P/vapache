@@ -84,7 +84,7 @@ impl CanonicalTarget {
     pub fn from_url_path(path: &str) -> Option<Self> {
         let trailing_slash = path.len() > 1 && path.ends_with('/');
         let norm = normalize_uri_path(path.as_bytes())?;
-        let mut url_path = String::from_utf8_lossy(&norm).into_owned();
+        let mut url_path = String::from_utf8(norm.clone()).ok()?;
         if trailing_slash && url_path != "/" {
             url_path.push('/');
         }
@@ -143,7 +143,7 @@ impl LayerIdentity {
 pub fn layer_subject(dir: &Path, fs_path: &Path, url_path: &str) -> Option<String> {
     let rel = fs_path.strip_prefix(dir).ok()?;
     let mut subject = rel
-        .to_string_lossy()
+        .to_str()?
         .replace('\\', "/")
         .trim_matches('/')
         .to_string();
@@ -281,6 +281,19 @@ impl RequestPlan {
         fs_path: PathBuf,
         script_alias: bool,
     ) -> Result<Self, PlanError> {
+        // Paths participate in routing, access-file selection, rewrite
+        // subjects and CGI identity.  Reject a filesystem identity that
+        // cannot be represented exactly instead of projecting it through
+        // U+FFFD at any of those policy boundaries.
+        let textual_identity = root.to_str().is_some()
+            && rel.to_str().is_some()
+            && fs_path.to_str().is_some();
+        if !vapache_verified::text_identity_admit(textual_identity) {
+            return Err(PlanError::AccessFiles(format!(
+                "{}: non-UTF-8 filesystem policy identity",
+                fs_path.display()
+            )));
+        }
         let layers = crate::htaccess::collect_layers_with_root(
             cfg,
             vhost,
@@ -587,6 +600,26 @@ mod tests {
             identity.subject(Path::new("/srv/www/dir/file"), "/dir/file"),
             Some("dir/file".into())
         );
+    }
+
+    #[test]
+    fn filesystem_policy_identities_reject_invalid_utf8() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let cfg = load_config("Listen 127.0.0.1:0\n");
+        let root = PathBuf::from(OsString::from_vec(b"/tmp/vapache-root-\xff".to_vec()));
+        let error = RequestPlan::build_with_fs_path(
+            &cfg,
+            None,
+            CanonicalTarget::from_url_path("/file.txt").unwrap(),
+            root.clone(),
+            PathBuf::from("file.txt"),
+            root.join("file.txt"),
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PlanError::AccessFiles(message) if message.contains("non-UTF-8")));
     }
 
     #[test]

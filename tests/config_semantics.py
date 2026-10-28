@@ -133,6 +133,10 @@ def make_case(case: dict):
     write(case_dir(case) / "secret.txt", f"{case['name']} secret\n")
     for rel, content in case.get("files", {}).items():
         case_file(case, rel, content)
+    for rel, target in case.get("symlinks", {}).items():
+        link = case_dir(case) / rel
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target)
     for p in case_dir(case).rglob("*"):
         if p.is_file() and not p.is_symlink():
             os.chmod(p, 0o644)
@@ -2633,6 +2637,51 @@ CASES.extend(
                 "</Directory>",
             ],
             "requests": [("GET", "/src_server_rewrite_env/file.txt", None, {})],
+        },
+        {
+            "name": "symlink-content-policy-keeps-url-identity",
+            "dir": "src_symlink_content_identity",
+            "files": {"target/data.bin": "content\n"},
+            "symlinks": {"public/link.bin": "../target/data.bin"},
+            "config": [
+                f'<Directory "{{dir}}/public">',
+                "    ForceType text/plain",
+                "</Directory>",
+                f'<Directory "{{dir}}/target">',
+                "    ForceType application/octet-stream",
+                "</Directory>",
+            ],
+            "requests": [
+                (
+                    "GET",
+                    "/src_symlink_content_identity/public/link.bin",
+                    None,
+                    {"content-type": None},
+                )
+            ],
+        },
+        {
+            "name": "symlink-environment-keeps-url-identity",
+            "dir": "src_symlink_environment_identity",
+            "files": {"target/data.txt": "content\n"},
+            "symlinks": {"public/link.txt": "../target/data.txt"},
+            "config": [
+                f'<Directory "{{dir}}/public">',
+                "    SetEnvIf X-Gate ^yes$ SHARED=url",
+                "</Directory>",
+                f'<Directory "{{dir}}/target">',
+                "    SetEnvIf X-Gate ^yes$ SHARED=target",
+                '    Require expr "env(\'SHARED\') == \'url\'"',
+                "</Directory>",
+            ],
+            "requests": [
+                (
+                    "GET",
+                    "/src_symlink_environment_identity/public/link.txt",
+                    {"X-Gate": "yes"},
+                    {},
+                )
+            ],
         },
     ]
 )

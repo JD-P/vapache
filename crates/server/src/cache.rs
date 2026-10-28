@@ -1092,7 +1092,11 @@ fn cache_stem(cfg: &Config, key: &str) -> Option<std::path::PathBuf> {
     let root = cfg.cache.root.as_ref()?;
     let mut hasher = Sha1::new();
     hasher.update(key.as_bytes());
-    let name = format!("{:x}", hasher.finalize());
+    let name: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     Some(root.join(name))
 }
 

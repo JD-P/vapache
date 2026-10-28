@@ -89,12 +89,13 @@ That audit closed these additional refinement failures:
   `Require all`, negative providers in OR contexts and authorization sections
   containing only negative providers are rejected like Apache.
 
-`tests/config_semantics.py` contains 235 fixed paired cases after this audit,
-including 23 source-derived additions, and `tests/config_validity.py` pins the
-corresponding load-time rejection rules. Unsupported expression forms or
-directive ownership that cannot be represented exactly fail configuration
-loading; they are not converted into a false condition that negation could
-turn into access.
+`tests/config_semantics.py` contains 237 fixed paired cases after this audit,
+including 25 source-derived additions. The two newest cases exercise content
+type and environment policy across lexical and canonical symlink identities.
+`tests/config_validity.py` pins the corresponding load-time rejection rules.
+Unsupported expression forms or directive ownership that cannot be
+represented exactly fail configuration loading; they are not converted into
+a false condition that negation could turn into access.
 
 ## Extracted Apache models
 

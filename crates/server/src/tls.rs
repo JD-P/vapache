@@ -7,13 +7,12 @@
 
 use crate::config::{vhost_port, Config, SslConfig, VHost};
 use rustls::crypto::{ring, CryptoProvider};
+use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{RootCertStore, ServerConfig, SupportedProtocolVersion};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
 use std::net::IpAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -81,10 +80,9 @@ impl ResolvesServerCert for SniResolver {
 }
 
 fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let f =
-        File::open(path).map_err(|e| format!("cannot open certificate {}: {e}", path.display()))?;
-    let mut r = BufReader::new(f);
-    let certs = rustls_pemfile::certs(&mut r)
+    let data = std::fs::read(path)
+        .map_err(|e| format!("cannot open certificate {}: {e}", path.display()))?;
+    let certs = CertificateDer::pem_slice_iter(&data)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("cannot parse certificate {}: {e}", path.display()))?;
     if certs.is_empty() {
@@ -94,12 +92,12 @@ fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
 }
 
 fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
-    let f =
-        File::open(path).map_err(|e| format!("cannot open private key {}: {e}", path.display()))?;
-    let mut r = BufReader::new(f);
-    rustls_pemfile::private_key(&mut r)
-        .map_err(|e| format!("cannot parse private key {}: {e}", path.display()))?
-        .ok_or_else(|| format!("no PEM private key found in {}", path.display()))
+    let data = std::fs::read(path)
+        .map_err(|e| format!("cannot open private key {}: {e}", path.display()))?;
+    PrivateKeyDer::from_pem_slice(&data).map_err(|e| match e {
+        PemError::NoItemsFound => format!("no PEM private key found in {}", path.display()),
+        _ => format!("cannot parse private key {}: {e}", path.display()),
+    })
 }
 
 fn load_key(

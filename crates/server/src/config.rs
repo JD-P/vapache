@@ -1937,6 +1937,16 @@ impl Scope {
 
         self.override_policy = self.override_policy.conjoined_with(&base.override_policy);
 
+        // The selected target and the client-visible URL are both policy
+        // identities.  Keep target content/environment effects, then apply
+        // the URL identity last just as a lexical child scope would apply:
+        // scalar content decisions and duplicate environment values cannot
+        // silently discard the policy attached to the requested URL, while
+        // RemoveType/UnsetEnv from either side remain effective.
+        self.content_policy.merge_child(&base.content_policy);
+        self.environment_policy
+            .merge_child(&base.environment_policy);
+
         // Preserve lexical response-header policy while still allowing the
         // target to add its own restrictions.  Unsets from either identity are
         // retained; target sets override lexical values only when the lexical
@@ -2160,22 +2170,22 @@ impl MimeMap {
     }
 
     pub fn load_types_file(&mut self, path: &Path) -> Result<(), String> {
+        if !vapache_verified::text_identity_admit(path.to_str().is_some()) {
+            return Err("TypesConfig path is not valid UTF-8".into());
+        }
         let data = std::fs::read(path)
             .map_err(|e| format!("cannot read TypesConfig {}: {e}", path.display()))?;
-        for line in data.split(|b| *b == b'\n') {
-            let line = line.split(|b| *b == b'#').next().unwrap_or(b"");
-            let fields: Vec<&[u8]> = line
-                .split(|b| b.is_ascii_whitespace())
-                .filter(|x| !x.is_empty())
-                .collect();
+        let text = std::str::from_utf8(&data)
+            .map_err(|_| format!("TypesConfig {} is not valid UTF-8", path.display()))?;
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("");
+            let fields: Vec<&str> = line.split_ascii_whitespace().collect();
             if fields.len() < 2 {
                 continue;
             }
-            let ty = String::from_utf8_lossy(fields[0]).to_string();
+            let ty = fields[0].to_string();
             for ext in &fields[1..] {
-                let e = String::from_utf8_lossy(ext)
-                    .trim_start_matches('.')
-                    .to_ascii_lowercase();
+                let e = ext.trim_start_matches('.').to_ascii_lowercase();
                 if !e.is_empty() {
                     self.types.insert(e, ty.clone());
                 }
@@ -2826,6 +2836,14 @@ impl ParserState {
     }
 
     fn parse_file(&mut self, path: &Path, required: bool) {
+        if !vapache_verified::text_identity_admit(path.to_str().is_some()) {
+            let loc = SourceLoc {
+                file: path.display().to_string(),
+                line: 0,
+            };
+            self.error(&loc, "config path is not valid UTF-8");
+            return;
+        }
         if self.depth > 32 {
             let loc = SourceLoc {
                 file: path.display().to_string(),
@@ -2847,9 +2865,19 @@ impl ParserState {
                 return;
             }
         };
+        let text = match std::str::from_utf8(&data) {
+            Ok(text) => text,
+            Err(_) => {
+                let loc = SourceLoc {
+                    file: path.display().to_string(),
+                    line: 0,
+                };
+                self.error(&loc, "config file is not valid UTF-8");
+                return;
+            }
+        };
         self.depth += 1;
-        let text = String::from_utf8_lossy(&data);
-        let logical = crate::config_frontend::logical_lines_with_numbers(&text);
+        let logical = crate::config_frontend::logical_lines_with_numbers(text);
 
         for (lineno, line) in logical {
             let loc = SourceLoc {
@@ -2996,21 +3024,29 @@ impl ParserState {
         } else {
             self.server_root.join(p)
         };
-        let s = full.to_string_lossy().to_string();
+        let Some(s) = full.to_str().map(str::to_owned) else {
+            self.error(loc, "Include path is not valid UTF-8");
+            return;
+        };
         if s.contains('*') || s.contains('?') || s.contains('[') {
             let (dir, pat) = match s.rfind('/') {
                 Some(i) => (&s[..i], &s[i + 1..]),
                 None => (".", s.as_str()),
             };
-            let mut names: Vec<String> = std::fs::read_dir(if dir.is_empty() { "/" } else { dir })
+            let mut names: Vec<String> = Vec::new();
+            for ent in std::fs::read_dir(if dir.is_empty() { "/" } else { dir })
                 .into_iter()
                 .flatten()
                 .flatten()
-                .filter_map(|ent| {
-                    let n = ent.file_name().to_string_lossy().to_string();
-                    glob_match(pat.as_bytes(), n.as_bytes()).then(|| format!("{dir}/{n}"))
-                })
-                .collect();
+            {
+                let Some(n) = ent.file_name().to_str().map(str::to_owned) else {
+                    self.error(loc, "Include directory contains a non-UTF-8 path");
+                    return;
+                };
+                if glob_match(pat.as_bytes(), n.as_bytes()) {
+                    names.push(format!("{dir}/{n}"));
+                }
+            }
             names.sort();
             if names.is_empty() && !optional {
                 self.error(loc, format!("Include file not found: {pattern}"));
@@ -8015,6 +8051,37 @@ mod tests {
     }
 
     #[test]
+    fn configuration_and_types_files_reject_invalid_utf8() {
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-invalid-config-utf8-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("httpd.conf");
+        std::fs::write(&config, b"Listen 127.0.0.1:0\nServerName bad\xffname\n").unwrap();
+        let errors = Config::load(
+            &config,
+            &dir,
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+        )
+        .unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.msg.contains("not valid UTF-8")));
+
+        let types = dir.join("mime.types");
+        std::fs::write(&types, b"text/plain txt\xff\n").unwrap();
+        assert!(MimeMap::new()
+            .load_types_file(&types)
+            .unwrap_err()
+            .contains("not valid UTF-8"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn implicit_document_root_is_bound_into_the_global_scope() {
         let cfg = load_text("Listen 127.0.0.1:0\n", true).unwrap();
         assert_eq!(
@@ -11894,6 +11961,18 @@ Require all granted\n\
     fn resolved_target_scope_is_a_meet_not_a_replacement() {
         let mut url = Scope::default();
         url.options.push_add(Options::EXEC_CGI | Options::INDEXES);
+        url.content_policy.force_type = Some("text/plain".into());
+        url.content_policy.remove_types.push("secret".into());
+        url.environment_policy.set_env_if.push(Originated::main(
+            parse_env_rule(
+                "setenvif",
+                &["X-Gate".into(), "^yes$".into(), "SHARED=url".into()],
+            )
+            .unwrap(),
+        ));
+        url.environment_policy
+            .unset_env
+            .push(Originated::main("TARGET_ONLY".into()));
         url.mapping_policy
             .handlers
             .push(Handler::remove("cgi".into()));
@@ -11903,6 +11982,26 @@ Require all granted\n\
             .options
             .push_add(Options::EXEC_CGI | Options::INDEXES);
         target.options.push_remove(Options::INDEXES);
+        target.content_policy.force_type = Some("application/octet-stream".into());
+        target
+            .content_policy
+            .add_types
+            .push(("application/x-secret".into(), "secret".into()));
+        target.environment_policy.set_env_if.push(Originated::main(
+            parse_env_rule(
+                "setenvif",
+                &[
+                    "X-Gate".into(),
+                    "^yes$".into(),
+                    "SHARED=target".into(),
+                ],
+            )
+            .unwrap(),
+        ));
+        target
+            .environment_policy
+            .set_env
+            .push(Originated::main(("TARGET_ONLY".into(), "visible".into())));
         target
             .mapping_policy
             .handlers
@@ -11912,6 +12011,33 @@ Require all granted\n\
         let options = target.effective_options();
         assert!(options.contains(Options::EXEC_CGI));
         assert!(!options.contains(Options::INDEXES));
+        assert_eq!(target.content_policy.force_type.as_deref(), Some("text/plain"));
+        assert!(target
+            .content_policy
+            .remove_types
+            .iter()
+            .any(|ext| ext == "secret"));
+        assert!(target
+            .content_policy
+            .add_types
+            .iter()
+            .any(|(ty, ext)| ty == "application/x-secret" && ext == "secret"));
+
+        let mut req = test_request("GET");
+        req.headers.insert("x-gate", b"yes".to_vec());
+        let peer = "127.0.0.1".parse().unwrap();
+        let auth_env = target.authorization_env(&req, "/x", peer);
+        assert_eq!(
+            auth_env
+                .iter()
+                .find(|(name, _)| name == "SHARED")
+                .map(|(_, value)| value.as_slice()),
+            Some(b"url".as_slice())
+        );
+        assert!(!target
+            .request_env(&req, "/x", peer)
+            .iter()
+            .any(|(name, _)| name == "TARGET_ONLY"));
         // The lexical RemoveHandler survives a canonical AddHandler.
         assert_eq!(effective_handler(&target, b"upload.cgi"), None);
 

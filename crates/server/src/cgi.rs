@@ -179,6 +179,12 @@ fn reserved_cgi_env(name: &str) -> bool {
 
 pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = Vec::new();
+    // CGI environment values are byte strings on Unix. Preserve the exact
+    // query instead of collapsing distinct octets through lossy UTF-8.
+    env.push((
+        OsString::from("QUERY_STRING"),
+        OsString::from_vec(ctx.req.query.clone()),
+    ));
     let mut put = |k: &str, v: String| env.push((OsString::from(k), OsString::from(v)));
     put("GATEWAY_INTERFACE", "CGI/1.1".into());
     put("SERVER_SOFTWARE", ctx.cfg.server_header());
@@ -198,10 +204,6 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
         ctx.script_name.to_string()
     };
     put("REQUEST_URI", request_uri);
-    put(
-        "QUERY_STRING",
-        String::from_utf8_lossy(&ctx.req.query).into_owned(),
-    );
     put("SCRIPT_NAME", ctx.script_name.to_string());
     put(
         "SCRIPT_FILENAME",
@@ -1405,7 +1407,7 @@ mod tests {
         let dir = tempdir("env-reserved");
         let cfg = config(&dir);
         let mut req = request("/cgi-bin/env.sh?x=1", Vec::new());
-        req.query = b"x=1".to_vec();
+        req.query = b"x=\xff".to_vec();
         let extra = vec![
             ("REQUEST_METHOD".into(), b"POST".to_vec()),
             ("HTTP_HOST".into(), b"evil.test".to_vec()),
@@ -1448,7 +1450,12 @@ mod tests {
             dir.join("cgi-bin/env.sh").to_string_lossy()
         );
         assert_eq!(get("CUSTOM_VALUE"), "ok");
-        assert_eq!(get("QUERY_STRING"), "x=1");
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key == "QUERY_STRING")
+                .map(|(_, value)| value.as_os_str().as_bytes()),
+            Some(b"x=\xff".as_slice())
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

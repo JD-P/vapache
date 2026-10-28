@@ -196,7 +196,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **446 verified functions, 0 errors** (percent-decoding,
+Current result: **448 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -235,7 +235,10 @@ inline Unicode classes disabled, header policy input preserves every raw byte,
 normalized path bytes require valid UTF-8 before becoming a routing/ACL
 identity, and access-file-origin environment entries can never be admitted to
 the FastCGI parameter environment or detached from their origin during scope
-merges.
+merges. The post-P16 hardening adds a verified textual-identity gate for
+configuration and filesystem policy paths; request plans, config files,
+access files, includes and MIME maps reject invalid UTF-8 instead of applying
+replacement-character policy.
 
 Function count is not the progress metric. The verification ledger tracks
 security obligations and proof debt:
@@ -250,7 +253,7 @@ Current ledger: **53.1% weighted obligations**, **6/6 proof debt**,
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **106 adversarial replay cases** covering the findings classes,
-and **446 Verus functions with 0 errors** (including the I3 fast-path
+and **448 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -305,7 +308,7 @@ documented rather than re-derived.
 Security-sensitive configuration semantics are checked separately:
 
 ```sh
-python3 tests/config_semantics.py  # 235 fixed differential cases
+python3 tests/config_semantics.py  # 237 fixed differential cases
 python3 tests/config_semantics.py --random 300 --seed 7  # deterministic randomized matrix
 python3 tests/config_validity.py  # context acceptance matrix (Apache -t vs vapached -t)
 python3 tests/config_grammar.py   # finite valid/invalid grammar matrix
@@ -381,9 +384,9 @@ Delimiter-only lines and narrowly documented unreachable invariants, external
 failure races and privileged-kernel failures are excluded from that metric.
 
 Latest snapshot: **18,913/18,913 executable server production lines (100%)**.
-The current suite is 451 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
-integration tests, 165 conformance tests and 235 fixed configuration cases.
-The separate Verus gate proves 446 functions with 0 errors; proof-only code is
+The current suite is 454 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
+integration tests, 165 conformance tests and 237 fixed configuration cases.
+The separate Verus gate proves 448 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):
