@@ -196,7 +196,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **379 verified functions, 0 errors** (percent-decoding,
+Current result: **422 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -218,10 +218,16 @@ predicates, and the pass-10 I61 Options/handler/`AllowOverride` meet and
 rewrite-scope-retention kernels, plus pass-12 admission proofs for exact
 `Require method`/`Require env` operands, HTTP/2 pseudo-header identity, CGI
 status/header framing, first-existing `AccessFileName`, `FileETag None`,
-bounded `RewriteMap prg` results, exact disk-cache keys, targeted cache
+bounded and descriptor-snapshotted `RewriteMap prg` execution, exact disk-cache keys, targeted cache
 invalidation and `[BNE]` escaping, plus the P13 lexical Files-scope handler
-binding proof and the executable `AllowOverride`/`AllowOverrideList`/`Nonfatal`
-admission gate).
+binding proof, the executable `AllowOverride`/`AllowOverrideList`/`Nonfatal`
+admission gate, and the P14 per-depth Files phase plan, proxy-template dynamic
+marker guard, full rewrite-chain resume and duplicate-header merge selection,
+plus the executable rewrite expansion-token/match-action/program-counter state
+machine and recursive configuration kind/phase/deferred-slot/order decisions).
+The latest kernels also model the universal transform capability carried from
+authorization to each protected sink, prove its inode/backend/cache-policy
+requirements, and validate descriptor snapshots used for access-file parsing.
 
 Function count is not the progress metric. The verification ledger tracks
 security obligations and proof debt:
@@ -231,12 +237,12 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus   # include the Verus gate
 ```
 
-Current ledger: **52.3% weighted obligations**, **6/6 proof debt**,
-**8/8 grant-required sinks**, **8/8 path-target-bound sinks**, **4/8
+Current ledger: **53.1% weighted obligations**, **6/6 proof debt**,
+**8/8 grant-required sinks**, **8/8 path-target-bound sinks**, **5/8
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
-failures**, **94 adversarial replay cases** covering the findings classes,
-and **379 Verus functions with 0 errors** (including the I3 fast-path
+failures**, **101 adversarial replay cases** covering the findings classes,
+and **422 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -273,7 +279,7 @@ requiring a grant. Raising a budget is a deliberate, reviewable change.
 cargo test --workspace          # Rust unit tests
 python3 tests/conformance.py    # 165 local vapached conformance tests
 python3 tests/conformance.py --differential  # also compare with Apache
-python3 tests/adversarial_regressions.py  # F23-P13 end-to-end replay suite
+python3 tests/adversarial_regressions.py  # F23-P14 end-to-end replay suite
 ```
 
 The conformance suite starts a real `vapached` and covers HTTP/1.1, HTTPS,
@@ -281,10 +287,11 @@ HTTP/2, CGI, conditional requests, ranges, access control and Basic auth. Use
 `--differential` when Apache is installed to start both servers and write
 `tests/differential_report.md`, comparing status codes, selected headers and
 bodies.  The `adversarial/`
-folder holds the numbered findings write-ups (passes 3–13) and the pass-11
-and pass-13 exploit harnesses (`adversarial/p11/exploit_p11.py` and
-`adversarial/p13/exploit_p13.py`) with their Apache-versus-vapached case
-dossiers, so the exact exploit shapes are documented rather than re-derived.
+folder holds the numbered findings write-ups (passes 3–14) and the pass-11,
+pass-13 and pass-14 exploit harnesses (`adversarial/p11/exploit_p11.py`,
+`adversarial/p13/exploit_p13.py` and `adversarial/p14/exploit_p14.py`) with
+their Apache-versus-vapached case dossiers, so the exact exploit shapes are
+documented rather than re-derived.
 
 Security-sensitive configuration semantics are checked separately:
 
@@ -362,10 +369,10 @@ cache, file serving, HTTP/2, logging, OCSP, proxying and rewrite execution.
 Delimiter-only lines and narrowly documented unreachable invariants, external
 failure races and privileged-kernel failures are excluded from that metric.
 
-Latest snapshot: **18,524/18,524 executable server production lines (100%)**.
-The current suite is 435 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
+Latest snapshot: **18,824/18,824 executable server production lines (100%)**.
+The current suite is 443 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
 integration tests, 165 conformance tests and 206 generated configuration cases.
-The separate Verus gate proves 379 functions with 0 errors; proof-only code is
+The separate Verus gate proves 422 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

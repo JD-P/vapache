@@ -179,7 +179,10 @@ The confirmed cases in `adversarial/findings_p12.md` are closed as follows:
   `FileETag None` emits no entity tag while preserving wildcard preconditions.
 - `RewriteMap prg` runs in a separate process group with a whole-operation
   deadline and an 8 KiB result limit; timeout, overflow and worker failure
-  produce no substitution.
+  produce no substitution. Its executable is copied from one stable descriptor
+  into a sealed memfd at configuration load; each lookup verifies that the
+  configured pathname still names the original inode/version and executes the
+  immutable snapshot, so rename and same-inode replacement both fail closed.
 - Disk cache metadata carries the complete V4 key, lookup verifies the exact
   key rather than trusting a SHA-1 filename, and unsafe-method invalidation is
   canonical and prefix-targeted rather than flushing unrelated entries.
@@ -206,11 +209,82 @@ dispatch assertion:
   five P13 regressions cover FastCGI, PATH_INFO, Files-scoped SetHandler,
   canonical Files denial and live Location controls.
 
-The Verus gate now proves 379 functions with zero errors. The `.htaccess`
+The Verus gate now proves 422 functions with zero errors. The `.htaccess`
 admission seam is also executable proof code: `override_mode_allows` decides
 category bits, while `htaccess_gate_admit` ensures only a known, policy-allowed
 directive or section can reach the effectful parser; `Nonfatal` can only turn a
 rejection into a skip.
+
+## Pass 14 closure
+
+The five phase, rewrite, expression and request-head findings in
+`adversarial/findings_p14.md` are closed as follows:
+
+- The verified Files plan now applies main-config and access-file
+  `<Files>`/`<FilesMatch>` layers in root-to-leaf directory-depth order, config
+  first at each depth. Deeper operator policy therefore outranks a shallow
+  writable `.htaccess`, while same-directory access-file precedence is kept.
+- `[P]` template admission consumes `rewrite_template_static`, whose model
+  recognizes every spelling accepted by the runtime expander (`$N`, `%N`,
+  `\N`, `${...}` and `%{...}`). Request-derived authorities fail at load time.
+- Config compilation copies the effective default or explicit DocumentRoot
+  into the global scope and inherited vhosts. Expression file tests have no
+  `/` fallback; an unbound synthetic scope fails closed.
+- HTTP/1 duplicate field lines are merged, in arrival order, only after the
+  verified raw framing checks. `header_merge_index` proves that the selected
+  slot is the exact canonical name and has no earlier match; duplicate Host
+  remains a parse error.
+- A failed `[C]` chain uses the verified `rewrite_chain_resume` decision to
+  skip every remaining chained rule and its first non-chain action. Three-rule
+  unit coverage and live P14 replays pin both failing and passing gates.
+- The follow-on refinement makes every Directory and Files plan step name its
+  exact depth and provenance (`Config` or `Access`), and the runtime consumes
+  those steps directly. Rule kind-to-phase, deferred-slot selection and the
+  recursive nested-rule comparator are likewise executable Verus decisions.
+- Rewrite evaluation now uses one verified token alphabet for expansion and
+  template admission, one staged matched/unmatched action, and one bounded
+  program-counter transition for `[S]`, `[N]`, `[L]` and `[END]` after both
+  `-` and internal substitutions. This also pins `RewriteRule ... - [END]` as
+  a final pass.
+
+The Verus gate proves 422 functions with zero errors. Seven P14 replay cases
+cover the deeper Files deny/auth/handler/Options variants, implicit-DocumentRoot
+file oracles, duplicate-header guards and full rewrite-chain skipping; parser
+and verified-kernel tests cover every dynamic proxy-authority spelling.
+
+## Transform-to-sink and filesystem-race closure
+
+The two pre-review hardening items after Pass 14 are now runtime-enforced
+invariants:
+
+- TransformCapability is an executable Verus state machine. Retargeting
+  removes authorization and all concrete bindings; authorization, inode and
+  backend transitions rebuild them. The proofs show that a retargeted state
+  cannot reach a sink, every admitted sink was reauthorized, and file,
+  backend and cache sinks carry their required binding.
+- AccessGrant::require_sink projects that model at every protected static
+  file, directory, local CGI, FastCGI, HTTP proxy, WebSocket and cache sink.
+  Exact ResourceKey equality prevents a grant for the pre-transform target
+  from being reused even when the capability bits are otherwise sufficient.
+- Access-file selection opens one descriptor. Candidate identity, cache key,
+  bytes, and the post-read metadata validation all come from that descriptor;
+  a changed regular-file bit, device/inode, version, mode or size fails
+  closed. Pathname replacement cannot substitute new policy between lookup
+  and parsing.
+- FastCGI script selection now opens the script below its configured base,
+  reauthorizes the actual descriptor path, binds both (dev, inode) and the
+  exact backend, and compares a final pathname open against the authorized
+  inode after backend connection and immediately before parameters are emitted.
+- `RewriteMap prg` program selection is descriptor-first too. The load-time
+  source must be a bounded executable regular file and remain unchanged while
+  copied into a sealed memfd. Runtime pathname identity/version changes fail
+  closed, while execution uses the immutable snapshot rather than reopening
+  attacker-replaceable code.
+
+FastCGI itself cannot pass an open file descriptor to PHP-FPM. Consequently,
+an external backend still opens SCRIPT_FILENAME after vapache's final
+identity check. That last protocol-boundary race is documented as a backend
+contract rather than hidden as a stable-filesystem assumption.
 
 ## Regression surface
 
@@ -228,11 +302,13 @@ The closure is exercised by:
   rewrites and rewrite-set environment effects, CGI/FastCGI exact environment
   and script-containment cases, mixed prefix/regex plus balancer
   logical/concrete proxy identity cases, main-config directive disposition
-  cases, and framing/trailer/record-limit cases for HTTP, proxy and FastCGI;
+  cases, framing/trailer/record-limit cases for HTTP, proxy and FastCGI,
+  transform sink-binding progression, access-file descriptor/cache mutation,
+  FastCGI script inode replacement and missing/non-file script targets;
 - `tests/conformance.py`, `tests/config_semantics.py`,
   `tests/config_validity.py` and `tests/config_grammar.py`;
 - `tests/adversarial_regressions.py`, which starts fresh servers and replays
-  the F23–P13 exploit shapes (rewrite-to-proxy/redirect authorization, cache
+  the F23–P14 exploit shapes (rewrite-to-proxy/redirect authorization, cache
   reload plus PATH_INFO, relative and capture-only aliases, autoindex schemes,
   negated/env providers, `IndexIgnore`, `DirectorySlash Off`,
   `UnsafePrefixStat` re-rooting, header-selected cache entries,

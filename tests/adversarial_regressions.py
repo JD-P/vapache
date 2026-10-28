@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end regressions for the pass-2 through pass-13 findings (F23-P13).
+"""End-to-end regressions for the pass-2 through pass-14 findings (F23-P14).
 
 The suite starts fresh vapached instances in temporary trees and exercises
 the exploit shapes from adversarial/findings.md: terminal rewrite/proxy authorization,
@@ -69,14 +69,18 @@ class Backend(BaseHTTPRequestHandler):
         pass
 
 
-def start_vapached(base: Path, config: str):
+def start_vapached(base: Path, config: str, server_root: Path | None = None):
     logs = base / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     logs.chmod(0o777)
     config_path = base / "vp.conf"
     config_path.write_text(config)
+    command = [str(VAPACHED)]
+    if server_root is not None:
+        command.extend(["-d", str(server_root)])
+    command.extend(["-f", str(config_path), "-DFOREGROUND"])
     proc = subprocess.Popen(
-        [str(VAPACHED), "-f", str(config_path), "-DFOREGROUND"],
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -2949,6 +2953,227 @@ AddHandler cgi-script .run
         for path in ("/fcgi/app.php", "/pathinfo/run.run", "/forced/force.cgi"):
             status, _, body = request(self.port, path)
             self.assertEqual(status, 403, f"{path}: {body[:200]}")
+
+
+class P14ConfigRewriteHardeningTests(unittest.TestCase):
+    """P14 phase-order, expression-root, header and chain regressions."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p14-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "htdocs"  # Exercise the implicit DocumentRoot.
+        cls.logs = cls.base / "logs"
+        directories = [
+            "grant/deep-deny",
+            "grant/deep-auth",
+            "grant/deep-static",
+            "grant/deep-options",
+            "grant/deep-match",
+            "same",
+            "deny/deep",
+            "oracle",
+            "remote",
+        ]
+        for rel in directories:
+            path = cls.www / rel
+            path.mkdir(parents=True, exist_ok=True)
+            path.chmod(0o755)
+        cls.logs.mkdir(parents=True, exist_ok=True)
+        cls.logs.chmod(0o777)
+
+        def script(rel: str, marker: str):
+            path = cls.www / rel
+            path.write_text(
+                "#!/bin/sh\n"
+                "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+                f"printf '{marker} uid=%s\\n' \"$(id -u)\"\n"
+            )
+            path.chmod(0o755)
+
+        for rel, marker in [
+            ("grant/deep-deny/run.cgi", "P14-DENY-EXEC"),
+            ("grant/deep-auth/auth.cgi", "P14-AUTH-EXEC"),
+            ("grant/deep-static/run.cgi", "P14-STATIC-EXEC"),
+            ("grant/deep-options/run.cgi", "P14-OPTIONS-EXEC"),
+            ("grant/deep-match/match.cgi", "P14-MATCH-EXEC"),
+            ("same/run.cgi", "P14-SAME-EXEC"),
+            ("deny/deep/run.cgi", "P14-INVERSE-EXEC"),
+        ]:
+            script(rel, marker)
+        (cls.www / "oracle" / "index.txt").write_text("ORACLE\n")
+        (cls.www / "remote" / "index.txt").write_text("REMOTE\n")
+        (cls.www / "public.txt").write_text("P14-CHAIN-PUBLIC\n")
+        (cls.base / "users").write_text("nobody:{SHA}2jmj7l5rSw0yVb/vlWAYkK/YBwk=\n")
+
+        (cls.www / "grant" / ".htaccess").write_text(
+            "<Files \"run.cgi\">\n"
+            "    Require all granted\n"
+            "    SetHandler cgi-script\n"
+            "    Options +ExecCGI\n"
+            "</Files>\n"
+            "<Files \"auth.cgi\">\n"
+            "    Require all granted\n"
+            "    SetHandler cgi-script\n"
+            "</Files>\n"
+            "<FilesMatch \"^match\\.cgi$\">\n"
+            "    Require all granted\n"
+            "    SetHandler cgi-script\n"
+            "</FilesMatch>\n"
+        )
+        (cls.www / "same" / ".htaccess").write_text(
+            '<Files "run.cgi">\nRequire all granted\nSetHandler cgi-script\n</Files>\n'
+        )
+        (cls.www / "deny" / ".htaccess").write_text(
+            '<Files "run.cgi">\nRequire all denied\n</Files>\n'
+        )
+
+        cls.port = free_port()
+        cls.config_text = f'''ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+AddHandler cgi-script .cgi
+RemoteIPHeader X-Forwarded-For
+RemoteIPInternalProxy 127.0.0.1
+<Directory "{cls.www}">
+    AllowOverride All
+    Options +ExecCGI
+    Require all granted
+</Directory>
+<Directory "{cls.www}/grant/deep-deny">
+    <Files "run.cgi">
+        Require all denied
+    </Files>
+</Directory>
+<Directory "{cls.www}/grant/deep-auth">
+    <Files "auth.cgi">
+        AuthType Basic
+        AuthName "private"
+        AuthUserFile "{cls.base}/users"
+        Require valid-user
+    </Files>
+</Directory>
+<Directory "{cls.www}/grant/deep-static">
+    <Files "run.cgi">
+        SetHandler default-handler
+    </Files>
+</Directory>
+<Directory "{cls.www}/grant/deep-options">
+    <Files "run.cgi">
+        Options -ExecCGI
+    </Files>
+</Directory>
+<Directory "{cls.www}/grant/deep-match">
+    <FilesMatch "^match\\.cgi$">
+        Require all denied
+    </FilesMatch>
+</Directory>
+<Directory "{cls.www}/same">
+    <Files "run.cgi">
+        Require all denied
+    </Files>
+</Directory>
+<Directory "{cls.www}/deny/deep">
+    <Files "run.cgi">
+        Require all granted
+    </Files>
+</Directory>
+<Directory "{cls.www}/oracle">
+    Require expr "file('etc/passwd') =~ /^root/"
+</Directory>
+<Directory "{cls.www}/remote">
+    Require ip 198.51.100.1
+</Directory>
+RewriteEngine On
+RewriteCond "%{{HTTP_USER_AGENT}}" "scanner"
+RewriteRule "^/duplicate$" "-" [F,L]
+RewriteCond "%{{HTTP:X-Gate}}" "=yes"
+RewriteRule "^/chain$" "-" [C]
+RewriteRule "^/chain$" "-" [C]
+RewriteRule "^/chain$" "/public.txt" [PT,L]
+'''
+        cls.proc, cls.config = start_vapached(
+            cls.base, cls.config_text, server_root=cls.base
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def test_p14_a_deeper_files_require_beats_ancestor_access_grant(self):
+        status, _, body = request(self.port, "/grant/deep-deny/run.cgi")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"P14-DENY-EXEC", body)
+
+    def test_p14_a_deeper_basic_auth_beats_ancestor_access_grant(self):
+        status, _, body = request(self.port, "/grant/deep-auth/auth.cgi")
+        self.assertEqual(status, 401, body[:200])
+        self.assertNotIn(b"P14-AUTH-EXEC", body)
+
+    def test_p14_a_deeper_handler_and_options_cannot_be_rearmed(self):
+        status, _, body = request(self.port, "/grant/deep-static/run.cgi")
+        self.assertEqual(status, 200, body[:200])
+        self.assertTrue(body.startswith(b"#!/bin/sh"), body[:200])
+        status, _, body = request(self.port, "/grant/deep-options/run.cgi")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"P14-OPTIONS-EXEC", body)
+
+    def test_p14_a_filesmatch_and_ordering_controls(self):
+        status, _, body = request(self.port, "/grant/deep-match/match.cgi")
+        self.assertEqual(status, 403, body[:200])
+        status, _, body = request(self.port, "/same/run.cgi")
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"P14-SAME-EXEC", body)
+        status, _, body = request(self.port, "/deny/deep/run.cgi")
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"P14-INVERSE-EXEC", body)
+
+    def test_p14_c_implicit_document_root_confines_require_expr_files(self):
+        status, _, body = request(self.port, "/oracle/index.txt")
+        self.assertEqual(status, 403, body[:200])
+
+    def _raw(self, fields: bytes, target: bytes) -> tuple[int, bytes]:
+        conn = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        conn.sendall(
+            b"GET " + target + b" HTTP/1.1\r\nHost: localhost\r\n"
+            + fields
+            + b"Connection: close\r\n\r\n"
+        )
+        data = b""
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        conn.close()
+        head, _, body = data.partition(b"\r\n\r\n")
+        return int(head.splitlines()[0].split()[1]), body
+
+    def test_p14_d_duplicate_policy_headers_are_merged(self):
+        status, _ = self._raw(
+            b"User-Agent: benign\r\nUser-Agent: scanner\r\n", b"/duplicate"
+        )
+        self.assertEqual(status, 403)
+        status, _ = self._raw(
+            b"X-Forwarded-For: 198.51.100.1\r\n"
+            b"X-Forwarded-For: 203.0.113.1\r\n",
+            b"/remote/index.txt",
+        )
+        self.assertEqual(status, 403)
+
+    def test_p14_e_failed_chain_skips_the_complete_action_chain(self):
+        status, body = self._raw(b"", b"/chain")
+        self.assertEqual(status, 404, body[:200])
+        status, body = self._raw(b"X-Gate: yes\r\n", b"/chain")
+        self.assertEqual(status, 200, body[:200])
+        self.assertIn(b"P14-CHAIN-PUBLIC", body)
 
 
 if __name__ == "__main__":

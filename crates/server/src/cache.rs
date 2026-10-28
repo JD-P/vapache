@@ -640,7 +640,9 @@ fn rewrite_map_material(map: &crate::config::RewriteMap) -> String {
             entries.sort_by(|a, b| a.0.cmp(b.0));
             format!("rnd:{entries:?}")
         }
-        crate::config::RewriteMap::Prg(program) => format!("prg:{program}"),
+        crate::config::RewriteMap::Prg(program) => {
+            format!("prg:{}", program.cache_material())
+        }
         crate::config::RewriteMap::Int(function) => format!("int:{function}"),
     }
 }
@@ -839,13 +841,10 @@ pub fn lookup(
     target: &std::path::Path,
 ) -> Option<Response> {
     let fingerprint = cache_policy_fingerprint(scope, req, peer, target);
-    if !grant.require(&crate::access::ResourceKey::cache_policy(
-        vhost,
-        req,
-        host,
-        path,
-        fingerprint,
-    )) {
+    if !grant.require_sink(
+        &crate::access::ResourceKey::cache_policy(vhost, req, host, path, fingerprint),
+        vapache_verified::TransformSink::Cache,
+    ) {
         return None;
     }
     if !request_allows_lookup(cfg, req) {
@@ -1325,13 +1324,10 @@ pub fn store(
         return;
     }
     let fingerprint = cache_policy_fingerprint(scope, req, peer, target);
-    if !grant.require(&crate::access::ResourceKey::cache_policy(
-        vhost,
-        req,
-        host,
-        path,
-        fingerprint,
-    )) {
+    if !grant.require_sink(
+        &crate::access::ResourceKey::cache_policy(vhost, req, host, path, fingerprint),
+        vapache_verified::TransformSink::Cache,
+    ) {
         return;
     }
     // Credentialed responses are never placed in the shared cache.  The
@@ -3535,9 +3531,10 @@ CacheIgnoreQueryString On\n\
             ("a".into(), vec!["1".into()]),
         ]));
         assert!(rewrite_map_material(&rnd).starts_with("rnd:"));
-        assert_eq!(
-            rewrite_map_material(&crate::config::RewriteMap::Prg("worker".into())),
-            "prg:worker"
+        let program = crate::config::RewriteProgram::bind("/bin/true".into(), Vec::new()).unwrap();
+        assert!(
+            rewrite_map_material(&crate::config::RewriteMap::Prg(program))
+                .starts_with("prg:/bin/true|")
         );
         let ims = crate::util::http_date(unix_now()).into_bytes();
         let mut ims_req = test_request();

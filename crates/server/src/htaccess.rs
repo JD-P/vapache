@@ -13,8 +13,9 @@ use crate::config::{
 };
 use crate::config_frontend::{logical_lines, tokenize_config};
 use std::collections::HashMap;
-use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -189,22 +190,6 @@ pub fn apply_req_deferred_with_root(
         if !cfg.access_file_dir_applicable(&dir) {
             continue;
         }
-        // Resolving a per-directory scope walks the vhost and rule lists.  The
-        // overwhelmingly common case is a tree with no access files at all, so
-        // avoid that work unless an access file is actually present here.
-        let mut has_access_file = false;
-        for name in &cfg.access_file_names {
-            match crate::files::metadata_cached(&dir.join(name)) {
-                Ok(meta) if meta.is_file() => {
-                    has_access_file = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        if !has_access_file {
-            continue;
-        }
         let dir_scope = cfg.effective_scope_cached(vhost, &dir, url_path);
         let mode = dir_scope.override_policy.mode();
         let allow_list = dir_scope.override_policy.allow_list();
@@ -215,28 +200,25 @@ pub fn apply_req_deferred_with_root(
         let mut selected = false;
         for name in cfg.access_file_names_for(&dir_scope) {
             let path = dir.join(&name);
-            let metadata = crate::files::metadata_cached(&path);
-            let exists = !matches!(
-                &metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound
-            );
+            let opened = open_access_file(&path);
+            let exists = !matches!(&opened, Ok(None));
             if !vapache_verified::access_file_candidate_admit(selected, exists) {
                 continue;
             }
             selected = true;
-            let delta = match metadata {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            let delta = match opened {
+                Ok(None) => continue, // coverage:ignore-line -- candidate_admit requires exists
                 Err(e) => return Err(format!("{}: {e}", path.display())),
-                Ok(m) if !m.is_file() => {
+                Ok(Some(opened)) if !opened.meta.is_file() => {
                     return Err(format!("{}: not a regular file", path.display()))
                 }
-                Ok(m) if m.len() > MAX_HTACCESS => {
+                Ok(Some(opened)) if opened.meta.len() > MAX_HTACCESS => {
                     return Err(format!("{}: access file too large", path.display()))
                 }
-                Ok(meta) => {
+                Ok(Some(opened)) => {
                     let identity =
                         crate::request_plan::LayerIdentity::new(&root, &dir, fs_path, url_path);
-                    parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, &meta)?
+                    parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, opened)?
                 }
             };
             scope.merge(&delta.scope);
@@ -464,26 +446,23 @@ pub fn collect_layers_with_root(
         let mut found = false;
         for name in cfg.access_file_names_for(&dir_scope) {
             let path = dir.join(&name);
-            let metadata = crate::files::metadata_cached(&path);
-            let exists = !matches!(
-                &metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound
-            );
+            let opened = open_access_file(&path);
+            let exists = !matches!(&opened, Ok(None));
             if !vapache_verified::access_file_candidate_admit(found, exists) {
                 continue;
             }
-            let meta = match metadata {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            let opened = match opened {
+                Ok(None) => continue, // coverage:ignore-line -- candidate_admit requires exists
                 Err(e) => return Err(format!("{}: {e}", path.display())),
-                Ok(m) if !m.is_file() => {
+                Ok(Some(opened)) if !opened.meta.is_file() => {
                     return Err(format!("{}: not a regular file", path.display()))
                 }
-                Ok(m) if m.len() > MAX_HTACCESS => {
+                Ok(Some(opened)) if opened.meta.len() > MAX_HTACCESS => {
                     return Err(format!("{}: access file too large", path.display()))
                 }
-                Ok(m) => m,
+                Ok(Some(opened)) => opened,
             };
-            let parsed = parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, &meta)?;
+            let parsed = parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, opened)?;
             // Preserve AuthMerging on the selected access file; later
             // AccessFileName candidates are not merged.
             layer.scope = Arc::clone(&parsed.scope);
@@ -582,19 +561,23 @@ pub fn trace_access_files_with_root(
         let mut selected = false;
         for name in cfg.access_file_names_for(&dir_scope) {
             let path = dir.join(&name);
-            let metadata = fs::metadata(&path);
-            let exists = metadata.is_ok();
+            let opened = open_access_file(&path);
+            let exists = !matches!(&opened, Ok(None));
             if !vapache_verified::access_file_candidate_admit(selected, exists) {
                 continue;
             }
-            let meta = metadata.expect("admitted access-file candidate exists");
             selected = true;
-            if !meta.is_file() {
-                continue;
-            }
-            found = true;
             let identity = crate::request_plan::LayerIdentity::new(&root, &dir, fs_path, url_path);
-            match parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, &meta) {
+            let parsed = match opened {
+                Ok(Some(opened)) if opened.meta.is_file() && opened.meta.len() <= MAX_HTACCESS => {
+                    found = true;
+                    parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, opened)
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => continue, // coverage:ignore-line -- candidate_admit requires exists
+                Err(e) => Err(format!("{}: {e}", path.display())),
+            };
+            match parsed {
                 Ok(parsed) => out.push(format!(
                     "{} mode={:?} list={:?} nonfatal={:?} rules={}",
                     path.display(),
@@ -672,6 +655,69 @@ fn cache() -> &'static Mutex<HashMap<CacheKey, Arc<Parsed>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+struct OpenedAccessFile {
+    file: File,
+    meta: fs::Metadata,
+}
+
+/// Open an access file once and derive every subsequent fact from that
+/// descriptor.  `O_NONBLOCK` prevents a raced-in FIFO from hanging the
+/// request before the regular-file check.
+fn open_access_file(path: &Path) -> std::io::Result<Option<OpenedAccessFile>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let meta = file.metadata()?;
+    Ok(Some(OpenedAccessFile { file, meta }))
+}
+
+fn same_access_file_version(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+        && before.len() == after.len()
+        && before.mode() == after.mode()
+}
+
+fn stable_access_snapshot(
+    path: &Path,
+    mut opened: OpenedAccessFile,
+) -> Result<(Vec<u8>, fs::Metadata), String> {
+    let before = opened.meta;
+    let mut data = Vec::with_capacity((before.len().min(MAX_HTACCESS) as usize).saturating_add(1));
+    opened
+        .file
+        .by_ref()
+        .take(MAX_HTACCESS + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let after = opened
+        .file
+        .metadata()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !vapache_verified::descriptor_snapshot_admit(
+        before.is_file() && after.is_file(),
+        before.dev() == after.dev() && before.ino() == after.ino(),
+        same_access_file_version(&before, &after),
+        data.len() as u64 <= MAX_HTACCESS,
+    ) {
+        return Err(format!(
+            "{}: access file changed while it was being evaluated",
+            path.display()
+        ));
+    }
+    Ok((data, before))
+}
+
 fn parse_cached(
     cfg: &Config,
     path: &Path,
@@ -679,8 +725,9 @@ fn parse_cached(
     allow_list: &[String],
     nonfatal: NonfatalMode,
     identity: &crate::request_plan::LayerIdentity,
-    meta: &fs::Metadata,
+    opened: OpenedAccessFile,
 ) -> Result<Arc<Parsed>, String> {
+    let meta = &opened.meta;
     let key = CacheKey {
         path: path.to_path_buf(),
         server_root: cfg.server_root.clone(),
@@ -704,13 +751,34 @@ fn parse_cached(
     {
         let guard = cache().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(parsed) = guard.get(&key) {
-            return Ok(Arc::clone(parsed));
+            // Validate that the already-open descriptor did not change while
+            // the cache lookup ran.  The key and parse always describe the
+            // same inode/version, never a pathname reopened later.
+            let after = opened
+                .file
+                .metadata()
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            if vapache_verified::descriptor_snapshot_admit(
+                meta.is_file() && after.is_file(),
+                meta.dev() == after.dev() && meta.ino() == after.ino(),
+                same_access_file_version(meta, &after),
+                meta.len() <= MAX_HTACCESS,
+            ) {
+                return Ok(Arc::clone(parsed));
+            }
+            return Err(format!(
+                "{}: access file changed while it was being evaluated",
+                path.display()
+            ));
         }
     }
     // Parse outside the lock: a slow filesystem read must not serialize
     // unrelated requests.  Duplicate parses on a race are harmless.
-    let parsed = Arc::new(parse_file_with_list(
-        cfg, path, mode, allow_list, nonfatal, identity,
+    let (data, stable_meta) = stable_access_snapshot(path, opened)?;
+    debug_assert_eq!(stable_meta.dev(), key.dev);
+    debug_assert_eq!(stable_meta.ino(), key.ino);
+    let parsed = Arc::new(parse_access_bytes(
+        cfg, path, &data, mode, allow_list, nonfatal, identity,
     )?);
     let mut guard = cache().lock().unwrap_or_else(|e| e.into_inner());
     if guard.len() >= 512 {
@@ -740,10 +808,22 @@ fn parse_file_with_list(
     nonfatal: NonfatalMode,
     identity: &crate::request_plan::LayerIdentity,
 ) -> Result<Parsed, String> {
-    let data = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if data.len() as u64 > MAX_HTACCESS {
-        return Err(format!("{}: .htaccess file too large", path.display()));
-    }
+    let opened = open_access_file(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .ok_or_else(|| format!("{}: not found", path.display()))?;
+    let (data, _) = stable_access_snapshot(path, opened)?;
+    parse_access_bytes(cfg, path, &data, mode, allow_list, nonfatal, identity)
+}
+
+fn parse_access_bytes(
+    cfg: &Config,
+    path: &Path,
+    data: &[u8],
+    mode: OverrideMode,
+    allow_list: &[String],
+    nonfatal: NonfatalMode,
+    identity: &crate::request_plan::LayerIdentity,
+) -> Result<Parsed, String> {
     let text = String::from_utf8_lossy(&data);
     let lines = logical_lines(&text);
     let mut scope = Scope::default();
@@ -4062,7 +4142,6 @@ mod tests {
         let cfg = config(&dir, "Listen 127.0.0.1:0\n");
         let file = dir.join(".htaccess");
         fs::write(&file, "Require all granted\n").unwrap();
-        let meta = fs::metadata(&file).unwrap();
         let mut parsed = None;
         for nonfatal in [
             NonfatalMode::None,
@@ -4078,7 +4157,7 @@ mod tests {
                     &[],
                     nonfatal,
                     &crate::request_plan::LayerIdentity::with_url_mount(&dir, &dir, "/"),
-                    &meta,
+                    open_access_file(&file).unwrap().unwrap(),
                 )
                 .unwrap(),
             );
@@ -4116,13 +4195,73 @@ mod tests {
             &[],
             NonfatalMode::None,
             &crate::request_plan::LayerIdentity::with_url_mount(&dir, &dir, "/"),
-            &meta
+            open_access_file(&file).unwrap().unwrap()
         )
         .is_ok());
 
         let big = dir.join("big.htaccess");
         fs::write(&big, vec![b'#'; (MAX_HTACCESS + 1) as usize]).unwrap();
         assert!(parse_file(&cfg, &big, OverrideMode::All, "/").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn access_file_parse_is_bound_to_the_opened_inode() {
+        let dir = tempdir("descriptor-snapshot");
+        let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        let path = dir.join(".htaccess");
+        let displaced = dir.join("opened.htaccess");
+        fs::write(&path, "SetEnv SNAPSHOT opened\n").unwrap();
+        let opened = open_access_file(&path).unwrap().unwrap();
+
+        // Swap the directory entry after selection.  Parsing must consume the
+        // already-open descriptor, not reopen `path` and silently authorize
+        // the replacement file.
+        fs::rename(&path, &displaced).unwrap();
+        fs::write(&path, "SetEnv SNAPSHOT replacement\n").unwrap();
+        let error = parse_cached(
+            &cfg,
+            &path,
+            OverrideMode::All,
+            &[],
+            NonfatalMode::None,
+            &crate::request_plan::LayerIdentity::with_url_mount(&dir, &dir, "/"),
+            opened,
+        )
+        .err()
+        .expect("a pathname swap must fail closed");
+        assert!(error.contains("changed while it was being evaluated"));
+
+        // A cache hit is usable only while the descriptor still describes
+        // exactly the version captured in its cache key.
+        let cached = dir.join("cached.htaccess");
+        fs::write(&cached, "SetEnv SNAPSHOT cached\n").unwrap();
+        let identity = crate::request_plan::LayerIdentity::with_url_mount(&dir, &dir, "/");
+        parse_cached(
+            &cfg,
+            &cached,
+            OverrideMode::All,
+            &[],
+            NonfatalMode::None,
+            &identity,
+            open_access_file(&cached).unwrap().unwrap(),
+        )
+        .unwrap();
+        let stale = open_access_file(&cached).unwrap().unwrap();
+        fs::write(&cached, "SetEnv SNAPSHOT changed-and-longer\n").unwrap();
+        let error = parse_cached(
+            &cfg,
+            &cached,
+            OverrideMode::All,
+            &[],
+            NonfatalMode::None,
+            &identity,
+            stale,
+        )
+        .err()
+        .expect("a changed cached descriptor must fail closed");
+        assert!(error.contains("changed while it was being evaluated"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4203,6 +4342,9 @@ mod tests {
         .is_err());
         std::os::unix::fs::symlink(".htaccess", www.join("sub/.htaccess")).unwrap();
         fs::write(www.join("sub/.htaccess2"), "Require all granted\n").unwrap();
+        let trace =
+            trace_access_files(&cfg, None, &www.join("sub/file.txt"), "/sub/file.txt").join("\n");
+        assert!(trace.contains("ERROR"));
         let mut scope = Scope::default();
         let mut files = Vec::new();
         let mut deferred = Vec::new();

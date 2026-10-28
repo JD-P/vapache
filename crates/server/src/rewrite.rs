@@ -19,11 +19,12 @@
 //! `[UnsafePrefixStat]` remains parsed and deliberately inert (the F32
 //! remediation), with a load-time warning in the main config.
 
-use crate::config::{RewriteCond, RewriteMap, RewriteRule, Scope};
+use crate::config::{RewriteCond, RewriteMap, RewriteProgram, RewriteRule, Scope};
 use crate::http::Request;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::IpAddr;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -381,6 +382,21 @@ pub enum Outcome {
     Error(String),
 }
 
+fn rewrite_no_match_index(chain_flags: &[bool], next_index: usize, rule: &RewriteRule) -> usize {
+    match vapache_verified::rewrite_match_action(
+        chain_flags,
+        next_index,
+        false,
+        rule.flags.chain,
+        rule.flags.forbidden,
+        rule.flags.gone,
+        rule.substitution == "-",
+    ) {
+        vapache_verified::RewriteMatchAction::Continue { index } => index,
+        _ => unreachable!("an unmatched rewrite rule can only continue"), // coverage:ignore-line - proved by rewrite_unmatched_rule_has_no_terminal_effect
+    }
+}
+
 pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
     if scope.rewrite_policy.rewrite_engine != Some(true)
         || scope.rewrite_policy.rewrite_rules.is_empty()
@@ -397,16 +413,17 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
     let mut env: Vec<(String, String)> = scope.request_env(req, ctx.url_path);
     let mut vary: Vec<String> = Vec::new();
     let mut idx = 0usize;
-    let mut skip_next = 0usize;
+    let chain_flags: Vec<bool> = scope
+        .rewrite_policy
+        .rewrite_rules
+        .iter()
+        .map(|rule| rule.flags.chain)
+        .collect();
     let mut loops = 0u64;
 
     while idx < scope.rewrite_policy.rewrite_rules.len() {
         let rule = &scope.rewrite_policy.rewrite_rules[idx];
         idx += 1;
-        if skip_next > 0 {
-            skip_next -= 1;
-            continue;
-        }
         vary.clear();
         let subject = subject_for(rule, &path, ctx.fs_path);
         if !vapache_verified::htaccess_rewrite_subject_admit(
@@ -420,9 +437,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             );
         }
         let Some(subject) = subject else {
-            if rule.flags.chain {
-                skip_next = 1;
-            }
+            idx = rewrite_no_match_index(&chain_flags, idx, rule);
             continue;
         };
         let conds = match conditions_match(
@@ -440,17 +455,13 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             Err(e) => return Outcome::Error(e),
         };
         if !conds {
-            if rule.flags.chain {
-                skip_next = 1;
-            }
+            idx = rewrite_no_match_index(&chain_flags, idx, rule);
             continue;
         }
         let caps = rule.pattern.captures(subject.as_ref());
         let cap_strings: Vec<String> = if rule.negated {
             if caps.is_some() {
-                if rule.flags.chain {
-                    skip_next = 1;
-                }
+                idx = rewrite_no_match_index(&chain_flags, idx, rule);
                 continue;
             }
             Vec::new()
@@ -461,9 +472,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                     .map(|m| m.map(|m| m.as_str().to_string()).unwrap_or_default())
                     .collect(),
                 None => {
-                    if rule.flags.chain {
-                        skip_next = 1;
-                    }
+                    idx = rewrite_no_match_index(&chain_flags, idx, rule);
                     continue;
                 }
             }
@@ -497,31 +506,53 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             Err(e) => return Outcome::Error(e),
         }
 
-        if rule.flags.forbidden {
-            return Outcome::Forbidden;
-        }
-        if rule.flags.gone {
-            return Outcome::Gone;
-        }
-        if rule.substitution == "-" {
-            if rule.flags.qsd {
-                query.clear();
-            }
-            if let Some(n) = rule.flags.skip {
-                idx = idx.saturating_add(n);
-            }
-            if rule.flags.next {
-                if !vapache_verified::rewrite_restart_admit(loops, 10) {
-                    return Outcome::Error("rewrite [N] loop limit exceeded".into());
+        match vapache_verified::rewrite_match_action(
+            &chain_flags,
+            idx,
+            true,
+            rule.flags.chain,
+            rule.flags.forbidden,
+            rule.flags.gone,
+            rule.substitution == "-",
+        ) {
+            vapache_verified::RewriteMatchAction::Forbidden => return Outcome::Forbidden,
+            vapache_verified::RewriteMatchAction::Gone => return Outcome::Gone,
+            vapache_verified::RewriteMatchAction::NoSubstitution => {
+                if rule.flags.qsd {
+                    query.clear();
                 }
-                loops += 1;
-                idx = 0;
+                match vapache_verified::rewrite_advance(
+                    idx,
+                    chain_flags.len(),
+                    rule.flags.skip.is_some(),
+                    rule.flags.skip.unwrap_or(0),
+                    rule.flags.next,
+                    rule.flags.last,
+                    rule.flags.end,
+                    loops,
+                    10,
+                ) {
+                    vapache_verified::RewriteAdvance::Continue { index } => idx = index,
+                    vapache_verified::RewriteAdvance::Restart { completed } => {
+                        loops = completed;
+                        idx = 0;
+                    }
+                    vapache_verified::RewriteAdvance::Stop { final_pass: final_ } => {
+                        final_pass = final_;
+                        break;
+                    }
+                    vapache_verified::RewriteAdvance::RestartLimit => {
+                        return Outcome::Error("rewrite [N] loop limit exceeded".into());
+                    }
+                }
                 continue;
             }
-            if rule.flags.last {
-                break;
+            vapache_verified::RewriteMatchAction::Expand => {}
+            vapache_verified::RewriteMatchAction::Continue { .. } => {
+                // coverage:ignore-start - executable verified action is called with matched=true
+                unreachable!("a matched rewrite rule cannot take the no-match transition")
+                // coverage:ignore-stop
             }
-            continue;
         }
 
         let spec = escape_spec(&rule.flags);
@@ -683,20 +714,30 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         path = new_path_from_joined(&joined);
         query = new_query.into_bytes();
         changed = true;
-        if let Some(n) = rule.flags.skip {
-            idx = idx.saturating_add(n);
-        }
-        if rule.flags.next {
-            if !vapache_verified::rewrite_restart_admit(loops, 10) {
+        match vapache_verified::rewrite_advance(
+            idx,
+            chain_flags.len(),
+            rule.flags.skip.is_some(),
+            rule.flags.skip.unwrap_or(0),
+            rule.flags.next,
+            rule.flags.last,
+            rule.flags.end,
+            loops,
+            10,
+        ) {
+            vapache_verified::RewriteAdvance::Continue { index } => idx = index,
+            vapache_verified::RewriteAdvance::Restart { completed } => {
+                loops = completed;
+                idx = 0;
+                continue;
+            }
+            vapache_verified::RewriteAdvance::Stop { final_pass: final_ } => {
+                final_pass = final_;
+                break;
+            }
+            vapache_verified::RewriteAdvance::RestartLimit => {
                 return Outcome::Error("rewrite [N] loop limit exceeded".into());
             }
-            loops += 1;
-            idx = 0;
-            continue;
-        }
-        if rule.flags.last {
-            final_pass = rule.flags.end;
-            break;
         }
     }
 
@@ -980,29 +1021,24 @@ fn expand_vars(
     let mut i = 0;
     let bytes = test.as_bytes();
     while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            if let Some(end) = test[i + 2..].find('}') {
-                let name = expand_caps(&test[i + 2..i + 2 + end], &[], cond_caps);
-                out.push_str(&variable_value(&name, req, ctx, path, query, maps, env)?);
-                i += 2 + end + 1;
+        match vapache_verified::rewrite_expand_token(bytes, i) {
+            vapache_verified::RewriteExpandToken::Variable => {
+                if let Some(end) = test[i + 2..].find('}') {
+                    let name = expand_caps(&test[i + 2..i + 2 + end], &[], cond_caps);
+                    out.push_str(&variable_value(&name, req, ctx, path, query, maps, env)?);
+                    i += 2 + end + 1;
+                    continue;
+                }
+            }
+            vapache_verified::RewriteExpandToken::ConditionCapture { index } => {
+                if let Some(v) = cond_caps.get(index as usize) {
+                    out.push_str(v);
+                }
+                i += 2;
                 continue;
             }
-        }
-        if bytes[i] == b'%' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            if let Some(end) = test[i + 2..].find('}') {
-                let name = expand_caps(&test[i + 2..i + 2 + end], &[], cond_caps);
-                out.push_str(&variable_value(&name, req, ctx, path, query, maps, env)?);
-                i += 2 + end + 1;
-                continue;
-            }
-        }
-        if bytes[i] == b'%' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
-            let n = (bytes[i + 1] - b'0') as usize;
-            if let Some(v) = cond_caps.get(n) {
-                out.push_str(v);
-            }
-            i += 2;
-            continue;
+            vapache_verified::RewriteExpandToken::Literal
+            | vapache_verified::RewriteExpandToken::RuleCapture { .. } => {}
         }
         let ch = test[i..].chars().next().unwrap_or('\u{fffd}');
         out.push(ch);
@@ -1150,37 +1186,43 @@ fn write_prg_key(stdin: &mut impl Write, key: &str) -> bool {
     stdin.write_all(key.as_bytes()).is_ok() && stdin.write_all(b"\n").is_ok()
 }
 
-fn run_prg_map(program: &str, key: &str) -> String {
+fn run_prg_map(program: &RewriteProgram, key: &str) -> String {
     run_prg_map_timeout(program, key, PRG_MAP_TIMEOUT)
 }
 
-fn run_prg_map_timeout(program: &str, key: &str, timeout: Duration) -> String {
-    let mut parts = program.split_whitespace();
-    let Some(command) = parts.next() else {
+fn run_prg_map_timeout(program: &RewriteProgram, key: &str, timeout: Duration) -> String {
+    if !program.binding_intact() {
         return String::new();
-    };
-    let mut command = Command::new(command);
+    }
+    let exec_fd = program.file.as_raw_fd();
+    let mut command = Command::new(format!("/proc/self/fd/{exec_fd}"));
     command
-        .args(parts)
+        .args(&program.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     // A separate process group lets the timeout close stdout held by a
-    // helper's descendants as well as terminating the direct child.
+    // helper's descendants as well as terminating the direct child. Clear
+    // CLOEXEC only in the forked child: script interpreters must be able to
+    // reopen /proc/self/fd/N, while unrelated parent-side spawns must never
+    // inherit the retained program descriptor.
     // coverage:ignore-start - runs in the forked child before coverage can flush
     unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
+        command.pre_exec(move || {
+            let flags = libc::fcntl(exec_fd, libc::F_GETFD);
+            if flags < 0
+                || libc::fcntl(exec_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                || libc::setpgid(0, 0) != 0
+            {
+                return Err(std::io::Error::last_os_error());
             }
+            Ok(())
         });
     }
     // coverage:ignore-stop
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => return String::new(),
+        Err(_) => return String::new(), // coverage:ignore-line -- fork/exec kernel failure
     };
     let stdin = child.stdin.take();
     finish_prg_map(child, stdin, key, timeout)
@@ -1274,13 +1316,19 @@ fn expand_caps(name: &str, caps: &[String], cond_caps: &[String]) -> String {
     let b = name.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        if (b[i] == b'$' || b[i] == b'%' || b[i] == b'\\')
-            && i + 1 < b.len()
-            && b[i + 1].is_ascii_digit()
+        let token = vapache_verified::rewrite_expand_token(b, i);
+        if let vapache_verified::RewriteExpandToken::RuleCapture { index }
+        | vapache_verified::RewriteExpandToken::ConditionCapture { index } = token
         {
-            let n = (b[i + 1] - b'0') as usize;
-            let pool = if b[i] == b'%' { cond_caps } else { caps };
-            if let Some(v) = pool.get(n) {
+            let pool = if matches!(
+                token,
+                vapache_verified::RewriteExpandToken::ConditionCapture { .. }
+            ) {
+                cond_caps
+            } else {
+                caps
+            };
+            if let Some(v) = pool.get(index as usize) {
                 out.push_str(v);
             }
             i += 2;
@@ -1310,56 +1358,46 @@ fn expand_backrefs(
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            if let Some(end) = s[i + 2..].find('}') {
-                let name = expand_caps(&s[i + 2..i + 2 + end], caps, cond_caps);
-                let value = variable_value(&name, req, ctx, path, query, maps, env)?;
-                if let Some(spec) = escape {
-                    out.push_str(&escape_backref_value(&value, spec));
-                } else if allow_3f {
-                    out.push_str(&value);
-                } else {
-                    let encoded = vapache_verified::rewrite_backref_no_qmark(value.as_bytes());
-                    out.push_str(&String::from_utf8_lossy(&encoded));
+        match vapache_verified::rewrite_expand_token(bytes, i) {
+            vapache_verified::RewriteExpandToken::Variable => {
+                if let Some(end) = s[i + 2..].find('}') {
+                    let name = expand_caps(&s[i + 2..i + 2 + end], caps, cond_caps);
+                    let value = variable_value(&name, req, ctx, path, query, maps, env)?;
+                    if let Some(spec) = escape {
+                        out.push_str(&escape_backref_value(&value, spec));
+                    } else if allow_3f {
+                        out.push_str(&value);
+                    } else {
+                        let encoded = vapache_verified::rewrite_backref_no_qmark(value.as_bytes());
+                        out.push_str(&String::from_utf8_lossy(&encoded));
+                    }
+                    i += 2 + end + 1;
+                    continue;
                 }
-                i += 2 + end + 1;
+            }
+            token @ (vapache_verified::RewriteExpandToken::RuleCapture { .. }
+            | vapache_verified::RewriteExpandToken::ConditionCapture { .. }) => {
+                let (index, pool) = match token {
+                    vapache_verified::RewriteExpandToken::RuleCapture { index } => (index, caps),
+                    vapache_verified::RewriteExpandToken::ConditionCapture { index } => {
+                        (index, cond_caps)
+                    }
+                    _ => unreachable!(), // coverage:ignore-line - outer pattern admits only capture variants
+                };
+                if let Some(v) = pool.get(index as usize) {
+                    if let Some(spec) = escape {
+                        out.push_str(&escape_backref_value(v, spec));
+                    } else if !allow_3f {
+                        let encoded = vapache_verified::rewrite_backref_no_qmark(v.as_bytes());
+                        out.push_str(&String::from_utf8_lossy(&encoded));
+                    } else {
+                        out.push_str(v);
+                    }
+                }
+                i += 2;
                 continue;
             }
-        }
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            if let Some(end) = s[i + 2..].find('}') {
-                let name = expand_caps(&s[i + 2..i + 2 + end], caps, cond_caps);
-                let value = variable_value(&name, req, ctx, path, query, maps, env)?;
-                if let Some(spec) = escape {
-                    out.push_str(&escape_backref_value(&value, spec));
-                } else if allow_3f {
-                    out.push_str(&value);
-                } else {
-                    let encoded = vapache_verified::rewrite_backref_no_qmark(value.as_bytes());
-                    out.push_str(&String::from_utf8_lossy(&encoded));
-                }
-                i += 2 + end + 1;
-                continue;
-            }
-        }
-        if (bytes[i] == b'$' || bytes[i] == b'%' || bytes[i] == b'\\')
-            && i + 1 < bytes.len()
-            && bytes[i + 1].is_ascii_digit()
-        {
-            let n = (bytes[i + 1] - b'0') as usize;
-            let pool = if bytes[i] == b'%' { cond_caps } else { caps };
-            if let Some(v) = pool.get(n) {
-                if let Some(spec) = escape {
-                    out.push_str(&escape_backref_value(v, spec));
-                } else if !allow_3f {
-                    let encoded = vapache_verified::rewrite_backref_no_qmark(v.as_bytes());
-                    out.push_str(&String::from_utf8_lossy(&encoded));
-                } else {
-                    out.push_str(v);
-                }
-            }
-            i += 2;
-            continue;
+            vapache_verified::RewriteExpandToken::Literal => {}
         }
         let ch = s[i..].chars().next().unwrap_or('\u{fffd}');
         out.push(ch);
@@ -1576,7 +1614,9 @@ mod tests {
 
     #[test]
     fn verified_rewrite_decisions_cover_flag_truth_tables() {
-        use vapache_verified::{RewriteQueryAction, RewriteSink};
+        use vapache_verified::{
+            RewriteAdvance, RewriteExpandToken, RewriteMatchAction, RewriteQueryAction, RewriteSink,
+        };
 
         for proxy in [false, true] {
             for external in [false, true] {
@@ -1652,6 +1692,65 @@ mod tests {
                 completed < 10
             );
         }
+
+        let token_cases: &[(&[u8], RewriteExpandToken)] = &[
+            (b"literal", RewriteExpandToken::Literal),
+            (b"${name}", RewriteExpandToken::Variable),
+            (b"%{name}", RewriteExpandToken::Variable),
+            (b"$7", RewriteExpandToken::RuleCapture { index: 7 }),
+            (b"\\2", RewriteExpandToken::RuleCapture { index: 2 }),
+            (b"%4", RewriteExpandToken::ConditionCapture { index: 4 }),
+        ];
+        for (input, expected) in token_cases {
+            assert_eq!(vapache_verified::rewrite_expand_token(input, 0), *expected);
+            assert_eq!(
+                vapache_verified::rewrite_template_static(input),
+                *expected == RewriteExpandToken::Literal
+            );
+        }
+
+        let chained = [false, true, false, false];
+        assert_eq!(
+            vapache_verified::rewrite_match_action(&chained, 1, false, true, true, true, true),
+            RewriteMatchAction::Continue { index: 3 }
+        );
+        assert_eq!(
+            vapache_verified::rewrite_match_action(&chained, 1, true, false, true, true, true),
+            RewriteMatchAction::Forbidden
+        );
+        assert_eq!(
+            vapache_verified::rewrite_match_action(&chained, 1, true, false, false, true, true),
+            RewriteMatchAction::Gone
+        );
+        assert_eq!(
+            vapache_verified::rewrite_match_action(&chained, 1, true, false, false, false, true),
+            RewriteMatchAction::NoSubstitution
+        );
+        assert_eq!(
+            vapache_verified::rewrite_match_action(&chained, 1, true, true, false, false, false),
+            RewriteMatchAction::Expand
+        );
+
+        assert_eq!(
+            vapache_verified::rewrite_advance(1, 4, true, 2, false, false, false, 0, 10),
+            RewriteAdvance::Continue { index: 3 }
+        );
+        assert_eq!(
+            vapache_verified::rewrite_advance(3, 4, true, usize::MAX, false, false, false, 0, 10),
+            RewriteAdvance::Continue { index: 4 }
+        );
+        assert_eq!(
+            vapache_verified::rewrite_advance(1, 4, true, 2, true, true, true, 3, 10),
+            RewriteAdvance::Restart { completed: 4 }
+        );
+        assert_eq!(
+            vapache_verified::rewrite_advance(1, 4, false, 0, true, false, false, 10, 10),
+            RewriteAdvance::RestartLimit
+        );
+        assert_eq!(
+            vapache_verified::rewrite_advance(1, 4, false, 0, false, true, true, 0, 10),
+            RewriteAdvance::Stop { final_pass: true }
+        );
     }
 
     #[test]
@@ -2152,7 +2251,7 @@ mod tests {
     }
 
     #[test]
-    fn chain_failure_skips_the_next_rule() {
+    fn chain_failure_skips_the_entire_trailing_chain() {
         let mut scope = Scope::default();
         scope.rewrite_policy.rewrite_engine = Some(true);
         scope.rewrite_policy.rewrite_rules.push(
@@ -2165,7 +2264,15 @@ mod tests {
         );
         scope.rewrite_policy.rewrite_rules.push(
             parse_rewrite_rule(
-                &["^/old$".into(), "/skipped".into(), "[L]".into()],
+                &["^/old$".into(), "/middle".into(), "[C]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/old$".into(), "/escaped".into(), "[L]".into()],
                 "/",
                 false,
             )
@@ -2993,7 +3100,10 @@ mod tests {
         let maps = vec![
             ("txt".into(), RewriteMap::Txt(txt)),
             ("rnd".into(), RewriteMap::Rnd(rnd)),
-            ("prg".into(), RewriteMap::Prg("/bin/cat".into())),
+            (
+                "prg".into(),
+                RewriteMap::Prg(RewriteProgram::bind("/bin/cat".into(), Vec::new()).unwrap()),
+            ),
             ("int".into(), RewriteMap::Int("toupper".into())),
         ];
         assert_eq!(
@@ -3061,10 +3171,12 @@ mod tests {
         assert_eq!(int_map("escape", "a b/%"), "a+b/%25");
         assert_eq!(int_map("unescape", "a+b%2f%zz"), "a b/%zz");
         assert_eq!(int_map("unknown", "x"), "");
-        assert_eq!(run_prg_map("", "x"), "");
-        assert_eq!(run_prg_map("no-such-program-xyz", "x"), "");
-        assert_eq!(run_prg_map("/bin/cat", "abc"), "abc");
-        assert_eq!(run_prg_map("/bin/false", "abc"), "");
+        assert!(RewriteProgram::bind(PathBuf::new(), Vec::new()).is_err());
+        assert!(RewriteProgram::bind("no-such-program-xyz".into(), Vec::new()).is_err());
+        let cat_program = RewriteProgram::bind("/bin/cat".into(), Vec::new()).unwrap();
+        let false_program = RewriteProgram::bind("/bin/false".into(), Vec::new()).unwrap();
+        assert_eq!(run_prg_map(&cat_program, "abc"), "abc");
+        assert_eq!(run_prg_map(&false_program, "abc"), "");
         struct InterruptedThenError(u8);
         impl Read for InterruptedThenError {
             fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
@@ -3131,12 +3243,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         mode.set_mode(0o700);
         fs::set_permissions(&timeout_script, mode).unwrap();
+        let timeout_program = RewriteProgram::bind(timeout_script.clone(), Vec::new()).unwrap();
         assert_eq!(
-            run_prg_map_timeout(
-                &timeout_script.to_string_lossy(),
-                "x",
-                Duration::from_millis(20),
-            ),
+            run_prg_map_timeout(&timeout_program, "x", Duration::from_millis(20),),
             ""
         );
 
@@ -3146,12 +3255,9 @@ mod tests {
         let mut mode = fs::metadata(&overflow_script).unwrap().permissions();
         mode.set_mode(0o700);
         fs::set_permissions(&overflow_script, mode).unwrap();
+        let overflow_program = RewriteProgram::bind(overflow_script.clone(), Vec::new()).unwrap();
         assert_eq!(
-            run_prg_map_timeout(
-                &overflow_script.to_string_lossy(),
-                "x",
-                Duration::from_secs(1),
-            ),
+            run_prg_map_timeout(&overflow_program, "x", Duration::from_secs(1),),
             ""
         );
         let no_stdout = Command::new("/bin/true")
@@ -3277,6 +3383,57 @@ mod tests {
         assert!(same_host_internal(&c, &no_host, "http://localhost:80/x").is_some());
     }
 
+    #[test]
+    fn rewrite_program_replacement_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("vapache-prg-binding-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("worker");
+        let displaced = dir.join("trusted-worker");
+        fs::write(
+            &path,
+            "#!/bin/sh\nread key\nprintf 'trusted:%s\\n' \"$key\"\n",
+        )
+        .unwrap();
+        let mut mode = fs::metadata(&path).unwrap().permissions();
+        mode.set_mode(0o700);
+        fs::set_permissions(&path, mode.clone()).unwrap();
+
+        let program = RewriteProgram::bind(path.clone(), Vec::new()).unwrap();
+        assert!(program.file.set_len(0).is_err(), "snapshot must be sealed");
+        assert_eq!(run_prg_map(&program, "value"), "trusted:value");
+
+        fs::rename(&path, &displaced).unwrap();
+        assert!(!program.binding_intact());
+        assert_eq!(run_prg_map(&program, "value"), "");
+        fs::write(&path, "#!/bin/sh\nprintf 'attacker\\n'\n").unwrap();
+        fs::set_permissions(&path, mode.clone()).unwrap();
+        assert!(!program.binding_intact());
+        assert_eq!(run_prg_map(&program, "value"), "");
+
+        let mutable = dir.join("mutable-worker");
+        fs::write(
+            &mutable,
+            "#!/bin/sh\nread key\nprintf 'trusted:%s\\n' \"$key\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&mutable, mode).unwrap();
+        let mutable_program = RewriteProgram::bind(mutable.clone(), Vec::new()).unwrap();
+        fs::write(&mutable, "#!/bin/sh\nprintf 'attacker\\n'\n").unwrap();
+        assert!(!mutable_program.binding_intact());
+        assert_eq!(run_prg_map(&mutable_program, "value"), "");
+
+        let invalid = dir.join("invalid-worker");
+        fs::write(&invalid, "not an executable format\n").unwrap();
+        fs::set_permissions(&invalid, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let invalid_program = RewriteProgram::bind(invalid, Vec::new()).unwrap();
+        assert_eq!(run_prg_map(&invalid_program, "value"), "");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     struct ErrorWriter;
     impl Write for ErrorWriter {
         fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
@@ -3339,6 +3496,20 @@ mod tests {
         assert_eq!(process(&dash_skip, &r, &c), Outcome::None);
         let dash_last = scope_with(vec![parsed_rule("^/x$", "-", "[L]", "/", false)]);
         assert_eq!(process(&dash_last, &r, &c), Outcome::None);
+        let dash_end = scope_with(vec![parsed_rule(
+            "^/x$",
+            "-",
+            "[E=ENDED:1,END]",
+            "/",
+            false,
+        )]);
+        assert!(matches!(
+            process(&dash_end, &r, &c),
+            Outcome::Internal {
+                final_pass: true,
+                ..
+            }
+        ));
 
         // The [N] loop limit is enforced for both dash and substituted rules.
         for sub in ["-", "/x"] {

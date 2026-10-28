@@ -1563,7 +1563,7 @@ fn bind_target_grant(
     );
     replace_handler_policy(&mut target_scope, &handler_scope.scope);
     debug_assert!(vapache_verified::handler_scope_lexical_admit(
-        actual_path != fs_path,
+        actual_path != fs_path, // coverage:ignore-line -- assertion-only invariant input
         true,
     ));
     // The canonical target may add restrictions but it must never replace the
@@ -1715,7 +1715,7 @@ fn authorize_resolved_target(
         );
         replace_handler_policy(&mut target_scope, &handler_scope.scope);
         debug_assert!(vapache_verified::handler_scope_lexical_admit(
-            lexical_differs,
+            lexical_differs, // coverage:ignore-line -- assertion-only invariant input
             true,
         ));
     }
@@ -3201,22 +3201,42 @@ fn run_fastcgi(
     local_port: u16,
     scope: &Scope,
     target: &fastcgi::Target,
-    grant: &crate::access::AccessGrant,
-    resource: &crate::access::ResourceKey,
+    _grant: &crate::access::AccessGrant,
+    _resource: &crate::access::ResourceKey,
     mapping_root: &Path,
 ) -> Response {
     // `ProxyPassMatch`/`SetHandler` can resolve PATH_INFO to a real script
     // whose own `<Files>`/`<Directory>` policy differs from the requested URL.
     // Re-evaluate policy for the script target before binding the backend.
-    // Resolve the actual script first: forwarding the lexical symlink path let
-    // PHP-FPM execute a file whose real `<Directory>` policy was never checked
-    // (F41/I39).
+    // Resolve the actual script through an opened descriptor first: forwarding
+    // a lexical pathname let PHP-FPM execute an object whose inode and real
+    // `<Directory>` policy were never bound to the grant (F41/I39).
     let mut target = target.clone();
-    if let Ok(actual) = std::fs::canonicalize(&target.script_filename) {
-        if actual.is_file() {
-            target.script_filename = actual;
-        }
-    }
+    let follow = scope.effective_options().contains(Options::FOLLOW_SYMLINKS);
+    let owner_match_only = !follow
+        && scope
+            .effective_options()
+            .contains(Options::SYMLINKS_IF_OWNER_MATCH);
+    let Some(script_binding) = fastcgi::open_script(
+        &target,
+        mapping_root,
+        follow || owner_match_only,
+        owner_match_only,
+    ) else {
+        return error_response(
+            cfg,
+            vhost,
+            scope,
+            403,
+            req,
+            url_path,
+            local_port,
+            server_name,
+            peer.ip(),
+            local_ip,
+        );
+    };
+    target.script_filename = script_binding.actual_path.clone();
     let script_url = if target.path_info.is_empty() {
         url_path.to_string()
     } else {
@@ -3246,9 +3266,9 @@ fn run_fastcgi(
     let scope = &target_scope;
     let grant = &target_grant;
     let resource = &target_resource;
-    let binding = target.binding_key();
+    let backend_binding = target.binding_key();
     // coverage:ignore-start
-    let Some(bound) = grant.bind_backend(resource, binding.clone()) else {
+    let Some(file_bound) = grant.bind_file(resource, &script_binding.meta) else {
         return error_response(
             cfg,
             vhost,
@@ -3262,10 +3282,24 @@ fn run_fastcgi(
             local_ip,
         );
     };
-    let mut expected = resource.clone();
-    expected.backend_target = Some(binding);
-    if !bound.require(&expected)
-        || resource.fs_path.as_deref() != Some(target.script_filename.as_path())
+    let file_resource = file_bound.key().clone();
+    let Some(bound) = file_bound.bind_backend(&file_resource, backend_binding) else {
+        return error_response(
+            cfg,
+            vhost,
+            scope,
+            500,
+            req,
+            url_path,
+            local_port,
+            server_name,
+            peer.ip(),
+            local_ip,
+        );
+    };
+    let expected = bound.key().clone();
+    if !bound.require_sink(&expected, vapache_verified::TransformSink::FastCgi)
+        || expected.fs_path.as_deref() != Some(target.script_filename.as_path())
     {
         return error_response(
             cfg,
@@ -3282,7 +3316,7 @@ fn run_fastcgi(
     }
     // coverage:ignore-stop
     let docroot = cfg.documentation_root_for(vhost);
-    let remote_user = grant.key().identity.as_deref();
+    let remote_user = bound.key().identity.as_deref();
     let auth_type = remote_user.and_then(|_| {
         scope
             .authorization
@@ -3315,7 +3349,7 @@ fn run_fastcgi(
         auth_type,
         script_file: None,
     };
-    let mut r = fastcgi::execute(&ctx, scope, &target);
+    let mut r = fastcgi::execute_bound(&ctx, scope, &target, &script_binding);
     scope.header_policy.apply(&mut r.headers, r.status < 400);
     r
 }
@@ -3340,7 +3374,42 @@ fn run_cgi(
     script_file: Option<&std::fs::File>,
     script_meta: Option<&std::fs::Metadata>,
 ) -> Response {
-    if !grant.require(resource) {
+    // CGI is an execution sink: a pathname-only grant is never sufficient.
+    // The descriptor and metadata originate from the same open, and the
+    // verified sink gate requires the resulting inode-bound capability.
+    let (Some(script_file), Some(meta)) = (script_file, script_meta) else {
+        return error_response(
+            cfg,
+            vhost,
+            scope,
+            500,
+            req,
+            script_name,
+            local_port,
+            server_name,
+            peer.ip(),
+            local_ip,
+        );
+    };
+    // coverage:ignore-start
+    let Some(bound) = grant.bind_file(resource, meta) else {
+        return error_response(
+            cfg,
+            vhost,
+            scope,
+            500,
+            req,
+            script_name,
+            local_port,
+            server_name,
+            peer.ip(),
+            local_ip,
+        );
+    };
+    let mut expected = resource.clone();
+    expected.file_dev = Some(meta.dev());
+    expected.file_ino = Some(meta.ino());
+    if !bound.require_sink(&expected, vapache_verified::TransformSink::LocalCgi) {
         return error_response(
             cfg,
             vhost,
@@ -3354,47 +3423,13 @@ fn run_cgi(
             local_ip,
         );
     }
-    if let (Some(_), Some(meta)) = (script_file, script_meta) {
-        // coverage:ignore-start
-        let Some(bound) = grant.bind_file(resource, meta) else {
-            return error_response(
-                cfg,
-                vhost,
-                scope,
-                500,
-                req,
-                script_name,
-                local_port,
-                server_name,
-                peer.ip(),
-                local_ip,
-            );
-        };
-        let mut expected = resource.clone();
-        expected.file_dev = Some(meta.dev());
-        expected.file_ino = Some(meta.ino());
-        if !bound.require(&expected) {
-            return error_response(
-                cfg,
-                vhost,
-                scope,
-                500,
-                req,
-                script_name,
-                local_port,
-                server_name,
-                peer.ip(),
-                local_ip,
-            );
-        }
-        // coverage:ignore-stop
-    }
+    // coverage:ignore-stop
     let follow = scope.effective_options().contains(Options::FOLLOW_SYMLINKS)
         || scope
             .effective_options()
             .contains(Options::SYMLINKS_IF_OWNER_MATCH);
     let docroot = cfg.documentation_root_for(vhost);
-    let remote_user = grant.key().identity.as_deref();
+    let remote_user = bound.key().identity.as_deref();
     let auth_type = remote_user.and_then(|_| {
         scope
             .authorization
@@ -3425,7 +3460,7 @@ fn run_cgi(
         env: &scope.request_env(req, url_path),
         remote_user,
         auth_type,
-        script_file,
+        script_file: Some(script_file),
     };
     let mut r = cgi::execute(&ctx);
     scope.header_policy.apply(&mut r.headers, r.status < 400);
@@ -5069,6 +5104,7 @@ mod tests {
                  AuthName \"realm\"\n\
                  AuthUserFile \"{}\"\n\
                  Require valid-user\n\
+                 Options -FollowSymLinks +SymLinksIfOwnerMatch\n\
                  </Directory>\n\
                  ProxyPassMatch ^/(.*\\.php(/.*)?)$ \"unix:/tmp/vapache-missing.sock|fcgi://localhost{}/www/\"\n",
                 dir.display(),
@@ -5107,6 +5143,25 @@ mod tests {
             &cfg.documentation_root_for(None),
         );
         assert!(matches!(resp.status, 500 | 502 | 503), "{}", resp.status);
+
+        let mut missing_target = target.clone();
+        missing_target.script_filename = dir.join("www/missing.php");
+        let resp = run_fastcgi(
+            &cfg,
+            None,
+            &req,
+            "/missing.php",
+            "localhost",
+            cov_peer(),
+            "127.0.0.1",
+            80,
+            &scope,
+            &missing_target,
+            &access::test_grant(),
+            &resource,
+            &cfg.documentation_root_for(None),
+        );
+        assert_eq!(resp.status, 403);
 
         let unauthorized = cov_req("GET", "/script.php/info");
         let resp = run_fastcgi(

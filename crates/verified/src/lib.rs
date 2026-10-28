@@ -1010,6 +1010,274 @@ pub proof fn rewrite_internal_sink_has_no_terminal_flag(
 {
 }
 
+// ---------------------------------------------------------------------------
+// Transform -> reauthorize -> sink capability pipeline
+// ---------------------------------------------------------------------------
+
+/// The security-relevant state carried from target selection to the final
+/// body/tunnel/cache sink.  A transform deliberately clears every authority;
+/// authorization and object/backend binding must then be rebuilt for the new
+/// target before a sink can be entered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TransformCapability {
+    pub target_bound: bool,
+    pub authorized: bool,
+    pub inode_bound: bool,
+    pub backend_bound: bool,
+    pub policy_bound: bool,
+}
+
+/// The distinct sink classes have different binding requirements.  FastCGI
+/// is both a local script-object transition and an outbound backend
+/// transition, so it is intentionally the strongest case.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransformSink {
+    StaticFile,
+    Directory,
+    LocalCgi,
+    FastCgi,
+    Proxy,
+    Cache,
+}
+
+pub open spec fn transform_retarget_spec() -> TransformCapability {
+    TransformCapability {
+        target_bound: false,
+        authorized: false,
+        inode_bound: false,
+        backend_bound: false,
+        policy_bound: false,
+    }
+}
+
+/// Select a new target after any rewrite/alias/symlink/DirectoryIndex,
+/// PATH_INFO, ErrorDocument, proxy or cache-key transform.  No capability for
+/// the old target survives this operation.
+pub fn transform_retarget() -> (state: TransformCapability)
+    ensures state == transform_retarget_spec(),
+{
+    TransformCapability {
+        target_bound: false,
+        authorized: false,
+        inode_bound: false,
+        backend_bound: false,
+        policy_bound: false,
+    }
+}
+
+pub open spec fn transform_authorize_spec(policy_bound: bool) -> TransformCapability {
+    TransformCapability {
+        target_bound: true,
+        authorized: true,
+        inode_bound: false,
+        backend_bound: false,
+        policy_bound,
+    }
+}
+
+/// Mint a capability only after the effective policy for the selected target
+/// has allowed the request.  Object/backend bindings are still absent.
+pub fn transform_authorize(policy_bound: bool) -> (state: TransformCapability)
+    ensures state == transform_authorize_spec(policy_bound),
+{
+    TransformCapability {
+        target_bound: true,
+        authorized: true,
+        inode_bound: false,
+        backend_bound: false,
+        policy_bound,
+    }
+}
+
+pub open spec fn transform_bind_inode_spec(
+    state: TransformCapability,
+) -> TransformCapability {
+    TransformCapability { inode_bound: true, ..state }
+}
+
+pub fn transform_bind_inode(state: TransformCapability) -> (out: TransformCapability)
+    ensures out == transform_bind_inode_spec(state),
+{
+    TransformCapability { inode_bound: true, ..state }
+}
+
+pub open spec fn transform_bind_backend_spec(
+    state: TransformCapability,
+) -> TransformCapability {
+    TransformCapability { backend_bound: true, ..state }
+}
+
+pub fn transform_bind_backend(state: TransformCapability) -> (out: TransformCapability)
+    ensures out == transform_bind_backend_spec(state),
+{
+    TransformCapability { backend_bound: true, ..state }
+}
+
+pub open spec fn transform_sink_needs_inode(sink: TransformSink) -> bool {
+    match sink {
+        TransformSink::StaticFile
+        | TransformSink::Directory
+        | TransformSink::LocalCgi
+        | TransformSink::FastCgi => true,
+        TransformSink::Proxy | TransformSink::Cache => false,
+    }
+}
+
+pub open spec fn transform_sink_needs_backend(sink: TransformSink) -> bool {
+    match sink {
+        TransformSink::FastCgi | TransformSink::Proxy => true,
+        _ => false,
+    }
+}
+
+pub open spec fn transform_sink_needs_policy(sink: TransformSink) -> bool {
+    match sink {
+        TransformSink::Cache => true,
+        _ => false,
+    }
+}
+
+pub fn transform_sink_requires_inode(sink: TransformSink) -> (needed: bool)
+    ensures needed == transform_sink_needs_inode(sink),
+{
+    match sink {
+        TransformSink::StaticFile
+        | TransformSink::Directory
+        | TransformSink::LocalCgi
+        | TransformSink::FastCgi => true,
+        TransformSink::Proxy | TransformSink::Cache => false,
+    }
+}
+
+pub fn transform_sink_requires_backend(sink: TransformSink) -> (needed: bool)
+    ensures needed == transform_sink_needs_backend(sink),
+{
+    match sink {
+        TransformSink::FastCgi | TransformSink::Proxy => true,
+        _ => false,
+    }
+}
+
+pub fn transform_sink_requires_policy(sink: TransformSink) -> (needed: bool)
+    ensures needed == transform_sink_needs_policy(sink),
+{
+    match sink {
+        TransformSink::Cache => true,
+        _ => false,
+    }
+}
+
+pub open spec fn transform_sink_admit_spec(
+    same_resource: bool,
+    state: TransformCapability,
+    sink: TransformSink,
+) -> bool {
+    same_resource
+        && state.target_bound
+        && state.authorized
+        && (!transform_sink_needs_inode(sink) || state.inode_bound)
+        && (!transform_sink_needs_backend(sink) || state.backend_bound)
+        && (!transform_sink_needs_policy(sink) || state.policy_bound)
+}
+
+/// Universal executable gate used immediately before every body, execution,
+/// tunnel and cache sink.
+pub fn transform_sink_admit(
+    same_resource: bool,
+    state: TransformCapability,
+    sink: TransformSink,
+) -> (ok: bool)
+    ensures ok == transform_sink_admit_spec(same_resource, state, sink),
+{
+    same_resource
+        && state.target_bound
+        && state.authorized
+        && (!transform_sink_requires_inode(sink) || state.inode_bound)
+        && (!transform_sink_requires_backend(sink) || state.backend_bound)
+        && (!transform_sink_requires_policy(sink) || state.policy_bound)
+}
+
+/// A target transform alone cannot reach any sink.
+pub proof fn transform_retarget_requires_reauthorization(sink: TransformSink)
+    ensures !transform_sink_admit_spec(true, transform_retarget_spec(), sink),
+{
+}
+
+pub proof fn transform_sink_implies_reauthorized(
+    same_resource: bool,
+    state: TransformCapability,
+    sink: TransformSink,
+)
+    ensures
+        transform_sink_admit_spec(same_resource, state, sink)
+            ==> same_resource && state.target_bound && state.authorized,
+{
+}
+
+pub proof fn transform_file_sink_implies_inode_bound(
+    same_resource: bool,
+    state: TransformCapability,
+    sink: TransformSink,
+)
+    requires transform_sink_needs_inode(sink),
+    ensures transform_sink_admit_spec(same_resource, state, sink) ==> state.inode_bound,
+{
+}
+
+pub proof fn transform_backend_sink_implies_backend_bound(
+    same_resource: bool,
+    state: TransformCapability,
+    sink: TransformSink,
+)
+    requires transform_sink_needs_backend(sink),
+    ensures transform_sink_admit_spec(same_resource, state, sink) ==> state.backend_bound,
+{
+}
+
+pub proof fn transform_cache_sink_implies_policy_bound(
+    same_resource: bool,
+    state: TransformCapability,
+)
+    ensures
+        transform_sink_admit_spec(same_resource, state, TransformSink::Cache)
+            ==> state.policy_bound,
+{
+}
+
+/// Descriptor snapshots are usable only when both observations name the same
+/// regular inode and the metadata version did not change while it was read.
+pub open spec fn descriptor_snapshot_spec(
+    regular: bool,
+    same_inode: bool,
+    same_version: bool,
+    within_limit: bool,
+) -> bool {
+    regular && same_inode && same_version && within_limit
+}
+
+pub fn descriptor_snapshot_admit(
+    regular: bool,
+    same_inode: bool,
+    same_version: bool,
+    within_limit: bool,
+) -> (ok: bool)
+    ensures ok == descriptor_snapshot_spec(regular, same_inode, same_version, within_limit),
+{
+    regular && same_inode && same_version && within_limit
+}
+
+pub proof fn descriptor_snapshot_admit_implies_stable_inode(
+    regular: bool,
+    same_inode: bool,
+    same_version: bool,
+    within_limit: bool,
+)
+    ensures
+        descriptor_snapshot_spec(regular, same_inode, same_version, within_limit)
+            ==> regular && same_inode && same_version && within_limit,
+{
+}
+
 /// Query-state operation after splitting the expanded substitution.  The
 /// returned action is consumed directly by `mod_rewrite`'s runtime path so
 /// QSA/QSD precedence and the no-target-query preservation rule cannot drift
@@ -1610,6 +1878,399 @@ pub fn expr_file_test_admit(
     ensures ok == (!absolute && !parent_relative && under_root),
 {
     !absolute && !parent_relative && under_root
+}
+
+/// The complete token alphabet understood by the rewrite substitution
+/// expander.  Both the runtime expander and load-time proxy-authority guard
+/// consume this classifier, so admission cannot drift from interpretation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RewriteExpandToken {
+    Literal,
+    Variable,
+    RuleCapture { index: u8 },
+    ConditionCapture { index: u8 },
+}
+
+pub open spec fn rewrite_expand_token_spec(input: Seq<u8>, i: int) -> RewriteExpandToken
+    recommends 0 <= i < input.len(),
+{
+    if i + 1 >= input.len() {
+        RewriteExpandToken::Literal
+    } else {
+        let marker = input[i];
+        let next = input[i + 1];
+        if (marker == b'$' || marker == b'%') && next == b'{' {
+            RewriteExpandToken::Variable
+        } else if (marker == b'$' || marker == b'\\') && next >= b'0' && next <= b'9' {
+            RewriteExpandToken::RuleCapture { index: (next - b'0') as u8 }
+        } else if marker == b'%' && next >= b'0' && next <= b'9' {
+            RewriteExpandToken::ConditionCapture { index: (next - b'0') as u8 }
+        } else {
+            RewriteExpandToken::Literal
+        }
+    }
+}
+
+pub fn rewrite_expand_token(input: &[u8], i: usize) -> (token: RewriteExpandToken)
+    requires i < input.len(),
+    ensures token == rewrite_expand_token_spec(input@, i as int),
+{
+    if i + 1 >= input.len() {
+        RewriteExpandToken::Literal
+    } else {
+        let marker = input[i];
+        let next = input[i + 1];
+        if (marker == b'$' || marker == b'%') && next == b'{' {
+            RewriteExpandToken::Variable
+        } else if (marker == b'$' || marker == b'\\') && next >= b'0' && next <= b'9' {
+            RewriteExpandToken::RuleCapture { index: next - b'0' }
+        } else if marker == b'%' && next >= b'0' && next <= b'9' {
+            RewriteExpandToken::ConditionCapture { index: next - b'0' }
+        } else {
+            RewriteExpandToken::Literal
+        }
+    }
+}
+
+/// P14-B: a proxy authority (or a scheme-less proxy template) is static only
+/// when the shared expander classifier sees no variable or capture token.
+pub open spec fn rewrite_template_static_spec(input: Seq<u8>) -> bool {
+    forall|i: int|
+        0 <= i < input.len() ==>
+            rewrite_expand_token_spec(input, i) == RewriteExpandToken::Literal
+}
+
+pub fn rewrite_template_static(input: &[u8]) -> (ok: bool)
+    ensures ok == rewrite_template_static_spec(input@),
+{
+    let mut i: usize = 0;
+    while i < input.len()
+        invariant
+            i <= input.len(),
+            forall|j: int|
+                0 <= j < i ==>
+                    rewrite_expand_token_spec(input@, j) == RewriteExpandToken::Literal,
+        decreases input.len() - i,
+    {
+        let token = rewrite_expand_token(input, i);
+        match token {
+            RewriteExpandToken::Literal => {
+                assert(token == rewrite_expand_token_spec(input@, i as int));
+                assert(rewrite_expand_token_spec(input@, i as int)
+                    == RewriteExpandToken::Literal);
+            }
+            _ => {
+                assert(token == rewrite_expand_token_spec(input@, i as int));
+                assert(rewrite_expand_token_spec(input@, i as int)
+                    != RewriteExpandToken::Literal);
+                assert(!rewrite_template_static_spec(input@)) by {
+                    if rewrite_template_static_spec(input@) {
+                        assert(rewrite_expand_token_spec(input@, i as int)
+                            == RewriteExpandToken::Literal);
+                    }
+                }
+                return false;
+            }
+        }
+        assert forall|j: int|
+            0 <= j < i + 1 ==>
+                rewrite_expand_token_spec(input@, j) == RewriteExpandToken::Literal
+        by {
+            if 0 <= j < i + 1 {
+                if j < i {
+                    assert(rewrite_expand_token_spec(input@, j)
+                        == RewriteExpandToken::Literal);
+                } else {
+                    assert(j == i);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    true
+}
+
+/// P14-E: after a chained rule fails, skip every following chained rule and
+/// the first non-chained action rule.
+pub open spec fn rewrite_chain_resume_spec(chained: Seq<bool>, start: int) -> int
+    recommends 0 <= start <= chained.len(),
+    decreases chained.len() - start,
+{
+    if start >= chained.len() {
+        start
+    } else if chained[start] {
+        rewrite_chain_resume_spec(chained, start + 1)
+    } else {
+        start + 1
+    }
+}
+
+pub fn rewrite_chain_resume(chained: &[bool], start: usize) -> (resume: usize)
+    requires start <= chained.len(),
+    ensures
+        resume == rewrite_chain_resume_spec(chained@, start as int),
+        start <= resume <= chained.len(),
+    decreases chained.len() - start,
+{
+    if start >= chained.len() {
+        start
+    } else if chained[start] {
+        rewrite_chain_resume(chained, start + 1)
+    } else {
+        start + 1
+    }
+}
+
+/// Staged rule-control decision made after subject/condition/regex evaluation
+/// but before a substitution is expanded.  This is the single control point
+/// for chain failure, `[F]`/`[G]`, no-substitution rules and target expansion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RewriteMatchAction {
+    Continue { index: usize },
+    Forbidden,
+    Gone,
+    NoSubstitution,
+    Expand,
+}
+
+pub open spec fn rewrite_match_action_spec(
+    chained: Seq<bool>,
+    next_index: int,
+    matched: bool,
+    chain: bool,
+    forbidden: bool,
+    gone: bool,
+    no_substitution: bool,
+) -> RewriteMatchAction
+    recommends 0 <= next_index <= chained.len(),
+{
+    if !matched {
+        RewriteMatchAction::Continue {
+            index: if chain {
+                rewrite_chain_resume_spec(chained, next_index) as usize
+            } else {
+                next_index as usize
+            },
+        }
+    } else if forbidden {
+        RewriteMatchAction::Forbidden
+    } else if gone {
+        RewriteMatchAction::Gone
+    } else if no_substitution {
+        RewriteMatchAction::NoSubstitution
+    } else {
+        RewriteMatchAction::Expand
+    }
+}
+
+pub fn rewrite_match_action(
+    chained: &[bool],
+    next_index: usize,
+    matched: bool,
+    chain: bool,
+    forbidden: bool,
+    gone: bool,
+    no_substitution: bool,
+) -> (action: RewriteMatchAction)
+    requires next_index <= chained.len(),
+    ensures
+        action == rewrite_match_action_spec(
+            chained@,
+            next_index as int,
+            matched,
+            chain,
+            forbidden,
+            gone,
+            no_substitution,
+        ),
+        match action {
+            RewriteMatchAction::Continue { index } => index <= chained.len(),
+            _ => true,
+        },
+{
+    if !matched {
+        RewriteMatchAction::Continue {
+            index: if chain {
+                rewrite_chain_resume(chained, next_index)
+            } else {
+                next_index
+            },
+        }
+    } else if forbidden {
+        RewriteMatchAction::Forbidden
+    } else if gone {
+        RewriteMatchAction::Gone
+    } else if no_substitution {
+        RewriteMatchAction::NoSubstitution
+    } else {
+        RewriteMatchAction::Expand
+    }
+}
+
+/// Verified program-counter transition shared by `-` and internal-target
+/// rules. `[N]` takes precedence over `[L]/[END]`; `[END]` makes a stopped
+/// pass final even when the substitution is `-`; `[S]` is bounded by the
+/// remaining rule count instead of relying on integer saturation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RewriteAdvance {
+    Continue { index: usize },
+    Restart { completed: u64 },
+    Stop { final_pass: bool },
+    RestartLimit,
+}
+
+pub open spec fn rewrite_skip_index_spec(
+    next_index: int,
+    rule_count: int,
+    has_skip: bool,
+    skip: int,
+) -> int
+    recommends 0 <= next_index <= rule_count && 0 <= skip,
+{
+    if has_skip && skip <= rule_count - next_index {
+        next_index + skip
+    } else if has_skip {
+        rule_count
+    } else {
+        next_index
+    }
+}
+
+pub open spec fn rewrite_advance_spec(
+    next_index: int,
+    rule_count: int,
+    has_skip: bool,
+    skip: int,
+    restart: bool,
+    last: bool,
+    end: bool,
+    completed: u64,
+    limit: u64,
+) -> RewriteAdvance
+    recommends 0 <= next_index <= rule_count && 0 <= skip,
+{
+    if restart {
+        if rewrite_restart_admit_spec(completed, limit) {
+            RewriteAdvance::Restart { completed: (completed + 1) as u64 }
+        } else {
+            RewriteAdvance::RestartLimit
+        }
+    } else if last {
+        RewriteAdvance::Stop { final_pass: end }
+    } else {
+        RewriteAdvance::Continue {
+            index: rewrite_skip_index_spec(next_index, rule_count, has_skip, skip) as usize,
+        }
+    }
+}
+
+pub fn rewrite_advance(
+    next_index: usize,
+    rule_count: usize,
+    has_skip: bool,
+    skip: usize,
+    restart: bool,
+    last: bool,
+    end: bool,
+    completed: u64,
+    limit: u64,
+) -> (advance: RewriteAdvance)
+    requires next_index <= rule_count,
+    ensures
+        advance == rewrite_advance_spec(
+            next_index as int,
+            rule_count as int,
+            has_skip,
+            skip as int,
+            restart,
+            last,
+            end,
+            completed,
+            limit,
+        ),
+        match advance {
+            RewriteAdvance::Continue { index } => index <= rule_count,
+            RewriteAdvance::Restart { completed: after } =>
+                completed < limit && after == completed + 1 && after <= limit,
+            RewriteAdvance::Stop { final_pass } => last && final_pass == end,
+            RewriteAdvance::RestartLimit => restart && completed >= limit,
+        },
+{
+    if restart {
+        if rewrite_restart_admit(completed, limit) {
+            RewriteAdvance::Restart { completed: completed + 1 }
+        } else {
+            RewriteAdvance::RestartLimit
+        }
+    } else if last {
+        RewriteAdvance::Stop { final_pass: end }
+    } else {
+        let index = if has_skip {
+            let remaining = rule_count - next_index;
+            if skip <= remaining {
+                next_index + skip
+            } else {
+                rule_count
+            }
+        } else {
+            next_index
+        };
+        RewriteAdvance::Continue { index }
+    }
+}
+
+pub proof fn rewrite_unmatched_rule_has_no_terminal_effect(
+    chained: Seq<bool>,
+    next_index: int,
+    chain: bool,
+    forbidden: bool,
+    gone: bool,
+    no_substitution: bool,
+)
+    requires 0 <= next_index <= chained.len(),
+    ensures
+        match rewrite_match_action_spec(
+            chained,
+            next_index,
+            false,
+            chain,
+            forbidden,
+            gone,
+            no_substitution,
+        ) {
+            RewriteMatchAction::Continue { .. } => true,
+            _ => false,
+        },
+{
+}
+
+pub proof fn rewrite_restart_cannot_fall_through(
+    next_index: int,
+    rule_count: int,
+    has_skip: bool,
+    skip: int,
+    last: bool,
+    end: bool,
+    completed: u64,
+    limit: u64,
+)
+    requires 0 <= next_index <= rule_count && 0 <= skip,
+    ensures
+        match rewrite_advance_spec(
+            next_index,
+            rule_count,
+            has_skip,
+            skip,
+            true,
+            last,
+            end,
+            completed,
+            limit,
+        ) {
+            RewriteAdvance::Restart { .. } | RewriteAdvance::RestartLimit => true,
+            _ => false,
+        },
+{
 }
 
 /// F50/I47: an access-file layer participates for every ancestor directory
@@ -3321,6 +3982,38 @@ fn bytes_eq(a: &[u8], b: &[u8]) -> (ok: bool)
     true
 }
 
+/// P14-D: choose the unique policy-visible slot for a canonicalized HTTP/1
+/// field name. The bridge uses this verified lookup to merge duplicate field
+/// lines in arrival order before constructing `Request::headers`.
+pub fn header_merge_index(
+    headers: &[(Vec<u8>, Vec<u8>)],
+    name: &[u8],
+) -> (found: Option<usize>)
+    ensures
+        match found {
+            Some(i) => {
+                &&& i < headers@.len()
+                &&& headers@[i as int].0@ == name@
+                &&& forall|j: int| 0 <= j < i ==> headers@[j].0@ != name@
+            }
+            None => forall|j: int| 0 <= j < headers@.len() ==> headers@[j].0@ != name@,
+        },
+{
+    let mut i: usize = 0;
+    while i < headers.len()
+        invariant
+            i <= headers.len(),
+            forall|j: int| 0 <= j < i ==> headers@[j].0@ != name@,
+        decreases headers.len() - i,
+    {
+        if bytes_eq(&headers[i].0, name) {
+            return Some(i);
+        }
+        i = i + 1;
+    }
+    None
+}
+
 fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> (ok: bool)
     ensures ok == eq_ignore_ascii_case_spec(a@, b@),
 {
@@ -4568,28 +5261,296 @@ proof fn combine_or_commutative(a: PolicyResult, b: PolicyResult)
 // Configuration phase and access-file interleaving plan
 // ---------------------------------------------------------------------------
 
-/// Canonical stage order.  A `Walk { access }` step applies the literal
-/// `<Directory>` rules for the next ancestor directory and, when `access` is
-/// true, immediately merges that directory's top-level `.htaccess` scope.  The
-/// per-directory interleaving `Directory(i); access-file(i)` is therefore one
-/// indivisible step.  Files/Location are deferred until all directory steps
-/// finish; conditions are last.
+/// Parser-level rule kind stripped of regex/path payload. Runtime `MatchKind`
+/// is exhaustively translated to this enum before any phase or sort decision.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigRuleKind {
+    Always,
+    Directory,
+    DirectoryMatch,
+    Files,
+    Location,
+    LocationMatch,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigRulePhase {
+    Directory,
+    Files,
+    Location,
+    Condition,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigDeferredSlot {
+    Ignore,
+    Files,
+    Location,
+    Condition,
+}
+
+pub open spec fn config_rule_phase_spec(
+    kind: ConfigRuleKind,
+    conditional: bool,
+) -> ConfigRulePhase {
+    // `Always` is the parser's payload-free carrier for <If>/<ElseIf>/<Else>.
+    // It belongs to the final condition phase even if a malformed synthetic
+    // rule omits the expression/branch marker used by the runtime parser.
+    match kind {
+        ConfigRuleKind::Always => ConfigRulePhase::Condition,
+        ConfigRuleKind::Directory | ConfigRuleKind::DirectoryMatch => if conditional {
+            ConfigRulePhase::Condition
+        } else {
+            ConfigRulePhase::Directory
+        },
+        ConfigRuleKind::Files => if conditional {
+            ConfigRulePhase::Condition
+        } else {
+            ConfigRulePhase::Files
+        },
+        ConfigRuleKind::Location | ConfigRuleKind::LocationMatch => if conditional {
+            ConfigRulePhase::Condition
+        } else {
+            ConfigRulePhase::Location
+        },
+    }
+}
+
+pub fn config_rule_phase(
+    kind: ConfigRuleKind,
+    conditional: bool,
+) -> (phase: ConfigRulePhase)
+    ensures phase == config_rule_phase_spec(kind, conditional),
+{
+    match kind {
+        ConfigRuleKind::Always => ConfigRulePhase::Condition,
+        ConfigRuleKind::Directory | ConfigRuleKind::DirectoryMatch => if conditional {
+            ConfigRulePhase::Condition
+        } else {
+            ConfigRulePhase::Directory
+        },
+        ConfigRuleKind::Files => if conditional {
+            ConfigRulePhase::Condition
+        } else {
+            ConfigRulePhase::Files
+        },
+        ConfigRuleKind::Location | ConfigRuleKind::LocationMatch => if conditional {
+            ConfigRulePhase::Condition
+        } else {
+            ConfigRulePhase::Location
+        },
+    }
+}
+
+pub open spec fn config_deferred_slot_spec(
+    kind: ConfigRuleKind,
+    conditional: bool,
+) -> ConfigDeferredSlot {
+    match kind {
+        ConfigRuleKind::Always => ConfigDeferredSlot::Condition,
+        ConfigRuleKind::Files => if conditional {
+            ConfigDeferredSlot::Condition
+        } else {
+            ConfigDeferredSlot::Files
+        },
+        ConfigRuleKind::Location | ConfigRuleKind::LocationMatch => if conditional {
+            ConfigDeferredSlot::Condition
+        } else {
+            ConfigDeferredSlot::Location
+        },
+        ConfigRuleKind::Directory | ConfigRuleKind::DirectoryMatch => if conditional {
+            ConfigDeferredSlot::Condition
+        } else {
+            ConfigDeferredSlot::Ignore
+        },
+    }
+}
+
+pub fn config_deferred_slot(
+    kind: ConfigRuleKind,
+    conditional: bool,
+) -> (slot: ConfigDeferredSlot)
+    ensures slot == config_deferred_slot_spec(kind, conditional),
+{
+    match kind {
+        ConfigRuleKind::Always => ConfigDeferredSlot::Condition,
+        ConfigRuleKind::Files => if conditional {
+            ConfigDeferredSlot::Condition
+        } else {
+            ConfigDeferredSlot::Files
+        },
+        ConfigRuleKind::Location | ConfigRuleKind::LocationMatch => if conditional {
+            ConfigDeferredSlot::Condition
+        } else {
+            ConfigDeferredSlot::Location
+        },
+        ConfigRuleKind::Directory | ConfigRuleKind::DirectoryMatch => if conditional {
+            ConfigDeferredSlot::Condition
+        } else {
+            ConfigDeferredSlot::Ignore
+        },
+    }
+}
+
+pub open spec fn config_sort_rank_spec(kind: ConfigRuleKind, conditional: bool) -> u8 {
+    match kind {
+        ConfigRuleKind::Always => 5,
+        ConfigRuleKind::Directory => if conditional { 5 } else { 0 },
+        ConfigRuleKind::DirectoryMatch => if conditional { 5 } else { 1 },
+        ConfigRuleKind::Files => if conditional { 5 } else { 2 },
+        ConfigRuleKind::Location => if conditional { 5 } else { 3 },
+        ConfigRuleKind::LocationMatch => if conditional { 5 } else { 4 },
+    }
+}
+
+pub fn config_sort_rank(kind: ConfigRuleKind, conditional: bool) -> (rank: u8)
+    ensures rank == config_sort_rank_spec(kind, conditional),
+{
+    match kind {
+        ConfigRuleKind::Always => 5,
+        ConfigRuleKind::Directory => if conditional { 5 } else { 0 },
+        ConfigRuleKind::DirectoryMatch => if conditional { 5 } else { 1 },
+        ConfigRuleKind::Files => if conditional { 5 } else { 2 },
+        ConfigRuleKind::Location => if conditional { 5 } else { 3 },
+        ConfigRuleKind::LocationMatch => if conditional { 5 } else { 4 },
+    }
+}
+
+pub open spec fn config_rule_precedes_spec(
+    a_kind: ConfigRuleKind,
+    a_conditional: bool,
+    a_specificity: int,
+    a_order: int,
+    b_kind: ConfigRuleKind,
+    b_conditional: bool,
+    b_specificity: int,
+    b_order: int,
+) -> bool {
+    let ar = config_sort_rank_spec(a_kind, a_conditional);
+    let br = config_sort_rank_spec(b_kind, b_conditional);
+    ar < br
+        || (ar == br
+            && (a_specificity < b_specificity
+                || (a_specificity == b_specificity && a_order < b_order)))
+}
+
+pub fn config_rule_precedes(
+    a_kind: ConfigRuleKind,
+    a_conditional: bool,
+    a_specificity: usize,
+    a_order: usize,
+    b_kind: ConfigRuleKind,
+    b_conditional: bool,
+    b_specificity: usize,
+    b_order: usize,
+) -> (before: bool)
+    ensures
+        before == config_rule_precedes_spec(
+            a_kind,
+            a_conditional,
+            a_specificity as int,
+            a_order as int,
+            b_kind,
+            b_conditional,
+            b_specificity as int,
+            b_order as int,
+        ),
+{
+    let ar = config_sort_rank(a_kind, a_conditional);
+    let br = config_sort_rank(b_kind, b_conditional);
+    ar < br
+        || (ar == br
+            && (a_specificity < b_specificity
+                || (a_specificity == b_specificity && a_order < b_order)))
+}
+
+pub proof fn config_rule_order_is_asymmetric(
+    a_kind: ConfigRuleKind,
+    a_conditional: bool,
+    a_specificity: int,
+    a_order: int,
+    b_kind: ConfigRuleKind,
+    b_conditional: bool,
+    b_specificity: int,
+    b_order: int,
+)
+    ensures
+        config_rule_precedes_spec(
+            a_kind,
+            a_conditional,
+            a_specificity,
+            a_order,
+            b_kind,
+            b_conditional,
+            b_specificity,
+            b_order,
+        ) ==>
+        !config_rule_precedes_spec(
+            b_kind,
+            b_conditional,
+            b_specificity,
+            b_order,
+            a_kind,
+            a_conditional,
+            a_specificity,
+            a_order,
+        ),
+{
+}
+
+/// Canonical stage order emitted by a pure verified compiler. Config and
+/// access-file sources are separate typed steps carrying their exact depth;
+/// the runtime no longer hides source ordering inside one imperative branch.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AccessStep {
-    Walk { access: bool },
+    DirectoryConfig { depth: usize },
+    DirectoryAccess { depth: usize },
+    DirectoryOwnPath,
     DirectoryMatch,
-    ConfigFiles,
-    AccessFiles,
+    BaseFiles,
+    FilesConfig { depth: usize },
+    FilesAccess { depth: usize },
+    DirectoryMatchFiles,
     ConfigLocation,
     ConfigConditions,
     AccessConditions,
 }
 
-pub open spec fn access_suffix() -> Seq<AccessStep> {
+/// Provenance order for the deferred condition phase. Configuration
+/// conditions run before access-file conditions, with independent chain
+/// state for the two sources.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConditionSource {
+    Config,
+    Access,
+}
+
+pub open spec fn condition_source_plan() -> Seq<ConditionSource> {
+    seq![ConditionSource::Config, ConditionSource::Access]
+}
+
+pub fn condition_source_plan_exec() -> (out: Vec<ConditionSource>)
+    ensures out@ == condition_source_plan(),
+{
+    let mut out = Vec::new();
+    out.push(ConditionSource::Config);
+    out.push(ConditionSource::Access);
+    out
+}
+
+pub proof fn condition_source_plan_matches_access_tail()
+    ensures
+        condition_source_plan().len() == 2,
+        condition_source_plan()[0] == ConditionSource::Config,
+        condition_source_plan()[1] == ConditionSource::Access,
+        access_tail()[2] == AccessStep::ConfigConditions,
+        access_tail()[3] == AccessStep::AccessConditions,
+{
+}
+
+pub open spec fn access_tail() -> Seq<AccessStep> {
     seq![
-        AccessStep::DirectoryMatch,
-        AccessStep::ConfigFiles,
-        AccessStep::AccessFiles,
+        AccessStep::DirectoryMatchFiles,
         AccessStep::ConfigLocation,
         AccessStep::ConfigConditions,
         AccessStep::AccessConditions,
@@ -4605,7 +5566,12 @@ pub open spec fn access_walk_plan_from(
     if start >= present.len() {
         Seq::empty()
     } else {
-        seq![AccessStep::Walk { access: present[start] }]
+        seq![AccessStep::DirectoryConfig { depth: start as usize }]
+            + if present[start] {
+                seq![AccessStep::DirectoryAccess { depth: start as usize }]
+            } else {
+                Seq::empty()
+            }
             + access_walk_plan_from(present, start + 1)
     }
 }
@@ -4614,15 +5580,38 @@ pub open spec fn access_walk_plan(present: Seq<bool>) -> Seq<AccessStep> {
     access_walk_plan_from(present, 0)
 }
 
-pub open spec fn access_plan(present: Seq<bool>) -> Seq<AccessStep> {
-    access_walk_plan(present) + access_suffix()
+pub open spec fn access_files_plan_from(
+    present: Seq<bool>,
+    start: int,
+) -> Seq<AccessStep>
+    decreases present.len() - start,
+{
+    if start >= present.len() {
+        Seq::empty()
+    } else {
+        seq![AccessStep::FilesConfig { depth: start as usize }]
+            + if present[start] {
+                seq![AccessStep::FilesAccess { depth: start as usize }]
+            } else {
+                Seq::empty()
+            }
+            + access_files_plan_from(present, start + 1)
+    }
 }
 
-pub open spec fn is_walk(step: AccessStep) -> bool {
-    match step {
-        AccessStep::Walk { .. } => true,
-        _ => false,
-    }
+pub open spec fn access_files_plan(present: Seq<bool>) -> Seq<AccessStep> {
+    access_files_plan_from(present, 0)
+}
+
+pub open spec fn access_plan(present: Seq<bool>) -> Seq<AccessStep> {
+    access_walk_plan(present)
+        + seq![
+            AccessStep::DirectoryOwnPath,
+            AccessStep::DirectoryMatch,
+            AccessStep::BaseFiles,
+        ]
+        + access_files_plan(present)
+        + access_tail()
 }
 
 pub fn access_walk_plan_exec_from(
@@ -4637,11 +5626,12 @@ pub fn access_walk_plan_exec_from(
         Vec::new()
     } else {
         let mut out: Vec<AccessStep> = Vec::new();
-        out.push(AccessStep::Walk { access: present[start] });
+        out.push(AccessStep::DirectoryConfig { depth: start });
+        if present[start] {
+            out.push(AccessStep::DirectoryAccess { depth: start });
+        }
         let mut rest = access_walk_plan_exec_from(present, start + 1);
         out.append(&mut rest);
-        assert(out@ == seq![AccessStep::Walk { access: present@[start as int] }]
-            + access_walk_plan_from(present@, start as int + 1));
         out
     }
 }
@@ -4652,86 +5642,66 @@ pub fn access_walk_plan_exec(present: &[bool]) -> (out: Vec<AccessStep>)
     access_walk_plan_exec_from(present, 0)
 }
 
+pub fn access_files_plan_exec_from(
+    present: &[bool],
+    start: usize,
+) -> (out: Vec<AccessStep>)
+    requires start <= present.len(),
+    ensures out@ == access_files_plan_from(present@, start as int),
+    decreases present.len() - start,
+{
+    if start >= present.len() {
+        Vec::new()
+    } else {
+        let mut out: Vec<AccessStep> = Vec::new();
+        out.push(AccessStep::FilesConfig { depth: start });
+        if present[start] {
+            out.push(AccessStep::FilesAccess { depth: start });
+        }
+        let mut rest = access_files_plan_exec_from(present, start + 1);
+        out.append(&mut rest);
+        out
+    }
+}
+
+pub fn access_files_plan_exec(present: &[bool]) -> (out: Vec<AccessStep>)
+    ensures out@ == access_files_plan(present@)
+{
+    access_files_plan_exec_from(present, 0)
+}
+
 pub fn access_plan_exec(present: &[bool]) -> (out: Vec<AccessStep>)
     ensures out@ == access_plan(present@)
 {
     let mut out = access_walk_plan_exec(present);
+    out.push(AccessStep::DirectoryOwnPath);
     out.push(AccessStep::DirectoryMatch);
-    out.push(AccessStep::ConfigFiles);
-    out.push(AccessStep::AccessFiles);
+    out.push(AccessStep::BaseFiles);
+    let mut files = access_files_plan_exec(present);
+    out.append(&mut files);
+    out.push(AccessStep::DirectoryMatchFiles);
     out.push(AccessStep::ConfigLocation);
     out.push(AccessStep::ConfigConditions);
     out.push(AccessStep::AccessConditions);
-    assert(out@ == access_walk_plan(present@) + access_suffix());
     out
 }
 
-proof fn lemma_access_walk_plan_length_from(present: Seq<bool>, start: int)
-    requires 0 <= start <= present.len(),
-    ensures access_walk_plan_from(present, start).len() == present.len() - start,
-    decreases present.len() - start,
-{
-    if start >= present.len() {
-    } else {
-        lemma_access_walk_plan_length_from(present, start + 1);
-    }
-}
-
-proof fn lemma_access_walk_plan_all_walk_from(present: Seq<bool>, start: int)
-    requires 0 <= start <= present.len(),
-    ensures
-        forall|k: int|
-            0 <= k < access_walk_plan_from(present, start).len() ==>
-                #[trigger] is_walk(access_walk_plan_from(present, start)[k]),
-    decreases present.len() - start,
-{
-    if start >= present.len() {
-    } else {
-        lemma_access_walk_plan_all_walk_from(present, start + 1);
-        assert(access_walk_plan_from(present, start)
-            == seq![AccessStep::Walk { access: present[start] }]
-                + access_walk_plan_from(present, start + 1));
-        assert forall|k: int|
-            0 <= k < access_walk_plan_from(present, start).len() ==>
-                #[trigger] is_walk(access_walk_plan_from(present, start)[k])
-        by {
-            if 0 <= k < access_walk_plan_from(present, start).len() {
-                if k == 0 {
-                } else {
-                    lemma_access_walk_plan_length_from(present, start + 1);
-                    assert(access_walk_plan_from(present, start).len()
-                        == 1 + access_walk_plan_from(present, start + 1).len());
-                    assert(k - 1 < access_walk_plan_from(present, start + 1).len());
-                    assert(access_walk_plan_from(present, start)[k]
-                        == access_walk_plan_from(present, start + 1)[k - 1]);
-                }
-            }
-        }
-    }
-}
-
-/// Interleaver theorem:
-///
-/// 1. the walk plan has exactly one step per ancestor directory;
-/// 2. every walk step precedes the deferred phase suffix;
-/// 3. the suffix is exactly
-///    `DirectoryMatch, ConfigFiles, AccessFiles, Location, config If, access If`.
-///
-/// Step (1) pairs each `Walk` with the root-to-leaf directory list.  The
-/// per-directory `Directory; access scope` order is inside the step, so it
-/// cannot be reordered by construction.
+/// The plan shape itself proves source/depth ordering: each recursive depth
+/// emits config before an optional access step, in both Directory and Files
+/// phases; DirectoryMatch/Location/conditions are fixed suffixes.
 pub proof fn access_plan_interleaves(present: Seq<bool>)
     ensures
-        access_walk_plan(present).len() == present.len(),
-        forall|k: int|
-            0 <= k < access_walk_plan(present).len() ==>
-                #[trigger] is_walk(access_walk_plan(present)[k]),
-        access_plan(present) == access_walk_plan(present) + access_suffix(),
-        access_suffix().len() == 6,
+        access_plan(present) == access_walk_plan(present)
+            + seq![
+                AccessStep::DirectoryOwnPath,
+                AccessStep::DirectoryMatch,
+                AccessStep::BaseFiles,
+            ]
+            + access_files_plan(present)
+            + access_tail(),
+        access_tail().len() == 4,
 {
-    lemma_access_walk_plan_length_from(present, 0);
-    lemma_access_walk_plan_all_walk_from(present, 0);
-    assert(access_suffix().len() == 6);
+    assert(access_tail().len() == 4);
 }
 
 

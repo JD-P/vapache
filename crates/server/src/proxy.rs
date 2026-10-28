@@ -1055,7 +1055,8 @@ where
     };
     let mut expected = resource.clone();
     expected.backend_target = Some(binding);
-    if !bound.require(&expected) || resource.proxy_url.as_deref() != Some(target.proxy_url.as_str())
+    if !bound.require_sink(&expected, vapache_verified::TransformSink::Proxy)
+        || resource.proxy_url.as_deref() != Some(target.proxy_url.as_str())
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -1652,7 +1653,7 @@ fn authorize_failover(
     let mut expected = next_resource;
     expected.backend_target = Some(binding);
     debug_assert!(
-        bound.require(&expected),
+        bound.require_sink(&expected, vapache_verified::TransformSink::Proxy),
         "failover grant does not cover bound backend"
     );
     Some((next_scope, bound, expected))
@@ -1689,7 +1690,7 @@ pub fn execute(
     };
     let mut active_resource = resource.clone();
     active_resource.backend_target = Some(binding);
-    if !bound.require(&active_resource)
+    if !bound.require_sink(&active_resource, vapache_verified::TransformSink::Proxy)
         || resource.proxy_url.as_deref() != Some(target.proxy_url.as_str())
     {
         return error(
@@ -1716,7 +1717,7 @@ pub fn execute(
         let mut expected = active_resource.clone();
         expected.backend_target = Some(binding.clone());
         debug_assert!(
-            active_grant.require(&expected)
+            active_grant.require_sink(&expected, vapache_verified::TransformSink::Proxy)
                 && active_resource.proxy_url.as_deref() == Some(current.proxy_url.as_str())
                 && active_resource.backend_target.as_deref() == Some(binding.as_str()),
             "proxy failover grant/identity drift"

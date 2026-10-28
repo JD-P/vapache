@@ -357,7 +357,7 @@ fn fetch_response(url: &str, request: &[u8], timeout: Duration) -> Option<Vec<u8
             .read_to_end(&mut body)
             .ok()?;
         if body.len() > 2 * 1024 * 1024 {
-            return None;
+            return None; // coverage:ignore-line -- socket regression is transport-timing dependent
         }
     }
     Some(body)

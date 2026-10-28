@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-10-28",
   "verus": {
-    "verified_functions": 379,
+    "verified_functions": 422,
     "errors": 0
   },
   "obligations": [
@@ -18,14 +18,14 @@
       "title": "Directory < Files < Location < Condition",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "access_plan_interleaves and the consumed plan; directory sort/pairing are outside Verus"
+      "evidence": "config_rule_phase, config_deferred_slot and config_rule_precedes are executable specifications consumed through an exhaustive MatchKind projection by phase collection and the recursive nested-rule sorter; config_rule_order_is_asymmetric proves the comparator cannot order a pair both ways. access_plan_interleaves proves the exact source/depth plan consumed by the runtime: DirectoryConfig then optional DirectoryAccess at each root-to-leaf depth, Directory own-path and DirectoryMatch, BaseFiles, FilesConfig then optional FilesAccess at each depth, DirectoryMatch Files, Location, config conditions and access conditions. condition_source_plan_exec is consumed by request_plan when it applies config conditions before access-file conditions, and its proof ties that order to the access-plan tail. Standard-library sort correctness and parser directive/pattern payload semantics remain outside Verus."
     },
     {
       "id": "htaccess_interleave",
       "title": "per-directory Directory; access-file interleaving",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "verified plan and collect_layers classifier; the access walk covers every ancestor whose effective AllowOverride permits a layer and is not bounded by DocumentRoot or an alias target (access_walk_dir_admit, I47); parser-to-AccessLayer refinement is assumed"
+      "evidence": "AccessStep names config versus access-file provenance and exact depth for both Directory and Files phases; access_plan_exec is the only production iteration plan, and access_plan_interleaves proves its structural equality and suffix. The access walk covers every ancestor whose effective AllowOverride permits a layer and is not bounded by DocumentRoot or an alias target (access_walk_dir_admit, I47). AccessLayer parsing and filesystem discovery remain refinement assumptions."
     },
     {
       "id": "require_eval_sound",
@@ -60,7 +60,7 @@
       "title": "ACL reachability and resource binding",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "I1a path/URL/proxy/cache grants and I1b inode binding for file/directory; I31 binds CGI scripts by inode and FastCGI by transport/script/PATH_INFO, exports grant identity and makes the FastCGI target authoritative for derived environment; I32 binds both logical and concrete balancer identities and atomically replaces grant/resource on failover; the mechanized universal sink theorem remains open"
+      "evidence": "I1a exact ResourceKey grants and I1b inode/backend/policy binding feed the executable TransformCapability state. Every protected file, directory, CGI, FastCGI, proxy, WebSocket and cache sink calls AccessGrant::require_sink, which combines exact resource equality with the verified sink-specific admission predicate. I31 opens and reauthorizes CGI and FastCGI scripts before binding the selected inode; FastCGI additionally binds transport/script/PATH_INFO. Authorization providers and request-plan refinement remain outside this obligation."
     },
     {
       "id": "mapping_order",
@@ -72,9 +72,9 @@
     {
       "id": "transform_reauthorization",
       "title": "Every target-changing transform reauthorizes the sink",
-      "status": "partial",
+      "status": "mechanized",
       "weight": 1.0,
-      "evidence": "the I30 transform inventory covers alias mapping, CGI/FastCGI PATH_INFO and handlers, symlink targets, internal URL/filesystem rewrites, DirectoryIndex, ErrorDocument, DirectorySlash, proxy/balancer failover, cache PATH_INFO and WebSocket targets; each re-evaluates the target scope and binds the sink grant, and original-URL rechecks use the original request context plus accumulated rewrite effects; the universal Resolve/Authorize/Transform/Sink theorem remains a proof obligation; F60 adds the resolved-target/rewrite two-identity meet so a transform can add restrictions but never drop URL-mapped Options, handlers or AllowOverride policy"
+      "evidence": "TransformCapability is an executable Verus state machine: retarget clears authorization and every binding, authorize binds the current target, and inode/backend transitions add only their exact capability. transform_retarget_requires_reauthorization proves a retargeted state cannot reach any sink; transform_sink_implies_reauthorized plus the file/backend/cache lemmas prove every admitted sink has the required bindings. AccessGrant::require_sink is the runtime projection at every protected sink, and exact ResourceKey equality makes a pre-transform grant unusable after a target change. The I30 inventory covers alias, CGI/FastCGI PATH_INFO and handlers, symlinks, rewrites, DirectoryIndex, ErrorDocument, DirectorySlash, proxy/balancer failover, cache targets and WebSocket."
     },
     {
       "id": "trusted_request_context",
@@ -102,7 +102,7 @@
       "title": "Every positive terminal outcome enforces original-URL and current-target grants",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "Static/directory, CGI/FastCGI, proxy and positive redirect outcomes require both the original request URL scope and the transformed target scope; F23 regression covers rewrite-then-proxy and rewrite-then-redirect, but the state-machine gate is not mechanized"
+      "evidence": "TransformCapability plus AccessGrant::require_sink mechanize the final exact-resource and sink-binding gate for static/directory, CGI/FastCGI, proxy, WebSocket and cache outcomes. Original-URL and current-target scopes are both enforced and F23 covers rewrite-then-proxy/redirect. Redirect and error-response orchestration remain runtime projections outside the protected body/tunnel/cache sink state machine, so the broader all-positive-outcomes obligation remains partial."
     },
     {
       "id": "cache_generation_epoch",
@@ -179,7 +179,7 @@
       "title": "Upstream request lines and forwarded headers reject control injection",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "backend authorities are validated at parse time, X-Forwarded-Host is checked before insertion, and validate_proxy_head applies the verified proxy_request_line_admit and proxy_header_admit kernels (method/target/version plus token/header-value admission) immediately before every upstream write"
+      "evidence": "backend authorities are validated at parse time; RewriteRule [P] templates consume rewrite_template_static so every runtime capture/variable spelling ($N, %N, \\N, ${...}, %{...}) is rejected from the authority; X-Forwarded-Host is checked before insertion, and validate_proxy_head applies the verified proxy_request_line_admit and proxy_header_admit kernels immediately before every upstream write"
     },
     {
       "id": "cgi_authentication_env",
@@ -207,7 +207,7 @@
       "title": "CGI/FastCGI reauthorize and bind the actual target",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "the dispatcher binds the opened target before handler selection; PATH_INFO reauthorizes fd_path(file); FastCGI canonicalizes SCRIPT_FILENAME and reauthorizes the actual path before backend binding; cgi_actual_target_admit is mechanized and the F41 replay covers direct, PATH_INFO and FastCGI symlink targets Pass-11: classification (is_cgi) is a single cgi_exec_admit kernel call with fail-closed lemmas, evaluated on the lexical basename while containment stays on the resolved target."
+      "evidence": "the dispatcher binds the opened target before handler selection; PATH_INFO reauthorizes fd_path(file). FastCGI now resolves the script through an open descriptor, reauthorizes its actual fd path, binds both dev/inode and the exact backend identity, and reopens plus compares dev/inode immediately before emitting SCRIPT_FILENAME. cgi_actual_target_admit is mechanized and the F41 replay covers direct, PATH_INFO and FastCGI symlink targets. Pass-11 classification (is_cgi) is a single cgi_exec_admit kernel call with fail-closed lemmas, evaluated on the lexical basename while containment stays on the resolved target."
     },
     {
       "id": "capture_only_alias_base",
@@ -235,7 +235,7 @@
       "title": "Expression file tests use the document-root confinement",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "Expr::FileTest consumes confined_expr_path for -f/-d/-e/-s/-F/-U, rejecting absolute, parent-relative and escaping-symlink arguments; the containment check consumes the verified component-aware path_under_base kernel (matching the rewrite/alias/FastCGI call sites) instead of a local starts_with; main-config <IfFile> uses a separate operator-supplied Expr::IfFile; expr_file_test_admit is mechanized and unit cases cover absolute paths and an escaping symlink; rewrite condition -f/-d/-s/-l tests now also canonicalize the probed path and consume path_under_base so an in-root symlink cannot probe outside the document/alias root"
+      "evidence": "Expr::FileTest consumes confined_expr_path for -f/-d/-e/-s/-F/-U, rejecting absolute, parent-relative and escaping-symlink arguments; the containment check consumes the verified component-aware path_under_base kernel. Config compilation binds the effective default or explicit DocumentRoot into every global/vhost scope, and synthetic empty-root scopes fail closed rather than falling back to '/'. Main-config <IfFile> uses a separate operator-supplied Expr::IfFile; unit and P14 regressions cover absent-DocumentRoot, absolute, parent-relative and escaping-symlink cases; rewrite condition file tests also canonicalize and consume path_under_base."
     },
     {
       "id": "require_none_multi",
@@ -319,7 +319,7 @@
       "title": "Component-aware containment composes across path identities",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "path_under_base_reflexive and path_under_base_transitive mechanize composition of the verified component-aware containment kernel: every base contains itself, and target-under-mid plus mid-under-base implies target-under-base for the lexical byte domain. expr file-test confinement now consumes path_under_base (with starts_with removed), matching the rewrite, alias and FastCGI containment call sites; the canonicalize/join-stability half of the composition argument remains the documented filesystem-view assumption"
+      "evidence": "path_under_base_reflexive and path_under_base_transitive mechanize composition of the verified component-aware containment kernel: every base contains itself, and target-under-mid plus mid-under-base implies target-under-base for the lexical byte domain. expr file-test confinement consumes path_under_base. Protected filesystem sinks resolve with openat2/descriptor binding and FastCGI plus access-file parsing validate descriptor snapshots; parser-to-path construction remains a refinement boundary, while the external FastCGI backend's later SCRIPT_FILENAME open is the explicit residual contract."
     },
     {
       "id": "expr_parser_totality",
@@ -333,7 +333,7 @@
       "title": "Rewrite flags and rounds select one target: [PT] maps URLs, overrides are not sticky, dead flags warn",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "Partially implemented. The verified rewrite_sink kernel gives proxying explicit precedence over redirect classification and permits internal remapping only when no terminal sink applies. rewrite_query_action mechanizes QSA/QSD and target-query precedence, rewrite_restart_admit bounds [N] restarts with a pre-increment overflow-free check, and the filesystem shape/candidate kernels keep [PT] substitutions in URL space. rewrite.rs consumes all four decisions directly and an exhaustive Boolean truth-table unit test covers their executable forms. Per-rule filesystem overrides are still replaced unconditionally so an earlier target cannot become sticky. The regex and substitution interpreters remain outside Verus."
+      "evidence": "Partially implemented. rewrite_expand_token is the shared executable alphabet for variable/rule-capture/condition-capture interpretation and proxy-template admission. rewrite_match_action is the single post-match decision for chain failure, [F], [G], '-' and expansion; rewrite_advance is the shared bounded program-counter transition for [S], [N], [L] and [END] after both '-' and internal substitutions. rewrite_unmatched_rule_has_no_terminal_effect and rewrite_restart_cannot_fall_through prove the key control exclusions, while rewrite_chain_resume proves failed-chain skipping. rewrite_sink, rewrite_query_action and filesystem shape/candidate kernels cover terminal sink, query and [PT] selection. Runtime truth-table and dash-[END] regressions consume these executable forms. Regex matching, variable values, filesystem observations and target-string construction remain outside Verus."
     },
     {
       "id": "apache_options_reset",
@@ -347,7 +347,7 @@
       "title": "RewriteMap sources are validated and bounded at load time",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "Implemented (load-time validation); agent handoff item H4. txt/rnd map loads go through Compile::load_rewritemap_file, which fails closed with a ConfigError when stat fails, the file cannot be read, or the file exceeds MAX_REWRITEMAP (1 MiB) - previously unreadable maps silently loaded as empty; int maps validate the function against tolower/toupper/escape/unescape and reject unknown functions; prg maps resolve their first whitespace-delimited token against ServerRoot and require an executable regular file, storing only the resolved command plus remaining args. The runtime prg spawn timeout / unbounded-stdout budget was NOT attempted in this pass (handoff stretch goal, left open). Unit tests: rewritemap_loading_fails_closed in config.rs."
+      "evidence": "txt/rnd map loads fail closed when missing, unreadable, invalid UTF-8 or larger than MAX_REWRITEMAP; int maps reject unknown functions. prg helpers resolve against ServerRoot, must be executable regular files no larger than 64 MiB, and are copied from one descriptor snapshot into a sealed memfd. Each lookup reopens the configured pathname only to verify the original dev/inode/version, then executes the immutable descriptor with a process-group deadline and 8 KiB output cap. Rename replacement, same-inode mutation, non-file/oversized helpers, sealing and shebang execution are regression-tested; descriptor_snapshot_admit is the executable identity/version gate."
     },
     {
       "id": "htaccess_cookie_grammar",
@@ -469,9 +469,9 @@
     "partially_bound_sinks": [],
     "assumptions": [
       "regex engine implements the stated language",
-      "filesystem view and access-file metadata are stable",
+      "an external FastCGI backend opens SCRIPT_FILENAME after vapache's final descriptor/inode check; pathname stability beyond that protocol boundary is a backend contract",
       "h2 wire framing, TLS client-certificate chain validation, and CGI/proxy protocol details are outside the model",
-      "configuration parsing refines the model",
+      "configuration tokenization and directive/pattern payloads refine the executable kind/phase model",
       "authorization backends implement their stated contracts",
       "IP literal and authority parsing (standard/string layer)"
     ],
@@ -485,9 +485,9 @@
     "total": 8,
     "grant_required": 8,
     "path_target_bound": 8,
-    "inode_bound": 4,
+    "inode_bound": 5,
     "policy_key_bound": 3,
-    "minimum_inode_bound": 4,
+    "minimum_inode_bound": 5,
     "backend_target_bound": 3,
     "minimum_backend_target_bound": 3,
     "minimum_policy_key_bound": 3
@@ -534,6 +534,7 @@
     "Shared request-to-target mapping for dispatch and cache authorization",
     "Ordered alias/redirect/proxy route tables and handler operation ordering",
     "Closed transform inventory with original-context and current-target reauthorization",
+    "Executable transform-to-sink capability state with exact-resource, inode, backend and cache-policy admission",
     "Canonical ServerName context for redirects and expression variables",
     "Cache key identity for listener, vhost, URL, resolved target and policy",
     "Balancer logical/concrete proxy identity and failover reauthorization",
@@ -543,6 +544,7 @@
     "Configuration section-context nesting transition",
     "Configured-base containment for regex aliases and internal rewrites",
     "FastCGI script and PATH_INFO containment",
+    "Descriptor-snapshot admission for access-file regularity, identity, version and size",
     "Cache policy fingerprint closure over every Scope policy slice and header-selected authorization input",
     "CGI/FastCGI authenticated identity environment and exact target-derived environment",
     "Upstream proxy request-head serialization validation",
@@ -570,13 +572,20 @@
     "Generalized policy bit meet (bits_meet) with no-broadening and order algebra",
     "Component-aware containment reflexivity and transitivity across path identities",
     "Generalized percent encoding (percent_encode_from) with identity and no-raw-masked-byte guarantees",
-    "RewriteMap program deadline/output admission and BNE exclusion-aware escaping",
+    "RewriteMap sealed executable snapshot, pathname identity, deadline/output admission and BNE escaping",
     "Exact HTTP method and environment Require operand admission",
     "Known expression-variable admission without generic HTTP-prefix fallback",
     "HTTP/2 pseudo-target identity admission",
     "CGI status and response-header framing admission",
     "First-existing AccessFileName selection and FileETag None emission",
     "Exact V4 disk-cache metadata key admission",
-    "Canonical targeted cache-invalidation admission"
+    "Canonical targeted cache-invalidation admission",
+    "Depth-interleaved config/access Files phase plan",
+    "Rewrite proxy-template dynamic-marker admission and complete chained-rule resume",
+    "HTTP/1 duplicate-header merge-slot selection",
+    "Rewrite expansion-token, matched-action and bounded program-counter state machine",
+    "Recursive configuration kind/phase/deferred-slot/order decisions",
+    "Exact config/access provenance and depth in the Directory/Files evaluation plan",
+    "Config-before-access conditional source plan with independent chain state"
   ]
 }

@@ -3,7 +3,7 @@
 //! This module implements the same canonical order as the request dispatcher:
 //!
 //! ```text
-//! Directory/DirectoryMatch -> Files -> Location -> If
+//! Directory/access walk -> DirectoryMatch -> depth-interleaved Files -> Location -> If
 //! ```
 //!
 //! It is intentionally kept free of I/O and `.htaccess` handling.  The live
@@ -52,9 +52,12 @@ pub struct AccessLayer {
 ///
 /// ```text
 /// for each directory root..leaf:
-///     Directory rules; access-file scope; defer access Files/If
+///     Directory rules; access-file scope; defer config/access Files and If
 /// DirectoryMatch
-/// config Files; access Files
+/// base config Files
+/// for each directory root..leaf:
+///     config Files; access-file Files
+/// DirectoryMatch-nested Files
 /// Location
 /// config If; access If
 /// ```
@@ -91,7 +94,7 @@ pub fn effective_scope_with_layers_and_file_name(
     layers: &[AccessLayer],
     fname: &str,
 ) -> (Scope, Vec<ScopeRule>, Vec<ScopeRule>) {
-    let mut config_files = Vec::new();
+    let mut base_config_files = Vec::new();
     let mut config_locations = Vec::new();
     let mut config_conditionals = Vec::new();
     let mut scope = cfg.effective_scope_req_base_deferred_with_file_name(
@@ -101,11 +104,10 @@ pub fn effective_scope_with_layers_and_file_name(
         req,
         peer,
         fname,
-        &mut config_files,
+        &mut base_config_files,
         &mut config_locations,
         &mut config_conditionals,
     );
-    let root = cfg.documentation_root_for(vhost);
     let start = if crate::files::is_dir_cached(fs_path) {
         fs_path
     } else {
@@ -134,14 +136,15 @@ pub fn effective_scope_with_layers_and_file_name(
     for dir in &dirs {
         present.push(layers.iter().any(|layer| layer.identity.dir == *dir));
     }
-    let mut htaccess_files = Vec::new();
+    let mut config_file_layers: Vec<Vec<ScopeRule>> = vec![Vec::new(); dirs.len()];
+    let mut access_file_layers: Vec<Vec<ScopeRule>> = vec![Vec::new(); dirs.len()];
+    let mut directory_match_files = Vec::new();
     let mut htaccess_conditionals = Vec::new();
-    let mut dir_index = 0usize;
     for step in crate::verified::access_plan_exec(&present) {
         match step {
-            crate::verified::AccessStep::Walk { access } => {
-                let dir = &dirs[dir_index];
-                dir_index += 1;
+            crate::verified::AccessStep::DirectoryConfig { depth } => {
+                let dir = &dirs[depth];
+                let mut dir_config_files = Vec::new();
                 cfg.apply_directory_rules_for_dir(
                     vhost,
                     &mut scope,
@@ -150,44 +153,50 @@ pub fn effective_scope_with_layers_and_file_name(
                     dir,
                     fs_path,
                     url_path,
-                    &mut config_files,
+                    &mut dir_config_files,
                     &mut config_locations,
                     &mut config_conditionals,
                 );
-                if access {
-                    if let Some(layer) = layers.iter().find(|layer| layer.identity.dir == *dir) {
-                        scope.merge(&layer.scope);
-                        htaccess_files.extend(layer.files.iter().cloned());
-                        htaccess_conditionals.extend(layer.conditionals.iter().cloned());
-                    }
-                }
+                config_file_layers[depth] = dir_config_files;
             }
-            crate::verified::AccessStep::DirectoryMatch => {
+            crate::verified::AccessStep::DirectoryAccess { depth } => {
+                let dir = &dirs[depth];
+                let layer = layers
+                    .iter()
+                    .find(|layer| layer.identity.dir == *dir)
+                    .expect("verified access step was derived from the same layer set");
+                scope.merge(&layer.scope);
+                access_file_layers[depth] = layer.files.clone();
+                htaccess_conditionals.extend(layer.conditionals.iter().cloned());
+            }
+            crate::verified::AccessStep::DirectoryOwnPath => {
                 // F61-C: the file's own path is the final walked entry of the
                 // Directory phase; apply wildcard `<Directory>` sections that
-                // match it before the `<DirectoryMatch>` step.
+                // match it before `<DirectoryMatch>`.
                 cfg.apply_directory_own_path_rules(
                     vhost,
                     &mut scope,
                     fs_path,
                     url_path,
-                    &mut config_files,
+                    &mut directory_match_files,
                     &mut config_locations,
                     &mut config_conditionals,
                 );
+            }
+            crate::verified::AccessStep::DirectoryMatch => {
                 cfg.apply_directory_match_rules(
                     vhost,
                     &mut scope,
                     fs_path,
                     url_path,
-                    &mut config_files,
+                    &mut directory_match_files,
                     &mut config_locations,
                     &mut config_conditionals,
                 );
             }
-            crate::verified::AccessStep::ConfigFiles => {
+            crate::verified::AccessStep::BaseFiles => {
                 apply_normal_rule_list(
-                    &config_files,
+                    &base_config_files,
                     &mut scope,
                     req,
                     peer,
@@ -198,9 +207,22 @@ pub fn effective_scope_with_layers_and_file_name(
                     &mut config_conditionals,
                 );
             }
-            crate::verified::AccessStep::AccessFiles => {
+            crate::verified::AccessStep::FilesConfig { depth } => {
                 apply_normal_rule_list(
-                    &htaccess_files,
+                    &config_file_layers[depth],
+                    &mut scope,
+                    req,
+                    peer,
+                    &docroot,
+                    fs_path,
+                    url_path,
+                    fname,
+                    &mut config_conditionals,
+                );
+            }
+            crate::verified::AccessStep::FilesAccess { depth } => {
+                apply_normal_rule_list(
+                    &access_file_layers[depth],
                     &mut scope,
                     req,
                     peer,
@@ -209,6 +231,19 @@ pub fn effective_scope_with_layers_and_file_name(
                     url_path,
                     fname,
                     &mut htaccess_conditionals,
+                );
+            }
+            crate::verified::AccessStep::DirectoryMatchFiles => {
+                apply_normal_rule_list(
+                    &directory_match_files,
+                    &mut scope,
+                    req,
+                    peer,
+                    &docroot,
+                    fs_path,
+                    url_path,
+                    fname,
+                    &mut config_conditionals,
                 );
             }
             crate::verified::AccessStep::ConfigLocation => {
@@ -228,7 +263,6 @@ pub fn effective_scope_with_layers_and_file_name(
             | crate::verified::AccessStep::AccessConditions => {}
         }
     }
-    debug_assert_eq!(dir_index, dirs.len());
     config_conditionals.sort_by_key(|rule| rule.order);
     (scope, config_conditionals, htaccess_conditionals)
 }
@@ -411,19 +445,46 @@ mod tests {
     fn verified_plan_pairs_one_walk_with_each_directory() {
         let present = [false, true, true];
         let plan = crate::verified::access_plan_exec(&present);
-        assert_eq!(plan.len(), present.len() + 6);
-        for (i, step) in plan.iter().take(present.len()).enumerate() {
-            assert_eq!(
-                step,
-                &crate::verified::AccessStep::Walk { access: present[i] }
-            );
-        }
         assert_eq!(
-            &plan[present.len()..],
+            crate::verified::condition_source_plan_exec(),
+            vec![
+                crate::verified::ConditionSource::Config,
+                crate::verified::ConditionSource::Access,
+            ]
+        );
+        assert_eq!(plan.len(), present.len() * 2 + 2 * 2 + 7);
+        assert_eq!(
+            &plan[..5],
             &[
+                crate::verified::AccessStep::DirectoryConfig { depth: 0 },
+                crate::verified::AccessStep::DirectoryConfig { depth: 1 },
+                crate::verified::AccessStep::DirectoryAccess { depth: 1 },
+                crate::verified::AccessStep::DirectoryConfig { depth: 2 },
+                crate::verified::AccessStep::DirectoryAccess { depth: 2 },
+            ]
+        );
+        assert_eq!(
+            &plan[5..8],
+            &[
+                crate::verified::AccessStep::DirectoryOwnPath,
                 crate::verified::AccessStep::DirectoryMatch,
-                crate::verified::AccessStep::ConfigFiles,
-                crate::verified::AccessStep::AccessFiles,
+                crate::verified::AccessStep::BaseFiles,
+            ]
+        );
+        assert_eq!(
+            &plan[8..13],
+            &[
+                crate::verified::AccessStep::FilesConfig { depth: 0 },
+                crate::verified::AccessStep::FilesConfig { depth: 1 },
+                crate::verified::AccessStep::FilesAccess { depth: 1 },
+                crate::verified::AccessStep::FilesConfig { depth: 2 },
+                crate::verified::AccessStep::FilesAccess { depth: 2 },
+            ]
+        );
+        assert_eq!(
+            &plan[13..],
+            &[
+                crate::verified::AccessStep::DirectoryMatchFiles,
                 crate::verified::AccessStep::ConfigLocation,
                 crate::verified::AccessStep::ConfigConditions,
                 crate::verified::AccessStep::AccessConditions,

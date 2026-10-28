@@ -125,6 +125,7 @@ impl ResourceKey {
 #[derive(Debug)]
 pub struct AccessGrant {
     key: ResourceKey,
+    pipeline: vapache_verified::TransformCapability,
     /// Test-only grants are intentionally wildcard; production grants are
     /// always constructed with a concrete key.
     wildcard: bool,
@@ -137,6 +138,14 @@ impl AccessGrant {
 
     pub fn key(&self) -> &ResourceKey {
         &self.key
+    }
+
+    /// Universal transform-to-sink gate.  Exact resource equality prevents a
+    /// grant minted before a retarget from reaching the new object; the
+    /// verified capability additionally enforces the sink-specific inode,
+    /// backend and cache-policy bindings.
+    pub fn require_sink(&self, key: &ResourceKey, sink: vapache_verified::TransformSink) -> bool {
+        vapache_verified::transform_sink_admit(self.require(key), self.pipeline, sink)
     }
 
     /// Bind a grant that already covers `resource` to the exact outbound
@@ -153,6 +162,7 @@ impl AccessGrant {
         key.backend_target = Some(backend_target);
         Some(AccessGrant {
             key,
+            pipeline: vapache_verified::transform_bind_backend(self.pipeline),
             wildcard: self.wildcard,
         })
     }
@@ -171,14 +181,20 @@ impl AccessGrant {
         key.file_ino = Some(meta.ino());
         Some(AccessGrant {
             key,
+            pipeline: vapache_verified::transform_bind_inode(self.pipeline),
             wildcard: self.wildcard,
         })
     }
 }
 
+fn authorized_pipeline(key: &ResourceKey) -> vapache_verified::TransformCapability {
+    vapache_verified::transform_authorize(key.policy_fingerprint.is_some())
+}
+
 pub(crate) fn grant_if_allowed(access: Access, key: ResourceKey) -> Option<AccessGrant> {
     match access {
         Access::Allowed => Some(AccessGrant {
+            pipeline: authorized_pipeline(&key),
             key,
             wildcard: false,
         }),
@@ -204,6 +220,16 @@ pub fn test_grant() -> AccessGrant {
             backend_target: None,
             policy_fingerprint: None,
         },
+        // Unit tests deliberately use a fully-bound wildcard capability to
+        // exercise downstream protocol behavior without reproducing access
+        // evaluation in every fixture.
+        pipeline: vapache_verified::TransformCapability {
+            target_bound: true,
+            authorized: true,
+            inode_bound: true,
+            backend_bound: true,
+            policy_bound: true,
+        },
         wildcard: true,
     }
 }
@@ -219,6 +245,7 @@ pub(crate) fn check_grant(
 ) -> Result<AccessGrant, Access> {
     match check(scope, req, peer, identity, url_path, fs_path) {
         Access::Allowed => Ok(AccessGrant {
+            pipeline: authorized_pipeline(&key),
             key,
             wildcard: false,
         }),
@@ -245,11 +272,15 @@ pub fn check(
         .legacy
         .as_ref()
         .map(|_| legacy_check(scope, peer, &req.method));
+    // Compiled configurations always bind the effective document root. Keep
+    // synthetic scopes useful for non-filesystem authorization tests, but
+    // give their expression evaluator an empty relative sentinel: file tests
+    // then fail confinement instead of widening to the filesystem root.
     let docroot = scope
         .content_policy
         .document_root
         .as_deref()
-        .unwrap_or(Path::new("/"));
+        .unwrap_or_else(|| Path::new(""));
     let auth = check_requires(scope, req, peer, identity, docroot, url_path, fs_path);
     let satisfy = scope
         .authorization
@@ -1212,6 +1243,79 @@ mod tests {
         assert_eq!(bound.key().file_dev, Some(meta.dev()));
         assert_eq!(bound.key().file_ino, Some(meta.ino()));
         assert!(!bound.require(&key));
+    }
+
+    #[test]
+    fn transform_sink_gate_requires_each_concrete_binding() {
+        let req = req("GET");
+        let peer = "127.0.0.1".parse().unwrap();
+        let scope = Scope::default();
+        let key = ResourceKey::request(
+            None,
+            &req,
+            "/script.php",
+            Some(Path::new("/proc/self/exe")),
+            Some("fcgi://backend/script.php"),
+        );
+        let grant = check_grant(
+            &scope,
+            &req,
+            peer,
+            None,
+            "/script.php",
+            Some(Path::new("/proc/self/exe")),
+            key.clone(),
+        )
+        .expect("allowed");
+        assert!(!grant.require_sink(&key, vapache_verified::TransformSink::StaticFile));
+        assert!(!grant.require_sink(&key, vapache_verified::TransformSink::Proxy));
+
+        let meta = std::fs::metadata("/proc/self/exe").expect("self metadata");
+        let file_bound = grant.bind_file(&key, &meta).expect("file bound");
+        let file_key = file_bound.key().clone();
+        assert!(file_bound.require_sink(&file_key, vapache_verified::TransformSink::LocalCgi));
+        assert!(!file_bound.require_sink(&file_key, vapache_verified::TransformSink::FastCgi));
+
+        let backend_bound = file_bound
+            .bind_backend(&file_key, "fcgi-backend".into())
+            .expect("backend bound");
+        let backend_key = backend_bound.key().clone();
+        assert!(backend_bound.require_sink(&backend_key, vapache_verified::TransformSink::FastCgi));
+
+        let mut other = backend_key;
+        other.url_path = "/different.php".into();
+        assert!(!backend_bound.require_sink(&other, vapache_verified::TransformSink::FastCgi));
+    }
+
+    #[test]
+    fn cache_sink_requires_a_policy_fingerprint() {
+        let req = req("GET");
+        let scope = Scope::default();
+        let plain = ResourceKey::cache(None, &req, "example.test", "/a");
+        let plain_grant = check_grant(
+            &scope,
+            &req,
+            "127.0.0.1".parse().unwrap(),
+            None,
+            "/a",
+            None,
+            plain.clone(),
+        )
+        .unwrap();
+        assert!(!plain_grant.require_sink(&plain, vapache_verified::TransformSink::Cache));
+
+        let policy = ResourceKey::cache_policy(None, &req, "example.test", "/a", [7; 32]);
+        let policy_grant = check_grant(
+            &scope,
+            &req,
+            "127.0.0.1".parse().unwrap(),
+            None,
+            "/a",
+            None,
+            policy.clone(),
+        )
+        .unwrap();
+        assert!(policy_grant.require_sink(&policy, vapache_verified::TransformSink::Cache));
     }
 
     #[test]

@@ -183,6 +183,14 @@ by the phases above.
 A disallowed directive is an error (500), not a silent skip.  This is the
 fail-closed rule and must be preserved by the model.
 
+Access-file discovery and parsing are descriptor-first. The selected
+candidate is opened once with `O_CLOEXEC|O_NONBLOCK`; its identity, cache key
+and bytes all come from that descriptor. A bounded read is followed by
+`fstat`, and `descriptor_snapshot_admit` requires a regular file, unchanged
+device/inode and version metadata, and the size limit. Cache hits perform the
+same post-lookup descriptor validation. A pathname rename or in-place policy
+change between selection and use therefore fails closed.
+
 ## 7. Authorization evaluation
 
 For a scope and method:
@@ -343,12 +351,17 @@ expands outside its configured base; there is no parent-root fallback.
 `ResourceKey` carries the vhost, URL, filesystem target, proxy target, backend
 identity, inode, authenticated identity and policy fingerprint; `bind_file`
 and `bind_backend` produce the bound grant required by every sink.
+`AccessGrant` also carries the executable `TransformCapability` state. Every
+protected sink calls `require_sink`, which admits the operation only when the
+key is exact, the current target was authorized, and the sink-specific inode,
+backend or cache-policy capability is present.
 
 ### I11 — Reauthorize every target-changing transform
 
 ```text
 Resolve -> Authorize -> [Transform -> Reauthorize]* -> Sink
 Invariant: sink_grant.target == current_target
+Invariant: Transform clears authorization; Sink implies reauthorization
 ```
 
 PATH_INFO splitting, Alias/ScriptAlias mapping, symlink resolution, internal
@@ -380,6 +393,15 @@ transforms.  In particular:
 The complete transform inventory and the original/current target gate are
 specified in I30.  The CGI/FastCGI execution boundary is closed in I31 and the
 proxy route/balancer identity boundary in I32.
+
+The transform-to-sink state is executable rather than ledger-only:
+`transform_retarget` clears target authorization and every binding,
+`transform_authorize` binds the current target, and bind transitions add inode
+or backend identity. `transform_retarget_requires_reauthorization` proves that
+no sink admits the post-retarget/pre-authorization state;
+`transform_sink_implies_reauthorized` and the sink-specific lemmas prove the
+required capabilities. Exact `ResourceKey` equality supplies the runtime target
+identity refinement.
 
 ### I12 — Cache non-interference
 
@@ -742,6 +764,7 @@ forall terminal positive outcomes after a transform:
     && Allowed(current_request, current_url, current_target)
     && grant.target == current_target
     && grant is bound to the current inode/backend/cache key
+    && transform_sink_admit(grant.capability, sink)
 ```
 
 A transform adds an authorization obligation; it never replaces one.  The
@@ -756,8 +779,8 @@ conversion:
 | internal URL rewrite | canonical rewritten URL | target scope + original-URL gate with rewrite effects; original and target policy meet (I61) |
 | internal filesystem rewrite | canonical file below current root | target scope + rewritten URL scope meet, original-URL gate, file inode grant |
 | CGI `PATH_INFO` | `find_script_checked` actual script | script scope, inode-bound CGI grant |
-| FastCGI `ProxyPassMatch`/`PATH_INFO` | contained script filename + `PATH_INFO` | script scope, backend-bound FastCGI grant |
-| `SetHandler proxy:fcgi` | contained handler script | script scope, backend-bound FastCGI grant |
+| FastCGI `ProxyPassMatch`/`PATH_INFO` | opened script inode + `PATH_INFO` | actual descriptor-path scope, inode- and backend-bound FastCGI grant |
+| `SetHandler proxy:fcgi` | opened contained handler script | actual descriptor-path scope, inode- and backend-bound FastCGI grant |
 | symlink resolution | opened descriptor path | target scope, file inode grant |
 | `DirectoryIndex` | index subrequest URL | normal dispatcher authorization for the index target |
 | local `ErrorDocument` | error-document subrequest URL | normal dispatcher authorization; recursion bound |
@@ -780,7 +803,8 @@ script = resolve_script(req)
 contained(script, configured_base)
 authorized(script, target_scope) && identity(grant) == identity(req)
 CGI:     grant bound to opened script inode
-FastCGI: grant bound to (transport, script, SCRIPT_NAME, PATH_INFO)
+FastCGI: grant bound to opened script inode and
+         (transport, script, SCRIPT_NAME, PATH_INFO)
 env = calculated_env(req, script) ∪ admitted(config/rewrite env)
 calculated_env ∩ admitted_env = ∅
 fds(child) subseteq {0,1,2,script_fd}
@@ -792,11 +816,18 @@ The handler is selected from the **actual script basename**, never from a
 trailing `PATH_INFO` component.  Script construction, `PATH_INFO` splitting
 and the ancestor walk are bounded by the configured FastCGI prefix or the
 document/alias root; symlink escapes are rejected.  The target script is
-reauthorized before execution and the grant is bound to its inode (CGI) or
-transport/script identity (FastCGI).  `REMOTE_USER`/`AUTH_TYPE` come from the
+opened first and reauthorized through its descriptor path. The grant is bound
+to its inode (CGI) or to both inode and transport/script identity (FastCGI).
+Immediately before FastCGI parameters are emitted, the pathname is reopened
+and compared with the authorized `(dev, inode)`. `REMOTE_USER`/`AUTH_TYPE` come from the
 authenticated grant, while configured or rewrite-set environment entries
 cannot override calculated names.  Request bodies stay on their spool file
 above the threshold; stdout/stderr, descriptors and deadlines are bounded.
+
+The FastCGI protocol has no descriptor-passing primitive: PHP-FPM opens
+`SCRIPT_FILENAME` after this final comparison. Pathname stability beyond that
+external protocol boundary is therefore a backend contract. Local CGI has no
+equivalent residual because it executes from the retained descriptor.
 
 ### I32 — Proxy route and balancer identity
 
@@ -931,8 +962,10 @@ actual_target != lexical_target ->
     authorize(actual_target) && bind(actual_target) before execute/forward
 ```
 
-CGI and FastCGI dispatch re-authorize the opened or canonicalized target and
-bind the sink to it before execution or before sending `SCRIPT_FILENAME`.  This
+CGI and FastCGI dispatch open the target first, re-authorize its descriptor
+path and bind the sink to its inode before execution or before sending
+`SCRIPT_FILENAME`. FastCGI also binds the exact backend and repeats the
+pathname-to-inode comparison immediately before parameter emission. This
 includes `PATH_INFO`, `SetHandler` and `ProxyPassMatch` routes; a public
 symlink cannot inherit the allowed directory's policy (F41).
 `cgi_actual_target_admit` is the mechanized implication.
@@ -1465,7 +1498,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **268 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **422 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1478,11 +1511,25 @@ construction: there is no second production interleaver.
   vhost filter.
 - `AccessStep`, `access_walk_plan`, `access_plan`, `access_plan_exec`.
   `policy_ref::effective_scope_with_layers` iterates the verified plan.  The
-  plan has one `Walk { access }` step per ancestor directory, with the
-  per-directory `Directory; access-scope` interleaving inside that step, then
-  the exact suffix `DirectoryMatch, ConfigFiles, AccessFiles, Location,
-  config If, access If`.  `access_plan_interleaves` proves one step per
-  directory, every walk before the suffix, and the suffix shape.
+  plan emits `DirectoryConfig { depth }` then an optional
+  `DirectoryAccess { depth }` at each ancestor, followed by own-path and
+  DirectoryMatch rules.  Its Files half likewise emits `FilesConfig { depth }`
+  then optional `FilesAccess { depth }`, followed by DirectoryMatch Files,
+  Location, config conditions and access conditions.
+  `access_plan_interleaves` proves the exact structure and suffix.
+- `ConfigRuleKind`, `config_rule_phase`, `config_deferred_slot` and
+  `config_rule_precedes`. The runtime exhaustively projects every `MatchKind`
+  into this model; phase collection and recursive nested-rule sorting consume
+  the executable decisions. `config_rule_order_is_asymmetric` proves the
+  comparator cannot order the same pair in both directions.
+- `ConditionSource` and `condition_source_plan_exec`. Request evaluation
+  consumes the verified `Config, Access` order for deferred conditions and
+  resets `<If>/<ElseIf>/<Else>` chain state between the two source streams;
+  `condition_source_plan_matches_access_tail` connects it to the phase plan.
+- `RewriteExpandToken`, `rewrite_match_action` and `rewrite_advance`. The
+  runtime expander and template guard share the verified token alphabet;
+  matched/unmatched rule actions and the bounded `[S]`/`[N]`/`[L]`/`[END]`
+  program-counter transition are shared by dash and internal substitutions.
 - `auth_merge_kind`.  `Scope::merge` uses this three-way verified decision
   (`Replace`/`And`/`Or`) before constructing the authorization tree.
   `auth_merge_kind_properties` proves that `And`/`Or` are impossible without
@@ -1513,6 +1560,18 @@ construction: there is no second production interleaver.
   the proxy serializer admits the outbound method, target, version and every
   header through the same token/header predicates immediately before
   `write_all`.
+- `TransformCapability`, `transform_retarget`, `transform_authorize`,
+  `transform_bind_inode`, `transform_bind_backend` and
+  `transform_sink_admit`. `AccessGrant` carries this state and every protected
+  body/tunnel/cache sink consumes it through `require_sink`. The proofs show
+  retargeting cannot sink without reauthorization and that every file,
+  backend or cache sink has its required concrete binding.
+- `descriptor_snapshot_admit`. Access-file cache lookup/parsing and
+  `RewriteMap prg` executable capture consume opened descriptors and require
+  stable regular-file identity, version metadata and bounded size before
+  accepting the snapshot. Program bytes are sealed in a memfd; every lookup
+  checks the source pathname's original inode/version and executes only that
+  immutable descriptor.
 - `alias_file_target_split`, `alias_access_root_admit`,
   `handler_name_from_target`, `limit_directive_effect`,
   `cgi_actual_target_admit`, `capture_only_alias_admit`,
@@ -1719,11 +1778,15 @@ scope, and uses the same method/access helper before taking the connection.  A
 rewrite that changes the filesystem target re-evaluates
 `<Directory>`/`<Files>`/`.htaccess` policy for that target before dispatch.
 
-Static file/directory grants now carry the opened inode and a symlink target
-is re-authorized.  Proxy/cache grants remain path/URL-bound, and CGI/FastCGI
-script descriptors are selected after the grant rather than bound to an
-inode.  Those are the next resource-binding steps, along with the parser, the regex engine and expression leaf evaluators, and
-directory sort/pairing outside Verus.
+Static file/directory/local-CGI grants carry the opened inode and symlink
+targets are reauthorized. FastCGI opens its script first, reauthorizes the
+descriptor path, binds both inode and backend, and performs a final pathname
+inode comparison before emitting parameters. Proxy and WebSocket grants are
+backend-bound; cache grants are policy-key-bound. Parser payload semantics,
+the regex engine, expression leaf evaluators and the standard library's
+concrete sorting implementation remain outside Verus. The only script-path
+stability assumption is beyond the FastCGI protocol boundary, where the
+external backend must open `SCRIPT_FILENAME` itself.
 
 Security-sensitive unimplemented directives fail closed in compatibility mode.
 The classifier covers the auth/TLS/proxy/filter/DAV/LDAP/cache families by
@@ -1789,18 +1852,23 @@ boundaries are already verified.
 
 ### Remaining refinement boundary
 
-The verified plan is consumed by the evaluator.  The root-to-leaf directory
-sort/pairing and raw configuration/access-file tokenization remain outside
-mechanical proof; container/list field merging and the security disposition /
-layer-slot translation use verified helpers.  The parser is covered by the
-explicit `configuration parsing refines the model` assumption.
+The verified source/depth plan is consumed by the evaluator. Rule-kind phase
+classification, deferred-slot selection and the recursive ordering comparator
+are executable verified decisions. Raw configuration/access-file tokenization,
+directive and pattern payload construction, and standard-library sort
+correctness remain outside mechanical proof; container/list field merging and
+the security disposition/layer-slot translation use verified helpers. The
+parser boundary is covered by the explicit `configuration tokenization and
+directive/pattern payloads refine the executable kind/phase model` assumption.
 
 The authorization decision, access-phase interleaving, Options algebra,
 scalar overrides, `.htaccess` rule classification, expression truthiness,
 comparison and glob semantics, and rewrite condition-chain folding are
-verified kernels.  The parser-to-model
-translation, Directory sort, regex semantics and the
-filesystem view are explicit assumptions, not hidden axioms.
+verified kernels. Parser payload translation, standard-library sorting and
+regex semantics are explicit assumptions, not hidden axioms. Filesystem
+objects used by protected sinks and access-file parsing are descriptor/inode
+bound; the remaining path-stability contract is the external FastCGI
+backend's later open of `SCRIPT_FILENAME`.
 
 ## 10b. Verification progress ledger
 
@@ -1813,18 +1881,18 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus
 ```
 
-The current ledger (2026-10-25) is:
+The current ledger (2026-10-28) is:
 
-- weighted obligations: **13.0 / 26.0 (50.0%)** if partial obligations receive
+- weighted obligations: **34.5 / 65.0 (53.1%)** if partial obligations receive
   half credit;
 - proof debt: **6 / 6** — 0 named unverified security components, 0 partially
   bound sinks, 6 assumptions and 0 accepted unmodeled security-directive
   classes;
-- sinks: **8/8** grant-required, **8/8** path/target-bound, **4/8**
+- sinks: **8/8** grant-required, **8/8** path/target-bound, **5/8**
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–F38);
-- Verus: **218 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **422 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops
@@ -1896,11 +1964,12 @@ excludes test-only code from the denominator.
 ## 12. Known gaps before formal proof
 
 - Configuration phases and access-file interleaving now run through a verified
-  plan consumed by the single production evaluator.  The directory
-  sort/pairing and raw parser tokenization are still outside Verus and remain
-  covered by the explicit `configuration parsing refines the model`
-  assumption.  Container/list field merging, directive disposition and
-  `.htaccess` layer-slot translation use verified helpers.
+  source/depth plan consumed by the single production evaluator. Rule-kind
+  phase classification, deferred-slot selection and the recursive ordering
+  comparator also consume executable Verus decisions. Raw parser tokenization,
+  directive/pattern payloads and concrete library sorting remain covered by
+  the explicit refinement assumption. Container/list field merging, directive
+  disposition and `.htaccess` layer-slot translation use verified helpers.
 - Some module-specific merge rules are not modelled.  `AllowOverrideList`,
   `Nonfatal=...`, `Include`/`IncludeOptional` and the covered contexts are now
   implemented or covered by the differential/context matrices.
@@ -1918,7 +1987,9 @@ excludes test-only code from the denominator.
   model.  The path-pattern matcher and the parser-to-flattened-rule-list
   refinement are still explicit assumptions; the cache lookup also requires an
   `AccessGrant` at runtime.
-- The durable `.htaccess` cache/metadata invalidation is outside the model.
+- FastCGI cannot pass its retained script descriptor through the protocol;
+  the external backend's open of `SCRIPT_FILENAME` occurs after vapache's
+  final pathname-to-inode comparison and remains a backend contract.
 
 ## 13. Apache CVE triage
 

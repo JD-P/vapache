@@ -623,8 +623,20 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
 
     let method =
         String::from_utf8(method).map_err(|_| ParseError::BadRequest("non-ASCII method"))?;
-    let mut entries = Vec::with_capacity(headers.len());
+    // The verified parser validates framing against the original field lines
+    // first. Now compress duplicates for the policy/module view, matching
+    // Apache's HTTP/1 table semantics without weakening CL/TE validation.
+    let mut merged: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(headers.len());
     for (name, value) in headers {
+        if let Some(i) = vapache_verified::header_merge_index(&merged, &name) {
+            merged[i].1.extend_from_slice(b", ");
+            merged[i].1.extend_from_slice(&value);
+        } else {
+            merged.push((name, value));
+        }
+    }
+    let mut entries = Vec::with_capacity(merged.len());
+    for (name, value) in merged {
         let name =
             String::from_utf8(name).map_err(|_| ParseError::BadRequest("non-ASCII header name"))?;
         entries.push((name, value));
@@ -1080,6 +1092,18 @@ mod tests {
         let req = parse_head(raw, &limits()).unwrap();
         assert_eq!(req.header("host"), Some(&b"Example.COM"[..]));
         assert_eq!(req.header("x-mixed-case"), Some(&b"value"[..]));
+    }
+
+    #[test]
+    fn duplicate_http1_fields_are_merged_before_policy_consumers() {
+        let raw = b"GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: benign\r\nuser-agent: scanner\r\nX-Forwarded-For: 198.51.100.1\r\nX-Forwarded-For: 127.0.0.1\r\n\r\n";
+        let req = parse_head(raw, &limits()).unwrap();
+        assert_eq!(req.header("user-agent"), Some(&b"benign, scanner"[..]));
+        assert_eq!(
+            req.header("x-forwarded-for"),
+            Some(&b"198.51.100.1, 127.0.0.1"[..])
+        );
+        assert_eq!(req.headers.get_all("user-agent").count(), 1);
     }
 
     #[test]

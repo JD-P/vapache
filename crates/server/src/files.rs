@@ -569,7 +569,9 @@ pub fn serve_file(
     grant: &crate::access::AccessGrant,
     resource: &crate::access::ResourceKey,
 ) -> Response {
-    if !grant.require(resource) || resource.fs_path.as_deref() != Some(fs_path) {
+    if !grant.require_sink(resource, vapache_verified::TransformSink::StaticFile)
+        || resource.fs_path.as_deref() != Some(fs_path)
+    {
         return error_response(cfg, None, scope, 500, req, "", 0, "", peer, local_ip);
     }
     let mut r = serve_file_inner(cfg, scope, req, file, meta, mime_name, peer, local_ip);
@@ -805,7 +807,9 @@ pub fn serve_directory(
     grant: &crate::access::AccessGrant,
     resource: &crate::access::ResourceKey,
 ) -> Response {
-    if !grant.require(resource) || resource.fs_path.as_deref() != Some(fs_path) {
+    if !grant.require_sink(resource, vapache_verified::TransformSink::Directory)
+        || resource.fs_path.as_deref() != Some(fs_path)
+    {
         return error_response(
             cfg, vhost, scope, 500, req, url_path, port, host, peer, local_ip,
         );

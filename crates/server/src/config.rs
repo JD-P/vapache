@@ -18,9 +18,14 @@ use crate::scope_policy::{
 use regex::Regex;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::net::IpAddr;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -1043,11 +1048,178 @@ pub struct ProxyReverseRule {
 }
 
 #[derive(Debug, Clone)]
+pub struct RewriteProgram {
+    pub(crate) path: PathBuf,
+    pub(crate) args: Vec<String>,
+    pub(crate) file: Arc<File>,
+    dev: u64,
+    ino: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+    size: u64,
+    mode: u32,
+}
+
+impl RewriteProgram {
+    pub(crate) fn bind(path: PathBuf, args: Vec<String>) -> std::io::Result<Self> {
+        let mut source = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(&path)?;
+        let meta = source.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "is not a regular file",
+            ));
+        }
+        if meta.mode() & 0o111 == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "is not executable",
+            ));
+        }
+        if meta.len() > MAX_REWRITEMAP_PROGRAM {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("exceeds the {MAX_REWRITEMAP_PROGRAM} byte executable limit"),
+            ));
+        }
+
+        // Copy the validated version into a sealed anonymous executable. The
+        // later pathname check detects operator changes, while execution from
+        // this immutable snapshot also closes same-inode write races between
+        // the check and execve.
+        let name = CString::new("vapache-rewritemap-prg").expect("static memfd name");
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                name.as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
+        if fd < 0 {
+            // coverage:ignore-start -- kernel/platform lacks required memfd support
+            return Err(std::io::Error::last_os_error());
+            // coverage:ignore-stop
+        }
+        let mut file = unsafe { File::from_raw_fd(fd as i32) };
+        let copied = std::io::copy(
+            &mut source
+                .by_ref()
+                .take(MAX_REWRITEMAP_PROGRAM.saturating_add(1)),
+            &mut file,
+        )?; // coverage:ignore-line -- regular-file/memfd I/O failure
+        let after = source.metadata()?;
+        if copied != meta.len()
+            || !vapache_verified::descriptor_snapshot_admit(
+                meta.is_file() && after.is_file(),
+                meta.dev() == after.dev() && meta.ino() == after.ino(),
+                meta.mtime() == after.mtime()
+                    && meta.mtime_nsec() == after.mtime_nsec()
+                    && meta.ctime() == after.ctime()
+                    && meta.ctime_nsec() == after.ctime_nsec()
+                    && meta.len() == after.len()
+                    && meta.mode() == after.mode(),
+                copied <= MAX_REWRITEMAP_PROGRAM,
+            )
+        {
+            // coverage:ignore-start -- concurrent source mutation during startup snapshot
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "changed while its executable snapshot was created",
+            ));
+            // coverage:ignore-stop
+        }
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o500) } != 0 {
+            // coverage:ignore-start -- kernel rejects mode change on a new memfd
+            return Err(std::io::Error::last_os_error());
+            // coverage:ignore-stop
+        }
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+            // coverage:ignore-start -- kernel rejects sealing despite MFD_ALLOW_SEALING
+            return Err(std::io::Error::last_os_error());
+            // coverage:ignore-stop
+        }
+        Ok(Self {
+            path,
+            args,
+            file: Arc::new(file),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+            size: meta.len(),
+            mode: meta.mode(),
+        })
+    }
+
+    fn metadata_matches(&self, meta: &std::fs::Metadata) -> bool {
+        meta.dev() == self.dev
+            && meta.ino() == self.ino
+            && meta.mtime() == self.mtime
+            && meta.mtime_nsec() == self.mtime_nsec
+            && meta.ctime() == self.ctime
+            && meta.ctime_nsec() == self.ctime_nsec
+            && meta.len() == self.size
+            && meta.mode() == self.mode
+    }
+
+    /// The configured pathname must still name the exact executable version
+    /// retained at load time. Execution uses the retained descriptor, so a
+    /// rename after this check cannot redirect the child to a replacement.
+    pub(crate) fn binding_intact(&self) -> bool {
+        let retained = match self.file.metadata() {
+            Ok(meta) => meta,
+            Err(_) => return false, // coverage:ignore-line -- live owned memfd fstat failure
+        };
+        let current = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(&self.path)
+            .and_then(|file| file.metadata())
+        {
+            Ok(meta) => meta,
+            Err(_) => return false,
+        };
+        vapache_verified::descriptor_snapshot_admit(
+            retained.is_file() && current.is_file(),
+            current.dev() == self.dev && current.ino() == self.ino,
+            self.metadata_matches(&current),
+            current.len() <= MAX_REWRITEMAP_PROGRAM,
+        ) && retained.mode() & 0o111 != 0
+            && current.mode() & 0o111 != 0
+    }
+
+    pub(crate) fn cache_material(&self) -> String {
+        format!(
+            "{}|{:?}|{}:{}:{}:{}:{}:{}:{}:{}",
+            self.path.display(),
+            self.args,
+            self.dev,
+            self.ino,
+            self.mtime,
+            self.mtime_nsec,
+            self.ctime,
+            self.ctime_nsec,
+            self.size,
+            self.mode
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum RewriteMap {
     Txt(HashMap<String, String>),
     /// key -> one of several pipe-separated random choices
     Rnd(HashMap<String, Vec<String>>),
-    Prg(String),
+    Prg(RewriteProgram),
     Int(String),
 }
 
@@ -1145,6 +1317,7 @@ pub const ETAG_ALL: u32 = 7;
 /// the `.htaccess` size cap: parsing an unbounded file into memory is
 /// unbounded work a configuration error can avert.
 const MAX_REWRITEMAP: u64 = 1024 * 1024;
+const MAX_REWRITEMAP_PROGRAM: u64 = 64 * 1024 * 1024;
 
 #[cfg(debug_assertions)]
 #[derive(Debug, PartialEq, Eq)]
@@ -1604,20 +1777,51 @@ pub struct ScopeRule {
 
 impl ScopeRule {
     pub fn phase(&self) -> RulePhase {
-        if self.condition.is_some() || self.branch != ConditionBranch::Normal {
-            return RulePhase::Condition;
+        match vapache_verified::config_rule_phase(
+            verified_config_rule_kind(&self.kind),
+            rule_is_conditional(self),
+        ) {
+            vapache_verified::ConfigRulePhase::Directory => RulePhase::Directory,
+            vapache_verified::ConfigRulePhase::Files => RulePhase::Files,
+            vapache_verified::ConfigRulePhase::Location => RulePhase::Location,
+            vapache_verified::ConfigRulePhase::Condition => RulePhase::Condition,
         }
-        match self.kind {
-            MatchKind::Directory(_) | MatchKind::DirectoryMatch(_) | MatchKind::Always => {
-                RulePhase::Directory
-            }
-            MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_) => {
-                RulePhase::Files
-            }
-            MatchKind::Location(_) | MatchKind::LocationGlob(_) | MatchKind::LocationMatch(_) => {
-                RulePhase::Location
-            }
+    }
+}
+
+fn verified_config_rule_kind(kind: &MatchKind) -> vapache_verified::ConfigRuleKind {
+    match kind {
+        MatchKind::Always => vapache_verified::ConfigRuleKind::Always,
+        MatchKind::Directory(_) => vapache_verified::ConfigRuleKind::Directory,
+        MatchKind::DirectoryMatch(_) => vapache_verified::ConfigRuleKind::DirectoryMatch,
+        MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_) => {
+            vapache_verified::ConfigRuleKind::Files
         }
+        MatchKind::Location(_) | MatchKind::LocationGlob(_) => {
+            vapache_verified::ConfigRuleKind::Location
+        }
+        MatchKind::LocationMatch(_) => vapache_verified::ConfigRuleKind::LocationMatch,
+    }
+}
+
+fn rule_is_conditional(rule: &ScopeRule) -> bool {
+    rule.condition.is_some() || rule.branch != ConditionBranch::Normal
+}
+
+fn defer_rule_by_verified_phase(
+    rule: &ScopeRule,
+    files: &mut Vec<ScopeRule>,
+    locations: &mut Vec<ScopeRule>,
+    conditionals: &mut Vec<ScopeRule>,
+) {
+    match vapache_verified::config_deferred_slot(
+        verified_config_rule_kind(&rule.kind),
+        rule_is_conditional(rule),
+    ) {
+        vapache_verified::ConfigDeferredSlot::Files => files.push(rule.clone()),
+        vapache_verified::ConfigDeferredSlot::Location => locations.push(rule.clone()),
+        vapache_verified::ConfigDeferredSlot::Condition => conditionals.push(rule.clone()),
+        vapache_verified::ConfigDeferredSlot::Ignore => {}
     }
 }
 
@@ -2663,10 +2867,6 @@ impl Compile {
         self.cfg.global_directory_index = DirectoryRuleIndex::build(&rules);
         self.cfg.global_rules = rules;
 
-        let global_scope = self.cfg.global.clone();
-        let global_rules = self.cfg.global_rules.clone();
-        let global_ssl = self.cfg.ssl.clone();
-
         if self.cfg.listeners.is_empty() {
             self.cfg.listeners.push(ListenSpec {
                 raw: "80".into(),
@@ -2678,6 +2878,15 @@ impl Compile {
         if let Some(dr) = &self.cfg.global.content_policy.document_root {
             self.cfg.document_root = dr.clone();
         }
+        // P14-C: make the compiled-in ServerRoot/htdocs default an explicit
+        // scope invariant too. Require-expr file predicates consume Scope,
+        // so leaving this absent previously turned their confinement root
+        // into the filesystem root.
+        self.cfg.global.content_policy.document_root = Some(self.cfg.document_root.clone());
+
+        let global_scope = self.cfg.global.clone();
+        let global_rules = self.cfg.global_rules.clone();
+        let global_ssl = self.cfg.ssl.clone();
         for v in &mut self.vhosts_raw {
             v.ports = v.addrs.iter().map(|a| vhost_port(a)).collect();
             v.scope = global_scope.clone();
@@ -3916,48 +4125,38 @@ impl Compile {
                             .push((name, RewriteMap::Rnd(map)));
                     }
                     "prg" => {
-                        // Resolve a relative program against ServerRoot at
-                        // load time and require an existing executable regular
-                        // file; PATH lookup at spawn time would surface every
-                        // miss as an empty map value instead of a config
-                        // error.
+                        // Resolve and retain the executable descriptor at load
+                        // time. Runtime execution uses that descriptor and
+                        // refuses a pathname/version mismatch, so replacing a
+                        // validated helper cannot redirect a later request to
+                        // attacker code.
                         let (program, args_rest) = match source.split_once(char::is_whitespace) {
-                            Some((p, r)) => (p, Some(r.trim_start().to_string())),
-                            None => (source, None),
+                            Some((p, r)) => (p, r.split_whitespace().map(str::to_string).collect()),
+                            None => (source, Vec::new()),
                         };
                         let prog_path = if program.starts_with('/') {
                             PathBuf::from(program)
                         } else {
                             self.cfg.server_root.join(program)
                         };
-                        let check = match std::fs::metadata(&prog_path) {
-                            Ok(md) if !md.is_file() => Some("is not a regular file".to_string()),
-                            Ok(md) if md.mode() & 0o111 == 0 => {
-                                Some("is not executable".to_string())
+                        let program = match RewriteProgram::bind(prog_path.clone(), args_rest) {
+                            Ok(program) => program,
+                            Err(error) => {
+                                self.errors.push(ConfigError {
+                                    file: loc.file.clone(),
+                                    line: loc.line,
+                                    msg: format!(
+                                        "RewriteMap '{name}': prg program {} {error}",
+                                        prog_path.display()
+                                    ),
+                                });
+                                return;
                             }
-                            Err(e) => Some(format!("cannot stat: {e}")),
-                            _ => None,
-                        };
-                        if let Some(problem) = check {
-                            self.errors.push(ConfigError {
-                                file: loc.file.clone(),
-                                line: loc.line,
-                                msg: format!(
-                                    "RewriteMap '{name}': prg program {} {problem}",
-                                    prog_path.display()
-                                ),
-                            });
-                            return;
-                        }
-                        let resolved = prog_path.to_string_lossy().into_owned();
-                        let stored = match args_rest {
-                            Some(rest) => format!("{resolved} {rest}"),
-                            None => resolved,
                         };
                         scope
                             .rewrite_policy
                             .rewrite_maps
-                            .push((name, RewriteMap::Prg(stored)));
+                            .push((name, RewriteMap::Prg(program)));
                     }
                     "int" => {
                         let function = source.to_ascii_lowercase();
@@ -5394,7 +5593,7 @@ pub(crate) fn apply_rules_config(
     fname: &str,
 ) {
     for rule in rules {
-        if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
+        if rule.phase() == RulePhase::Condition {
             continue;
         }
         if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
@@ -5467,7 +5666,7 @@ pub(crate) fn collect_rules_req(
         if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
             continue;
         }
-        if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
+        if rule.phase() == RulePhase::Condition {
             deferred.push(rule.clone());
             continue;
         }
@@ -5507,36 +5706,16 @@ pub(crate) fn collect_directory_phase(
         if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
             continue;
         }
-        if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
-            conditionals.push(rule.clone());
-            continue;
-        }
-        match rule.kind {
-            MatchKind::Directory(_) | MatchKind::DirectoryMatch(_) => {
+        match rule.phase() {
+            RulePhase::Condition => conditionals.push(rule.clone()),
+            RulePhase::Directory => {
                 merge_rule_delta(s, rule, fs_path, url_path);
                 for nested in &rule.nested {
-                    if nested.condition.is_some() || nested.branch != ConditionBranch::Normal {
-                        conditionals.push(nested.clone());
-                    } else {
-                        match nested.kind {
-                            MatchKind::Files(_)
-                            | MatchKind::FilesGlob(_)
-                            | MatchKind::FilesMatch(_) => files.push(nested.clone()),
-                            MatchKind::Location(_)
-                            | MatchKind::LocationGlob(_)
-                            | MatchKind::LocationMatch(_) => locations.push(nested.clone()),
-                            _ => {}
-                        }
-                    }
+                    defer_rule_by_verified_phase(nested, files, locations, conditionals);
                 }
             }
-            MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_) => {
-                files.push(rule.clone())
-            }
-            MatchKind::Location(_) | MatchKind::LocationGlob(_) | MatchKind::LocationMatch(_) => {
-                locations.push(rule.clone())
-            }
-            MatchKind::Always => conditionals.push(rule.clone()),
+            RulePhase::Files => files.push(rule.clone()),
+            RulePhase::Location => locations.push(rule.clone()),
         }
     }
 }
@@ -5559,13 +5738,13 @@ pub fn apply_normal_rule_list(
         if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
             continue;
         }
-        if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
+        if rule.phase() == RulePhase::Condition {
             conditionals.push(rule.clone());
             continue;
         }
         merge_rule_delta(s, rule, fs_path, url_path);
         for nested in &rule.nested {
-            if nested.condition.is_some() || nested.branch != ConditionBranch::Normal {
+            if nested.phase() == RulePhase::Condition {
                 conditionals.push(nested.clone());
             }
         }
@@ -5639,29 +5818,48 @@ fn apply_conditional_rule(
 }
 
 fn sort_rules(rules: &mut [ScopeRule]) {
+    // Compile every nesting level, not only the top-level vector. Conditional
+    // sections may themselves contain Directory/Files/Location sections, and
+    // leaving those in source order bypassed the canonical phase compiler.
+    for rule in rules.iter_mut() {
+        sort_rules(&mut rule.nested);
+    }
     rules.sort_by(|a, b| {
-        // Apache's merge order is: <Directory> (least specific first),
-        // then <Files>/<FilesMatch>, then <Location>, then <If> sections.
-        // More specific paths override less specific ones within a class.
-        let ka = match &a.kind {
-            MatchKind::Always => (5, 0),
-            MatchKind::Directory(p) => (0, p.as_os_str().len()),
-            MatchKind::DirectoryMatch(_) => (1, 0),
-            MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_) => (2, 0),
-            MatchKind::Location(p) => (3, p.len()),
-            MatchKind::LocationGlob(p) => (3, p.len()),
-            MatchKind::LocationMatch(_) => (4, 0),
+        let specificity = |rule: &ScopeRule| {
+            if rule_is_conditional(rule) {
+                return 0;
+            }
+            match &rule.kind {
+                MatchKind::Directory(p) => p.as_os_str().len(),
+                MatchKind::Location(p) | MatchKind::LocationGlob(p) => p.len(),
+                _ => 0,
+            }
         };
-        let kb = match &b.kind {
-            MatchKind::Always => (5, 0),
-            MatchKind::Directory(p) => (0, p.as_os_str().len()),
-            MatchKind::DirectoryMatch(_) => (1, 0),
-            MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_) => (2, 0),
-            MatchKind::Location(p) => (3, p.len()),
-            MatchKind::LocationGlob(p) => (3, p.len()),
-            MatchKind::LocationMatch(_) => (4, 0),
-        };
-        ka.cmp(&kb).then(a.order.cmp(&b.order))
+        let ab = vapache_verified::config_rule_precedes(
+            verified_config_rule_kind(&a.kind),
+            rule_is_conditional(a),
+            specificity(a),
+            a.order,
+            verified_config_rule_kind(&b.kind),
+            rule_is_conditional(b),
+            specificity(b),
+            b.order,
+        );
+        let ba = vapache_verified::config_rule_precedes(
+            verified_config_rule_kind(&b.kind),
+            rule_is_conditional(b),
+            specificity(b),
+            b.order,
+            verified_config_rule_kind(&a.kind),
+            rule_is_conditional(a),
+            specificity(a),
+            a.order,
+        );
+        match (ab, ba) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        }
     });
 }
 
@@ -6356,15 +6554,14 @@ fn proxy_template_authority_safe(value: &str) -> bool {
     let Some((_, rest)) = value.split_once("://") else {
         // Non-URL backends (notably Unix FastCGI sockets) must not be
         // derivable from a rewrite capture either.
-        return !value.contains("$") && !value.contains("%{");
+        return vapache_verified::rewrite_template_static(value.as_bytes());
     };
     let end = rest
         .find(|c| c == '/' || c == '?' || c == '#')
         .unwrap_or(rest.len());
     let authority = &rest[..end];
     !authority.is_empty()
-        && !authority.contains('$')
-        && !authority.contains('%')
+        && vapache_verified::rewrite_template_static(authority.as_bytes())
         && !authority.contains('@')
 }
 
@@ -7068,6 +7265,16 @@ mod tests {
     }
 
     #[test]
+    fn implicit_document_root_is_bound_into_the_global_scope() {
+        let cfg = load_text("Listen 127.0.0.1:0\n", true).unwrap();
+        assert_eq!(
+            cfg.global.content_policy.document_root.as_deref(),
+            Some(cfg.document_root.as_path())
+        );
+        assert_ne!(cfg.document_root, Path::new("/"));
+    }
+
+    #[test]
     fn strict_mode_refuses_silently_dropped_directives() {
         // Compat mode keeps loading these with a warning only.
         let promoted = [
@@ -7135,6 +7342,11 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
+        let oversized_program = dir.join("bin/oversized-worker");
+        let oversized = std::fs::File::create(&oversized_program).unwrap();
+        oversized.set_len(MAX_REWRITEMAP_PROGRAM + 1).unwrap();
+        std::fs::set_permissions(&oversized_program, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         std::fs::write(dir.join("plain.txt"), "x y\n").unwrap();
         std::fs::write(dir.join("invalid-utf8.map"), [0xff, 0xfe]).unwrap();
         std::fs::set_permissions(
@@ -7199,14 +7411,15 @@ mod tests {
         assert!(
             matches!(
                 prg.as_slice(),
-                [(_, RewriteMap::Prg(p))] if p.ends_with("bin/worker")
+                [(_, RewriteMap::Prg(p))] if p.path.ends_with("bin/worker") && p.args.is_empty()
             ),
             "{prg:?}"
         );
         let prg_args = maps("Listen 127.0.0.1:0\nRewriteMap w \"prg:bin/worker --mode test\"\n");
         assert!(matches!(
             prg_args.as_slice(),
-            [(_, RewriteMap::Prg(p))] if p.ends_with("bin/worker --mode test")
+            [(_, RewriteMap::Prg(p))]
+                if p.path.ends_with("bin/worker") && p.args == ["--mode", "test"]
         ));
         let unsafe_prefix = load_with_root(
             "Listen 127.0.0.1:0\nRewriteEngine On\nRewriteRule ^/x$ /y [UnsafePrefixStat]\n",
@@ -7217,6 +7430,10 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("UnsafePrefixStat")));
         assert!(load_with_root("Listen 127.0.0.1:0\nRewriteMap n prg:plain.txt\n").is_err());
+        assert!(load_with_root("Listen 127.0.0.1:0\nRewriteMap n prg:bin\n").is_err());
+        assert!(
+            load_with_root("Listen 127.0.0.1:0\nRewriteMap n prg:bin/oversized-worker\n").is_err()
+        );
         assert!(load_with_root("Listen 127.0.0.1:0\nRewriteMap n prg:no-such-worker\n").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7781,6 +7998,16 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
             false
         )
         .is_err());
+        for target in [r"http://\1/", "http://%1/"] {
+            assert!(
+                load_text(
+                    &format!("Listen 127.0.0.1:0\nRewriteRule ^/(.*)$ {target} [P]\n"),
+                    false,
+                )
+                .is_err(),
+                "dynamic proxy authority was accepted: {target}"
+            );
+        }
         assert!(load_text(
             "Listen 127.0.0.1:0\nRewriteRule ^/(.*)$ http://127.0.0.1:9000/$1 [P]\n",
             false
@@ -9596,10 +9823,15 @@ ServerName localhost\n\
 
         assert!(proxy_template_authority_safe("http://backend"));
         assert!(!proxy_template_authority_safe("http://$1/"));
+        assert!(!proxy_template_authority_safe("http://\\1/"));
+        assert!(!proxy_template_authority_safe("http://%1/"));
         assert!(!proxy_template_authority_safe("http://backend@host/"));
         assert!(!proxy_template_authority_safe("http:///path"));
         assert!(!proxy_template_authority_safe("$1"));
+        assert!(!proxy_template_authority_safe("\\1"));
+        assert!(!proxy_template_authority_safe("%1"));
         assert!(!proxy_template_authority_safe("%{HTTP_HOST}"));
+        assert!(proxy_template_authority_safe("http://backend/$1"));
         assert!(proxy_template_authority_safe("/unix/socket"));
         assert!(supported_proxy_backend("https://x", false));
         assert!(supported_proxy_backend("ws://x", false));
@@ -10380,7 +10612,7 @@ Require all granted\n\
         );
         assert_eq!(files.len(), 2);
         assert_eq!(locations.len(), 2);
-        assert_eq!(conditionals.len(), 4);
+        assert_eq!(conditionals.len(), 5);
         assert!(scope
             .header_policy
             .add_headers
@@ -10438,7 +10670,7 @@ Require all granted\n\
             fname,
             &mut deferred,
         );
-        assert_eq!(deferred.len(), 3);
+        assert_eq!(deferred.len(), 5);
         let mut chain = HashMap::new();
         apply_deferred_req(
             &mut scope, &deferred, &req, peer, root, fs_path, url_path, fname, &mut chain,
@@ -10523,6 +10755,110 @@ Require all granted\n\
         ];
         sort_rules(&mut rules);
         assert_eq!(rules.len(), 9);
+    }
+
+    #[test]
+    fn verified_phase_classification_and_recursive_sort_agree() {
+        let make_rule = |kind: MatchKind, order: usize| ScopeRule {
+            kind,
+            delta: Scope::default(),
+            order,
+            condition: None,
+            branch: ConditionBranch::Normal,
+            chain: None,
+            nested: Vec::new(),
+        };
+
+        let classified = [
+            (
+                make_rule(MatchKind::Directory(PathBuf::from("/a")), 1),
+                RulePhase::Directory,
+            ),
+            (
+                make_rule(MatchKind::DirectoryMatch(compile_regex("a").unwrap()), 2),
+                RulePhase::Directory,
+            ),
+            (
+                make_rule(MatchKind::FilesGlob("*.php".into()), 3),
+                RulePhase::Files,
+            ),
+            (
+                make_rule(MatchKind::FilesMatch(compile_regex("php").unwrap()), 4),
+                RulePhase::Files,
+            ),
+            (
+                make_rule(MatchKind::LocationGlob("/a*".into()), 5),
+                RulePhase::Location,
+            ),
+            (
+                make_rule(MatchKind::LocationMatch(compile_regex("a").unwrap()), 6),
+                RulePhase::Location,
+            ),
+            // `Always` is the parser's synthetic <If>/<Else> carrier.  The
+            // verified classifier keeps it in the final condition phase even
+            // if a hand-built rule omits its expression and branch marker.
+            (make_rule(MatchKind::Always, 7), RulePhase::Condition),
+        ];
+        for (rule, expected) in classified {
+            assert_eq!(rule.phase(), expected);
+        }
+
+        let mut conditional_files = make_rule(MatchKind::FilesGlob("*.deny".into()), 9);
+        conditional_files.condition = Some(crate::expr::parse("true").unwrap());
+        let mut parent = make_rule(MatchKind::Directory(PathBuf::from("/outer")), 20);
+        parent.nested = vec![
+            make_rule(MatchKind::Always, 4),
+            make_rule(MatchKind::Location("/nested/deep".into()), 3),
+            make_rule(MatchKind::FilesGlob("*.php".into()), 2),
+            make_rule(MatchKind::Directory(PathBuf::from("/nested/deep")), 6),
+            make_rule(MatchKind::Directory(PathBuf::from("/n")), 1),
+            make_rule(
+                MatchKind::DirectoryMatch(compile_regex("nested").unwrap()),
+                7,
+            ),
+            make_rule(MatchKind::Location("/n".into()), 5),
+            make_rule(
+                MatchKind::LocationMatch(compile_regex("nested").unwrap()),
+                8,
+            ),
+            conditional_files,
+        ];
+        let mut rules = vec![
+            make_rule(MatchKind::Always, 40),
+            make_rule(MatchKind::FilesGlob("*.html".into()), 30),
+            parent,
+        ];
+        sort_rules(&mut rules);
+        assert_eq!(
+            rules.iter().map(ScopeRule::phase).collect::<Vec<_>>(),
+            vec![RulePhase::Directory, RulePhase::Files, RulePhase::Condition]
+        );
+        assert_eq!(
+            rules[0]
+                .nested
+                .iter()
+                .map(ScopeRule::phase)
+                .collect::<Vec<_>>(),
+            vec![
+                RulePhase::Directory,
+                RulePhase::Directory,
+                RulePhase::Directory,
+                RulePhase::Files,
+                RulePhase::Location,
+                RulePhase::Location,
+                RulePhase::Location,
+                RulePhase::Condition,
+                RulePhase::Condition,
+            ]
+        );
+        assert_eq!(
+            rules[0]
+                .nested
+                .iter()
+                .map(|rule| rule.order)
+                .collect::<Vec<_>>(),
+            vec![1, 6, 7, 2, 5, 3, 8, 4, 9]
+        );
     }
 
     #[test]
@@ -11131,7 +11467,7 @@ impl Config {
 
     /// Start a request scope at the inherited base and collect only the
     /// top-level Files, Location and conditional rules.  Literal Directory
-    /// rules are applied by `htaccess::apply_req_deferred` as it walks each
+    /// rules are applied by `policy_ref::effective_scope` as it walks each
     /// directory, so they can be interleaved with that directory's access
     /// files exactly as Apache does.
     pub fn effective_scope_req_base_deferred(
@@ -11188,19 +11524,7 @@ impl Config {
             if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
                 continue;
             }
-            if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
-                conditionals.push(rule.clone());
-            } else {
-                match rule.kind {
-                    MatchKind::Files(_) | MatchKind::FilesGlob(_) | MatchKind::FilesMatch(_) => {
-                        files.push(rule.clone())
-                    }
-                    MatchKind::Location(_)
-                    | MatchKind::LocationGlob(_)
-                    | MatchKind::LocationMatch(_) => locations.push(rule.clone()),
-                    _ => {}
-                }
-            }
+            defer_rule_by_verified_phase(rule, files, locations, conditionals);
         }
         files.sort_by_key(|rule| rule.order);
         locations.sort_by_key(|rule| rule.order);
@@ -11232,19 +11556,7 @@ impl Config {
         let mut apply_rule = |rule: &ScopeRule| {
             merge_rule_delta(scope, rule, fs_path, url_path);
             for nested in &rule.nested {
-                if nested.condition.is_some() || nested.branch != ConditionBranch::Normal {
-                    conditionals.push(nested.clone());
-                } else {
-                    match nested.kind {
-                        MatchKind::Files(_)
-                        | MatchKind::FilesGlob(_)
-                        | MatchKind::FilesMatch(_) => files.push(nested.clone()),
-                        MatchKind::Location(_)
-                        | MatchKind::LocationGlob(_)
-                        | MatchKind::LocationMatch(_) => locations.push(nested.clone()),
-                        _ => {}
-                    }
-                }
+                defer_rule_by_verified_phase(nested, files, locations, conditionals);
             }
         };
         if index.wildcard.is_empty() {
@@ -11295,19 +11607,7 @@ impl Config {
             }
             merge_rule_delta(scope, rule, fs_path, url_path);
             for nested in &rule.nested {
-                if nested.condition.is_some() || nested.branch != ConditionBranch::Normal {
-                    conditionals.push(nested.clone());
-                } else {
-                    match nested.kind {
-                        MatchKind::Files(_)
-                        | MatchKind::FilesGlob(_)
-                        | MatchKind::FilesMatch(_) => files.push(nested.clone()),
-                        MatchKind::Location(_)
-                        | MatchKind::LocationGlob(_)
-                        | MatchKind::LocationMatch(_) => locations.push(nested.clone()),
-                        _ => {}
-                    }
-                }
+                defer_rule_by_verified_phase(nested, files, locations, conditionals);
             }
         }
     }
@@ -11357,19 +11657,7 @@ impl Config {
             }
             merge_rule_delta(scope, rule, fs_path, url_path);
             for nested in &rule.nested {
-                if nested.condition.is_some() || nested.branch != ConditionBranch::Normal {
-                    conditionals.push(nested.clone());
-                } else {
-                    match nested.kind {
-                        MatchKind::Files(_)
-                        | MatchKind::FilesGlob(_)
-                        | MatchKind::FilesMatch(_) => files.push(nested.clone()),
-                        MatchKind::Location(_)
-                        | MatchKind::LocationGlob(_)
-                        | MatchKind::LocationMatch(_) => locations.push(nested.clone()),
-                        _ => {}
-                    }
-                }
+                defer_rule_by_verified_phase(nested, files, locations, conditionals);
             }
         }
     }

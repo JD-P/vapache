@@ -501,30 +501,26 @@ pub fn apply_conditionals_with_file_name(
     fname: &str,
 ) {
     let docroot = cfg.documentation_root_for(vhost);
-    let mut state = std::collections::HashMap::new();
-    crate::config::apply_deferred_req(
-        scope,
-        config_conditionals,
-        req,
-        peer,
-        &docroot,
-        fs_path,
-        url_path,
-        fname,
-        &mut state,
-    );
-    let mut state = std::collections::HashMap::new();
-    crate::config::apply_deferred_req(
-        scope,
-        access_conditionals,
-        req,
-        peer,
-        &docroot,
-        fs_path,
-        url_path,
-        fname,
-        &mut state,
-    );
+    for source in crate::verified::condition_source_plan_exec() {
+        let conditionals = match source {
+            crate::verified::ConditionSource::Config => config_conditionals,
+            crate::verified::ConditionSource::Access => access_conditionals,
+        };
+        // Apache's <If>/<ElseIf>/<Else> chain state is local to its source
+        // stream; an access-file chain cannot continue a main-config chain.
+        let mut state = std::collections::HashMap::new();
+        crate::config::apply_deferred_req(
+            scope,
+            conditionals,
+            req,
+            peer,
+            &docroot,
+            fs_path,
+            url_path,
+            fname,
+            &mut state,
+        );
+    }
 }
 
 /// Error union used by the initial dispatch/cache plan construction.

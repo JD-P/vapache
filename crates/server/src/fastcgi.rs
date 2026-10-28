@@ -20,7 +20,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -72,6 +72,42 @@ impl Target {
             self.path_info
         )
     }
+}
+
+/// Descriptor-first binding for the local script object named by a FastCGI
+/// target.  The backend still receives `SCRIPT_FILENAME` (the FastCGI
+/// protocol has no descriptor-passing primitive), but selection,
+/// authorization and the last pre-send identity check all use this opened
+/// inode.
+pub(crate) struct ScriptBinding {
+    pub(crate) file: File,
+    pub(crate) meta: std::fs::Metadata,
+    pub(crate) actual_path: PathBuf,
+}
+
+pub(crate) fn open_script(
+    target: &Target,
+    root: &Path,
+    follow_symlinks: bool,
+    owner_match_only: bool,
+) -> Option<ScriptBinding> {
+    let base = fastcgi_script_base(&target.backend, root);
+    let rel = target.script_filename.strip_prefix(&base).ok()?;
+    let crate::files::Target::File { file, meta } =
+        crate::files::resolve_target_checked(&base, rel, follow_symlinks, owner_match_only)
+    else {
+        return None;
+    };
+    let actual_path = crate::files::fd_path(&file)?;
+    let actual_base = std::fs::canonicalize(&base).ok()?;
+    if !script_under_base(&actual_path, &actual_base) {
+        return None; // coverage:ignore-line -- resolve_target_checked enforces beneath base
+    }
+    Some(ScriptBinding {
+        file,
+        meta,
+        actual_path,
+    })
 }
 
 fn parse_backend(value: &str) -> Option<Backend> {
@@ -676,6 +712,51 @@ fn read_response(stream: &mut dyn ReadWrite) -> io::Result<(Spool, Vec<u8>)> {
 /// Execute a FastCGI request.  `base` supplies the request and connection
 /// metadata; `target` supplies the backend and SCRIPT_FILENAME.
 pub fn execute(base: &CgiContext, scope: &Scope, target: &Target) -> Response {
+    execute_inner(base, scope, target, None)
+}
+
+/// Execute only while the target pathname still resolves to the exact script
+/// inode selected and authorized by the dispatcher.
+pub(crate) fn execute_bound(
+    base: &CgiContext,
+    scope: &Scope,
+    target: &Target,
+    binding: &ScriptBinding,
+) -> Response {
+    execute_inner(base, scope, target, Some(binding))
+}
+
+fn retain_script_path_binding(target: &Target, binding: &ScriptBinding) -> io::Result<File> {
+    let selected = binding.file.metadata()?;
+    let current = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&target.script_filename)?;
+    let current_meta = current.metadata()?;
+    let same_selected =
+        selected.dev() == binding.meta.dev() && selected.ino() == binding.meta.ino();
+    let same_path =
+        current_meta.dev() == binding.meta.dev() && current_meta.ino() == binding.meta.ino();
+    if !vapache_verified::descriptor_snapshot_admit(
+        selected.is_file() && current_meta.is_file(),
+        same_selected && same_path,
+        true,
+        true,
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "FastCGI script inode changed after authorization",
+        ));
+    }
+    Ok(current)
+}
+
+fn execute_inner(
+    base: &CgiContext,
+    scope: &Scope,
+    target: &Target,
+    binding: Option<&ScriptBinding>,
+) -> Response {
     let mut env = env_from_base(base);
     // The FastCGI target, not the base request mapping, is authoritative for
     // the script and PATH_INFO.  Remove all four derived values before adding
@@ -714,6 +795,17 @@ pub fn execute(base: &CgiContext, scope: &Scope, target: &Target) -> Response {
         let timeout = base.cfg.timeout.max(Duration::from_secs(5));
         let mut stream = connect(&target.backend, timeout)?;
         let params = build_params(&env);
+        // Connect first, then keep both the originally selected descriptor and
+        // a last-moment open of SCRIPT_FILENAME alive through the exchange.
+        // A slow backend connection therefore cannot widen the check-to-send
+        // window. The protocol cannot make PHP-FPM consume our fd, but this
+        // closes vapache's own select/authorize/use gap and fails if the
+        // pathname changed before parameters are emitted.
+        let _path_binding = if let Some(binding) = binding {
+            Some(retain_script_path_binding(target, binding)?)
+        } else {
+            None
+        };
         if let Some(reader) = base.req.body_reader() {
             let mut reader = reader?;
             send_request(&mut stream, &params, &mut reader)?;
@@ -1735,6 +1827,34 @@ mod tests {
         assert!(split_path_info(root.join("../outside/secret.php/info"), "/x", &base).is_none());
         std::os::unix::fs::symlink(outside.join("secret.php"), root.join("link.php")).unwrap();
         assert!(split_path_info(root.join("link.php"), "/link.php", &base).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fastcgi_binding_rejects_a_swapped_script_inode() {
+        let dir = std::env::temp_dir().join(format!("vapache-fcgi-inode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("index.php");
+        let old = dir.join("selected.php");
+        fs::write(&script, "<?php echo 'selected';\n").unwrap();
+        let target = Target {
+            backend: parse_backend("fcgi://127.0.0.1:9000/").unwrap(),
+            script_filename: script.clone(),
+            script_name: "/index.php".into(),
+            path_info: String::new(),
+            route_order: 0,
+            logical_url: None,
+        };
+        let non_file_target = Target {
+            script_filename: dir.clone(),
+            ..target.clone()
+        };
+        assert!(open_script(&non_file_target, &dir, true, false).is_none());
+        let binding = open_script(&target, &dir, true, false).expect("opened script");
+        fs::rename(&script, &old).unwrap();
+        fs::write(&script, "<?php echo 'replacement';\n").unwrap();
+        assert!(retain_script_path_binding(&target, &binding).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }
