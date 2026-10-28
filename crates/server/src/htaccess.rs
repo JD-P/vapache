@@ -907,15 +907,25 @@ fn parse_block(
                         });
                     }
                     "requireall" | "requireany" | "requirenone" => {
-                        if !mode.allows(OverrideCategory::AuthConfig) && allow_list.is_empty() {
-                            if nonfatal.allows_override() {
+                        let policy_allowed =
+                            mode.allows(OverrideCategory::AuthConfig) || !allow_list.is_empty();
+                        match vapache_verified::htaccess_gate_admit(
+                            policy_allowed,
+                            true,
+                            nonfatal.allows_override(),
+                            nonfatal.allows_unknown(),
+                        ) {
+                            1 => {
                                 skip_section(lines, i, &name)?;
                                 continue;
                             }
-                            return Err(format!(
-                                "line {}: <{name}> is not allowed by AllowOverride",
-                                *i
-                            ));
+                            2 => {
+                                return Err(format!(
+                                    "line {}: <{name}> is not allowed by AllowOverride",
+                                    *i
+                                ));
+                            }
+                            _ => {}
                         }
                         let mut inner = Scope::default();
                         let mut inner_rules = Vec::new();
@@ -961,18 +971,26 @@ fn parse_block(
                         if require_only {
                             return Err(format!("line {}: <{name}> is not allowed here", *i));
                         }
-                        if !(mode.allows(OverrideCategory::AuthConfig)
+                        let policy_allowed = mode.allows(OverrideCategory::AuthConfig)
                             || mode.allows(OverrideCategory::Limit)
-                            || !allow_list.is_empty())
-                        {
-                            if nonfatal.allows_override() {
+                            || !allow_list.is_empty();
+                        match vapache_verified::htaccess_gate_admit(
+                            policy_allowed,
+                            true,
+                            nonfatal.allows_override(),
+                            nonfatal.allows_unknown(),
+                        ) {
+                            1 => {
                                 skip_section(lines, i, &name)?;
                                 continue;
                             }
-                            return Err(format!(
-                                "line {}: <{name}> is not allowed by AllowOverride",
-                                *i
-                            ));
+                            2 => {
+                                return Err(format!(
+                                    "line {}: <{name}> is not allowed by AllowOverride",
+                                    *i
+                                ));
+                            }
+                            _ => {}
                         }
                         let methods = crate::config::parse_method_set_args(&name, &args, true)
                             .map_err(|e| format!("line {}: {e}", *i))?;
@@ -1080,14 +1098,23 @@ fn parse_block(
                         ));
                     }
                     _ => {
-                        if nonfatal.allows_unknown() {
-                            skip_section(lines, i, &name)?;
-                            continue;
+                        match vapache_verified::htaccess_gate_admit(
+                            true,
+                            false,
+                            nonfatal.allows_override(),
+                            nonfatal.allows_unknown(),
+                        ) {
+                            1 => {
+                                skip_section(lines, i, &name)?;
+                                continue;
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "line {}: unsupported .htaccess section <{name}>",
+                                    *i
+                                ));
+                            }
                         }
-                        return Err(format!(
-                            "line {}: unsupported .htaccess section <{name}>",
-                            *i
-                        ));
                     }
                 }
             }
@@ -1109,17 +1136,28 @@ fn parse_block(
                     *i
                 ));
                 }
-                if !directive_allowed_list(mode, allow_list, &name, &args) {
-                    if nonfatal.allows_override() {
-                        continue;
+                let policy_allowed = directive_allowed_list(mode, allow_list, &name, &args);
+                let known = directive_category(&name).is_some();
+                match vapache_verified::htaccess_gate_admit(
+                    policy_allowed,
+                    known,
+                    nonfatal.allows_override(),
+                    nonfatal.allows_unknown(),
+                ) {
+                    1 => continue,
+                    2 if !policy_allowed => {
+                        return Err(format!(
+                            "line {}: directive '{name}' is not allowed by AllowOverride",
+                            *i
+                        ));
                     }
-                    return Err(format!(
-                        "line {}: directive '{name}' is not allowed by AllowOverride",
-                        *i
-                    ));
-                }
-                if directive_category(&name).is_none() && nonfatal.allows_unknown() {
-                    continue;
+                    2 => {
+                        return Err(format!(
+                            "line {}: unsupported .htaccess directive '{name}'",
+                            *i
+                        ));
+                    }
+                    _ => {}
                 }
                 apply_directive(cfg, scope, &name, &args, limit)
                     .map_err(|e| format!("line {}: {e}", *i))?;
@@ -4234,6 +4272,9 @@ mod tests {
     fn direct_directive_errors_and_unknown_specs() {
         let dir = tempdir("coverage-directive-errors");
         let cfg = config(&dir, "Listen 127.0.0.1:0\n");
+        assert!(
+            apply_directive(&cfg, &mut Scope::default(), "definitely-unknown", &[], None,).is_err()
+        );
         let file = dir.join(".htaccess");
         let parse = |text: &str| {
             fs::write(&file, text).unwrap();

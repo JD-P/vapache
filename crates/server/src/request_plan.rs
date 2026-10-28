@@ -377,6 +377,36 @@ impl RequestPlan {
         }
     }
 
+    /// Re-evaluate the same canonical directory and access-file layers while
+    /// matching Files sections against a lexical basename.  Only handler
+    /// fields from this scope may be consumed; its authorization fields are
+    /// intentionally not a substitute for the canonical evaluation.
+    pub fn evaluate_scope_with_file_name(
+        &self,
+        cfg: &Config,
+        vhost: Option<&VHost>,
+        req: &Request,
+        peer: std::net::IpAddr,
+        file_name: &str,
+    ) -> EvaluatedScope {
+        let (scope, config_conditionals, access_conditionals) =
+            crate::policy_ref::effective_scope_with_layers_and_file_name(
+                cfg,
+                vhost,
+                &self.fs_path,
+                &self.target.url_path,
+                req,
+                peer,
+                &self.layers,
+                file_name,
+            );
+        EvaluatedScope {
+            scope,
+            config_conditionals: Arc::new(config_conditionals),
+            access_conditionals: Arc::new(access_conditionals),
+        }
+    }
+
     /// Evaluate and apply every conditional phase.  Cache policy needs the
     /// final scope, while dispatch needs `evaluate_scope()` so it can insert
     /// rewrite effects before this call.
@@ -441,6 +471,35 @@ pub fn apply_conditionals(
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_default();
+    apply_conditionals_with_file_name(
+        cfg,
+        vhost,
+        scope,
+        config_conditionals,
+        access_conditionals,
+        fs_path,
+        url_path,
+        req,
+        peer,
+        &fname,
+    );
+}
+
+/// Apply deferred rules with a caller-supplied Files basename while keeping
+/// filesystem expressions bound to the canonical target path.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_conditionals_with_file_name(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    scope: &mut Scope,
+    config_conditionals: &[ScopeRule],
+    access_conditionals: &[ScopeRule],
+    fs_path: &Path,
+    url_path: &str,
+    req: &Request,
+    peer: std::net::IpAddr,
+    fname: &str,
+) {
     let docroot = cfg.documentation_root_for(vhost);
     let mut state = std::collections::HashMap::new();
     crate::config::apply_deferred_req(
@@ -451,7 +510,7 @@ pub fn apply_conditionals(
         &docroot,
         fs_path,
         url_path,
-        &fname,
+        fname,
         &mut state,
     );
     let mut state = std::collections::HashMap::new();
@@ -463,7 +522,7 @@ pub fn apply_conditionals(
         &docroot,
         fs_path,
         url_path,
-        &fname,
+        fname,
         &mut state,
     );
 }

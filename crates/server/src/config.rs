@@ -181,6 +181,14 @@ impl OverrideCategory {
 }
 
 impl OverrideMode {
+    fn proof_parts(self) -> (u8, u32) {
+        match self {
+            Self::None => (0, 0),
+            Self::All => (1, OverrideCategories::all().0),
+            Self::Categories(c) => (2, c.0),
+        }
+    }
+
     pub fn is_enabled(self) -> bool {
         match self {
             Self::None => false,
@@ -190,19 +198,13 @@ impl OverrideMode {
     }
 
     pub fn allows(self, category: OverrideCategory) -> bool {
-        match self {
-            Self::None => false,
-            Self::All => true,
-            Self::Categories(c) => c.contains(category.flag()),
-        }
+        let (mode, categories) = self.proof_parts();
+        vapache_verified::override_mode_allows(mode, categories, category.flag())
     }
 
     pub fn allows_flag(self, flag: u32) -> bool {
-        match self {
-            Self::None => false,
-            Self::All => true,
-            Self::Categories(c) => c.contains(flag),
-        }
+        let (mode, categories) = self.proof_parts();
+        vapache_verified::override_mode_allows(mode, categories, flag)
     }
 
     pub fn allows_any_option(self) -> bool {
@@ -11143,17 +11145,47 @@ impl Config {
         locations: &mut Vec<ScopeRule>,
         conditionals: &mut Vec<ScopeRule>,
     ) -> Scope {
-        let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
-        let mut s = base.clone();
-        let rules: &[ScopeRule] = vhost
-            .map(|v| v.rules.as_slice())
-            .unwrap_or(self.global_rules.as_slice());
         let fname = fs_path
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
+        self.effective_scope_req_base_deferred_with_file_name(
+            vhost,
+            fs_path,
+            url_path,
+            req,
+            peer,
+            &fname,
+            files,
+            locations,
+            conditionals,
+        )
+    }
+
+    /// Collect the configuration phases while matching `<Files>` containers
+    /// against an explicit filename identity.  Resolved-target authorization
+    /// uses the canonical basename, but handler policy for an in-root symlink
+    /// must be re-evaluated with the lexical request-mapped basename (P13).
+    #[allow(clippy::too_many_arguments)]
+    pub fn effective_scope_req_base_deferred_with_file_name(
+        &self,
+        vhost: Option<&VHost>,
+        fs_path: &Path,
+        url_path: &str,
+        req: &crate::http::Request,
+        peer: std::net::IpAddr,
+        fname: &str,
+        files: &mut Vec<ScopeRule>,
+        locations: &mut Vec<ScopeRule>,
+        conditionals: &mut Vec<ScopeRule>,
+    ) -> Scope {
+        let base = vhost.map(|v| &v.scope).unwrap_or(&self.global);
+        let s = base.clone();
+        let rules: &[ScopeRule] = vhost
+            .map(|v| v.rules.as_slice())
+            .unwrap_or(self.global_rules.as_slice());
         for rule in rules {
-            if !rule_kind_matches(&rule.kind, fs_path, url_path, &fname) {
+            if !rule_kind_matches(&rule.kind, fs_path, url_path, fname) {
                 continue;
             }
             if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {

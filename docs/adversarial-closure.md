@@ -76,6 +76,7 @@ returning through a different directive or dispatch path.
 | F65 | `cgi::is_cgi` returned true for a `ScriptAlias` tree before consulting Options/handlers, so `SetHandler default-handler` inside a ScriptAlias tree had no effect | `is_cgi` reduces to a single kernel call `cgi_exec_admit(handler_bound, handler_is_cgi, script_alias, exec_allowed)`: execution needs the Options grant or a ScriptAlias mapping AND a handler classification, where a `SetHandler default-handler` force classifies as static. `cgi_exec_requires_cgi_handler`/`cgi_exec_requires_exec_allowed` prove the fail-closed direction | `cgi_exec_admission`, I39-adjacent |
 | F66 | `<DirectoryMatch ".../private/$">` was already fixed in pass 10; the pass-11 retest verified the trailing-slash directory URL (autoindex path) stays 403 on both sides | No new code; the F66 replay stays in the battery as a guard (`F61ToF69Pass11Tests::test_f66_directory_match_guard_stays_fixed`) | I11 |
 | F69 | Handler and MIME classification used the canonical symlink target basename, so `public/link.txt -> ../secret/secret.cgi` under a global `AddHandler cgi-script .cgi` executed a file Apache serves as static source | The dispatch binds the classification name to the lexical request-mapped basename (`fs_path.file_name()` first); `handler_identity_lexical_admit` is debug-asserted at the bind site. Authorization and containment still bind to the resolved canonical target | `handler_identity_lexical`, I61 |
+| P13-A–C | F69's lexical identity was enforced only at one direct extension-table lookup: FastCGI and CGI `PATH_INFO` re-derived the canonical basename, while a canonical-only Files-scoped `SetHandler` force bypassed the name entirely | Direct CGI, PATH_INFO and FastCGI consume the same lexical basename. Canonical authorization and lexical handler Files policy are evaluated from one request plan; only handler fields use the lexical view, preserving canonical access denials. `handler_scope_lexical_admit` guards the force-binding site | `handler_identity_lexical`, I70 |
 | Additional | `Require not valid-user` dropped negation; non-HTTP control bytes passed header serialization; `close, keep-alive` re-enabled a connection; mmap allowed other-owner write races | Negation is carried into `Require::ValidUser`; header values admit only HTAB/SP/VCHAR/obs-text; `close` is sticky; mmap requires no owner/group/other write bits | I23, I33-adjacent |
 
 ## Additional hardening before the next pass
@@ -183,8 +184,33 @@ The confirmed cases in `adversarial/findings_p12.md` are closed as follows:
   key rather than trusting a SHA-1 filename, and unsafe-method invalidation is
   canonical and prefix-targeted rather than flushing unrelated entries.
 
-These decisions are backed by new Verus admission kernels and refinement tests;
-the Verus gate now proves 373 functions with zero errors.
+These decisions are backed by new Verus admission kernels and refinement tests.
+
+## Pass 13 closure
+
+The three handler-identity RCE paths in `adversarial/findings_p13.md` are
+closed by making I70 a pipeline-wide invariant rather than a single direct
+dispatch assertion:
+
+- FastCGI receives the already-bound lexical basename; the canonical opened
+  path is used only for containment, authorization and `SCRIPT_FILENAME`.
+- CGI `PATH_INFO` classifies the longest existing lexical prefix, while the
+  opened canonical script still supplies the executable inode and access
+  identity.
+- Resolved-target evaluation derives canonical authorization and lexical
+  handler scopes from one immutable `RequestPlan` and access-layer set.  Only
+  `handlers` and `set_handler` are copied from the lexical Files phase, so a
+  canonical-only `<Files>`/`<FilesMatch>` force cannot arm execution while a
+  canonical Files `Require` denial still binds.
+- `handler_scope_lexical_admit` mechanizes the scope-force obligation and the
+  five P13 regressions cover FastCGI, PATH_INFO, Files-scoped SetHandler,
+  canonical Files denial and live Location controls.
+
+The Verus gate now proves 379 functions with zero errors. The `.htaccess`
+admission seam is also executable proof code: `override_mode_allows` decides
+category bits, while `htaccess_gate_admit` ensures only a known, policy-allowed
+directive or section can reach the effectful parser; `Nonfatal` can only turn a
+rejection into a skip.
 
 ## Regression surface
 
@@ -206,7 +232,7 @@ The closure is exercised by:
 - `tests/conformance.py`, `tests/config_semantics.py`,
   `tests/config_validity.py` and `tests/config_grammar.py`;
 - `tests/adversarial_regressions.py`, which starts fresh servers and replays
-  the F23–F68 exploit shapes (rewrite-to-proxy/redirect authorization, cache
+  the F23–P13 exploit shapes (rewrite-to-proxy/redirect authorization, cache
   reload plus PATH_INFO, relative and capture-only aliases, autoindex schemes,
   negated/env providers, `IndexIgnore`, `DirectorySlash Off`,
   `UnsafePrefixStat` re-rooting, header-selected cache entries,

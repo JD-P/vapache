@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end regressions for the pass-2 through pass-10 findings (F23-F60).
+"""End-to-end regressions for the pass-2 through pass-13 findings (F23-P13).
 
 The suite starts fresh vapached instances in temporary trees and exercises
 the exploit shapes from adversarial/findings.md: terminal rewrite/proxy authorization,
@@ -2833,6 +2833,122 @@ RewriteRule "^" "-" [F]
 
     def test_f66_directory_match_guard_stays_fixed(self):
         self.assert_denied("/privatematch/")
+
+
+class P13LexicalHandlerIdentityTests(unittest.TestCase):
+    """Every handler-selection path keeps the request-mapped basename.
+
+    Canonical paths still supply containment, access checks and executable
+    inode binding; they never supply a FastCGI/CGI classification or a
+    Files-scoped SetHandler force.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p13-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.logs = cls.base / "logs"
+        for directory in (
+            cls.www / "public",
+            cls.www / "fcgi",
+            cls.www / "pathinfo",
+            cls.www / "forced",
+            cls.logs,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o755)
+
+        (cls.www / "fcgi" / "app.php").write_text("PHP-SOURCE-P13\n")
+
+        def script(path: Path, marker: str):
+            path.write_text(
+                "#!/bin/sh\n"
+                "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+                f"printf '{marker} uid=%s\\n' \"$(id -u)\"\n"
+            )
+            path.chmod(0o755)
+
+        script(cls.www / "pathinfo" / "run.run", "P13-PATHINFO-EXEC")
+        script(cls.www / "forced" / "force.cgi", "P13-FORCE-EXEC")
+        script(cls.www / "forced" / "access.cgi", "P13-ACCESS-EXEC")
+        (cls.www / "public" / "php.txt").symlink_to("../fcgi/app.php")
+        (cls.www / "public" / "path.txt").symlink_to("../pathinfo/run.run")
+        (cls.www / "public" / "force.txt").symlink_to("../forced/force.cgi")
+        (cls.www / "public" / "access.txt").symlink_to("../forced/access.cgi")
+
+        cls.mock = FastCgiMock(cls.base / "fcgi.sock")
+        cls.mock.start()
+        cls.port = free_port()
+        cls.config_text = f"""ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+AddHandler cgi-script .run
+<FilesMatch "\\.php$">
+    SetHandler "proxy:unix:{cls.base}/fcgi.sock|fcgi://localhost"
+</FilesMatch>
+<Directory "{cls.www}">
+    Options +ExecCGI +FollowSymLinks
+    Require all granted
+</Directory>
+<Directory "{cls.www}/forced">
+    <FilesMatch "\\.cgi$">
+        SetHandler cgi-script
+    </FilesMatch>
+    <Files "access.cgi">
+        Require all denied
+    </Files>
+</Directory>
+<Location "/fcgi/">
+    Require all denied
+</Location>
+<Location "/pathinfo/">
+    Require all denied
+</Location>
+<Location "/forced/">
+    Require all denied
+</Location>
+"""
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "mock", None):
+            cls.mock.stop()
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def test_p13_a_fastcgi_uses_lexical_basename(self):
+        status, _, body = request(self.port, "/public/php.txt")
+        self.assertEqual(status, 200, body[:200])
+        self.assertEqual(body, b"PHP-SOURCE-P13\n")
+
+    def test_p13_b_path_info_uses_lexical_script_basename(self):
+        status, _, body = request(self.port, "/public/path.txt/x")
+        self.assertEqual(status, 404, body[:200])
+        self.assertNotIn(b"P13-PATHINFO-EXEC", body)
+
+    def test_p13_c_files_sethandler_force_uses_lexical_basename(self):
+        status, _, body = request(self.port, "/public/force.txt")
+        self.assertEqual(status, 200, body[:200])
+        self.assertTrue(body.startswith(b"#!/bin/sh"), body[:200])
+
+    def test_canonical_files_access_rule_still_denies(self):
+        status, _, body = request(self.port, "/public/access.txt")
+        self.assertEqual(status, 403, body[:200])
+        self.assertNotIn(b"P13-ACCESS-EXEC", body)
+
+    def test_canonical_location_guards_are_live_controls(self):
+        for path in ("/fcgi/app.php", "/pathinfo/run.run", "/forced/force.cgi"):
+            status, _, body = request(self.port, path)
+            self.assertEqual(status, 403, f"{path}: {body[:200]}")
 
 
 if __name__ == "__main__":

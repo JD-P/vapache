@@ -375,21 +375,16 @@ pub fn handler_target(scope: &Scope, root: &Path, rel: &Path, url_path: &str) ->
     })
 }
 
-/// Handler selection for a resolved file.  The actual opened target supplies
-/// the handler extension and `SCRIPT_FILENAME`, so a symlink cannot carry the
-/// policy of its lexical (allowed) name into a denied target (F41/I39).
+/// Handler selection for a resolved file.  `name` is the lexical
+/// request-mapped basename used for classification; the actual opened target
+/// supplies only `SCRIPT_FILENAME`, containment and authorization (P13/I70).
 pub(crate) fn handler_target_for_file(
     scope: &Scope,
     root: &Path,
-    rel: &Path,
     url_path: &str,
     actual_path: &Path,
+    name: &[u8],
 ) -> Option<Target> {
-    let name = actual_path
-        .file_name()
-        .or_else(|| rel.file_name())
-        .map(|n| n.as_encoded_bytes())
-        .unwrap_or(b"");
     let handler = crate::config::effective_handler(scope, name)?;
     if !handler.starts_with("proxy:") {
         return None;
@@ -1371,25 +1366,49 @@ mod tests {
         assert!(handler_target_for_file(
             &handler_scope(&proxy_handler),
             &root,
-            Path::new("secret.php"),
             "/secret.php",
             &outside.join("secret.php"),
+            b"secret.php",
         )
         .is_none());
         assert!(handler_target_for_file(
             &handler_scope(&proxy_handler),
             &root,
-            Path::new("link.php"),
             "/link.php",
             &root.join("link.php"),
+            b"link.php",
         )
         .is_none());
         assert!(handler_target_for_file(
             &handler_scope(&proxy_handler),
             &root,
-            Path::new("index.php"),
             "/index.php",
             &root.join("index.php"),
+            b"index.php",
+        )
+        .is_some());
+        let mut extension_scope = Scope::default();
+        extension_scope
+            .mapping_policy
+            .handlers
+            .push(crate::config::Handler::add(
+                "php".into(),
+                proxy_handler.clone(),
+            ));
+        assert!(handler_target_for_file(
+            &extension_scope,
+            &root,
+            "/link.txt",
+            &root.join("index.php"),
+            b"link.txt",
+        )
+        .is_none());
+        assert!(handler_target_for_file(
+            &extension_scope,
+            &root,
+            "/index.php",
+            &root.join("index.php"),
+            b"index.php",
         )
         .is_some());
         let _ = fs::remove_dir_all(&dir);

@@ -1379,6 +1379,45 @@ fn evaluate_scope_for_path(
     ),
     String,
 > {
+    let evaluated = evaluate_scope_identities_for_path(
+        cfg,
+        vhost,
+        fs_path,
+        None,
+        url_path,
+        req,
+        peer,
+        mapping_root,
+    )?;
+    Ok((
+        evaluated.scope,
+        evaluated.config_conditionals,
+        evaluated.htaccess_conditionals,
+    ))
+}
+
+struct PathScopeIdentities {
+    scope: Scope,
+    config_conditionals: Vec<crate::config::ScopeRule>,
+    htaccess_conditionals: Vec<crate::config::ScopeRule>,
+    handler_scope: Option<crate::request_plan::EvaluatedScope>,
+}
+
+/// Evaluate canonical authorization and optional lexical handler identities
+/// from one immutable RequestPlan.  In particular, both views consume the
+/// same parsed access-file layers, avoiding a second filesystem/config walk
+/// between authorization and handler selection.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_scope_identities_for_path(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    fs_path: &Path,
+    lexical_handler_path: Option<&Path>,
+    url_path: &str,
+    req: &Request,
+    peer: IpAddr,
+    mapping_root: &Path,
+) -> Result<PathScopeIdentities, String> {
     let target = CanonicalTarget::from_url_path(url_path)
         .ok_or_else(|| format!("invalid canonical URL path '{url_path}'"))?;
     let plan = RequestPlan::from_fs_target(
@@ -1396,11 +1435,24 @@ fn evaluate_scope_for_path(
         crate::request_plan::PlanError::AccessFiles(e) => e,
     })?;
     let evaluated = plan.evaluate_scope(cfg, vhost, req, peer);
-    Ok((
-        evaluated.scope,
-        (*evaluated.config_conditionals).clone(),
-        (*evaluated.access_conditionals).clone(),
-    ))
+    let handler_scope = lexical_handler_path.map(|lexical_path| {
+        let file_name = lexical_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        plan.evaluate_scope_with_file_name(cfg, vhost, req, peer, &file_name)
+    });
+    Ok(PathScopeIdentities {
+        scope: evaluated.scope,
+        config_conditionals: (*evaluated.config_conditionals).clone(),
+        htaccess_conditionals: (*evaluated.access_conditionals).clone(),
+        handler_scope,
+    })
+}
+
+fn replace_handler_policy(target: &mut Scope, lexical: &Scope) {
+    target.mapping_policy.handlers = lexical.mapping_policy.handlers.clone();
+    target.mapping_policy.set_handler = lexical.mapping_policy.set_handler.clone();
 }
 
 /// Re-authorize a resolved file/directory target and bind the grant to the
@@ -1447,25 +1499,36 @@ fn bind_target_grant(
         };
     }
 
-    let (mut target_scope, config_conditionals, htaccess_conditionals) =
-        match evaluate_scope_for_path(cfg, vhost, actual_path, url_path, req, peer, mapping_root) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("vapached: target scope error: {e}");
-                return Err(error_response(
-                    cfg,
-                    vhost,
-                    scope,
-                    500,
-                    req,
-                    url_path,
-                    local_port,
-                    server_name,
-                    peer,
-                    local_ip,
-                ));
-            }
-        };
+    let evaluated = match evaluate_scope_identities_for_path(
+        cfg,
+        vhost,
+        actual_path,
+        Some(fs_path),
+        url_path,
+        req,
+        peer,
+        mapping_root,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("vapached: target scope error: {e}");
+            return Err(error_response(
+                cfg,
+                vhost,
+                scope,
+                500,
+                req,
+                url_path,
+                local_port,
+                server_name,
+                peer,
+                local_ip,
+            ));
+        }
+    };
+    let mut target_scope = evaluated.scope;
+    let config_conditionals = evaluated.config_conditionals;
+    let htaccess_conditionals = evaluated.htaccess_conditionals;
     apply_rewrite_effects(&mut target_scope, rewrite_effects);
     apply_scope_conditionals(
         cfg,
@@ -1478,6 +1541,31 @@ fn bind_target_grant(
         req,
         peer,
     );
+    let mut handler_scope = evaluated
+        .handler_scope
+        .expect("resolved target evaluation requested a lexical handler identity");
+    apply_rewrite_effects(&mut handler_scope.scope, rewrite_effects);
+    let lexical_name = fs_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    crate::request_plan::apply_conditionals_with_file_name(
+        cfg,
+        vhost,
+        &mut handler_scope.scope,
+        &handler_scope.config_conditionals,
+        &handler_scope.access_conditionals,
+        actual_path,
+        url_path,
+        req,
+        peer,
+        &lexical_name,
+    );
+    replace_handler_policy(&mut target_scope, &handler_scope.scope);
+    debug_assert!(vapache_verified::handler_scope_lexical_admit(
+        actual_path != fs_path,
+        true,
+    ));
     // The canonical target may add restrictions but it must never replace the
     // policy of the URL that selected it.  Apache keeps the URL-mapped
     // `<Directory>`/access-file execution policy across a symlink; replacing
@@ -1541,49 +1629,13 @@ fn authorize_resolved_target(
     server_name: &str,
     local_ip: &str,
 ) -> Result<(access::AccessGrant, access::ResourceKey, Scope), Response> {
-    let (mut target_scope, config_conditionals, htaccess_conditionals) =
-        match evaluate_scope_for_path(cfg, vhost, target_fs, target_url, req, peer, mapping_root) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("vapached: target scope error: {e}");
-                return Err(error_response(
-                    cfg,
-                    vhost,
-                    &cfg.global,
-                    500,
-                    req,
-                    target_url,
-                    local_port,
-                    server_name,
-                    peer,
-                    local_ip,
-                ));
-            }
-        };
-    apply_scope_conditionals(
-        cfg,
-        vhost,
-        &mut target_scope,
-        &config_conditionals,
-        &htaccess_conditionals,
-        target_fs,
-        target_url,
-        req,
-        peer,
-    );
-    // A transform-selected target (PATH_INFO, FastCGI, DirectorySlash, alias
-    // target) has a lexical target URL and a canonical filesystem target.
-    // Meet those two identities, then retain the original request URL's
-    // non-handler policy (the selected target may legitimately use a different
-    // filename extension, so its handler map comes from the target URL)
-    // (F60/I61).
-    let lexical_target_scope = match CanonicalTarget::from_url_path(target_url)
+    let lexical_target_plan = match CanonicalTarget::from_url_path(target_url)
         .ok_or_else(|| format!("invalid canonical target URL '{target_url}'"))
         .and_then(|target| {
             RequestPlan::resolve(cfg, vhost, target)
                 .map_err(|error| format!("target URL has no mapping: {error:?}"))
         }) {
-        Ok(plan) => plan.effective_scope(cfg, vhost, req, peer),
+        Ok(plan) => plan,
         // coverage:ignore-start
         Err(e) => {
             eprintln!("vapached: target URL scope error: {e}");
@@ -1601,6 +1653,79 @@ fn authorize_resolved_target(
             ));
         } // coverage:ignore-stop
     };
+    let lexical_differs = lexical_target_plan.fs_path() != target_fs;
+    let evaluated = match evaluate_scope_identities_for_path(
+        cfg,
+        vhost,
+        target_fs,
+        lexical_differs.then_some(lexical_target_plan.fs_path()),
+        target_url,
+        req,
+        peer,
+        mapping_root,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("vapached: target scope error: {e}");
+            return Err(error_response(
+                cfg,
+                vhost,
+                &cfg.global,
+                500,
+                req,
+                target_url,
+                local_port,
+                server_name,
+                peer,
+                local_ip,
+            ));
+        }
+    };
+    let mut target_scope = evaluated.scope;
+    let config_conditionals = evaluated.config_conditionals;
+    let htaccess_conditionals = evaluated.htaccess_conditionals;
+    apply_scope_conditionals(
+        cfg,
+        vhost,
+        &mut target_scope,
+        &config_conditionals,
+        &htaccess_conditionals,
+        target_fs,
+        target_url,
+        req,
+        peer,
+    );
+    if let Some(mut handler_scope) = evaluated.handler_scope {
+        let lexical_name = lexical_target_plan
+            .fs_path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        crate::request_plan::apply_conditionals_with_file_name(
+            cfg,
+            vhost,
+            &mut handler_scope.scope,
+            &handler_scope.config_conditionals,
+            &handler_scope.access_conditionals,
+            target_fs,
+            target_url,
+            req,
+            peer,
+            &lexical_name,
+        );
+        replace_handler_policy(&mut target_scope, &handler_scope.scope);
+        debug_assert!(vapache_verified::handler_scope_lexical_admit(
+            lexical_differs,
+            true,
+        ));
+    }
+    // A transform-selected target (PATH_INFO, FastCGI, DirectorySlash, alias
+    // target) has a lexical target URL and a canonical filesystem target.
+    // Meet those two identities, then retain the original request URL's
+    // non-handler policy (the selected target may legitimately use a different
+    // filename extension, so its handler map comes from the target URL)
+    // (F60/I61).
+    let lexical_target_scope = lexical_target_plan.effective_scope(cfg, vhost, req, peer);
     target_scope.restrict_with(&lexical_target_scope);
     target_scope.restrict_policy_with(base_scope);
     let mut key = access::ResourceKey::request(vhost, req, target_url, Some(target_fs), proxy_url);
@@ -2515,12 +2640,14 @@ fn dispatch_inner(
                 .or_else(|| rel.file_name())
                 .map(|n| n.as_encoded_bytes())
                 .unwrap_or(b"");
-            debug_assert!(vapache_verified::handler_identity_lexical_admit(
-                actual_path != fs_path,
-                name == fs_path
+            let name_is_lexical = name
+                == fs_path
                     .file_name()
                     .map(|n| n.as_encoded_bytes())
-                    .unwrap_or(b""),
+                    .unwrap_or(b"");
+            debug_assert!(vapache_verified::handler_identity_lexical_admit(
+                actual_path != fs_path,
+                name_is_lexical,
             ));
             let script_root = actual_path.parent().unwrap_or(root.as_path()).to_path_buf();
             let script_rel = actual_path
@@ -2549,7 +2676,7 @@ fn dispatch_inner(
                 );
             }
             if let Some(target) =
-                fastcgi::handler_target_for_file(scope, &root, &rel, &url_path, &actual_path)
+                fastcgi::handler_target_for_file(scope, &root, &url_path, &actual_path, name)
             {
                 return run_fastcgi(
                     cfg,
@@ -2783,11 +2910,21 @@ fn dispatch_inner(
             if let Some(st) = cgi::find_script_checked(&root, &rel, follow, owner_match_only) {
                 let actual_path =
                     crate::files::fd_path(&st.file).unwrap_or_else(|| root.join(&st.rel_script));
-                let actual_name = actual_path
+                let actual_name = st
+                    .rel_script
                     .file_name()
-                    .or_else(|| st.rel_script.file_name())
+                    .or_else(|| actual_path.file_name())
                     .map(|n| n.as_encoded_bytes())
                     .unwrap_or(b"");
+                debug_assert!(vapache_verified::handler_identity_lexical_admit(
+                    actual_path != root.join(&st.rel_script),
+                    actual_name
+                        == st
+                            .rel_script
+                            .file_name()
+                            .map(|n| n.as_encoded_bytes())
+                            .unwrap_or(b""),
+                ));
                 let script_name = if st.path_info.is_empty() {
                     url_path.clone() // coverage:ignore-line
                 } else {

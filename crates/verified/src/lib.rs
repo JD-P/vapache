@@ -2003,6 +2003,83 @@ pub fn override_categories_conjoin(url_bits: u32, target_bits: u32) -> (out: u32
     bits_meet_exec(url_bits, target_bits)
 }
 
+/// The executable kernel for `AllowOverride` category admission.  `mode` is
+/// 0 for `None`, 1 for `All`, and 2 for an explicit category bit-vector.
+/// Keeping this decision in Verus means a category absent from the effective
+/// policy can never be admitted by the Rust parser's control flow.
+pub open spec fn override_mode_allows_spec(mode: u8, categories: u32, required: u32) -> bool {
+    mode == 1 || (mode == 2 && categories & required != 0)
+}
+
+pub fn override_mode_allows(mode: u8, categories: u32, required: u32) -> (ok: bool)
+    ensures ok == override_mode_allows_spec(mode, categories, required),
+{
+    mode == 1 || (mode == 2 && categories & required != 0)
+}
+
+pub proof fn override_none_never_allows(categories: u32, required: u32)
+    ensures !override_mode_allows_spec(0, categories, required),
+{
+}
+
+/// Final `.htaccess` directive/section disposition after category/list
+/// admission and Apache's `Nonfatal=` policy.  0 applies the construct, 1
+/// skips it, and 2 rejects the access file.  Unknown constructs can only be
+/// skipped or rejected; they can never enter the effectful parser.
+pub open spec fn htaccess_gate_spec(
+    policy_allowed: bool,
+    known: bool,
+    nonfatal_override: bool,
+    nonfatal_unknown: bool,
+) -> u8 {
+    if !policy_allowed {
+        if nonfatal_override { 1u8 } else { 2u8 }
+    } else if !known {
+        if nonfatal_unknown { 1u8 } else { 2u8 }
+    } else {
+        0u8
+    }
+}
+
+pub fn htaccess_gate_admit(
+    policy_allowed: bool,
+    known: bool,
+    nonfatal_override: bool,
+    nonfatal_unknown: bool,
+) -> (out: u8)
+    ensures out == htaccess_gate_spec(
+        policy_allowed,
+        known,
+        nonfatal_override,
+        nonfatal_unknown,
+    ),
+{
+    if !policy_allowed {
+        if nonfatal_override { 1u8 } else { 2u8 }
+    } else if !known {
+        if nonfatal_unknown { 1u8 } else { 2u8 }
+    } else {
+        0u8
+    }
+}
+
+pub proof fn htaccess_apply_requires_known_and_allowed(
+    policy_allowed: bool,
+    known: bool,
+    nonfatal_override: bool,
+    nonfatal_unknown: bool,
+)
+    ensures
+        htaccess_gate_spec(
+            policy_allowed,
+            known,
+            nonfatal_override,
+            nonfatal_unknown,
+        ) == 0
+            ==> policy_allowed && known,
+{
+}
+
 /// F60/I61: whenever the opened target differs from the URL-mapped path, the
 /// served policy must be a conjunction of both scopes.  Replacing the lexical
 /// scope with the canonical scope is never admissible.
@@ -7602,6 +7679,37 @@ pub fn handler_identity_lexical_admit(
     ensures ok == (!resolved_differs || name_is_lexical_basename),
 {
     !resolved_differs || name_is_lexical_basename
+}
+
+/// P13/I70: handler policy produced by `<Files>`/`<FilesMatch>` must use the
+/// same lexical basename as extension-based handler selection.  Canonical
+/// target policy remains authoritative for authorization, but it may not
+/// introduce a handler force by matching only the resolved basename.
+pub open spec fn handler_scope_lexical_spec(
+    resolved_differs: bool,
+    files_scope_uses_lexical_basename: bool,
+) -> bool {
+    !resolved_differs || files_scope_uses_lexical_basename
+}
+
+pub fn handler_scope_lexical_admit(
+    resolved_differs: bool,
+    files_scope_uses_lexical_basename: bool,
+) -> (ok: bool)
+    ensures ok == handler_scope_lexical_spec(resolved_differs, files_scope_uses_lexical_basename),
+{
+    !resolved_differs || files_scope_uses_lexical_basename
+}
+
+pub proof fn handler_scope_lexical_when_resolved_differs(
+    resolved_differs: bool,
+    files_scope_uses_lexical_basename: bool,
+)
+    ensures
+        handler_scope_lexical_spec(resolved_differs, files_scope_uses_lexical_basename)
+            && resolved_differs
+            ==> files_scope_uses_lexical_basename,
+{
 }
 
 } // verus!

@@ -1294,11 +1294,16 @@ L != T  ==>  the canonical target's basename must not classify the request
 ```
 
 The handler for a request is derived from the lexical URL-mapped filename,
-not from the canonicalized target (F69/I70): an in-root symlink
+not from the canonicalized target (F69/P13/I70): an in-root symlink
 `link.txt -> secret.cgi` under a global `AddHandler cgi-script .cgi` must
-serve static source, exactly as Apache does.  Authorization and containment
-still bind to the resolved target.  `handler_identity_lexical_admit` is the
-kernel guard at the dispatch binding.
+serve static source, exactly as Apache does.  The same identity is consumed by
+direct CGI, CGI `PATH_INFO` and FastCGI selection.  Resolved-target scope
+evaluation uses one immutable request plan twice: canonical basename for
+authorization and lexical basename for handler-producing `<Files>` /
+`<FilesMatch>` policy.  Only the handler table and `SetHandler` force come
+from the lexical view, so canonical Files access restrictions remain active.
+`handler_identity_lexical_admit` guards selection and
+`handler_scope_lexical_admit` proves the Files-scope obligation.
 
 ### I51 — Cache key byte identity
 
@@ -1433,8 +1438,11 @@ Suggested order:
    actually grants under the provider semantics.
 5. `require_none_never_grants`: a `<RequireNone>` subtree cannot produce a
    grant by itself.
-6. `override_gate`: if `allowed(mode, directive) == false`, applying the
-   directive leaves the scope unchanged (or produces the error result).
+6. `override_gate` (mechanized): `override_mode_allows` decides category-bit
+   admission and `htaccess_gate_admit` returns apply/skip/reject. The theorem
+   `htaccess_apply_requires_known_and_allowed` proves that applying a construct
+   requires both policy admission and a known directive/section; `Nonfatal`
+   can only select skip, never apply.
 7. `prefilter_sound`: fast-path predicates imply the authoritative checks.
 8. `acl_reachability`: every dispatch branch that returns a file/proxy body
    has a predecessor `check(scope, req) == Allowed`.

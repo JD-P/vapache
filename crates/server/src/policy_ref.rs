@@ -67,15 +67,40 @@ pub fn effective_scope_with_layers(
     peer: IpAddr,
     layers: &[AccessLayer],
 ) -> (Scope, Vec<ScopeRule>, Vec<ScopeRule>) {
+    let fname = fs_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    effective_scope_with_layers_and_file_name(
+        cfg, vhost, fs_path, url_path, req, peer, layers, &fname,
+    )
+}
+
+/// Evaluate the same canonical directory/access-file walk while supplying a
+/// distinct basename to the Files phase.  Callers use this only to extract
+/// lexical handler policy; authorization continues to use the canonical
+/// evaluation above.
+#[allow(clippy::too_many_arguments)]
+pub fn effective_scope_with_layers_and_file_name(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    fs_path: &Path,
+    url_path: &str,
+    req: &Request,
+    peer: IpAddr,
+    layers: &[AccessLayer],
+    fname: &str,
+) -> (Scope, Vec<ScopeRule>, Vec<ScopeRule>) {
     let mut config_files = Vec::new();
     let mut config_locations = Vec::new();
     let mut config_conditionals = Vec::new();
-    let mut scope = cfg.effective_scope_req_base_deferred(
+    let mut scope = cfg.effective_scope_req_base_deferred_with_file_name(
         vhost,
         fs_path,
         url_path,
         req,
         peer,
+        fname,
         &mut config_files,
         &mut config_locations,
         &mut config_conditionals,
@@ -100,10 +125,6 @@ pub fn effective_scope_with_layers(
     // avoids repeated `Path::components` parsing on every request.
     dirs.reverse();
     dirs.dedup();
-    let fname = fs_path
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_default();
     let docroot = cfg.documentation_root_for(vhost);
     // Build the verified stage plan.  One `Walk` step consumes exactly one
     // directory in root-to-leaf order; `access` records whether that
@@ -173,7 +194,7 @@ pub fn effective_scope_with_layers(
                     &docroot,
                     fs_path,
                     url_path,
-                    &fname,
+                    fname,
                     &mut config_conditionals,
                 );
             }
@@ -186,7 +207,7 @@ pub fn effective_scope_with_layers(
                     &docroot,
                     fs_path,
                     url_path,
-                    &fname,
+                    fname,
                     &mut htaccess_conditionals,
                 );
             }
@@ -199,7 +220,7 @@ pub fn effective_scope_with_layers(
                     &docroot,
                     fs_path,
                     url_path,
-                    &fname,
+                    fname,
                     &mut config_conditionals,
                 );
             }
@@ -407,6 +428,46 @@ mod tests {
                 crate::verified::AccessStep::ConfigConditions,
                 crate::verified::AccessStep::AccessConditions,
             ]
+        );
+    }
+
+    #[test]
+    fn lexical_file_name_changes_handler_scope_without_replacing_canonical_access() {
+        let cfg = load(
+            "p13-lexical-handler",
+            concat!(
+                "Listen 127.0.0.1:0\n",
+                "<Directory /srv/secret>\n",
+                "<Files \"run.cgi\">\n",
+                "SetHandler cgi-script\n",
+                "Require all denied\n",
+                "</Files>\n",
+                "</Directory>\n",
+            ),
+        );
+        let req = request();
+        let peer = "127.0.0.1".parse().unwrap();
+        let canonical = Path::new("/srv/secret/run.cgi");
+        let (canonical_scope, _, _) =
+            effective_scope_with_layers(&cfg, None, canonical, "/public/link.txt", &req, peer, &[]);
+        let (lexical_handler_scope, _, _) = effective_scope_with_layers_and_file_name(
+            &cfg,
+            None,
+            canonical,
+            "/public/link.txt",
+            &req,
+            peer,
+            &[],
+            "link.txt",
+        );
+        assert_eq!(
+            crate::config::effective_handler(&canonical_scope, b"link.txt"),
+            Some("cgi-script")
+        );
+        assert!(format!("{:?}", canonical_scope.authorization.requires).contains("AllDenied"));
+        assert_eq!(
+            crate::config::effective_handler(&lexical_handler_scope, b"link.txt"),
+            None
         );
     }
 }
