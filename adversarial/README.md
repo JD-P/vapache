@@ -16,6 +16,7 @@ prevents re-deriving them from scratch.
 | `findings_p12.md` | Pass 12 write-ups (P12-A–P12-F): trailing-slash `ProxyPass` auth bypass/local RCE, dotless-basename CGI execution, ScriptAlias PATH_INFO gate bypass, HTTP/2 body-window stall, plus secondary findings |
 | `findings_p13.md` | Pass 13 write-ups (P13-A–P13-C): F69 closure incomplete — FastCGI and CGI `PATH_INFO` still classify by the canonical symlink-target basename, and a canonical `<Files>`/`<FilesMatch>` `SetHandler` force overrides the lexical name; PHP RCE and `execve` of `<Location>`-denied CGIs through a symlink |
 | `findings_p14.md` | Pass 14 write-ups (P14-A–P14-E): `<Files>`/`<FilesMatch>` phase order lets an ancestor `.htaccess` override a deeper config section (RCE/auth bypass), `[P]` authority guard misses `\1`/`%1` (SSRF), `Require expr` file tests fall back to `/` without `DocumentRoot`, duplicate field lines defeat header guards, and `[C]` chain breaks skip one rule instead of the chain |
+| `findings_p15.md` | Pass 15 write-ups (P15-A/P15-B/P15-C): FastCGI `PATH_INFO` rebinds `SCRIPT_FILENAME` to the canonical symlink target (PHP-FPM's `security.limit_extensions` gate and `<Location>` guards bypassed, Apache 403 vs vapache PHP RCE); `RemoteIPTrustedProxy`/`RemoteIPInternalProxy` share one list with no private-address rule (private `X-Forwarded-For` rewrite spoofs `REMOTE_ADDR`, Apache 403 vs vapache 200); and expression regexes skip load-time dialect validation, so PCRE-only `<If>`/`Require (not) expr`/`RewriteCond expr` guards silently become inert (protected CGI executed, Apache 403 vs vapache 200) |
 | `p11/exploit_p11.py` | Pass-11 differential exploit battery: 13 micro-apps run against Apache 2.4.69 and vapached, one per finding row |
 | `p11/case01-F61-A` … `case13-F61-C` | Captured case dossiers (rendered `apache.conf` / `vp.conf`, fixture tree, server logs, `ap.strace`) |
 | `p11/f70_accessfilename.py` | F70 probe (dead finding: Apache rejects the configuration) |
@@ -121,3 +122,54 @@ skip the whole chain (Apache 404 vs vapache 200 privileged `[PT]` rewrite).
 The Apache oracle runs `-X` on sibling loopback ports with a separate pid file
 for each server.  Fixtures are built under `/tmp/opencode/p14-harness` unless
 `--keep` is given.
+
+## Running the pass-15 battery
+
+```sh
+cargo build --release -p vapached
+python3 adversarial/p15/exploit_p15.py                    # all groups A1-A4 + B1-B2 + C1 (37 verdicts)
+python3 adversarial/p15/exploit_p15.py A1 A3              # FastCGI symlink groups
+python3 adversarial/p15/exploit_p15.py B1 B2              # RemoteIP groups (no PHP-FPM needed)
+python3 adversarial/p15/exploit_p15.py C1                 # expression dialect group
+python3 adversarial/p15/exploit_p15.py --keep --show-fpm-log
+```
+
+Pass-15 case **P15-A** — the project's own benchmark FastCGI spelling
+(`ProxyPassMatch ^/(.*\.php(/.*)?)$ "unix:…|fcgi://localhost<docroot>/"`) with
+an in-root symlink whose lexical name is not `.php`
+(`pub/link.txt -> ../secret/app.php`).  Apache forwards the lexical path to
+PHP-FPM, whose `security.limit_extensions` gate refuses the `.txt` split
+script (`403 Access denied.`); vapache resolves the symlink, sends the
+canonical `.php` path as `SCRIPT_FILENAME`, and PHP-FPM executes it (`200
+PHPEXEC … uid=33`).  **A2** adds a live `<Location "/secret/"> Require all
+denied` guard (direct URL 403 on both, symlink route still executes on
+vapache); **A3** points the symlink at an uploaded `.php` inside a
+`<Location "/uploads/">`-denied tree and executes attacker content; **A4** is
+the `<Directory>` control (guard binds on vapache, fail-closed).
+
+Pass-15 case **P15-B** — `mod_remoteip` chain semantics.  **B1**
+(`RemoteIPTrustedProxy 127.0.0.1` + `<Directory> Require ip 10.1.2.3`) shows
+the same request granting on vapache and denying on Apache for
+`X-Forwarded-For: 10.1.2.3` (and for private values after a public entry, as
+IPv4-mapped, or before a trailing empty entry): Apache keeps the real peer
+and refuses the private presented address, vapache rewrites `REMOTE_ADDR` to
+the attacker-supplied value.  **B2** (`RemoteIPInternalProxy`) is the control
+that flips both servers to `200`, isolating the missing internal/trusted
+distinction plus Apache's private-address rejection.  A CGI oracle prints
+`REMOTE_ADDR` on both sides.
+
+Pass-15 case **P15-C** — expression-regex dialect (single group **C1**).
+`<If "/…/ =~ /PATTERN/"> Require all denied </If>`, an `<Else>` inversion, a
+`<RequireAll>` `Require not expr` deny-list and a `RewriteCond expr` `[F]`
+guard are each wrapped around a `.txt` and an executable `.cgi`, with a
+plain-pattern control.  Apache evaluates the PCRE patterns
+(`\Qsecret\E`, `secret\.txt\Z`, `sec(?#match)ret`, `\Ksecret`,
+`(se)cret\1`) and denies/executes accordingly; vapache's lazy regex compile
+errors, the error is swallowed as `false`, and the guards disappear
+(protected file read, protected CGI `EXEC`, rewrite deny skipped).  The
+control denies on both.
+
+`--show-fpm-log` prints PHP-FPM's access log with the Apache/vapache
+`SCRIPT_FILENAME` lines paired.  Fixtures and a private PHP-FPM pool are built
+under `/tmp/opencode/p15-harness` unless `--keep` is given.
+
