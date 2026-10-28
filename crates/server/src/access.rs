@@ -261,6 +261,9 @@ pub fn check(
     url_path: &str,
     fs_path: Option<&Path>,
 ) -> Access {
+    if scope.conditional_error {
+        return Access::Misconfigured;
+    }
     if !vapache_verified::authz_configuration_admit(
         scope.authorization.auth_type.is_some(),
         scope.authorization.requires.is_some(),
@@ -582,8 +585,13 @@ fn eval_require(
             // evaluator.
             let mut ctx =
                 crate::expr::Context::new(req, env, peer, docroot, url_path).with_fs_path(fs_path);
-            let hit = expr.eval(&mut ctx).map(|v| v.truthy()).unwrap_or(false);
-            decide(hit, *negate)
+            match expr.eval(&mut ctx) {
+                Ok(value) => decide(value.truthy(), *negate),
+                // An engine/context error is a deny, not a boolean false:
+                // `Require not expr` must never grant because evaluation
+                // failed (P15-C).
+                Err(_) => PolicyResult::Denied,
+            }
         }
         Require::Unsupported(_) => PolicyResult::Denied,
     }
@@ -863,6 +871,20 @@ mod tests {
             ),
             Access::Allowed
         );
+
+        scope.conditional_error = true;
+        assert_eq!(
+            check(
+                &scope,
+                &req("GET"),
+                "127.0.0.1".parse().unwrap(),
+                None,
+                "/x",
+                None,
+            ),
+            Access::Misconfigured
+        );
+        scope.conditional_error = false;
 
         scope.authorization.auth_type = Some("Basic".into());
         assert_eq!(

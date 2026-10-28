@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-10-28",
   "verus": {
-    "verified_functions": 422,
+    "verified_functions": 433,
     "errors": 0
   },
   "obligations": [
@@ -32,7 +32,7 @@
       "title": "Require/PolicyResult semantics",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "PolicyResult combinators and require_none are verified; expression integer/string comparison and glob matching now run through verified kernels (expr_compare_ints, expr_compare_strs, expr_glob_match); provider/auth backends and regex/file/IP leaf semantics remain outside the model"
+      "evidence": "PolicyResult combinators and require_none are verified; expression integer/string comparison and glob matching run through verified kernels (expr_compare_ints, expr_compare_strs, expr_glob_match). P15 expression regexes compile as PCRE2 at configuration load, and expr_regex_result proves an evaluation error cannot grant even through negation; provider/auth backends and PCRE2's internal matching semantics remain outside the model."
     },
     {
       "id": "require_none_never_grants",
@@ -60,7 +60,7 @@
       "title": "ACL reachability and resource binding",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "I1a exact ResourceKey grants and I1b inode/backend/policy binding feed the executable TransformCapability state. Every protected file, directory, CGI, FastCGI, proxy, WebSocket and cache sink calls AccessGrant::require_sink, which combines exact resource equality with the verified sink-specific admission predicate. I31 opens and reauthorizes CGI and FastCGI scripts before binding the selected inode; FastCGI additionally binds transport/script/PATH_INFO. Authorization providers and request-plan refinement remain outside this obligation."
+      "evidence": "I1a exact ResourceKey grants and I1b inode/backend/policy binding feed the executable TransformCapability state. Every protected file, directory, CGI, FastCGI, proxy, WebSocket and cache sink calls AccessGrant::require_sink, which combines exact resource equality with the verified sink-specific admission predicate. I31 opens and reauthorizes CGI and FastCGI scripts before binding the selected inode; P15 FastCGI additionally binds transport, lexical SCRIPT_FILENAME, authorized canonical path and PATH_INFO, with fastcgi_script_identity_admit proving that neither script identity can be omitted. Authorization providers and request-plan refinement remain outside this obligation."
     },
     {
       "id": "mapping_order",
@@ -81,7 +81,7 @@
       "title": "Scheme, peer, canonical name and identity have trusted sources",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "HTTPS/REQUEST_SCHEME come from listener TLS state, RemoteIP only trusts configured internal proxies, UseCanonicalName uses ServerName, and identity comes from verified authenticators; context-construction refinement is not mechanized"
+      "evidence": "HTTPS/REQUEST_SCHEME come from listener TLS state, UseCanonicalName uses ServerName, and identity comes from verified authenticators. RemoteIP retains Apache's internal/trusted proxy classes; remoteip_next_internal and remoteip_candidate_admit mechanize the one-way class transition and rejection of private values presented by an external chain. The parser/walk projection and broader context-construction refinement remain partial."
     },
     {
       "id": "resource_bounds",
@@ -468,7 +468,7 @@
     "unverified_security_components": [],
     "partially_bound_sinks": [],
     "assumptions": [
-      "regex engine implements the stated language",
+      "PCRE2 implements the Apache expression-regex subset exercised by the differential gate",
       "an external FastCGI backend opens SCRIPT_FILENAME after vapache's final descriptor/inode check; pathname stability beyond that protocol boundary is a backend contract",
       "h2 wire framing, TLS client-certificate chain validation, and CGI/proxy protocol details are outside the model",
       "configuration tokenization and directive/pattern payloads refine the executable kind/phase model",
@@ -494,7 +494,7 @@
   },
   "adversarial": {
     "conformance": 165,
-    "semantics": 206,
+    "semantics": 212,
     "random": 300,
     "cve_replay_cases": 29,
     "unexplained_replay_failures": 0,
@@ -510,7 +510,7 @@
     "virtual-host exact/wildcard host matching (host_pattern_matches)",
     "virtual-host first-match selection (first_true_index)",
     "IPv4/IPv6 network membership (ipv4_in_net/ipv6_in_net)",
-    "RemoteIP forwarded-trust selection (first_untrusted_index)",
+    "RemoteIP internal/trusted proxy transition and external-private candidate admission",
     "presence-preserving child-wins merge for optional security fields (option_child_presence)",
     "container-field merge model (append prefix/map child-wins)",
     "debug-build runtime audit of Scope container-field merge against the container model",
@@ -528,8 +528,9 @@
     "Scope append-only container/list merge and reverse child-wins map lookup",
     "Rewrite target external/internal classification, internal joining and same-host authority identity",
     "Component-aware filesystem containment for alias, rewrite and FastCGI targets (path_under_base)",
-    "Expression value truthiness, integer/string comparison and glob matching, plus rewrite condition-chain folding",
-    "Regex dialect admission guard for configuration and expression patterns",
+    "FastCGI lexical/canonical dual script identity admission",
+    "Expression value truthiness, integer/string comparison, glob matching and fail-closed regex results, plus rewrite condition-chain folding",
+    "PCRE2 configuration-load admission for expression patterns",
     "Directive disposition and fail-closed security fallback",
     "Shared request-to-target mapping for dispatch and cache authorization",
     "Ordered alias/redirect/proxy route tables and handler operation ordering",

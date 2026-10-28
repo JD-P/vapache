@@ -654,6 +654,7 @@ fn rewrite_map_material(map: &crate::config::RewriteMap) -> String {
 /// `HashMap`, so their entries are canonicalized before hashing.
 fn cache_policy_material(scope: &Scope) -> String {
     let Scope {
+        conditional_error,
         options,
         override_policy,
         authorization,
@@ -683,7 +684,7 @@ fn cache_policy_material(scope: &Scope) -> String {
         .collect();
     rewrite_maps.sort();
     format!(
-        "{options:?}|{override_policy:?}|{authorization:?}|{header_policy:?}|\
+        "{conditional_error:?}|{options:?}|{override_policy:?}|{authorization:?}|{header_policy:?}|\
          {content_policy:?}|{mapping_policy:?}|{error_policy:?}|\
          {environment_policy:?}|{compression_policy:?}|{proxy_policy:?}|\
          {rewrite_engine:?}|{}|{cache_enable:?}|{cache_disable:?}|\

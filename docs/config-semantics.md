@@ -964,8 +964,11 @@ actual_target != lexical_target ->
 
 CGI and FastCGI dispatch open the target first, re-authorize its descriptor
 path and bind the sink to its inode before execution or before sending
-`SCRIPT_FILENAME`. FastCGI also binds the exact backend and repeats the
-pathname-to-inode comparison immediately before parameter emission. This
+`SCRIPT_FILENAME`. FastCGI sends the lexical split path as `SCRIPT_FILENAME`
+so PHP-FPM makes the same extension decision it makes behind Apache, while
+binding both that path and the canonical authorized path. It also binds the
+exact backend and repeats the lexical-path-to-inode comparison immediately
+before parameter emission. This
 includes `PATH_INFO`, `SetHandler` and `ProxyPassMatch` routes; a public
 symlink cannot inherit the allowed directory's policy (F41).
 `cgi_actual_target_admit` is the mechanized implication.
@@ -1449,7 +1452,7 @@ The first Verus model should cover:
 
 The following remain assumptions or separate proofs:
 
-- the regex engine implements the stated language;
+- the PCRE2 and Rust regex engines implement their stated language subsets;
 - the filesystem contents match what the access-file walk sees;
 - path canonicalization and `openat` containment (already separately
   verified in `crates/verified`);
@@ -1498,7 +1501,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **422 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **433 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1636,12 +1639,13 @@ construction: there is no second production interleaver.
   mechanize the cache key encoder/refinement, lookup consequences, store
   admission gates, freshness arithmetic and disk projection/eviction steps
   consumed by `cache.rs` (I51, I54).
-- `regex_dialect_admit` / `guard_regex` / `compile_regex`.  Every
-  configuration- and expression-supplied regex is admitted only after the
-  verified dialect guard: backreferences, look-around, other PCRE-only
-  constructs, control bytes and oversized patterns fail closed.  The external
-  regex engine still supplies the matching semantics for the accepted
-  regular subset.
+- `regex_dialect_admit` / `guard_regex` / `compile_regex`. Directive regexes
+  backed by Rust `regex` are admitted only after the verified dialect guard.
+  Expression regexes instead compile as PCRE2 at configuration load so valid
+  Apache constructs retain their meaning; size/control admission remains
+  bounded, and `expr_regex_result` proves that an evaluation error cannot
+  grant even through negation. The external engines still supply matching
+  semantics for their accepted languages.
 - `directive_disposition`.  The configuration fallback uses a verified
   four-way disposition: security-sensitive unhandled directives fail closed;
   in strict mode every unhandled directive (known or unknown) fails; in
@@ -1763,9 +1767,10 @@ construction: there is no second production interleaver.
   rejected at configuration load.
 - `first_true_index`.  Virtual-host candidate selection uses the verified
   first-match policy.
-- `ipv4_in_net` / `ipv6_in_net` and `first_untrusted_index`.  RemoteIP trust
-  chain selection and IP network membership use verified functions.  Literal
-  IP/authority parsing remains an explicit assumption.
+- `ipv4_in_net` / `ipv6_in_net`, `remoteip_next_internal` and
+  `remoteip_candidate_admit`. RemoteIP network membership, the internal/trusted
+  proxy transition and the external-private-address refusal use verified
+  functions. Literal IP/authority parsing remains an explicit assumption.
 
 `crates/server/src/access.rs` also exposes an `AccessGrant` capability with a
 concrete `ResourceKey` (vhost, method, URL, filesystem path, proxy target,
@@ -1891,8 +1896,8 @@ The current ledger (2026-10-28) is:
 - sinks: **8/8** grant-required, **8/8** path/target-bound, **5/8**
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
-  not yet systematic; the separate finding-replay suite covers F23–F38);
-- Verus: **422 functions, 0 errors**, with no `assume` or `external_body`
+  not yet systematic; the separate finding-replay suite covers F23–P15);
+- Verus: **433 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

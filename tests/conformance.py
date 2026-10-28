@@ -2744,7 +2744,7 @@ class TlsTests(unittest.TestCase):
     def curl(self, port, path, *extra):
         proc = subprocess.run(
             [
-                "curl", "--silent", "--show-error", "--insecure",
+                "curl", "--silent", "--show-error", "--insecure", "--noproxy", "*",
                 "--output", "-", "--write-out", "\n%{http_version} %{http_code}",
                 *extra, f"https://127.0.0.1:{port}{path}",
             ],
@@ -2776,7 +2776,7 @@ class TlsTests(unittest.TestCase):
     def test_tls_sni_vhost(self):
         proc = subprocess.run(
             [
-                "curl", "--silent", "--show-error", "--insecure",
+                "curl", "--silent", "--show-error", "--insecure", "--noproxy", "*",
                 "--http2", "--resolve", f"vhost.test:{VP_TLS_PORT}:127.0.0.1",
                 "--output", "-", "--write-out", "\n%{http_version} %{http_code}",
                 f"https://vhost.test:{VP_TLS_PORT}/",

@@ -66,6 +66,7 @@ APACHE_MODULES = [
     "authz_user_module",
     "authz_groupfile_module",
     "rewrite_module",
+    "remoteip_module",
 ]
 
 
@@ -164,6 +165,8 @@ def base_config(port: int, apache: bool) -> str:
         "    AllowOverride None",
         "    Require all granted",
         "</Directory>",
+        "RemoteIPHeader X-Forwarded-For",
+        "RemoteIPTrustedProxy 127.0.0.1",
     ]
     for case in CASES:
         lines.append(f"# case: {case['name']}")
@@ -2057,6 +2060,74 @@ CASES = [
         "requests": [("GET", "/if_else/file.txt", None, {})],
     },
 ]
+
+# P15-C: these are all valid Apache PCRE patterns. The access-control parity
+# suite treats Apache as the executable oracle, so a future regex-engine or
+# expression-parser change cannot silently erase the guard again.
+for suffix, pattern, filename in [
+    ("q", r"\Qsecret\E", "secret.txt"),
+    ("z", r"secret\.txt\Z", "secret.txt"),
+    ("comment", r"sec(?#match)ret", "secret.txt"),
+    ("k", r"\Ksecret", "secret.txt"),
+    ("backref", r"(se)cret\1", "secretse.txt"),
+]:
+    name = f"p15-expr-pcre-{suffix}"
+    CASES.append(
+        {
+            "name": name,
+            "dir": name.replace("-", "_"),
+            "files": {filename: "protected\n"},
+            "config": [
+                f'<Directory "{{dir}}">',
+                f'    <If "%{{REQUEST_URI}} =~ /{pattern}/">',
+                "        Require all denied",
+                "    </If>",
+                "</Directory>",
+            ],
+            "requests": [
+                ("GET", f"/{name.replace('-', '_')}/{filename}", None, {})
+            ],
+        }
+    )
+
+CASES.append(
+    {
+        "name": "p15-remoteip-trusted-private",
+        "dir": "p15_remoteip_trusted_private",
+        "files": {"secret.txt": "protected\n"},
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    Require ip 10.1.2.3",
+            "</Directory>",
+        ],
+        "requests": [
+            (
+                "GET",
+                "/p15_remoteip_trusted_private/secret.txt",
+                {"X-Forwarded-For": "10.1.2.3"},
+                {},
+            ),
+            (
+                "GET",
+                "/p15_remoteip_trusted_private/secret.txt",
+                {"X-Forwarded-For": "8.8.8.8, 10.1.2.3"},
+                {},
+            ),
+            (
+                "GET",
+                "/p15_remoteip_trusted_private/secret.txt",
+                {"X-Forwarded-For": "::ffff:10.1.2.3"},
+                {},
+            ),
+            (
+                "GET",
+                "/p15_remoteip_trusted_private/secret.txt",
+                {"X-Forwarded-For": "10.1.2.3,"},
+                {},
+            ),
+        ],
+    }
+)
 
 
 def generated_cases():

@@ -59,15 +59,19 @@ pub struct Target {
 }
 
 impl Target {
-    /// Exact FastCGI transport/script identity used for resource binding.
-    pub(crate) fn binding_key(&self) -> String {
+    /// Exact FastCGI transport plus both script identities used for resource
+    /// binding. `script_filename` is the lexical Apache-compatible value sent
+    /// to the backend; `authorized_path` is the canonical opened object whose
+    /// inode and policy were authorized (P15-A).
+    pub(crate) fn binding_key(&self, authorized_path: &Path) -> String {
         let transport = match &self.backend.transport {
             Transport::Unix(path) => format!("unix:{}", path.display()),
             Transport::Tcp(host, port) => format!("tcp:{host}:{port}"),
         };
         format!(
-            "{transport}|{}|{}|{}",
+            "{transport}|lexical={}|authorized={}|{}|{}",
             self.script_filename.display(),
+            authorized_path.display(),
             self.script_name,
             self.path_info
         )
@@ -737,9 +741,15 @@ fn retain_script_path_binding(target: &Target, binding: &ScriptBinding) -> io::R
         selected.dev() == binding.meta.dev() && selected.ino() == binding.meta.ino();
     let same_path =
         current_meta.dev() == binding.meta.dev() && current_meta.ino() == binding.meta.ino();
-    if !vapache_verified::descriptor_snapshot_admit(
+    let lexical_inode_bound = vapache_verified::descriptor_snapshot_admit(
         selected.is_file() && current_meta.is_file(),
         same_selected && same_path,
+        true,
+        true,
+    );
+    if !vapache_verified::fastcgi_script_identity_admit(
+        selected.dev() == binding.meta.dev() && selected.ino() == binding.meta.ino(),
+        lexical_inode_bound,
         true,
         true,
     ) {
@@ -1229,7 +1239,9 @@ mod tests {
             route_order: 0,
             logical_url: None,
         };
-        assert!(unix_target.binding_key().starts_with("unix:/tmp/php.sock|"));
+        let key = unix_target.binding_key(Path::new("/srv/real/index.php"));
+        assert!(key.starts_with("unix:/tmp/php.sock|"));
+        assert!(key.contains("lexical=/srv/index.php|authorized=/srv/real/index.php"));
         let tcp_target = Target {
             backend: tcp_path,
             script_filename: PathBuf::from("/srv/index.php"),
@@ -1238,7 +1250,9 @@ mod tests {
             route_order: 0,
             logical_url: None,
         };
-        assert!(tcp_target.binding_key().starts_with("tcp:localhost:9001|"));
+        assert!(tcp_target
+            .binding_key(Path::new("/srv/index.php"))
+            .starts_with("tcp:localhost:9001|"));
     }
 
     #[test]

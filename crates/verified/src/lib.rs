@@ -1040,6 +1040,56 @@ pub enum TransformSink {
     Cache,
 }
 
+/// P15-A: a FastCGI request has two deliberately separate path identities.
+/// The canonical descriptor target is the authorization object, while the
+/// lexical split prefix is the Apache-compatible `SCRIPT_FILENAME` presented
+/// to the backend. Admission requires the lexical path to still resolve to
+/// the authorized inode immediately before it is sent.
+pub open spec fn fastcgi_script_identity_admit_spec(
+    canonical_authorized: bool,
+    lexical_inode_bound: bool,
+    forwards_lexical: bool,
+    backend_binds_both: bool,
+) -> bool {
+    canonical_authorized && lexical_inode_bound && forwards_lexical && backend_binds_both
+}
+
+pub fn fastcgi_script_identity_admit(
+    canonical_authorized: bool,
+    lexical_inode_bound: bool,
+    forwards_lexical: bool,
+    backend_binds_both: bool,
+) -> (admit: bool)
+    ensures admit == fastcgi_script_identity_admit_spec(
+        canonical_authorized,
+        lexical_inode_bound,
+        forwards_lexical,
+        backend_binds_both,
+    )
+{
+    canonical_authorized && lexical_inode_bound && forwards_lexical && backend_binds_both
+}
+
+pub proof fn fastcgi_identity_admission_requires_backend_parity(
+    canonical_authorized: bool,
+    lexical_inode_bound: bool,
+    forwards_lexical: bool,
+    backend_binds_both: bool,
+)
+    requires fastcgi_script_identity_admit_spec(
+        canonical_authorized,
+        lexical_inode_bound,
+        forwards_lexical,
+        backend_binds_both,
+    )
+    ensures
+        canonical_authorized,
+        lexical_inode_bound,
+        forwards_lexical,
+        backend_binds_both,
+{
+}
+
 pub open spec fn transform_retarget_spec() -> TransformCapability {
     TransformCapability {
         target_bound: false,
@@ -5040,6 +5090,45 @@ pub fn regex_dialect_admit(pattern: &[u8]) -> (admit: bool)
     true
 }
 
+/// P15-C: request-time regex failures are not boolean non-matches. Keeping
+/// the error as `None` prevents negation (`!~` / `Require not expr`) from
+/// turning an engine failure into an authorization success.
+pub open spec fn expr_regex_result_spec(
+    eval_ok: bool,
+    matched: bool,
+    negate: bool,
+) -> Option<bool> {
+    if eval_ok {
+        Some(matched != negate)
+    } else {
+        None
+    }
+}
+
+pub fn expr_regex_result(
+    eval_ok: bool,
+    matched: bool,
+    negate: bool,
+) -> (result: Option<bool>)
+    ensures result == expr_regex_result_spec(eval_ok, matched, negate)
+{
+    if eval_ok {
+        Some(matched != negate)
+    } else {
+        None
+    }
+}
+
+pub proof fn expr_regex_error_never_grants(matched: bool, negate: bool)
+    ensures expr_regex_result_spec(false, matched, negate) != Some(true)
+{
+}
+
+pub proof fn expr_regex_success_is_exact(matched: bool, negate: bool)
+    ensures expr_regex_result_spec(true, matched, negate) == Some(matched != negate)
+{
+}
+
 /// A configured/rewrite environment entry may pass only when its name is a
 /// valid non-reserved environment key.  Calculated CGI variables and `HTTP_*`
 /// request-derived variables are classified by the caller and cannot be
@@ -6498,6 +6587,104 @@ pub fn first_untrusted_index(flags: &[bool]) -> (out: Option<usize>)
             }
         }
     }
+}
+
+
+/// Apache `mod_remoteip` distinguishes proxies that may present private
+/// addresses from external trusted proxies. An untrusted current presenter
+/// terminates the right-to-left walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteIpProxyClass {
+    Untrusted,
+    Trusted,
+    Internal,
+}
+
+pub open spec fn remoteip_next_internal_spec(
+    chain_internal: bool,
+    presenter: RemoteIpProxyClass,
+) -> bool {
+    match presenter {
+        RemoteIpProxyClass::Internal => chain_internal,
+        RemoteIpProxyClass::Trusted | RemoteIpProxyClass::Untrusted => false,
+    }
+}
+
+pub fn remoteip_next_internal(
+    chain_internal: bool,
+    presenter: RemoteIpProxyClass,
+) -> (next_internal: bool)
+    ensures next_internal == remoteip_next_internal_spec(chain_internal, presenter)
+{
+    match presenter {
+        RemoteIpProxyClass::Internal => chain_internal,
+        RemoteIpProxyClass::Trusted | RemoteIpProxyClass::Untrusted => false,
+    }
+}
+
+pub open spec fn remoteip_candidate_admit_spec(
+    presenter: RemoteIpProxyClass,
+    next_internal: bool,
+    candidate_valid: bool,
+    candidate_public: bool,
+) -> bool {
+    match presenter {
+        RemoteIpProxyClass::Untrusted => false,
+        RemoteIpProxyClass::Trusted | RemoteIpProxyClass::Internal => {
+            candidate_valid && (next_internal || candidate_public)
+        }
+    }
+}
+
+pub fn remoteip_candidate_admit(
+    presenter: RemoteIpProxyClass,
+    next_internal: bool,
+    candidate_valid: bool,
+    candidate_public: bool,
+) -> (admit: bool)
+    ensures admit == remoteip_candidate_admit_spec(
+        presenter,
+        next_internal,
+        candidate_valid,
+        candidate_public,
+    )
+{
+    match presenter {
+        RemoteIpProxyClass::Untrusted => false,
+        RemoteIpProxyClass::Trusted | RemoteIpProxyClass::Internal => {
+            candidate_valid && (next_internal || candidate_public)
+        }
+    }
+}
+
+pub proof fn remoteip_external_chain_is_monotonic(presenter: RemoteIpProxyClass)
+    ensures !remoteip_next_internal_spec(false, presenter)
+{
+}
+
+pub proof fn remoteip_trusted_proxy_rejects_private_candidate(candidate_valid: bool)
+    ensures !remoteip_candidate_admit_spec(
+        RemoteIpProxyClass::Trusted,
+        remoteip_next_internal_spec(true, RemoteIpProxyClass::Trusted),
+        candidate_valid,
+        false,
+    )
+{
+}
+
+pub proof fn remoteip_accepted_private_candidate_requires_internal_chain(
+    presenter: RemoteIpProxyClass,
+    next_internal: bool,
+    candidate_valid: bool,
+)
+    requires remoteip_candidate_admit_spec(
+        presenter,
+        next_internal,
+        candidate_valid,
+        false,
+    )
+    ensures next_internal
+{
 }
 
 

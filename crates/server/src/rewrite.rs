@@ -816,7 +816,10 @@ fn conditions_match(
                 } else {
                     Some(Path::new(path))
                 });
-            let r = expr.eval(&mut ectx).map(|v| v.truthy()).unwrap_or(false);
+            let r = expr
+                .eval(&mut ectx)
+                .map(|value| value.truthy())
+                .map_err(|error| format!("RewriteCond expr failed closed: {error}"))?;
             matches.push(r);
             ors.push(cond.flags.or);
             continue;

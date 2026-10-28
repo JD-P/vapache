@@ -5,9 +5,54 @@
 //! filesystem root.  Unsupported syntax is a parse error (config fails closed).
 
 use crate::http::Request;
-use regex::Regex;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
+
+/// A PCRE2 expression compiled while the configuration is parsed.  Apache's
+/// `ap_expr` uses PCRE; retaining only Rust `regex` syntax made valid Apache
+/// guards disappear at request time when constructs such as `\Q...\E`, `\Z`,
+/// `\K`, comments or backreferences were encountered (P15-C).
+#[derive(Clone)]
+pub struct ExprRegex {
+    pattern: String,
+    nocase: bool,
+    compiled: pcre2::bytes::Regex,
+}
+
+impl std::fmt::Debug for ExprRegex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExprRegex")
+            .field("pattern", &self.pattern)
+            .field("nocase", &self.nocase)
+            .finish()
+    }
+}
+
+impl ExprRegex {
+    fn compile(pattern: String, nocase: bool) -> Result<Self, String> {
+        // Keep the same verified resource ceiling used by the other regex
+        // surfaces, but deliberately do not apply the Rust-regex dialect
+        // filter: this surface is backed by the same PCRE family as Apache.
+        if pattern.len() > 65_536
+            || pattern
+                .as_bytes()
+                .iter()
+                .any(|byte| *byte < 0x20 || *byte == 0x7f)
+        {
+            return Err("bad expression regex: pattern is too large or contains controls".into());
+        }
+        let mut builder = pcre2::bytes::RegexBuilder::new();
+        builder.caseless(nocase).jit_if_available(true);
+        let compiled = builder
+            .build(&pattern)
+            .map_err(|error| format!("bad expression regex: {error}"))?;
+        Ok(Self {
+            pattern,
+            nocase,
+            compiled,
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -22,7 +67,7 @@ pub enum Expr {
     And(Vec<Expr>),
     Or(Vec<Expr>),
     Compare(Box<Expr>, String, Box<Expr>),
-    Regex(Box<Expr>, String, bool, bool),
+    Regex(Box<Expr>, ExprRegex, bool),
     In(Box<Expr>, Vec<Expr>),
     FileTest(String, Box<Expr>),
     /// `<IfFile path>` from the main configuration.  Unlike per-directory
@@ -442,7 +487,7 @@ pub fn validate_vars(expr: &Expr) -> Result<(), String> {
                 walk(l)?;
                 walk(r)
             }
-            Expr::Regex(l, _, _, _) => walk(l),
+            Expr::Regex(l, _, _) => walk(l),
             Expr::In(l, list) => {
                 walk(l)?;
                 for item in list {
@@ -652,25 +697,33 @@ impl Expr {
                 Value::Bool(false)
             }
             Expr::Compare(l, op, r) => Value::Bool(cmp(&l.eval(ctx)?, op, &r.eval(ctx)?)),
-            Expr::Regex(l, pattern, nocase, negate) => {
+            Expr::Regex(l, regex, negate) => {
                 let text = l.eval(ctx)?.string();
-                if !vapache_verified::regex_dialect_admit(pattern.as_bytes()) {
-                    return Err("unsupported expression regex dialect".into());
-                }
-                let re = regex::RegexBuilder::new(pattern)
-                    .case_insensitive(*nocase)
-                    .build()
-                    .map_err(|e| format!("bad expression regex: {e}"))?;
-                let caps = re.captures(&text);
+                let (caps, eval_error) = match regex.compiled.captures(text.as_bytes()) {
+                    Ok(captures) => (captures, None),
+                    Err(error) => (None, Some(error.to_string())),
+                };
                 let matched = caps.is_some();
+                let result =
+                    vapache_verified::expr_regex_result(eval_error.is_none(), matched, *negate)
+                        .ok_or_else(|| {
+                            format!(
+                                "expression regex evaluation failed: {}",
+                                eval_error.as_deref().unwrap_or("unknown PCRE2 error")
+                            )
+                        })?;
                 ctx.captures = caps
                     .map(|c| {
-                        (0..c.len())
-                            .map(|i| c.get(i).map(|m| m.as_str().to_string()).unwrap_or_default())
+                        (0..regex.compiled.captures_len())
+                            .map(|i| {
+                                c.get(i)
+                                    .map(|m| String::from_utf8_lossy(m.as_bytes()).into_owned())
+                                    .unwrap_or_default()
+                            })
                             .collect()
                     })
                     .unwrap_or_default();
-                Value::Bool(matched != *negate)
+                Value::Bool(result)
             }
             Expr::In(l, list) => {
                 let needle = l.eval(ctx)?.string();
@@ -1163,7 +1216,8 @@ impl<'a> Parser<'a> {
                 if op == "=~" || op == "!~" {
                     self.skip();
                     let (pat, nocase) = self.regex()?;
-                    return Ok(Expr::Regex(Box::new(left), pat, nocase, op == "!~"));
+                    let regex = ExprRegex::compile(pat, nocase)?;
+                    return Ok(Expr::Regex(Box::new(left), regex, op == "!~"));
                 }
                 if op == "-in" {
                     self.skip();
@@ -1576,7 +1630,7 @@ mod tests {
         assert_eq!(eval_result("base64('abc')").unwrap().string(), "YWJj");
         assert_eq!(eval_result("unbase64('YWJj')").unwrap().string(), "abc");
         assert!(eval_result("bogus()").is_err());
-        assert!(eval_result("'a' =~ /(a)\\1/").is_err());
+        assert!(eval_result("'aa' =~ /(a)\\1/").unwrap().truthy());
 
         let r = req();
         let mut c = Context::new(
@@ -1640,8 +1694,35 @@ mod tests {
         assert!(parse("x =~  ").is_err());
         // The delimiter still works normally at every position.
         assert!(eval("'abc' =~ /bc/"));
-        // The unsupported-dialect case must stay a (parse-shaped) error.
-        assert!(eval_result("'a' =~ /(a)\\1/").is_err());
+        // Apache-compatible PCRE backreferences compile and evaluate.
+        assert!(eval_result("'aa' =~ /(a)\\1/").unwrap().truthy());
+    }
+
+    #[test]
+    fn apache_pcre_guard_constructs_are_compiled_at_load_time() {
+        for expression in [
+            r"'secret' =~ /\Qsecret\E/",
+            r"'secret.txt' =~ /secret\.txt\Z/",
+            r"'secret' =~ /sec(?#match)ret/",
+            r"'secret' =~ /\Ksecret/",
+            r"'secretse' =~ /(se)cret\1/",
+        ] {
+            assert!(eval_result(expression).unwrap().truthy(), "{expression}");
+        }
+        assert!(eval_result(r"'public' !~ /\Qprivate\E/").unwrap().truthy());
+        // Compilation occurs in Parser::compare, so an invalid PCRE pattern
+        // is a configuration/load error rather than a request-time branch.
+        assert!(parse(r"'secret' =~ /(?unterminated/").is_err());
+
+        let regex = ExprRegex::compile("secret".into(), true).unwrap();
+        let debug = format!("{regex:?}");
+        assert!(debug.contains("secret") && debug.contains("true"));
+        assert!(ExprRegex::compile("\n".into(), false).is_err());
+        assert!(ExprRegex::compile("x".repeat(65_537), false).is_err());
+        assert!(
+            eval_result(r"'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaX' =~ /(*LIMIT_MATCH=1)(a+)+$/")
+                .is_err()
+        );
     }
 
     #[test]
@@ -1804,7 +1885,11 @@ mod pass11_kernel_tests {
             Expr::Not(Box::new(leaf())),
             Expr::Neg(Box::new(leaf())),
             Expr::Compare(Box::new(leaf()), "==".into(), Box::new(leaf())),
-            Expr::Regex(Box::new(leaf()), "x".into(), false, false),
+            Expr::Regex(
+                Box::new(leaf()),
+                ExprRegex::compile("x".into(), false).unwrap(),
+                false,
+            ),
             Expr::In(Box::new(leaf()), vec![leaf()]),
             Expr::FileTest("-f".into(), Box::new(leaf())),
             Expr::StrTest(Box::new(leaf()), true),

@@ -195,8 +195,10 @@ The three handler-identity RCE paths in `adversarial/findings_p13.md` are
 closed by making I70 a pipeline-wide invariant rather than a single direct
 dispatch assertion:
 
-- FastCGI receives the already-bound lexical basename; the canonical opened
-  path is used only for containment, authorization and `SCRIPT_FILENAME`.
+- FastCGI receives the already-bound lexical basename and sends the lexical
+  split path as `SCRIPT_FILENAME`; the canonical opened path is used for
+  containment, authorization and inode binding. P15 strengthened this rule
+  after showing that sending the canonical name bypassed PHP-FPM's own gate.
 - CGI `PATH_INFO` classifies the longest existing lexical prefix, while the
   opened canonical script still supplies the executable inode and access
   identity.
@@ -209,7 +211,7 @@ dispatch assertion:
   five P13 regressions cover FastCGI, PATH_INFO, Files-scoped SetHandler,
   canonical Files denial and live Location controls.
 
-The Verus gate now proves 422 functions with zero errors. The `.htaccess`
+The Verus gate now proves 433 functions with zero errors. The `.htaccess`
 admission seam is also executable proof code: `override_mode_allows` decides
 category bits, while `htaccess_gate_admit` ensures only a known, policy-allowed
 directive or section can reach the effectful parser; `Nonfatal` can only turn a
@@ -247,10 +249,44 @@ The five phase, rewrite, expression and request-head findings in
   `-` and internal substitutions. This also pins `RewriteRule ... - [END]` as
   a final pass.
 
-The Verus gate proves 422 functions with zero errors. Seven P14 replay cases
+The Verus gate proves 433 functions with zero errors. Seven P14 replay cases
 cover the deeper Files deny/auth/handler/Options variants, implicit-DocumentRoot
 file oracles, duplicate-header guards and full rewrite-chain skipping; parser
 and verified-kernel tests cover every dynamic proxy-authority spelling.
+
+## Pass 15 closure
+
+The three component-semantics findings in `adversarial/findings_p15.md` are
+closed as follows:
+
+- FastCGI now keeps two script identities. The lexical `PATH_INFO` split path
+  is sent to the backend as `SCRIPT_FILENAME`, matching Apache and preserving
+  PHP-FPM's `security.limit_extensions` decision. The opened canonical path is
+  retained for containment, authorization and inode binding. A final lexical
+  reopen must still name that inode before parameters are emitted. When the
+  canonical target is under `DocumentRoot`, its canonical URL scope is also
+  authorized, so a symlink cannot bypass a target `<Location>` guard.
+- `RemoteIPTrustedProxy` and `RemoteIPInternalProxy` retain distinct proxy
+  classes. Header processing walks right to left, stops on invalid or empty
+  values, permits the one-way internal-to-external transition, and rejects the
+  private, loopback and link-local address ranges that Apache refuses once the
+  chain is external. IPv4-mapped IPv6 values are canonicalized before this
+  decision. VApache deliberately remains stricter than Apache when no trust
+  list exists: a header alone never authorizes address rewriting.
+- Expression regexes compile as PCRE2 when configuration is loaded. The P15
+  PCRE constructs therefore have Apache-compatible meaning instead of being
+  rejected lazily by a different regex dialect. Any later expression error is
+  a fail-closed result: `Require expr` denies, rewrite evaluation errors stop
+  the rewrite, and conditional configuration records a misconfiguration that
+  cannot silently remove an ACL, handler or Options guard.
+
+The production code consumes Verus kernels for the expression error result,
+RemoteIP proxy transition/candidate admission and dual FastCGI identity. Five
+P15 end-to-end regressions cover the exploit shapes, and the Apache differential
+suite now includes fixed PCRE and RemoteIP cases plus 128 deterministic
+generated ACL cases in the normal coverage gate. The broader parity process and
+the import boundary for a future extracted Apache model are documented in
+`docs/apache-access-parity.md`.
 
 ## Transform-to-sink and filesystem-race closure
 
@@ -308,7 +344,7 @@ The closure is exercised by:
 - `tests/conformance.py`, `tests/config_semantics.py`,
   `tests/config_validity.py` and `tests/config_grammar.py`;
 - `tests/adversarial_regressions.py`, which starts fresh servers and replays
-  the F23–P14 exploit shapes (rewrite-to-proxy/redirect authorization, cache
+  the F23–P15 exploit shapes (rewrite-to-proxy/redirect authorization, cache
   reload plus PATH_INFO, relative and capture-only aliases, autoindex schemes,
   negated/env providers, `IndexIgnore`, `DirectorySlash Off`,
   `UnsafePrefixStat` re-rooting, header-selected cache entries,

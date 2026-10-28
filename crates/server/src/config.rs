@@ -1277,6 +1277,10 @@ pub(crate) fn parse_env_rule(name: &str, args: &[String]) -> Result<EnvRule, Str
 
 #[derive(Debug, Clone)]
 pub struct Scope {
+    /// Set when a request-time conditional cannot be evaluated. Every
+    /// authorization path treats this as a configuration failure, so an
+    /// engine error can never erase a deny/handler restriction (P15-C).
+    pub conditional_error: bool,
     pub options: OptionsPolicy,
     pub override_policy: OverridePolicy,
     pub authorization: AuthorizationPolicy,
@@ -1293,6 +1297,7 @@ pub struct Scope {
 impl Default for Scope {
     fn default() -> Self {
         Scope {
+            conditional_error: false,
             options: OptionsPolicy::default(),
             override_policy: OverridePolicy::default(),
             authorization: AuthorizationPolicy::default(),
@@ -1598,6 +1603,7 @@ impl Scope {
         let audit_parent = self.container_snapshot();
         #[cfg(debug_assertions)]
         let audit_child = child.container_snapshot_with_rewrite(rewrite_rules);
+        self.conditional_error |= child.conditional_error;
         self.content_policy.merge_child(&child.content_policy);
         self.options.merge_child(&child.options);
         self.override_policy.merge_child(&child.override_policy);
@@ -1685,6 +1691,7 @@ impl Scope {
     /// extension, so the original URL's handler map is not the handler map of
     /// the selected target.
     pub fn restrict_policy_with(&mut self, base: &Scope) {
+        self.conditional_error |= base.conditional_error;
         let url_options = base.options.effective_bits(Options::FOLLOW_SYMLINKS);
         let target_options = self.options.effective_bits(Options::FOLLOW_SYMLINKS);
         let conjoined = vapache_verified::options_conjoin(url_options, target_options);
@@ -2124,6 +2131,16 @@ struct CachedPolicy {
     conditionals: Arc<Vec<ScopeRule>>,
 }
 
+/// One `mod_remoteip` trust entry. Apache gives internal proxies permission
+/// to present private addresses; an external trusted proxy may only present a
+/// public address. Keeping the class on each entry is security-significant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteIpProxy {
+    pub network: IpAddr,
+    pub bits: u8,
+    pub internal: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub server_root: PathBuf,
@@ -2167,7 +2184,7 @@ pub struct Config {
     pub balancers: Vec<Balancer>,
     pub health_templates: HashMap<String, HealthTemplate>,
     pub remoteip_header: Option<String>,
-    pub remoteip_internal: Vec<(IpAddr, u8)>,
+    pub remoteip_proxies: Vec<RemoteIpProxy>,
     pub access_file_names: Vec<String>,
     pub directory_index: Vec<String>,
     /// True when any compiled scope enables `AllowOverride All`.  This lets
@@ -2738,7 +2755,7 @@ impl Compile {
             balancers: Vec::new(),
             health_templates: HashMap::new(),
             remoteip_header: None,
-            remoteip_internal: Vec::new(),
+            remoteip_proxies: Vec::new(),
             access_file_names: vec![".htaccess".into()],
             directory_index: vec!["index.html".into()],
             override_enabled: false,
@@ -4760,18 +4777,32 @@ impl Compile {
                 self.cfg.remoteip_header = Some(first());
             }
             "remoteipinternalproxy" | "remoteiptrustedproxy" => {
+                let internal = name == "remoteipinternalproxy";
                 for a in args {
-                    if a.eq_ignore_ascii_case("all") {
-                        self.cfg
-                            .remoteip_internal
-                            .push(("0.0.0.0".parse().unwrap(), 0));
+                    let network = if a.eq_ignore_ascii_case("all") {
+                        Some(("0.0.0.0".parse().unwrap(), 0))
                     } else if let Some(net) = parse_ip_net(a) {
-                        self.cfg.remoteip_internal.push(net);
+                        Some(net)
                     } else {
                         self.errors.push(ConfigError {
                             file: loc.file.clone(),
                             line: loc.line,
-                            msg: format!("bad RemoteIPInternalProxy address '{a}'"),
+                            msg: format!(
+                                "bad {} address '{a}'",
+                                if internal {
+                                    "RemoteIPInternalProxy"
+                                } else {
+                                    "RemoteIPTrustedProxy"
+                                }
+                            ),
+                        });
+                        None
+                    };
+                    if let Some((network, bits)) = network {
+                        self.cfg.remoteip_proxies.push(RemoteIpProxy {
+                            network,
+                            bits,
+                            internal,
                         });
                     }
                 }
@@ -5388,7 +5419,54 @@ fn clean_path(p: &Path) -> PathBuf {
 /// `fs_path` is the filesystem path mapped for the request when one exists;
 /// it binds `%{REQUEST_FILENAME}`/`%{SCRIPT_FILENAME}` (F63/I63).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn rule_condition_matches(
+pub(crate) fn rule_condition_result(
+    rule: &ScopeRule,
+    req: &crate::http::Request,
+    env: &[(String, String)],
+    peer: IpAddr,
+    docroot: &Path,
+    url_path: &str,
+    fs_path: Option<&Path>,
+    chain_state: &mut HashMap<usize, bool>,
+) -> Result<bool, String> {
+    let eval = |expr: &crate::expr::Expr| {
+        let mut ctx =
+            crate::expr::Context::new(req, env, peer, docroot, url_path).with_fs_path(fs_path);
+        expr.eval(&mut ctx).map(|v| v.truthy())
+    };
+    match rule.branch {
+        ConditionBranch::Normal => match &rule.condition {
+            None => Ok(true),
+            Some(expr) => {
+                let matched = eval(expr)?;
+                if let Some(chain) = rule.chain {
+                    chain_state.insert(chain, matched);
+                }
+                Ok(matched)
+            }
+        },
+        ConditionBranch::ElseIf => {
+            let (Some(chain), Some(expr)) = (rule.chain, rule.condition.as_ref()) else {
+                return Ok(false);
+            };
+            let prior = chain_state.get(&chain).copied().unwrap_or(false);
+            let matched = !prior && eval(expr)?;
+            chain_state.insert(chain, prior || matched);
+            Ok(matched)
+        }
+        ConditionBranch::Else => {
+            let Some(chain) = rule.chain else {
+                return Ok(false);
+            };
+            let prior = chain_state.get(&chain).copied().unwrap_or(false);
+            chain_state.insert(chain, true);
+            Ok(!prior)
+        }
+    }
+}
+
+#[cfg(test)]
+fn rule_condition_matches(
     rule: &ScopeRule,
     req: &crate::http::Request,
     env: &[(String, String)],
@@ -5398,40 +5476,17 @@ pub(crate) fn rule_condition_matches(
     fs_path: Option<&Path>,
     chain_state: &mut HashMap<usize, bool>,
 ) -> bool {
-    let eval = |expr: &crate::expr::Expr| {
-        let mut ctx =
-            crate::expr::Context::new(req, env, peer, docroot, url_path).with_fs_path(fs_path);
-        expr.eval(&mut ctx).map(|v| v.truthy()).unwrap_or(false)
-    };
-    match rule.branch {
-        ConditionBranch::Normal => match &rule.condition {
-            None => true,
-            Some(expr) => {
-                let matched = eval(expr);
-                if let Some(chain) = rule.chain {
-                    chain_state.insert(chain, matched);
-                }
-                matched
-            }
-        },
-        ConditionBranch::ElseIf => {
-            let (Some(chain), Some(expr)) = (rule.chain, rule.condition.as_ref()) else {
-                return false;
-            };
-            let prior = chain_state.get(&chain).copied().unwrap_or(false);
-            let matched = !prior && eval(expr);
-            chain_state.insert(chain, prior || matched);
-            matched
-        }
-        ConditionBranch::Else => {
-            let Some(chain) = rule.chain else {
-                return false;
-            };
-            let prior = chain_state.get(&chain).copied().unwrap_or(false);
-            chain_state.insert(chain, true);
-            !prior
-        }
-    }
+    rule_condition_result(
+        rule,
+        req,
+        env,
+        peer,
+        docroot,
+        url_path,
+        fs_path,
+        chain_state,
+    )
+    .unwrap_or(false)
 }
 
 fn path_has_prefix(path: &Path, prefix: &Path) -> bool {
@@ -5791,7 +5846,7 @@ fn apply_conditional_rule(
     chain_state: &mut HashMap<usize, bool>,
 ) {
     let env = s.request_env(req, url_path);
-    if !rule_condition_matches(
+    let matched = rule_condition_result(
         rule,
         req,
         &env,
@@ -5800,7 +5855,16 @@ fn apply_conditional_rule(
         url_path,
         Some(fs_path),
         chain_state,
-    ) {
+    );
+    let matched = match matched {
+        Ok(matched) => matched,
+        Err(error) => {
+            eprintln!("vapached: conditional expression failed closed: {error}");
+            s.conditional_error = true;
+            return;
+        }
+    };
+    if !matched {
         return;
     }
     merge_rule_delta(s, rule, fs_path, url_path);
@@ -7799,6 +7863,20 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
             Some(AuthPolicy::List(ref entries))
                 if entries.iter().any(|e| matches!(e.node, RequireNode::Provider(Require::AllDenied)))
         ));
+
+        let failed = load_text(
+            "DocumentRoot /srv\n<If \"file('../escape') == 'x'\">\nRequire all granted\n</If>\n",
+            false,
+        )
+        .unwrap();
+        let failed_scope = failed.effective_scope_req(
+            None,
+            Path::new("/srv/file"),
+            "/file",
+            &req,
+            "127.0.0.1".parse().unwrap(),
+        );
+        assert!(failed_scope.conditional_error);
     }
 
     #[test]
@@ -9315,6 +9393,83 @@ ServerName localhost\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn remoteip_trusted_and_internal_classes_match_apache_chain_rules() {
+        let trusted = load_text(
+            "RemoteIPHeader X-Forwarded-For\nRemoteIPTrustedProxy 127.0.0.1\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(trusted.remoteip_proxies.len(), 1);
+        assert!(!trusted.remoteip_proxies[0].internal);
+        let peer: std::net::SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        for spoof in [
+            "10.1.2.3",
+            "8.8.8.8, 10.1.2.3",
+            "::ffff:10.1.2.3",
+            "10.1.2.3,",
+            "8.8.8.8, not-an-ip",
+        ] {
+            let mut request = test_request("GET");
+            request
+                .headers
+                .insert("x-forwarded-for", spoof.as_bytes().to_vec());
+            assert_eq!(trusted.client_addr(peer, &request), peer, "{spoof}");
+        }
+
+        let mut public = test_request("GET");
+        public
+            .headers
+            .insert("x-forwarded-for", b"8.8.8.8".to_vec());
+        assert_eq!(
+            trusted.client_addr(peer, &public),
+            "8.8.8.8:1234".parse().unwrap()
+        );
+
+        let internal = load_text(
+            "RemoteIPHeader X-Forwarded-For\nRemoteIPInternalProxy 127.0.0.1\n",
+            false,
+        )
+        .unwrap();
+        assert!(internal.remoteip_proxies[0].internal);
+        let mut private = test_request("GET");
+        private
+            .headers
+            .insert("x-forwarded-for", b"10.1.2.3".to_vec());
+        assert_eq!(
+            internal.client_addr(peer, &private),
+            "10.1.2.3:1234".parse().unwrap()
+        );
+
+        let errors = load_text("RemoteIPTrustedProxy not-an-address\n", false).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.msg.contains("bad RemoteIPTrustedProxy address")));
+    }
+
+    #[test]
+    fn remoteip_private_classifier_pins_apache_2469_ranges() {
+        for private in [
+            "10.0.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.0.1",
+            "::1",
+            "fc00::1",
+        ] {
+            assert!(!Config::remoteip_candidate_is_public(
+                private.parse().unwrap()
+            ));
+        }
+        for public in ["8.8.8.8", "172.32.0.1", "100.64.0.1", "2001:db8::1"] {
+            assert!(Config::remoteip_candidate_is_public(
+                public.parse().unwrap()
+            ));
+        }
+    }
+
     fn parser_state(root: &Path) -> ParserState {
         ParserState {
             events: Vec::new(),
@@ -9997,7 +10152,8 @@ RewriteOptions Inherit\n"
         assert!(c.cache.header);
         assert!(c.cache.detail_header);
         assert_eq!(c.cache.last_modified_factor, 0.5);
-        assert_eq!(c.remoteip_internal.len(), 4);
+        assert_eq!(c.remoteip_proxies.len(), 4);
+        assert!(c.remoteip_proxies.iter().all(|proxy| proxy.internal));
         assert_eq!(c.remoteip_header.as_deref(), Some("X-Forwarded-For"));
         assert_eq!(c.mime.content_type(b"x.html").as_deref(), Some("text/html"));
         assert_eq!(c.mime.encodings.get("gz").map(String::as_str), Some("gzip"));
@@ -10291,7 +10447,7 @@ Require all granted\n\
         let c = load_text(&cfg, false).unwrap();
         assert_eq!(c.document_root, PathBuf::from("/tmp/rel/www"));
         assert_eq!(c.cache.root.as_deref(), Some(Path::new("/tmp/rel/cache")));
-        assert_eq!(c.remoteip_internal.len(), 1);
+        assert_eq!(c.remoteip_proxies.len(), 1);
         assert_eq!(c.balancers.len(), 2);
         let b = &c.balancers[0];
         assert_eq!(b.members.len(), 1);
@@ -11000,8 +11156,42 @@ fn authority_host(host: &str) -> &str {
 impl Config {
     /// Select the virtual host for a connection.  `host` is the Host header
     /// value (possibly with port), `port` the local listening port.
-    /// Apply `mod_remoteip`-style client-address rewriting.  The immediate
-    /// peer must be listed as an internal proxy before its header is trusted.
+    fn remoteip_proxy_class(&self, ip: IpAddr) -> vapache_verified::RemoteIpProxyClass {
+        let ip = crate::access::canonical_ip(ip);
+        self.remoteip_proxies
+            .iter()
+            .find(|proxy| crate::access::ip_in_net(ip, proxy.network, proxy.bits))
+            .map(|proxy| {
+                if proxy.internal {
+                    vapache_verified::RemoteIpProxyClass::Internal
+                } else {
+                    vapache_verified::RemoteIpProxyClass::Trusted
+                }
+            })
+            .unwrap_or(vapache_verified::RemoteIpProxyClass::Untrusted)
+    }
+
+    /// Apache 2.4.69's exact external-chain address rule from
+    /// `mod_remoteip.c`: reject five IPv4 private/local ranges and accept only
+    /// IPv6 global-unicast 2000::/3. IPv4-mapped IPv6 is canonicalized first.
+    fn remoteip_candidate_is_public(ip: IpAddr) -> bool {
+        match crate::access::canonical_ip(ip) {
+            IpAddr::V4(ip) => {
+                let [a, b, _, _] = ip.octets();
+                !(a == 10
+                    || a == 127
+                    || (a == 169 && b == 254)
+                    || (a == 172 && b & 0xf0 == 16)
+                    || (a == 192 && b == 168))
+            }
+            IpAddr::V6(ip) => ip.octets()[0] & 0xe0 == 0x20,
+        }
+    }
+
+    /// Apply Apache `mod_remoteip` client-address rewriting. The immediate
+    /// peer must be configured as an internal or trusted proxy; this retains
+    /// vapache's fail-closed behavior for `RemoteIPHeader` without a trust
+    /// list while matching Apache once a list is present.
     pub fn client_addr(
         &self,
         peer: std::net::SocketAddr,
@@ -11011,11 +11201,7 @@ impl Config {
         let Some(header) = &self.remoteip_header else {
             return peer;
         };
-        let trusted = self
-            .remoteip_internal
-            .iter()
-            .any(|(net, bits)| crate::access::ip_in_net(peer.ip(), *net, *bits));
-        if !trusted {
+        if self.remoteip_proxies.is_empty() {
             return peer;
         }
         let header = header.to_ascii_lowercase();
@@ -11023,27 +11209,39 @@ impl Config {
             return peer;
         };
         let text = String::from_utf8_lossy(value);
-        // Parse the proxy chain once, then let the verified selector choose
-        // the first address not belonging to a trusted proxy.  Invalid
-        // entries are skipped; a chain of only trusted proxies keeps the
-        // real peer address.
-        let mut parsed: Vec<(IpAddr, bool)> = Vec::new();
+        // Apache walks the list right-to-left. The current presenter must be
+        // trusted for every hop; malformed/empty entries terminate the walk,
+        // and an external trusted chain cannot present a private address.
+        let mut current = peer.ip();
+        let mut selected = peer;
+        let mut chain_internal = true;
         for part in text.split(',').rev() {
-            let part = part.trim();
-            if let Ok(ip) = part.parse::<IpAddr>() {
-                let ip = crate::access::canonical_ip(ip);
-                let internal = self
-                    .remoteip_internal
-                    .iter()
-                    .any(|(net, bits)| crate::access::ip_in_net(ip, *net, *bits));
-                parsed.push((ip, internal));
+            let presenter = self.remoteip_proxy_class(current);
+            let next_internal = crate::verified::remoteip_next_internal(chain_internal, presenter);
+            let part = part.trim_matches(' ');
+            let Ok(candidate) = part.parse::<IpAddr>() else {
+                debug_assert!(!crate::verified::remoteip_candidate_admit(
+                    presenter,
+                    next_internal,
+                    false,
+                    false,
+                ));
+                break;
+            };
+            let candidate = crate::access::canonical_ip(candidate);
+            if !crate::verified::remoteip_candidate_admit(
+                presenter,
+                next_internal,
+                true,
+                Self::remoteip_candidate_is_public(candidate),
+            ) {
+                break;
             }
+            selected = std::net::SocketAddr::new(candidate, peer.port());
+            current = candidate;
+            chain_internal = next_internal;
         }
-        let trusted: Vec<bool> = parsed.iter().map(|(_, trusted)| *trusted).collect();
-        match crate::verified::first_untrusted_index(&trusted) {
-            Some(index) => std::net::SocketAddr::new(parsed[index].0, peer.port()),
-            None => peer,
-        }
+        selected
     }
 
     fn vhost_port_matches(v: &VHost, port: u16) -> bool {
@@ -11764,8 +11962,8 @@ impl Config {
                 }
                 let conditional =
                     rule.condition.is_some() || rule.branch != ConditionBranch::Normal;
-                let matched = if conditional {
-                    rule_condition_matches(
+                let (matched, condition_error) = if conditional {
+                    match rule_condition_result(
                         rule,
                         req,
                         env,
@@ -11774,11 +11972,16 @@ impl Config {
                         url_path,
                         Some(fs_path),
                         chain_state,
-                    )
+                    ) {
+                        Ok(matched) => (matched, None),
+                        Err(error) => (false, Some(error)),
+                    }
                 } else {
-                    true
+                    (true, None)
                 };
-                let condition = if conditional {
+                let condition = if let Some(error) = condition_error {
+                    format!(" condition=error({error})")
+                } else if conditional {
                     format!(" condition={matched}")
                 } else {
                     String::new()

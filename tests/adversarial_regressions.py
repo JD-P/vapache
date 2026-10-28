@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end regressions for the pass-2 through pass-14 findings (F23-P14).
+"""End-to-end regressions for the pass-2 through pass-15 findings (F23-P15).
 
 The suite starts fresh vapached instances in temporary trees and exercises
 the exploit shapes from adversarial/findings.md: terminal rewrite/proxy authorization,
@@ -119,7 +119,7 @@ def stop_vapached(proc) -> None:
 
 
 class FastCgiMock:
-    """Minimal FastCGI responder that reflects QUERY_STRING in its body."""
+    """Minimal FastCGI responder that reflects security-relevant parameters."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -188,6 +188,9 @@ class FastCgiMock:
                         "Content-Type: text/plain\r\n"
                         "Cache-Control: max-age=600\r\n\r\n"
                         f"SECRET-FOR-{query}\n"
+                        f"SCRIPT_FILENAME={params.get('SCRIPT_FILENAME', '')}\n"
+                        f"SCRIPT_NAME={params.get('SCRIPT_NAME', '')}\n"
+                        f"PATH_INFO={params.get('PATH_INFO', '')}\n"
                     ).encode("latin-1")
                     conn.sendall(
                         self._record(6, payload)
@@ -3174,6 +3177,184 @@ RewriteRule "^/chain$" "/public.txt" [PT,L]
         status, body = self._raw(b"X-Gate: yes\r\n", b"/chain")
         self.assertEqual(status, 200, body[:200])
         self.assertIn(b"P14-CHAIN-PUBLIC", body)
+
+
+class P15ApacheParityHardeningTests(unittest.TestCase):
+    """P15 backend identity, RemoteIP and PCRE access-control parity."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not VAPACHED.exists():
+            raise unittest.SkipTest(f"missing {VAPACHED}")
+        cls.base = Path(tempfile.mkdtemp(prefix="vapache-p15-", dir="/tmp/opencode"))
+        cls.base.chmod(0o755)
+        cls.www = cls.base / "www"
+        cls.logs = cls.base / "logs"
+        directories = [
+            "pub",
+            "open",
+            "secret",
+            "remote",
+            "expr-q",
+            "expr-z",
+            "expr-comment",
+            "expr-k",
+            "expr-backref",
+            "expr-not",
+            "expr-rewrite",
+            "expr-cgi",
+        ]
+        for rel in directories:
+            path = cls.www / rel
+            path.mkdir(parents=True, exist_ok=True)
+            path.chmod(0o755)
+        cls.logs.mkdir(parents=True, exist_ok=True)
+        cls.logs.chmod(0o777)
+
+        (cls.www / "open" / "app.php").write_text("<?php echo 'OPEN';\n")
+        (cls.www / "secret" / "app.php").write_text("<?php echo 'SECRET';\n")
+        (cls.www / "pub" / "open.txt").symlink_to("../open/app.php")
+        (cls.www / "pub" / "link.txt").symlink_to("../secret/app.php")
+        for rel, name in [
+            ("expr-q", "secret.txt"),
+            ("expr-z", "secret.txt"),
+            ("expr-comment", "secret.txt"),
+            ("expr-k", "secret.txt"),
+            ("expr-backref", "secretse.txt"),
+            ("expr-not", "private.txt"),
+            ("expr-rewrite", "secret.txt"),
+            ("remote", "secret.txt"),
+        ]:
+            (cls.www / rel / name).write_text(f"P15-{rel}\n")
+        cgi = cls.www / "expr-cgi" / "secret.cgi"
+        cgi.write_text(
+            "#!/bin/sh\n"
+            "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+            "printf 'P15-EXPR-CGI-EXEC\\n'\n"
+        )
+        cgi.chmod(0o755)
+
+        cls.mock = FastCgiMock(cls.base / "fcgi.sock")
+        cls.mock.start()
+        cls.port = free_port()
+        cls.config_text = f'''ServerRoot "{cls.base}"
+Listen 127.0.0.1:{cls.port}
+ServerName localhost
+PidFile "{cls.logs}/httpd.pid"
+ErrorLog "{cls.logs}/error.log"
+LogLevel warn
+DocumentRoot "{cls.www}"
+AddHandler cgi-script .cgi
+RemoteIPHeader X-Forwarded-For
+RemoteIPTrustedProxy 127.0.0.1
+ProxyPassMatch "^/(.*\\.php(/.*)?)$" "unix:{cls.base}/fcgi.sock|fcgi://localhost{cls.www}/"
+<Directory "{cls.www}">
+    Options +ExecCGI +FollowSymLinks
+    Require all granted
+</Directory>
+<Location "/secret/">
+    Require all denied
+</Location>
+<Directory "{cls.www}/remote">
+    Require ip 10.1.2.3
+</Directory>
+<Directory "{cls.www}/expr-q">
+    <If "%{{REQUEST_URI}} =~ /\\Qsecret\\E/">
+        Require all denied
+    </If>
+</Directory>
+<Directory "{cls.www}/expr-z">
+    <If "%{{REQUEST_URI}} =~ /secret\\.txt\\Z/">
+        Require all denied
+    </If>
+</Directory>
+<Directory "{cls.www}/expr-comment">
+    <If "%{{REQUEST_URI}} =~ /sec(?#match)ret/">
+        Require all denied
+    </If>
+</Directory>
+<Directory "{cls.www}/expr-k">
+    <If "%{{REQUEST_URI}} =~ /\\Ksecret/">
+        Require all denied
+    </If>
+</Directory>
+<Directory "{cls.www}/expr-backref">
+    <If "%{{REQUEST_URI}} =~ /(se)cret\\1/">
+        Require all denied
+    </If>
+</Directory>
+<Directory "{cls.www}/expr-not">
+    <RequireAll>
+        Require all granted
+        Require not expr "%{{REQUEST_URI}} =~ /\\Qprivate\\E/"
+    </RequireAll>
+</Directory>
+<Directory "{cls.www}/expr-cgi">
+    <If "%{{REQUEST_URI}} =~ /\\Qsecret\\E/">
+        Options -ExecCGI
+    </If>
+</Directory>
+RewriteEngine On
+RewriteCond expr "%{{REQUEST_URI}} =~ /\\Qexpr-rewrite\\E/"
+RewriteRule "^/expr-rewrite/secret\\.txt$" "-" [F,L]
+'''
+        cls.proc, cls.config = start_vapached(cls.base, cls.config_text)
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_vapached(getattr(cls, "proc", None))
+        if getattr(cls, "mock", None):
+            cls.mock.stop()
+        if getattr(cls, "base", None):
+            shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
+
+    def test_p15_a_fastcgi_forwards_lexical_script_identity(self):
+        status, _, body = request(self.port, "/pub/open.txt/x.php")
+        self.assertEqual(status, 200, body[:300])
+        self.assertIn(
+            f"SCRIPT_FILENAME={self.www}/pub/open.txt".encode(), body
+        )
+        self.assertIn(b"SCRIPT_NAME=/pub/open.txt", body)
+        self.assertIn(b"PATH_INFO=/x.php", body)
+        self.assertNotIn(f"SCRIPT_FILENAME={self.www}/open/app.php".encode(), body)
+
+    def test_p15_a_canonical_location_is_reauthorized(self):
+        status, _, body = request(self.port, "/pub/link.txt/x.php")
+        self.assertEqual(status, 403, body[:300])
+        status, _, body = request(self.port, "/secret/app.php")
+        self.assertEqual(status, 403, body[:300])
+
+    def test_p15_b_trusted_proxy_cannot_present_private_address(self):
+        for value in [
+            "10.1.2.3",
+            "8.8.8.8, 10.1.2.3",
+            "::ffff:10.1.2.3",
+            "10.1.2.3,",
+        ]:
+            status, _, body = request(
+                self.port,
+                "/remote/secret.txt",
+                {"X-Forwarded-For": value},
+            )
+            self.assertEqual(status, 403, (value, body[:300]))
+
+    def test_p15_c_apache_pcre_guards_apply(self):
+        for path in [
+            "/expr-q/secret.txt",
+            "/expr-z/secret.txt",
+            "/expr-comment/secret.txt",
+            "/expr-k/secret.txt",
+            "/expr-backref/secretse.txt",
+            "/expr-not/private.txt",
+            "/expr-rewrite/secret.txt",
+        ]:
+            status, _, body = request(self.port, path)
+            self.assertEqual(status, 403, (path, body[:300]))
+
+    def test_p15_c_conditional_options_cannot_disappear(self):
+        status, _, body = request(self.port, "/expr-cgi/secret.cgi")
+        self.assertEqual(status, 403, body[:300])
+        self.assertNotIn(b"P15-EXPR-CGI-EXEC", body)
 
 
 if __name__ == "__main__":

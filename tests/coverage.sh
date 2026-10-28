@@ -39,7 +39,7 @@ if command -v apache2 >/dev/null 2>&1; then
     VAPACHED="$PWD/target/cov/release/vapached" \
     LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
     PYTHONDONTWRITEBYTECODE=1 \
-        python3 tests/config_semantics.py
+        python3 tests/config_semantics.py --random 128 --seed 2469
 else
     echo "coverage: Apache not found; skipping differential config suites"
 fi

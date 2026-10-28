@@ -3208,10 +3208,12 @@ fn run_fastcgi(
     // `ProxyPassMatch`/`SetHandler` can resolve PATH_INFO to a real script
     // whose own `<Files>`/`<Directory>` policy differs from the requested URL.
     // Re-evaluate policy for the script target before binding the backend.
-    // Resolve the actual script through an opened descriptor first: forwarding
-    // a lexical pathname let PHP-FPM execute an object whose inode and real
-    // `<Directory>` policy were never bound to the grant (F41/I39).
-    let mut target = target.clone();
+    // Resolve the actual script through an opened descriptor first. The
+    // canonical object is the authorization identity, but Apache forwards the
+    // lexical split prefix as SCRIPT_FILENAME and lets PHP-FPM apply
+    // `security.limit_extensions` to that name. Conflating the two identities
+    // bypassed the backend's own gate (P15-A).
+    let target = target.clone();
     let follow = scope.effective_options().contains(Options::FOLLOW_SYMLINKS);
     let owner_match_only = !follow
         && scope
@@ -3236,8 +3238,7 @@ fn run_fastcgi(
             local_ip,
         );
     };
-    target.script_filename = script_binding.actual_path.clone();
-    let script_url = if target.path_info.is_empty() {
+    let lexical_script_url = if target.path_info.is_empty() {
         url_path.to_string()
     } else {
         url_path
@@ -3245,13 +3246,28 @@ fn run_fastcgi(
             .unwrap_or(url_path)
             .to_string()
     };
-    let proxy_identity = target.script_filename.to_string_lossy().into_owned();
+    let authorized_path = script_binding.actual_path.clone();
+    let docroot = cfg.documentation_root_for(vhost);
+    let canonical_docroot = std::fs::canonicalize(&docroot).unwrap_or(docroot.clone());
+    let script_url = authorized_path
+        .strip_prefix(&canonical_docroot)
+        .ok()
+        .map(|relative| {
+            let relative = relative.to_string_lossy();
+            format!("/{}", relative.trim_start_matches('/'))
+        })
+        .unwrap_or(lexical_script_url);
+    let proxy_identity = format!(
+        "lexical={}|authorized={}",
+        target.script_filename.display(),
+        authorized_path.display()
+    );
     let (target_grant, target_resource, target_scope) = match authorize_resolved_target(
         cfg,
         vhost,
         req,
         peer.ip(),
-        &target.script_filename,
+        &authorized_path,
         &script_url,
         scope,
         Some(&proxy_identity),
@@ -3266,7 +3282,9 @@ fn run_fastcgi(
     let scope = &target_scope;
     let grant = &target_grant;
     let resource = &target_resource;
-    let backend_binding = target.binding_key();
+    let backend_binding = target.binding_key(&authorized_path);
+    let backend_binds_both =
+        backend_binding.contains("|lexical=") && backend_binding.contains("|authorized=");
     // coverage:ignore-start
     let Some(file_bound) = grant.bind_file(resource, &script_binding.meta) else {
         return error_response(
@@ -3299,7 +3317,13 @@ fn run_fastcgi(
     };
     let expected = bound.key().clone();
     if !bound.require_sink(&expected, vapache_verified::TransformSink::FastCgi)
-        || expected.fs_path.as_deref() != Some(target.script_filename.as_path())
+        || !vapache_verified::fastcgi_script_identity_admit(
+            expected.fs_path.as_deref() == Some(authorized_path.as_path()),
+            script_binding.meta.dev() == expected.file_dev.unwrap_or_default()
+                && script_binding.meta.ino() == expected.file_ino.unwrap_or_default(),
+            true,
+            backend_binds_both,
+        )
     {
         return error_response(
             cfg,
@@ -3315,7 +3339,6 @@ fn run_fastcgi(
         );
     }
     // coverage:ignore-stop
-    let docroot = cfg.documentation_root_for(vhost);
     let remote_user = bound.key().identity.as_deref();
     let auth_type = remote_user.and_then(|_| {
         scope
