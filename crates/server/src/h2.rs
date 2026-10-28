@@ -115,6 +115,24 @@ enum H2ReadFailure {
     Response(Response),
 }
 
+fn request_target(method: &str, uri: &http::Uri) -> Option<Vec<u8>> {
+    // Accessors synthesize `/` for an absolute URI whose stored
+    // `path_and_query` is absent.  Inspect the raw URI parts so a missing
+    // HTTP/2 :path cannot silently become a request for the server root.
+    let parts = uri.clone().into_parts();
+    let path = parts.path_and_query.as_ref();
+    let serialized = uri.to_string();
+    let admitted = vapache_verified::h2_request_target_admit(
+        method.eq_ignore_ascii_case("CONNECT"),
+        parts.scheme.is_some(),
+        parts.authority.is_some(),
+        path.is_some(),
+        path.is_some_and(|value| !value.as_str().is_empty()),
+        serialized.as_bytes().contains(&b'#'),
+    );
+    admitted.then(|| path.expect("admitted path").as_str().as_bytes().to_vec())
+}
+
 /// A read-only mmap kept alive by `Bytes` for zero-copy HTTP/2 file bodies.
 struct MmapBytes {
     ptr: *mut libc::c_void,
@@ -207,8 +225,12 @@ async fn read_body(
 ) -> Result<Vec<u8>, H2ReadFailure> {
     let mut body = Vec::new();
     let mut budget = vapache_verified::h2_body_init(limit);
+    let started = Instant::now();
     loop {
-        let next = match tokio::time::timeout(timeout, recv.data()).await {
+        // One deadline covers the complete body.  Restarting the timeout for
+        // every DATA frame lets a slow peer keep a request alive forever.
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let next = match tokio::time::timeout(remaining, recv.data()).await {
             Ok(next) => next,
             Err(_) => return Err(H2ReadFailure::Response(bad(408, "request body timeout"))),
         };
@@ -234,6 +256,11 @@ async fn read_body(
         };
         budget = next_budget;
         body.extend_from_slice(&chunk);
+        // Return consumed receive-window capacity to h2.  Without this, any
+        // body larger than the initial connection window stalls permanently.
+        if recv.flow_control().release_capacity(chunk.len()).is_err() {
+            return Err(H2ReadFailure::Reset); // coverage:ignore-line - opaque h2 reset race
+        }
         debug_assert_eq!(body.len() as u64, budget.len);
     }
     Ok(body)
@@ -536,15 +563,16 @@ async fn handle_stream(
     let (parts, recv) = request.into_parts();
     let method = parts.method.as_str().to_string();
     let uri = parts.uri.clone();
-    let mut target = uri
-        .path_and_query()
-        .map(|p| p.as_str().as_bytes().to_vec())
-        .unwrap_or_else(|| b"/".to_vec());
-    if target.is_empty() {
-        // `http::Uri::path_and_query` normalizes every accepted URI to a
-        // nonempty path, but retain a defensive origin-form fallback.
-        target = b"/".to_vec(); // coverage:ignore-line - http URI invariant
-    }
+    let Some(target) = request_target(&method, &uri) else {
+        return send_response(
+            respond,
+            &cfg,
+            bad(400, "invalid HTTP/2 request target"),
+            false,
+        )
+        .await
+        .is_err();
+    };
     let (raw_path, query) = match target.iter().position(|b| *b == b'?') {
         Some(i) => (target[..i].to_vec(), target[i + 1..].to_vec()),
         None => (target.clone(), Vec::new()),
@@ -915,6 +943,8 @@ mod tests {
     use std::borrow::Cow;
     use std::collections::HashMap;
     use std::fs::{self, File};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
 
     fn test_config(name: &str) -> (Arc<Config>, Arc<Logger>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("vapache-h2-{name}-{}", std::process::id()));
@@ -992,7 +1022,19 @@ mod tests {
         let end = body.is_empty();
         let (response, mut send) = client.send_request(request, end).unwrap();
         if !end {
-            send.send_data(Bytes::copy_from_slice(body), true).unwrap();
+            let mut offset = 0usize;
+            while offset < body.len() {
+                send.reserve_capacity(body.len() - offset);
+                let capacity = std::future::poll_fn(|cx| send.poll_capacity(cx))
+                    .await
+                    .expect("HTTP/2 request stream closed")
+                    .expect("HTTP/2 request capacity failed");
+                let take = capacity.min(body.len() - offset);
+                let last = offset + take == body.len();
+                send.send_data(Bytes::copy_from_slice(&body[offset..offset + take]), last)
+                    .unwrap();
+                offset += take;
+            }
         }
         let response = tokio::time::timeout(std::time::Duration::from_secs(2), response)
             .await
@@ -1137,6 +1179,21 @@ mod tests {
             431
         );
 
+        // A traditional CONNECT request is valid at the h2 framing layer,
+        // but vapached does not implement tunnels and must reject the
+        // authority-form target before normal request dispatch.
+        let request = http::Request::builder()
+            .method("CONNECT")
+            .uri("localhost:443")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            round_trip(cfg.clone(), logger.clone(), request, &[])
+                .await
+                .0,
+            400
+        );
+
         let mut limited = (*cfg).clone();
         limited.limit_request_field_size = 1;
         let request = http::Request::builder()
@@ -1162,6 +1219,25 @@ mod tests {
             round_trip(Arc::new(limited), logger.clone(), request, b"small body")
                 .await
                 .0,
+            405
+        );
+
+        let mut limited = (*cfg).clone();
+        limited.limit_request_body = 512 * 1024;
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/file.txt")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            round_trip(
+                Arc::new(limited),
+                logger.clone(),
+                request,
+                &vec![b'x'; 300 * 1024],
+            )
+            .await
+            .0,
             405
         );
 
@@ -1480,6 +1556,81 @@ mod tests {
         let mut malformed = crate::http::Headers::default();
         malformed.push("content-length", b"not-a-number".to_vec());
         assert_eq!(declared_content_length(&malformed), Err(()));
+    }
+
+    #[test]
+    fn request_targets_require_complete_pseudo_header_identity() {
+        let good: http::Uri = "https://example.test/path?q=1".parse().unwrap();
+        assert_eq!(
+            request_target("GET", &good).as_deref(),
+            Some(b"/path?q=1".as_slice())
+        );
+
+        // h2/http normalize an absent :path to `/` before the application
+        // adapter sees it.  The exploitable no-:path/no-:authority shape is
+        // still rejected because the authority identity is absent.
+        let missing_target_identity: http::Uri = "/".parse().unwrap();
+        assert!(request_target("GET", &missing_target_identity).is_none());
+        let missing_authority: http::Uri = "/path".parse().unwrap();
+        assert!(request_target("GET", &missing_authority).is_none());
+        assert!(request_target("CONNECT", &good).is_none());
+        assert!(!vapache_verified::h2_request_target_admit(
+            false, true, true, true, true, true,
+        ));
+    }
+
+    async fn raw_malformed_request_is_rejected(mut hpack: Vec<u8>) {
+        let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            matches!(
+                tokio::time::timeout(Duration::from_millis(200), connection.accept()).await,
+                Ok(Some(Ok(_)))
+            )
+        });
+
+        let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        // Empty client SETTINGS.
+        wire.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        let len = hpack.len();
+        wire.extend_from_slice(&[
+            ((len >> 16) & 0xff) as u8,
+            ((len >> 8) & 0xff) as u8,
+            (len & 0xff) as u8,
+            1,   // HEADERS
+            0x5, // END_STREAM | END_HEADERS
+            0,
+            0,
+            0,
+            1,
+        ]);
+        wire.append(&mut hpack);
+        client_io.write_all(&wire).await.unwrap();
+
+        let accepted = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("malformed h2 request timed out")
+            .unwrap();
+        assert!(!accepted, "malformed request reached the application");
+    }
+
+    #[tokio::test]
+    async fn h2_parser_rejects_missing_path_and_fragments_before_uri_normalization() {
+        let mut base = vec![
+            0x82, // :method GET
+            0x87, // :scheme https
+            0x41, // literal :authority
+            0x0c, // value length
+        ];
+        base.extend_from_slice(b"example.test");
+
+        raw_malformed_request_is_rejected(base.clone()).await;
+
+        // Literal, never-indexed :path with a fragment. The http URI parser
+        // used to truncate `#admin` and dispatch `/path`.
+        base.extend_from_slice(&[0x04, 0x0b]);
+        base.extend_from_slice(b"/path#admin");
+        raw_malformed_request_is_rejected(base).await;
     }
 
     #[test]

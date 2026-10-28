@@ -1063,6 +1063,18 @@ fn helper_access_response(
             peer,
             local_ip,
         )),
+        Access::Misconfigured => Err(error_response(
+            cfg,
+            vhost,
+            scope,
+            500,
+            req,
+            url_path,
+            local_port,
+            server_name,
+            peer,
+            local_ip,
+        )),
         Access::AuthRequired => {
             let mut r = error_response(
                 cfg,
@@ -1238,6 +1250,9 @@ fn dispatch_inner_request(
     let _server_name_guard = crate::expr::set_server_name(&server_name_for_cache);
     let allow_encoded = cfg.encoded_slashes == EncodedSlashes::On;
     let initial_plan = RequestPlan::from_request(cfg, vhost, req, allow_encoded).ok();
+    let invalidation_path = initial_plan
+        .as_ref()
+        .map(|plan| plan.url_path().to_string());
     let cache_scope = initial_plan.as_ref().and_then(|plan| {
         crate::cache::request_scope_with_plan(
             cfg,
@@ -1295,7 +1310,7 @@ fn dispatch_inner_request(
         );
     }
     if !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE") {
-        crate::cache::invalidate(cfg, host, &path);
+        crate::cache::invalidate(cfg, host, invalidation_path.as_deref().unwrap_or(&path));
     }
     resp
 }
@@ -2783,7 +2798,7 @@ fn dispatch_inner(
                 };
                 let requested_base = norm.rsplit(|b| *b == b'/').next().unwrap_or(&norm);
                 let path_info_selected_cgi = cgi::is_cgi(cfg, &scope, requested_base, false);
-                let selected = script_alias || cgi::is_cgi(cfg, &scope, actual_name, false);
+                let selected = cgi::is_cgi(cfg, &scope, actual_name, script_alias);
                 if selected {
                     // Authorize the actual opened target, not the lexical
                     // `st.rel_script`: a public symlink to a denied script
@@ -2812,7 +2827,7 @@ fn dispatch_inner(
                         .file_name()
                         .map(PathBuf::from)
                         .unwrap_or_else(|| st.rel_script.clone());
-                    if script_alias || cgi::is_cgi(cfg, &target_scope, actual_name, false) {
+                    if cgi::is_cgi(cfg, &target_scope, actual_name, script_alias) {
                         return run_cgi(
                             cfg,
                             vhost,
@@ -4524,6 +4539,10 @@ mod tests {
 
         let mut auth_scope = Scope::default();
         auth_scope.authorization.auth_type = Some("Basic".into());
+        auth_scope.authorization.add_require(
+            crate::config::RequireNode::Provider(crate::config::Require::AllGranted),
+            None,
+        );
         let mut auth_resource =
             access::ResourceKey::request(None, &script_req, "/script.cgi", Some(&script), None);
         auth_resource.identity = Some("alice".into());
@@ -4723,6 +4742,60 @@ mod tests {
     }
 
     #[test]
+    fn script_alias_path_info_respects_forced_non_cgi_handler() {
+        let dir = cov_dir("script-alias-handler");
+        let scripts = dir.join("cgi-bin");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let marker = dir.join("executed");
+        let script = scripts.join("run.cgi");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf owned > '{}'\nprintf 'Content-Type: text/plain\\r\\n\\r\\nowned\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "ScriptAlias /cgi-bin/ \"{}/\"\n\
+                 <Directory \"{}\">\n\
+                 SetHandler default-handler\n\
+                 Require all granted\n\
+                 </Directory>\n",
+                scripts.display(),
+                scripts.display(),
+            ),
+        );
+        assert_ne!(
+            cov_dispatch(&cfg, "GET", "/cgi-bin/run.cgi/info").status,
+            200
+        );
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_type_without_require_returns_server_error() {
+        let dir = cov_dir("auth-without-require");
+        std::fs::write(dir.join("www/file.txt"), "public\n").unwrap();
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "<Directory \"{}/www\">\nAuthType Basic\nAuthName restricted\n</Directory>\n",
+                dir.display()
+            ),
+        );
+        assert_eq!(cov_dispatch(&cfg, "GET", "/file.txt").status, 500);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn coverage_dispatch_rewrite_redirect_and_pathinfo_edges() {
         let dir = cov_dir("dispatch-rewrite-edges");
         std::fs::create_dir_all(dir.join("www/bad")).unwrap();
@@ -4795,7 +4868,13 @@ mod tests {
         assert_eq!(cov_dispatch(&cfg, "GET", "/tofs").status, 500);
         assert_eq!(cov_dispatch(&cfg, "GET", "/script.cgi/info").status, 200);
         assert_eq!(cov_dispatch(&cfg, "GET", "/link.cgi/info").status, 500);
-        assert_eq!(cov_dispatch(&cfg, "GET", "/protected.sh/.cgi").status, 403);
+        // A hidden, dot-only final path component is not an extension and
+        // cannot classify the preceding script for CGI execution.
+        assert_eq!(cov_dispatch(&cfg, "GET", "/protected.sh/.cgi").status, 404);
+        assert_eq!(
+            cov_dispatch(&cfg, "GET", "/protected.sh/child.cgi").status,
+            403
+        );
 
         let mut manual = cov_config(&dir, "");
         manual

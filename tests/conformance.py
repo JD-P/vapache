@@ -1218,14 +1218,22 @@ def start_servers():
     vcfg = BASE / "vapache-httpd.conf"
     acfg.write_text(common(AP_PORT, BASE / "apache", True, AP_TLS_PORT))
     vcfg.write_text(common(VP_PORT, BASE, False, VP_TLS_PORT))
-    for name, cmd, log in [
-        ("apache", [APACHE, "-f", str(acfg), "-DFOREGROUND"], BASE / "logs" / "apache.out"),
+    servers = [
         ("vapache", [str(VAPACHED), "-f", str(vcfg), "-DFOREGROUND"], BASE / "logs" / "vapache.out"),
-    ]:
+    ]
+    if DIFFERENTIAL:
+        if not Path(APACHE).exists():
+            raise SystemExit(f"missing Apache httpd at {APACHE} for --differential")
+        servers.insert(
+            0,
+            ("apache", [APACHE, "-f", str(acfg), "-DFOREGROUND"], BASE / "logs" / "apache.out"),
+        )
+    for name, cmd, log in servers:
         f = open(log, "ab")
         p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
         PROCS.append((name, p, f))
-    for port in (AP_PORT, VP_PORT, AP_TLS_PORT, VP_TLS_PORT):
+    ports = (AP_PORT, VP_PORT, AP_TLS_PORT, VP_TLS_PORT) if DIFFERENTIAL else (VP_PORT, VP_TLS_PORT)
+    for port in ports:
         end = time.time() + 10
         while time.time() < end:
             try:
@@ -2953,6 +2961,8 @@ class TlsTests(unittest.TestCase):
             self.assertEqual((version, status, body), ("1.1", 200, b"hello world\n"))
 
     def test_tls_apache_differential(self):
+        if not DIFFERENTIAL:
+            self.skipTest("requires --differential")
         # Both servers must complete a TLS request and serve the same bytes.
         v = self.curl(VP_TLS_PORT, "/hello.txt", "--http1.1")
         a = self.curl(AP_TLS_PORT, "/hello.txt", "--http1.1")

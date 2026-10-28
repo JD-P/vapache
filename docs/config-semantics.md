@@ -1379,7 +1379,11 @@ expiry uses the verified saturating `cache_expiry`, so a positive TTL can never
 wrap into the past.  Disk accounting consumes `cache_disk_projected` and
 `cache_disk_evict`; eviction steps are proven not to increase projected usage.
 Policy binding uses `cache_fingerprint_field`, whose length framing is proven
-injective, before the SHA-256 digest is stored in V3 cache metadata.
+injective. V4 disk metadata stores the complete framed base key; lookup admits
+an entry only when that metadata key exactly matches the requested key, while
+the SHA-1 filename is treated only as an index. Unsafe-method invalidation uses
+the same canonical request/selected-representation identity and removes only
+entries admitted by the verified key-prefix predicate.
 
 ## 9. Formalization boundary
 

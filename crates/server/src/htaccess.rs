@@ -212,9 +212,19 @@ pub fn apply_req_deferred_with_root(
         if !mode.is_enabled() && allow_list.is_empty() {
             continue;
         }
+        let mut selected = false;
         for name in cfg.access_file_names_for(&dir_scope) {
             let path = dir.join(&name);
-            let delta = match crate::files::metadata_cached(&path) {
+            let metadata = crate::files::metadata_cached(&path);
+            let exists = !matches!(
+                &metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            );
+            if !vapache_verified::access_file_candidate_admit(selected, exists) {
+                continue;
+            }
+            selected = true;
+            let delta = match metadata {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(format!("{}: {e}", path.display())),
                 Ok(m) if !m.is_file() => {
@@ -454,7 +464,15 @@ pub fn collect_layers_with_root(
         let mut found = false;
         for name in cfg.access_file_names_for(&dir_scope) {
             let path = dir.join(&name);
-            let meta = match crate::files::metadata_cached(&path) {
+            let metadata = crate::files::metadata_cached(&path);
+            let exists = !matches!(
+                &metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            );
+            if !vapache_verified::access_file_candidate_admit(found, exists) {
+                continue;
+            }
+            let meta = match metadata {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(format!("{}: {e}", path.display())),
                 Ok(m) if !m.is_file() => {
@@ -466,13 +484,9 @@ pub fn collect_layers_with_root(
                 Ok(m) => m,
             };
             let parsed = parse_cached(cfg, &path, mode, allow_list, nonfatal, &identity, &meta)?;
-            if found {
-                Arc::make_mut(&mut layer.scope).merge(&parsed.scope);
-            } else {
-                // Preserve AuthMerging on the first access file; the cached
-                // parsed scope is shared rather than cloned per request.
-                layer.scope = Arc::clone(&parsed.scope);
-            }
+            // Preserve AuthMerging on the selected access file; later
+            // AccessFileName candidates are not merged.
+            layer.scope = Arc::clone(&parsed.scope);
             for rule in &parsed.rules {
                 add_layer_rule(&mut layer, rule);
             }
@@ -565,11 +579,16 @@ pub fn trace_access_files_with_root(
         if !mode.is_enabled() && allow_list.is_empty() {
             continue;
         }
+        let mut selected = false;
         for name in cfg.access_file_names_for(&dir_scope) {
             let path = dir.join(&name);
-            let Ok(meta) = fs::metadata(&path) else {
+            let metadata = fs::metadata(&path);
+            let exists = metadata.is_ok();
+            if !vapache_verified::access_file_candidate_admit(selected, exists) {
                 continue;
-            };
+            }
+            let meta = metadata.expect("admitted access-file candidate exists");
+            selected = true;
             if !meta.is_file() {
                 continue;
             }
@@ -1764,7 +1783,7 @@ fn apply_directive(
                     .mapping_policy
                     .handlers
                     .push(crate::config::Handler::add(
-                        ext.trim_start_matches('.').to_ascii_lowercase(),
+                        crate::config::normalize_handler_extension(ext),
                         args[0].clone(),
                     ));
             }
@@ -1775,7 +1794,7 @@ fn apply_directive(
                     .mapping_policy
                     .handlers
                     .push(crate::config::Handler::remove(
-                        ext.trim_start_matches('.').to_ascii_lowercase(),
+                        crate::config::normalize_handler_extension(&ext),
                     ));
             }
         }
@@ -2311,6 +2330,7 @@ mod tests {
                 "ErrorDocument 404 /not-found.html\n",
                 "AddType text/x-test .t\n",
                 "RemoveType .bad\n",
+                "AddHandler cgi-script ..cgi\n",
                 "ForceType text/plain\n",
                 "Header set X-Test yes\n",
                 "Header unset X-Old\n",
@@ -2345,6 +2365,7 @@ mod tests {
             p.scope.content_policy.force_type.as_deref(),
             Some("text/plain")
         );
+        assert_eq!(p.scope.mapping_policy.handlers[0].ext, ".cgi");
         assert!(p
             .scope
             .header_policy
@@ -3456,12 +3477,13 @@ mod tests {
         )
         .unwrap();
         let env = scope.request_env(&req, "/x");
-        for expected in ["ROOT", "SECOND", "SUB"] {
+        for expected in ["ROOT", "SUB"] {
             assert!(
                 env.iter().any(|(name, _)| name == expected),
                 "missing {expected}: {env:?}"
             );
         }
+        assert!(!env.iter().any(|(name, _)| name == "SECOND"));
         assert!(scope
             .header_policy
             .set_headers
@@ -3478,7 +3500,7 @@ mod tests {
 
         let trace = trace_access_files(&cfg, None, &file, "/sub/secret.txt").join("\n");
         assert!(trace.contains(".htaccess"));
-        assert!(trace.contains(".htaccess2"));
+        assert!(!trace.contains(".htaccess2"));
 
         // The non-directory start and the outer configuration phase.
         let path_info = www.join("sub/secret.txt/more");

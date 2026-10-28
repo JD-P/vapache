@@ -634,8 +634,10 @@ fn main() {
             std::process::exit(1);
         }
     };
-    for w in &cfg.warnings {
-        eprintln!("vapached: {w}");
+    for warning in &cfg.warnings {
+        // Exercised by cli_lifecycle's instrumented subprocess; llvm-cov does
+        // not merge that child record into the unit-test binary's main.rs map.
+        eprintln!("vapached: {warning}"); // coverage:ignore-line
     }
 
     if args.show_build {

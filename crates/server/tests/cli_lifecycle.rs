@@ -176,6 +176,15 @@ fn cli_information_explain_and_startup_failures() {
     fs::write(&malformed, "Listen not-a-port\n").unwrap();
     assert!(!output(&root, &malformed, &["-t"]).status.success());
 
+    let warning = write_config(
+        &root,
+        free_port(),
+        "RewriteEngine On\nRewriteRule ^/x$ /y [UnsafePrefixStat]",
+    );
+    let warning_result = output(&root, &warning, &["-t"]);
+    assert!(warning_result.status.success());
+    assert!(String::from_utf8_lossy(&warning_result.stderr).contains("has no effect"));
+
     let relative = root.file_name().unwrap().to_str().unwrap();
     let relative_result = Command::new(binary())
         .current_dir(root.parent().unwrap())

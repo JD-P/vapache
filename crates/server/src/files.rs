@@ -303,24 +303,27 @@ pub fn mime_type(cfg: &Config, scope: &Scope, name: &[u8]) -> Option<String> {
         }
         return Some(t);
     }
-    let base = name.rsplit(|b| *b == b'/').next().unwrap_or(name);
-    let ext = base
-        .rsplit(|b| *b == b'.')
-        .next()
-        .and_then(|e| std::str::from_utf8(e).ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let removed = scope
-        .content_policy
-        .remove_types
-        .iter()
-        .any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(&ext));
-    if !removed {
+    let extensions = crate::config::filename_extension_tokens(name);
+    let removed = extensions.iter().any(|ext| {
+        scope.content_policy.remove_types.iter().any(|configured| {
+            let configured = configured.strip_prefix('.').unwrap_or(configured);
+            std::str::from_utf8(ext).is_ok_and(|ext| configured.eq_ignore_ascii_case(ext))
+        })
+    });
+    if removed {
+        return None;
+    }
+    for ext in extensions.iter().rev() {
+        let Some(ext) = std::str::from_utf8(ext).ok() else {
+            continue;
+        };
         for (ty, exts) in scope.content_policy.add_types.iter().rev() {
-            if exts
-                .split_ascii_whitespace()
-                .any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(&ext))
-            {
+            if exts.split_ascii_whitespace().any(|configured| {
+                configured
+                    .strip_prefix('.')
+                    .unwrap_or(configured)
+                    .eq_ignore_ascii_case(ext)
+            }) {
                 let mut t = ty.clone();
                 if let Some(cs) = &scope.content_policy.default_charset {
                     if t.starts_with("text/") && !t.contains("charset") {
@@ -331,9 +334,6 @@ pub fn mime_type(cfg: &Config, scope: &Scope, name: &[u8]) -> Option<String> {
                 return Some(t);
             }
         }
-    }
-    if removed {
-        return None;
     }
     let mut t = cfg.mime.content_type(name)?;
     if let Some(cs) = &scope.content_policy.default_charset {
@@ -346,7 +346,6 @@ pub fn mime_type(cfg: &Config, scope: &Scope, name: &[u8]) -> Option<String> {
 }
 
 fn etag(meta: &Metadata, bits: u32) -> String {
-    let bits = if bits == 0 { ETAG_ALL } else { bits };
     let mut s = String::with_capacity(48);
     s.push('"');
     if bits & crate::config::ETAG_INODE != 0 {
@@ -402,6 +401,14 @@ fn header_etag_list_matches(value: &[u8], etag: &str, weak: bool) -> bool {
     false
 }
 
+fn current_etag_matches(value: &[u8], etag: Option<&str>, weak: bool) -> bool {
+    if std::str::from_utf8(value).is_ok_and(|value| value.split(',').any(|part| part.trim() == "*"))
+    {
+        return true;
+    }
+    etag.is_some_and(|etag| header_etag_list_matches(value, etag, weak))
+}
+
 /// Serve an opened regular file, applying HTTP conditional and range rules.
 fn serve_file_inner(
     cfg: &Config,
@@ -415,7 +422,8 @@ fn serve_file_inner(
 ) -> Response {
     let size = meta.size();
     let mtime = meta.mtime();
-    let tag = etag(meta, scope.content_policy.file_etag.unwrap_or(ETAG_ALL));
+    let etag_bits = scope.content_policy.file_etag.unwrap_or(ETAG_ALL);
+    let tag = vapache_verified::file_etag_emit_admit(etag_bits).then(|| etag(meta, etag_bits));
     let last_mod = http_date(mtime);
     let mime = mime_type(cfg, scope, mime_name);
 
@@ -424,7 +432,7 @@ fn serve_file_inner(
 
     // RFC 9110 §13.2.2 evaluation order.
     if let Some(v) = req.header("if-match") {
-        if !header_etag_list_matches(v, &tag, false) {
+        if !current_etag_matches(v, tag.as_deref(), false) {
             return error_response(cfg, None, scope, 412, req, "", 0, "", peer, local_ip);
         }
     } else if let Some(v) = req.header("if-unmodified-since") {
@@ -435,10 +443,12 @@ fn serve_file_inner(
         }
     }
     if let Some(v) = req.header("if-none-match") {
-        if header_etag_list_matches(v, &tag, true) {
+        if current_etag_matches(v, tag.as_deref(), true) {
             if is_get || is_head {
                 let mut r = Response::new(304);
-                r.headers.push(("ETag".into(), tag.into_bytes()));
+                if let Some(tag) = &tag {
+                    r.headers.push(("ETag".into(), tag.as_bytes().to_vec()));
+                }
                 r.headers
                     .push(("Last-Modified".into(), last_mod.into_bytes()));
                 if let Some(mime) = &mime {
@@ -454,7 +464,9 @@ fn serve_file_inner(
             if let Some(t) = parse_http_date(v) {
                 if mtime <= t {
                     let mut r = Response::new(304);
-                    r.headers.push(("ETag".into(), tag.into_bytes()));
+                    if let Some(tag) = &tag {
+                        r.headers.push(("ETag".into(), tag.as_bytes().to_vec()));
+                    }
                     r.headers
                         .push(("Last-Modified".into(), last_mod.into_bytes()));
                     if let Some(mime) = &mime {
@@ -478,7 +490,8 @@ fn serve_file_inner(
                 None => true,
                 Some(ir) => {
                     if ir.first() == Some(&b'"') || ir.starts_with(b"W/") {
-                        header_etag_list_matches(ir, &tag, true)
+                        tag.as_deref()
+                            .is_some_and(|tag| header_etag_list_matches(ir, tag, true))
                     } else {
                         parse_http_date(ir).map(|t| t == mtime).unwrap_or(false)
                     }
@@ -521,7 +534,9 @@ fn serve_file_inner(
     }
     r.headers
         .push(("Last-Modified".into(), last_mod.into_bytes()));
-    r.headers.push(("ETag".into(), tag.into_bytes()));
+    if let Some(tag) = tag {
+        r.headers.push(("ETag".into(), tag.into_bytes()));
+    }
     r.headers.push(("Accept-Ranges".into(), b"bytes".to_vec()));
     if let Some(cr) = content_range {
         r.headers.push(("Content-Range".into(), cr.into_bytes()));
@@ -1193,6 +1208,14 @@ mod tests {
                 .raw_os_error(),
             Some(libc::EINVAL)
         );
+        assert_eq!(
+            open_at(&File::open(&root).unwrap(), b"plain.txt", false)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            5
+        );
 
         let _guard = request_metadata_scope();
         assert!(metadata_cached(&root.join("plain.txt")).is_ok());
@@ -1224,6 +1247,15 @@ mod tests {
         );
         scope.content_policy.remove_types.push("foo".into());
         assert!(mime_type(&cfg, &scope, b"x.foo").is_none());
+        scope.content_policy.remove_types.clear();
+        scope
+            .content_policy
+            .add_types
+            .push(("text/cgi-token".into(), "cgi".into()));
+        assert_eq!(
+            mime_type(&cfg, &scope, b"x.cgi.\xff").as_deref(),
+            Some("text/cgi-token; charset=utf-8")
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1287,6 +1319,60 @@ mod tests {
             "\"abc\"",
             false
         ));
+
+        let mut no_etag_scope = Scope::default();
+        no_etag_scope.content_policy.file_etag = Some(0);
+        let (file, meta) = make();
+        let no_etag = serve_file_inner(
+            &cfg,
+            &no_etag_scope,
+            &request("GET", b"/file.txt"),
+            file,
+            &meta,
+            b"file.txt",
+            peer,
+            "127.0.0.1",
+        );
+        assert!(!no_etag
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("etag")));
+
+        let (file, meta) = make();
+        let mut wildcard = request("GET", b"/file.txt");
+        wildcard.headers.insert("if-none-match", b"*".to_vec());
+        assert_eq!(
+            serve_file_inner(
+                &cfg,
+                &no_etag_scope,
+                &wildcard,
+                file,
+                &meta,
+                b"file.txt",
+                peer,
+                "127.0.0.1",
+            )
+            .status,
+            304
+        );
+
+        let (file, meta) = make();
+        let mut absent = request("GET", b"/file.txt");
+        absent.headers.insert("if-none-match", b"\"fake\"".to_vec());
+        assert_eq!(
+            serve_file_inner(
+                &cfg,
+                &no_etag_scope,
+                &absent,
+                file,
+                &meta,
+                b"file.txt",
+                peer,
+                "127.0.0.1",
+            )
+            .status,
+            200
+        );
 
         let (file, meta) = make();
         let tag = etag(&meta, ETAG_ALL);
@@ -1427,6 +1513,30 @@ mod tests {
             "127.0.0.1",
         );
         assert_eq!(indexed.status, 200);
+        let mut owner_scope = Scope::default();
+        owner_scope
+            .options
+            .push_remove(crate::config::Options::FOLLOW_SYMLINKS);
+        owner_scope
+            .options
+            .push_add(crate::config::Options::SYMLINKS_IF_OWNER_MATCH);
+        assert_eq!(
+            serve_directory_inner(
+                &cfg,
+                None,
+                &owner_scope,
+                &request("GET", b"/"),
+                File::open(&root).unwrap(),
+                "/",
+                b"/",
+                "example.test",
+                80,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                "127.0.0.1",
+            )
+            .status,
+            200
+        );
 
         cfg.server_signature = ServerSignature::Email;
         let listed = autoindex(

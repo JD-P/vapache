@@ -754,22 +754,52 @@ impl Handler {
     }
 }
 
-/// Resolve the effective handler for one extension token.  `*` matches every
-/// extension.  Scanning the merged list in reverse gives the last operation
-/// for each matching name.
-pub(crate) fn effective_handler_for_ext<'a>(scope: &'a Scope, ext: &str) -> Option<&'a str> {
-    for handler in scope.mapping_policy.handlers.iter().rev() {
-        let matches = handler.ext == "*" || handler.ext.eq_ignore_ascii_case(ext);
-        if !matches {
-            continue;
-        }
-        return if handler.remove {
-            None
-        } else {
-            Some(handler.handler.as_str())
-        };
+pub(crate) fn normalize_handler_extension(raw: &str) -> String {
+    raw.strip_prefix('.').unwrap_or(raw).to_ascii_lowercase()
+}
+
+/// Return Apache-style extension tokens for a basename.  Leading dots belong
+/// to the hidden-file stem, not to an extension; at least one non-dot stem
+/// byte and a subsequent separator are required.  Every non-empty token is
+/// retained because mod_mime applies metadata across multi-extension names.
+pub(crate) fn filename_extension_tokens(name: &[u8]) -> Vec<&[u8]> {
+    let base = name.rsplit(|b| *b == b'/').next().unwrap_or(name);
+    let Some(first_stem) = base.iter().position(|b| *b != b'.') else {
+        return Vec::new();
+    };
+    let visible = &base[first_stem..];
+    let separator = visible.iter().position(|b| *b == b'.');
+    if !vapache_verified::extension_table_admit(
+        separator.is_some_and(|index| index > 0),
+        separator.is_some(),
+    ) {
+        return Vec::new();
     }
-    None
+    visible[separator.unwrap_or(visible.len()) + 1..]
+        .split(|b| *b == b'.')
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+/// Resolve the effective handler for one literal extension token.
+/// `RemoveHandler` is a deny entry and wins over matching additions in the
+/// effective scope regardless of directive order.
+pub(crate) fn effective_handler_for_ext<'a>(scope: &'a Scope, ext: &str) -> Option<&'a str> {
+    let removed = scope
+        .mapping_policy
+        .handlers
+        .iter()
+        .any(|handler| handler.remove && handler.ext.eq_ignore_ascii_case(ext));
+    let added = scope
+        .mapping_policy
+        .handlers
+        .iter()
+        .rev()
+        .find(|handler| !handler.remove && handler.ext.eq_ignore_ascii_case(ext));
+    if !vapache_verified::handler_extension_admit(removed, added.is_some()) {
+        return None;
+    }
+    added.map(|handler| handler.handler.as_str())
 }
 
 /// Resolve the effective handler for a filename.  `SetHandler` has
@@ -782,14 +812,16 @@ pub(crate) fn effective_handler<'a>(scope: &'a Scope, name: &[u8]) -> Option<&'a
         Some(SetHandler::Name(forced)) => return Some(forced.as_str()),
         Some(SetHandler::None_) | None => {}
     }
-    let base = name.rsplit(|b| *b == b'/').next().unwrap_or(name);
-    let ext = base
-        .rsplit(|b| *b == b'.')
-        .next()
-        .and_then(|e| std::str::from_utf8(e).ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    effective_handler_for_ext(scope, &ext)
+    let mut selected = None;
+    for token in filename_extension_tokens(name) {
+        let Some(ext) = std::str::from_utf8(token).ok() else {
+            continue;
+        };
+        if let Some(handler) = effective_handler_for_ext(scope, ext) {
+            selected = Some(handler);
+        }
+    }
+    selected
 }
 
 /// Meet two handler maps.  For every extension either side mentions, the
@@ -799,13 +831,16 @@ pub(crate) fn effective_handler<'a>(scope: &'a Scope, name: &[u8]) -> Option<&'a
 /// target `AddHandler` from undoing a lexical `RemoveHandler` (F60/I61).
 fn conjoined_handlers(base: &[Handler], target: &[Handler]) -> Vec<Handler> {
     fn lookup<'a>(handlers: &'a [Handler], ext: &str) -> Option<&'a str> {
-        for handler in handlers.iter().rev() {
-            if handler.ext == "*" || handler.ext.eq_ignore_ascii_case(ext) {
-                return if handler.remove {
-                    None
-                } else {
-                    Some(handler.handler.as_str())
-                };
+        let removed = handlers
+            .iter()
+            .any(|handler| handler.remove && handler.ext.eq_ignore_ascii_case(ext));
+        let added = handlers
+            .iter()
+            .rev()
+            .find(|handler| !handler.remove && handler.ext.eq_ignore_ascii_case(ext));
+        if vapache_verified::handler_extension_admit(removed, added.is_some()) {
+            if let Some(handler) = added {
+                return Some(handler.handler.as_str());
             }
         }
         None
@@ -819,31 +854,9 @@ fn conjoined_handlers(base: &[Handler], target: &[Handler]) -> Vec<Handler> {
         }
     }
 
-    // A sentinel extension cannot collide with a configured literal one, so
-    // it observes only the wildcard operations from each side.
-    const SENTINEL: &str = "\u{1}vapache-no-extension";
-    let base_wild = lookup(base, SENTINEL);
-    let target_wild = lookup(target, SENTINEL);
     let mut out = Vec::new();
-    if base_wild.is_some() || target_wild.is_some() {
-        if vapache_verified::handler_conjoin_admit(
-            base_wild.is_some(),
-            target_wild.is_some(),
-            same(base_wild, target_wild),
-        ) {
-            out.push(Handler::add(
-                "*".into(),
-                base_wild.unwrap_or_default().to_string(),
-            ));
-        } else {
-            out.push(Handler::remove("*".into()));
-        }
-    }
     let mut extensions: Vec<String> = Vec::new();
     for handler in base.iter().chain(target.iter()) {
-        if handler.ext == "*" {
-            continue;
-        }
         let ext = handler.ext.to_ascii_lowercase();
         if !extensions.contains(&ext) {
             extensions.push(ext);
@@ -4058,16 +4071,17 @@ impl Compile {
                 }
                 for ext in &args[1..] {
                     scope.mapping_policy.handlers.push(Handler::add(
-                        ext.trim_start_matches('.').to_ascii_lowercase(),
+                        normalize_handler_extension(ext),
                         args[0].clone(),
                     ));
                 }
             }
             "removehandler" => {
                 for ext in args {
-                    scope.mapping_policy.handlers.push(Handler::remove(
-                        ext.trim_start_matches('.').to_ascii_lowercase(),
-                    ));
+                    scope
+                        .mapping_policy
+                        .handlers
+                        .push(Handler::remove(normalize_handler_extension(&ext)));
                 }
             }
             "sethandler" => {
@@ -5841,6 +5855,7 @@ pub(crate) fn require_syntax_error(msg: &str) -> bool {
         || msg.starts_with("incomplete Require")
         || msg.starts_with("Require env requires")
         || msg.starts_with("empty Require env variable")
+        || msg.starts_with("Require env does not support")
         || msg.starts_with("bad Require expr")
         || msg.starts_with("unknown Require provider")
 }
@@ -5897,8 +5912,11 @@ pub(crate) fn parse_require(args: &[String]) -> Require {
             names: rest.to_vec(),
         },
         "method" => {
-            let methods: Vec<String> = rest.iter().map(|s| s.to_ascii_uppercase()).collect();
-            if methods.is_empty() || methods.iter().any(|m| !known_http_method(m)) {
+            let methods: Vec<String> = rest.to_vec();
+            if !vapache_verified::require_method_operand_admit(
+                !methods.is_empty(),
+                methods.iter().all(|method| known_http_method(method)),
+            ) {
                 return Require::Unsupported("bad Require method".into());
             }
             Require::Method { negate, methods }
@@ -5910,17 +5928,20 @@ pub(crate) fn parse_require(args: &[String]) -> Require {
             let Some(item) = rest.first() else {
                 return Require::Unsupported("Require env requires a variable".into());
             };
-            let (name, value) = match item.split_once('=') {
-                Some((n, v)) => (n.to_string(), Some(v.to_string())),
-                None => (item.to_string(), None),
-            };
-            if name.is_empty() {
+            let has_equals = item.contains('=');
+            let name = item.split_once('=').map(|(name, _)| name).unwrap_or(item);
+            if !vapache_verified::require_env_operand_admit(!name.is_empty(), has_equals) {
+                if has_equals {
+                    return Require::Unsupported(
+                        "Require env does not support NAME=VALUE comparisons".into(),
+                    );
+                }
                 return Require::Unsupported("empty Require env variable".into());
             }
             Require::Env {
                 negate,
-                name,
-                value,
+                name: name.to_string(),
+                value: None,
             }
         }
         "expr" => {
@@ -5983,7 +6004,10 @@ pub(crate) fn parse_rewrite_flags(args: &[String]) -> Result<RewriteFlags, Strin
             "QSL" => out.qslast = true,
             "UNSAFEALLOW3F" => out.unsafe_allow_3f = true,
             "B" => out.escape_backrefs = true,
-            "BNE" => out.noescape_backrefs = true,
+            "BNE" => {
+                out.escape_backrefs = true;
+                out.noescape_backrefs = true;
+            }
             "BNP" => out.backref_no_plus = true,
             "BCTLS" => {
                 out.escape_backrefs = true;
@@ -6014,6 +6038,7 @@ pub(crate) fn parse_rewrite_flags(args: &[String]) -> Result<RewriteFlags, Strin
                 out.escape_chars = flag[2..].to_string();
             }
             _ if upper.starts_with("BNE=") => {
+                out.escape_backrefs = true;
                 out.noescape_backrefs = true;
                 out.noescape_chars = flag[4..].to_string();
             }
@@ -6050,6 +6075,8 @@ pub(crate) fn parse_rewrite_flags(args: &[String]) -> Result<RewriteFlags, Strin
             _ => return Err(format!("unsupported RewriteRule flag '[{flag}]'")),
         }
     }
+    out.escape_backrefs =
+        vapache_verified::rewrite_backref_escape_admit(out.escape_backrefs, out.noescape_backrefs);
     Ok(out)
 }
 
@@ -6935,19 +6962,14 @@ mod tests {
             }
             _ => panic!(),
         }
-        let r = parse_require(&["not".into(), "env".into(), "BLOCK=1".into()]);
-        match r {
-            Require::Env {
-                negate,
-                name,
-                value,
-            } => {
-                assert!(negate);
-                assert_eq!(name, "BLOCK");
-                assert_eq!(value.as_deref(), Some("1"));
-            }
-            _ => panic!(),
-        }
+        assert!(matches!(
+            parse_require(&["not".into(), "env".into(), "BLOCK=1".into()]),
+            Require::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse_require(&["method".into(), "get".into()]),
+            Require::Unsupported(_)
+        ));
         let r = parse_require(&[
             "not".into(),
             "expr".into(),
@@ -7086,6 +7108,11 @@ mod tests {
                 .unwrap(),
             vec![200]
         );
+        let balancer = |entries: &str| {
+            format!("Listen 127.0.0.1:0\n<Proxy balancer://pool>\nProxySet {entries}\n</Proxy>\n")
+        };
+        assert!(load_text(&balancer("failonstatus=500,lop"), false).is_ok());
+        assert!(load_text(&balancer("failonstatus=500,lop"), true).is_err());
     }
 
     #[test]
@@ -9403,6 +9430,10 @@ ServerName localhost\n\
             Require::Unsupported(_)
         ));
         assert!(matches!(
+            parse_require(&["env".into(), "".into()]),
+            Require::Unsupported(_)
+        ));
+        assert!(matches!(
             parse_require(&["expr".into(), "(".into()]),
             Require::Unsupported(_)
         ));
@@ -9476,6 +9507,7 @@ ServerName localhost\n\
         assert!(parse_rewrite_flags(&["R=bad".into()]).is_err());
         assert!(parse_rewrite_flags(&["R=200".into()]).is_err());
         let custom = parse_rewrite_flags(&["B= !".into(), "BNE=&".into()]).unwrap();
+        assert!(custom.escape_backrefs);
         assert_eq!(custom.escape_chars, " !");
         assert_eq!(custom.noescape_chars, "&");
         let env = parse_rewrite_flags(&[
@@ -10542,8 +10574,7 @@ Require all granted\n\
             Some("cgi-script")
         );
 
-        // Wildcard handlers meet in the same way; disagreement denies every
-        // extension rather than letting the target grant one.
+        // `*` is a literal extension in Apache, not a wildcard.
         let mut url = Scope::default();
         url.mapping_policy
             .handlers
@@ -10554,10 +10585,8 @@ Require all granted\n\
             .handlers
             .push(Handler::add("*".into(), "cgi-script".into()));
         target.restrict_with(&url);
-        assert_eq!(
-            effective_handler(&target, b"upload.anything"),
-            Some("cgi-script")
-        );
+        assert_eq!(effective_handler(&target, b"upload.anything"), None);
+        assert_eq!(effective_handler(&target, b"upload.*"), Some("cgi-script"));
         let mut target = Scope::default();
         target
             .mapping_policy
@@ -10565,6 +10594,7 @@ Require all granted\n\
             .push(Handler::add("*".into(), "proxy:fcgi://localhost".into()));
         target.restrict_with(&url);
         assert_eq!(effective_handler(&target, b"upload.anything"), None);
+        assert_eq!(effective_handler(&target, b"upload.*"), None);
 
         // Two matching RemoveHandler operations stay removed.
         let mut url = Scope::default();
@@ -11702,6 +11732,56 @@ mod pass11_kernel_tests {
             "<Directory /srv>\nRemoveHandler .cgi\nSetHandler cgi-script\n</Directory>\n",
         );
         assert_eq!(effective_handler(&scope, b"x.cgi"), Some("cgi-script"));
+    }
+
+    #[test]
+    fn handler_extensions_require_a_real_suffix_and_removals_win() {
+        let mut scope = Scope::default();
+        scope
+            .mapping_policy
+            .handlers
+            .push(Handler::add("cgi".into(), "cgi-script".into()));
+        for name in [b"cgi".as_slice(), b".cgi", b"..cgi"] {
+            assert_eq!(effective_handler(&scope, name), None, "{name:?}");
+        }
+        assert_eq!(effective_handler(&scope, b"..."), None);
+        for name in [b"run.cgi".as_slice(), b"run.cgi.txt", b"run.cgi."] {
+            assert_eq!(
+                effective_handler(&scope, name),
+                Some("cgi-script"),
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            effective_handler(&scope, b"run.\xff.cgi"),
+            Some("cgi-script")
+        );
+
+        scope
+            .mapping_policy
+            .handlers
+            .push(Handler::add("*".into(), "literal-star".into()));
+        assert_eq!(effective_handler(&scope, b"run.txt"), None);
+        assert_eq!(effective_handler(&scope, b"run.*"), Some("literal-star"));
+
+        for handlers in [
+            vec![
+                Handler::remove("cgi".into()),
+                Handler::add("cgi".into(), "cgi-script".into()),
+            ],
+            vec![
+                Handler::add("cgi".into(), "cgi-script".into()),
+                Handler::remove("cgi".into()),
+            ],
+        ] {
+            let mut denied = Scope::default();
+            denied.mapping_policy.handlers = handlers;
+            assert_eq!(effective_handler(&denied, b"run.cgi"), None);
+        }
+
+        let parsed = handler_scope("<Directory /srv>\nAddHandler cgi-script ..cgi\n</Directory>\n");
+        assert_eq!(parsed.mapping_policy.handlers[0].ext, ".cgi");
+        assert_eq!(effective_handler(&parsed, b"run.cgi"), None);
     }
 
     #[test]

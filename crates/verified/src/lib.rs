@@ -1115,6 +1115,123 @@ pub proof fn rewrite_restart_rejects_at_limit(limit: u64)
 {
 }
 
+/// A `RewriteMap prg` lookup is usable only when one bounded output line was
+/// produced before the caller's deadline.  Process spawning and the wall
+/// clock remain trusted runtime services; this predicate is the decision the
+/// rewrite interpreter consumes after that bounded wait.
+pub open spec fn rewrite_map_result_spec(
+    completed_before_deadline: bool,
+    line_complete: bool,
+    output_len: u64,
+    max_output: u64,
+) -> bool {
+    completed_before_deadline && line_complete && output_len <= max_output
+}
+
+pub fn rewrite_map_result_admit(
+    completed_before_deadline: bool,
+    line_complete: bool,
+    output_len: u64,
+    max_output: u64,
+) -> (ok: bool)
+    ensures
+        ok == rewrite_map_result_spec(
+            completed_before_deadline,
+            line_complete,
+            output_len,
+            max_output,
+        ),
+{
+    completed_before_deadline && line_complete && output_len <= max_output
+}
+
+pub proof fn rewrite_map_timeout_or_overflow_fails_closed(
+    completed_before_deadline: bool,
+    line_complete: bool,
+    output_len: u64,
+    max_output: u64,
+)
+    ensures
+        !completed_before_deadline || !line_complete || output_len > max_output
+            ==> !rewrite_map_result_spec(
+                completed_before_deadline,
+                line_complete,
+                output_len,
+                max_output,
+            ),
+{
+}
+
+/// `[BNE]` supplies exclusions to the backreference escaping operation; it is
+/// not an independent no-op.  Any exclusion mode therefore implies that the
+/// escaping pass itself is enabled.
+pub open spec fn rewrite_backref_escape_spec(
+    explicit_escape: bool,
+    exclusion_mode: bool,
+) -> bool {
+    explicit_escape || exclusion_mode
+}
+
+pub fn rewrite_backref_escape_admit(
+    explicit_escape: bool,
+    exclusion_mode: bool,
+) -> (escape: bool)
+    ensures escape == rewrite_backref_escape_spec(explicit_escape, exclusion_mode),
+{
+    explicit_escape || exclusion_mode
+}
+
+pub proof fn rewrite_backref_exclusions_require_escape(
+    explicit_escape: bool,
+    exclusion_mode: bool,
+)
+    ensures
+        exclusion_mode
+            ==> rewrite_backref_escape_spec(explicit_escape, exclusion_mode),
+{
+}
+
+/// A persisted cache entry is usable only when its metadata carries the
+/// complete cache key and that key is exactly the one requested.  The digest
+/// filename is an index, not an authority for cache identity.
+pub open spec fn cache_disk_key_spec(has_key: bool, exact_key: bool) -> bool {
+    has_key && exact_key
+}
+
+pub fn cache_disk_key_admit(has_key: bool, exact_key: bool) -> (ok: bool)
+    ensures ok == cache_disk_key_spec(has_key, exact_key),
+{
+    has_key && exact_key
+}
+
+pub proof fn cache_disk_key_rejects_missing_or_mismatched(has_key: bool, exact_key: bool)
+    ensures
+        (!has_key || !exact_key) ==> !cache_disk_key_spec(has_key, exact_key),
+{
+}
+
+/// Targeted invalidation removes legacy/unkeyed metadata conservatively and
+/// removes a keyed entry exactly when its canonical request-URI prefix
+/// matches.  An unrelated keyed representation therefore survives.
+pub open spec fn cache_invalidation_remove_spec(has_key: bool, prefix_matches: bool) -> bool {
+    !has_key || prefix_matches
+}
+
+pub fn cache_invalidation_remove_admit(has_key: bool, prefix_matches: bool) -> (remove: bool)
+    ensures remove == cache_invalidation_remove_spec(has_key, prefix_matches),
+{
+    !has_key || prefix_matches
+}
+
+pub proof fn cache_invalidation_preserves_unrelated_keyed_entry(
+    has_key: bool,
+    prefix_matches: bool,
+)
+    requires has_key && !prefix_matches,
+    ensures !cache_invalidation_remove_spec(has_key, prefix_matches),
+{
+}
+
 /// Add the single leading slash required for an internal rewrite target.
 /// External targets are classified before this function is called.
 pub fn rewrite_internal_path(joined: &[u8]) -> (out: Vec<u8>)
@@ -1504,6 +1621,25 @@ pub fn access_walk_dir_admit(is_walk_ancestor: bool, override_permits: bool) -> 
     is_walk_ancestor && override_permits
 }
 
+/// Apache's `AccessFileName a b ...` consults candidates in order and uses
+/// only the first existing entry in each directory.  Merging later files lets
+/// an attacker-controlled secondary name add handlers or relax policy after a
+/// trusted primary access file.
+pub open spec fn access_file_candidate_spec(prior_selected: bool, exists: bool) -> bool {
+    !prior_selected && exists
+}
+
+pub fn access_file_candidate_admit(prior_selected: bool, exists: bool) -> (ok: bool)
+    ensures ok == access_file_candidate_spec(prior_selected, exists),
+{
+    !prior_selected && exists
+}
+
+pub proof fn access_file_later_candidate_cannot_merge(prior_selected: bool, exists: bool)
+    ensures prior_selected ==> !access_file_candidate_spec(prior_selected, exists),
+{
+}
+
 /// F51/I48: the mapping root used for URL/`RewriteBase` derivation is the one
 /// selected by URL mapping, never a root reconstructed from an arbitrary
 /// alias target that happens to contain the filesystem path.
@@ -1735,6 +1871,126 @@ pub proof fn handler_conjoin_requires_both(
     ensures
         handler_conjoin_spec(url_has_handler, target_has_handler, same_handler)
             ==> url_has_handler && target_has_handler,
+{
+}
+
+/// P12-B: an extension table is consulted only after a real, non-empty
+/// basename followed by a dot.  Dotless names and names made solely from
+/// leading dots therefore cannot acquire a handler.
+pub open spec fn extension_table_spec(stem_nonempty: bool, has_separator: bool) -> bool {
+    stem_nonempty && has_separator
+}
+
+pub fn extension_table_admit(stem_nonempty: bool, has_separator: bool) -> (ok: bool)
+    ensures ok == extension_table_spec(stem_nonempty, has_separator),
+{
+    stem_nonempty && has_separator
+}
+
+pub proof fn extension_table_rejects_unqualified_names(
+    stem_nonempty: bool,
+    has_separator: bool,
+)
+    ensures
+        extension_table_spec(stem_nonempty, has_separator)
+            ==> stem_nonempty && has_separator,
+{
+}
+
+/// P12-B: `RemoveHandler` is a deny entry, not an order-dependent table
+/// assignment.  Once the effective scope contains a matching removal, a
+/// matching AddHandler cannot restore execution.
+pub open spec fn handler_extension_spec(removed: bool, has_add: bool) -> bool {
+    !removed && has_add
+}
+
+pub fn handler_extension_admit(removed: bool, has_add: bool) -> (ok: bool)
+    ensures ok == handler_extension_spec(removed, has_add),
+{
+    !removed && has_add
+}
+
+pub proof fn handler_extension_removal_wins(removed: bool, has_add: bool)
+    ensures removed ==> !handler_extension_spec(removed, has_add),
+{
+}
+
+/// An explicit `FileETag None` is represented by zero bits and suppresses the
+/// field.  Zero must not be reinterpreted as the default `All` mask.
+pub open spec fn file_etag_emit_spec(bits: u32) -> bool {
+    bits != 0
+}
+
+pub fn file_etag_emit_admit(bits: u32) -> (ok: bool)
+    ensures ok == file_etag_emit_spec(bits),
+{
+    bits != 0
+}
+
+pub proof fn file_etag_none_emits_nothing()
+    ensures !file_etag_emit_spec(0),
+{
+}
+
+/// P12-E: configuring an authentication mechanism without an effective
+/// authorization policy is a server error and must never become an implicit
+/// grant (including through `Satisfy any`).
+pub open spec fn authz_configuration_spec(auth_type_set: bool, has_require: bool) -> bool {
+    !auth_type_set || has_require
+}
+
+pub fn authz_configuration_admit(auth_type_set: bool, has_require: bool) -> (ok: bool)
+    ensures ok == authz_configuration_spec(auth_type_set, has_require),
+{
+    !auth_type_set || has_require
+}
+
+pub proof fn auth_type_requires_authorization(auth_type_set: bool, has_require: bool)
+    ensures
+        auth_type_set && authz_configuration_spec(auth_type_set, has_require)
+            ==> has_require,
+{
+}
+
+/// P12 static-audit follow-up: `Require method` operands are admitted only
+/// when the parser saw at least one method and every spelling is an exact
+/// supported token.  In particular, silently uppercasing `get` into `GET`
+/// would turn an Apache non-match into a grant.
+pub open spec fn require_method_operand_spec(nonempty: bool, all_exact_known: bool) -> bool {
+    nonempty && all_exact_known
+}
+
+pub fn require_method_operand_admit(nonempty: bool, all_exact_known: bool) -> (ok: bool)
+    ensures ok == require_method_operand_spec(nonempty, all_exact_known),
+{
+    nonempty && all_exact_known
+}
+
+pub proof fn require_method_rejects_normalized_spelling(
+    nonempty: bool,
+    all_exact_known: bool,
+)
+    ensures
+        require_method_operand_spec(nonempty, all_exact_known)
+            ==> nonempty && all_exact_known,
+{
+}
+
+/// P12 static-audit follow-up: mod_authz_core's `env` provider accepts a
+/// variable name, not a `NAME=VALUE` comparison.  Treating the latter as a
+/// comparison can grant a request that Apache never grants.
+pub open spec fn require_env_operand_spec(name_nonempty: bool, has_equals: bool) -> bool {
+    name_nonempty && !has_equals
+}
+
+pub fn require_env_operand_admit(name_nonempty: bool, has_equals: bool) -> (ok: bool)
+    ensures ok == require_env_operand_spec(name_nonempty, has_equals),
+{
+    name_nonempty && !has_equals
+}
+
+pub proof fn require_env_rejects_value_comparisons(name_nonempty: bool, has_equals: bool)
+    ensures has_equals ==> !require_env_operand_spec(name_nonempty, has_equals),
 {
 }
 
@@ -2619,6 +2875,51 @@ pub open spec fn valid_method(s: Seq<u8>) -> bool {
 
 pub open spec fn valid_target(s: Seq<u8>) -> bool {
     s.len() > 0 && all_target_bytes(s)
+}
+
+/// P12-A: prefix routes are component-aware, while a prefix that already
+/// ends in `/` (including the root route) directly owns its descendants.
+pub open spec fn proxy_prefix_match_spec(
+    exact: bool,
+    has_prefix: bool,
+    prefix_ends_slash: bool,
+    remainder_starts_slash: bool,
+) -> bool {
+    exact || (has_prefix && (prefix_ends_slash || remainder_starts_slash))
+}
+
+pub fn proxy_prefix_match_admit(
+    exact: bool,
+    has_prefix: bool,
+    prefix_ends_slash: bool,
+    remainder_starts_slash: bool,
+) -> (ok: bool)
+    ensures
+        ok == proxy_prefix_match_spec(
+            exact,
+            has_prefix,
+            prefix_ends_slash,
+            remainder_starts_slash,
+        ),
+{
+    exact || (has_prefix && (prefix_ends_slash || remainder_starts_slash))
+}
+
+pub proof fn proxy_prefix_rejects_partial_component(
+    exact: bool,
+    has_prefix: bool,
+    prefix_ends_slash: bool,
+    remainder_starts_slash: bool,
+)
+    ensures
+        has_prefix && !exact && !prefix_ends_slash && !remainder_starts_slash
+            ==> !proxy_prefix_match_spec(
+                exact,
+                has_prefix,
+                prefix_ends_slash,
+                remainder_starts_slash,
+            ),
+{
 }
 
 pub open spec fn valid_header_name(s: Seq<u8>) -> bool {
@@ -3789,6 +4090,55 @@ pub fn cgi_field_len_ok(len: u32, limit: u32) -> (ok: bool)
     ensures ok == (len <= limit),
 {
     len <= limit
+}
+
+/// CGI responses are ordinary HTTP responses generated through the server;
+/// scripts cannot switch the client connection to another protocol or emit
+/// informational responses whose framing the CGI adapter does not own.
+pub open spec fn cgi_response_status_spec(status: u16) -> bool {
+    200 <= status && status <= 599
+}
+
+pub fn cgi_response_status_admit(status: u16) -> (ok: bool)
+    ensures ok == cgi_response_status_spec(status),
+{
+    200 <= status && status <= 599
+}
+
+pub proof fn cgi_response_rejects_informational(status: u16)
+    ensures status < 200 ==> !cgi_response_status_spec(status),
+{
+}
+
+/// The server, not a CGI script, owns HTTP framing and connection state.
+/// Connection-nominated fields are removed after the complete head is read.
+pub open spec fn cgi_response_header_spec(
+    framing: bool,
+    hop_by_hop: bool,
+    connection_nominated: bool,
+) -> bool {
+    !framing && !hop_by_hop && !connection_nominated
+}
+
+pub fn cgi_response_header_admit(
+    framing: bool,
+    hop_by_hop: bool,
+    connection_nominated: bool,
+) -> (ok: bool)
+    ensures ok == cgi_response_header_spec(framing, hop_by_hop, connection_nominated),
+{
+    !framing && !hop_by_hop && !connection_nominated
+}
+
+pub proof fn cgi_response_header_rejects_connection_state(
+    framing: bool,
+    hop_by_hop: bool,
+    connection_nominated: bool,
+)
+    ensures
+        framing || hop_by_hop || connection_nominated
+            ==> !cgi_response_header_spec(framing, hop_by_hop, connection_nominated),
+{
 }
 
 /// Number of bytes to hand to the next HTTP/2 DATA send.  The result is
@@ -5562,6 +5912,73 @@ pub fn h2_target_admit(len: u64, limit: u64) -> (ok: bool)
     len <= limit
 }
 
+/// HTTP/2 regular requests must carry the pseudo-header identity that HTTP/1
+/// obtains from the request target and Host field.  CONNECT is unsupported by
+/// the shared dispatcher, and fragments are never part of an HTTP request
+/// target.  Missing fields must not be normalized into `GET /`.
+pub open spec fn h2_request_target_spec(
+    is_connect: bool,
+    has_scheme: bool,
+    has_authority: bool,
+    has_path: bool,
+    path_nonempty: bool,
+    has_fragment: bool,
+) -> bool {
+    !is_connect
+        && has_scheme
+        && has_authority
+        && has_path
+        && path_nonempty
+        && !has_fragment
+}
+
+pub fn h2_request_target_admit(
+    is_connect: bool,
+    has_scheme: bool,
+    has_authority: bool,
+    has_path: bool,
+    path_nonempty: bool,
+    has_fragment: bool,
+) -> (ok: bool)
+    ensures
+        ok == h2_request_target_spec(
+            is_connect,
+            has_scheme,
+            has_authority,
+            has_path,
+            path_nonempty,
+            has_fragment,
+        ),
+{
+    !is_connect
+        && has_scheme
+        && has_authority
+        && has_path
+        && path_nonempty
+        && !has_fragment
+}
+
+pub proof fn h2_request_target_rejects_ambiguous_identity(
+    is_connect: bool,
+    has_scheme: bool,
+    has_authority: bool,
+    has_path: bool,
+    path_nonempty: bool,
+    has_fragment: bool,
+)
+    ensures
+        is_connect || !has_scheme || !has_authority || !has_path || !path_nonempty || has_fragment
+            ==> !h2_request_target_spec(
+                is_connect,
+                has_scheme,
+                has_authority,
+                has_path,
+                path_nonempty,
+                has_fragment,
+            ),
+{
+}
+
 /// Header count and one field size are both bounded independently.
 pub fn h2_header_admit(
     count: u64,
@@ -6999,7 +7416,6 @@ pub open spec fn expr_var_known_spec(name: Seq<u8>) -> bool {
         || starts_with_ignore_ascii_case_spec(name, b"http:"@)
         || starts_with_ignore_ascii_case_spec(name, b"env:"@)
         || starts_with_ignore_ascii_case_spec(name, b"http_"@)
-        || starts_with_ignore_ascii_case_spec(name, b"http"@)
         || expr_var_fixed_spec(name)
 }
 
@@ -7020,7 +7436,6 @@ pub fn expr_var_known(name: &[u8]) -> (known: bool)
         || starts_with_ignore_ascii_case(name, b"http:")
         || starts_with_ignore_ascii_case(name, b"env:")
         || starts_with_ignore_ascii_case(name, b"http_")
-        || starts_with_ignore_ascii_case(name, b"http")
         || eq_ignore_ascii_case(name, b"time")
         || eq_ignore_ascii_case(name, b"time_year")
         || eq_ignore_ascii_case(name, b"time_mon")

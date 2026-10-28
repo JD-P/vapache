@@ -480,17 +480,7 @@ fn join_path(base: &str, suffix: &str) -> String {
 }
 
 fn prefix_suffix<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
-    if path == prefix {
-        Some("")
-    } else if let Some(rest) = path.strip_prefix(prefix) {
-        if rest.starts_with('/') {
-            Some(rest.trim_start_matches('/'))
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+    crate::util::route_prefix_suffix(prefix, path)
 }
 
 /// Resolve an absolute URL produced by `RewriteRule ... [P]`.  The query
@@ -1522,6 +1512,9 @@ fn proxy_once(
                 reader: Box::new(body),
                 len: n as u64,
             };
+            scope
+                .header_policy
+                .apply(&mut response.headers, response.status < 400);
             crate::compression::finalize(scope, req, &mut response, url_path.as_bytes());
             return Ok((response, None));
         }
@@ -2162,6 +2155,11 @@ mod more_tests {
             "127.0.0.1",
         );
         assert_eq!(r.status, 502);
+        scope.proxy_policy.proxy_passes[0].prefix = "/app/".into();
+        assert!(match_target(&cfg, &scope, "/app/x").is_some());
+        assert!(match_target(&cfg, &scope, "/appx").is_none());
+        scope.proxy_policy.proxy_passes[0].prefix = "/".into();
+        assert!(match_target(&cfg, &scope, "/anything").is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2404,6 +2402,10 @@ mod more_tests {
                 fail_on_status: Vec::new(),
                 route_order: 0,
             });
+        scope
+            .header_policy
+            .set_headers
+            .push(("X-Stream-Policy".into(), "applied".into()));
         let request = req("/stream/x");
         let target = match_target(&cfg, &scope, "/stream/x").unwrap();
         let mut response = execute(
@@ -2420,6 +2422,9 @@ mod more_tests {
             "127.0.0.1",
         );
         assert_eq!(response.status, 200);
+        assert!(response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-stream-policy") && value == b"applied"
+        }));
         match &mut response.body {
             Body::Stream { reader, len } => {
                 assert_eq!(*len, 300 * 1024);

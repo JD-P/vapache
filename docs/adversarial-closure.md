@@ -145,6 +145,47 @@ The first closure pass also made the following classes explicit in the model:
   resource-limit directives can no longer disappear into the compatibility
   warning path, and strict mode rejects every unhandled directive (I34).
 
+## Pass 12 closure
+
+The confirmed cases in `adversarial/findings_p12.md` are closed as follows:
+
+- Proxy and FastCGI prefix routes share a verified component-boundary matcher;
+  trailing-slash routes match children, and `/` remains the root catch-all.
+- Handler selection tokenizes every real filename extension, rejects dotless
+  and all-dot basenames, normalizes exactly one configured leading dot, and
+  gives a matching `RemoveHandler` precedence independent of directive order.
+- `ScriptAlias` CGI classification after `PATH_INFO` splitting uses the
+  effective handler policy, so `SetHandler default-handler` cannot be bypassed
+  by appending a suffix.
+- HTTP/2 request bodies use one whole-body deadline and explicitly return
+  consumed flow-control capacity; responses wait for send capacity, including
+  bodies larger than the initial window.
+- `AuthType` without an effective `Require` is a fail-closed configuration
+  state and produces a server error even under `Satisfy any`.
+- Streamed proxy responses pass through the same response-header policy as
+  buffered responses before dispatch returns them.
+- A standalone `[BNE]`/`[BNE=...]` rewrite flag now activates backreference
+  escaping while excluding only the configured bytes.
+- The pinned HTTP/2 parser rejects a missing `:path` and fragment-bearing
+  pseudo-target before `http::Uri` can normalize either shape; the adapter's
+  verified gate additionally requires non-CONNECT scheme, authority and path
+  identity.
+- CGI rejects informational status responses and strips framing, hop-by-hop
+  and `Connection`-nominated response fields before server framing is chosen.
+- Unknown expression variables and malformed/lowercase `Require method` or
+  comparison-shaped `Require env` operands fail closed at configuration load.
+- Multiple `AccessFileName` entries select the first existing candidate, and
+  `FileETag None` emits no entity tag while preserving wildcard preconditions.
+- `RewriteMap prg` runs in a separate process group with a whole-operation
+  deadline and an 8 KiB result limit; timeout, overflow and worker failure
+  produce no substitution.
+- Disk cache metadata carries the complete V4 key, lookup verifies the exact
+  key rather than trusting a SHA-1 filename, and unsafe-method invalidation is
+  canonical and prefix-targeted rather than flushing unrelated entries.
+
+These decisions are backed by new Verus admission kernels and refinement tests;
+the Verus gate now proves 373 functions with zero errors.
+
 ## Regression surface
 
 The closure is exercised by:

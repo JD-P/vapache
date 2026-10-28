@@ -25,20 +25,24 @@ CARGO_TARGET_DIR=target/cov RUSTFLAGS="-C instrument-coverage" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/unit-%p-%m.profraw" \
     cargo test --workspace -- --test-threads=1
 
-VAPACHED="$PWD/target/cov/release/vapached" \
-LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
-PYTHONDONTWRITEBYTECODE=1 \
-    python3 tests/config_grammar.py
+if command -v apache2 >/dev/null 2>&1; then
+    VAPACHED="$PWD/target/cov/release/vapached" \
+    LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+    PYTHONDONTWRITEBYTECODE=1 \
+        python3 tests/config_grammar.py
 
-VAPACHED="$PWD/target/cov/release/vapached" \
-LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
-PYTHONDONTWRITEBYTECODE=1 \
-    python3 tests/config_validity.py
+    VAPACHED="$PWD/target/cov/release/vapached" \
+    LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+    PYTHONDONTWRITEBYTECODE=1 \
+        python3 tests/config_validity.py
 
-VAPACHED="$PWD/target/cov/release/vapached" \
-LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
-PYTHONDONTWRITEBYTECODE=1 \
-    python3 tests/config_semantics.py
+    VAPACHED="$PWD/target/cov/release/vapached" \
+    LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+    PYTHONDONTWRITEBYTECODE=1 \
+        python3 tests/config_semantics.py
+else
+    echo "coverage: Apache not found; skipping differential config suites"
+fi
 
 VAPACHED="$PWD/target/cov/release/vapached" \
 LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
@@ -50,7 +54,7 @@ LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/adversarial_regressions.py
 
-"$LLVM_BIN/llvm-profdata" merge -sparse "$PROFILE_DIR"/*.profraw \
+"$LLVM_BIN/llvm-profdata" merge -sparse -failure-mode=all "$PROFILE_DIR"/*.profraw \
     -o "$PROFILE_DIR/all.profdata"
 
 # Pass the release binary plus every instrumented test executable so the

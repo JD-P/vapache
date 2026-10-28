@@ -543,6 +543,7 @@ pub fn request_scope_with_plan(
         local_port,
         https,
         host,
+        &url_path,
         &cache_url_path,
         &req.query,
         &fs_path,
@@ -590,7 +591,8 @@ fn base_key(
     local_port: u16,
     https: bool,
     host: &str,
-    path: &str,
+    request_path: &str,
+    representation_path: &str,
     query: &[u8],
     target: &std::path::Path,
     policy_fingerprint: PolicyFingerprint,
@@ -609,10 +611,11 @@ fn base_key(
         .unwrap_or_else(|| "default".into());
     let policy_fingerprint = key_component(&policy_fingerprint);
     format!(
-        "{}\n{host}\n{path}\n{query}\n{scheme}\n{local_ip}\n{local_port}\n{vhost_id}\n{target}\n{policy_fingerprint}",
+        "{}\n{host}\n{request_path}\n{representation_path}\n{query}\n{scheme}\n{local_ip}\n{local_port}\n{vhost_id}\n{target}\n{policy_fingerprint}",
         key_component(cfg.server_root.as_os_str().as_bytes()),
         host = key_component(host.as_bytes()),
-        path = key_component(path.as_bytes()),
+        request_path = key_component(request_path.as_bytes()),
+        representation_path = key_component(representation_path.as_bytes()),
         scheme = if https { "https" } else { "http" },
         target = key_component(target.as_os_str().as_bytes()),
     )
@@ -1082,9 +1085,10 @@ fn cache_stem(cfg: &Config, key: &str) -> Option<std::path::PathBuf> {
     Some(root.join(name))
 }
 
-fn encode_meta(entry: &Entry) -> Vec<u8> {
+fn encode_meta(key: &str, entry: &Entry) -> Vec<u8> {
     let mut out = format!(
-        "V3\nS {}\nT {}\nE {}\nP {}\nG {}\n",
+        "V4\nK {}\nS {}\nT {}\nE {}\nP {}\nG {}\n",
+        STANDARD.encode(key.as_bytes()),
         entry.status,
         entry.stored,
         entry.expires,
@@ -1112,7 +1116,7 @@ fn decode_meta(data: &[u8]) -> Option<Entry> {
     let text = std::str::from_utf8(data).ok()?;
     let mut lines = text.lines();
     let version = lines.next()?;
-    if version != "V1" && version != "V2" && version != "V3" {
+    if version != "V1" && version != "V2" && version != "V3" && version != "V4" {
         return None;
     }
     let mut status = None;
@@ -1161,6 +1165,23 @@ fn decode_meta(data: &[u8]) -> Option<Entry> {
     })
 }
 
+/// Return the exact cache key carried by current metadata.  Older metadata is
+/// deliberately unkeyed: it can be decoded for diagnostics, but it is never
+/// served and is removed conservatively by targeted invalidation.
+fn decode_meta_key(data: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(data).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != "V4" {
+        return None;
+    }
+    for line in lines {
+        if let Some(encoded) = line.strip_prefix("K ") {
+            return STANDARD.decode(encoded).ok();
+        }
+    }
+    None
+}
+
 fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
     let Some(stem) = cache_stem(cfg, key) else {
         return;
@@ -1174,7 +1195,7 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
     if let Some(parent) = stem.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let meta = encode_meta(entry);
+    let meta = encode_meta(key, entry);
     let incoming = (entry.body.len() as u64).saturating_add(meta.len() as u64);
     // A single representation larger than the whole disk budget is never
     // written; `CacheMaxFileSize` already bounds the body, while this covers
@@ -1251,6 +1272,12 @@ fn disk_load(cfg: &Config, key: &str) -> Option<Entry> {
         Ok(meta) => meta,
         Err(_) => return None,
     };
+    let metadata_key = decode_meta_key(&meta);
+    let exact_key = metadata_key.as_deref() == Some(key.as_bytes());
+    if !vapache_verified::cache_disk_key_admit(metadata_key.is_some(), exact_key) {
+        remove_disk_stem(cfg, &stem);
+        return None;
+    }
     let mut entry = match decode_meta(&meta) {
         Some(entry) => entry,
         None => {
@@ -1420,11 +1447,7 @@ pub fn clear(cfg: &Config) {
     invalidate_disk(cfg);
 }
 
-/// Remove persisted cache files.  Disk filenames are SHA-1 digests of the full
-/// key, so a host/path prefix cannot be mapped back to a filename without an
-/// index.  Unsafe methods are rare compared with cache hits and correctness
-/// matters more than preserving unrelated entries, so drop every persisted
-/// representation and let the next GET repopulate the cache.
+/// Remove every persisted cache file after a configuration-generation change.
 fn invalidate_disk(cfg: &Config) {
     let Some(root) = &cfg.cache.root else {
         return;
@@ -1459,6 +1482,61 @@ fn invalidate_disk(cfg: &Config) {
     remove_cache_files(root);
 }
 
+/// Remove only disk entries whose embedded, complete key has the selected
+/// canonical request-URI prefix.  Unkeyed legacy/corrupt metadata and orphan
+/// temporary/body files are removed conservatively during the same scan.
+fn invalidate_disk_prefix(cfg: &Config, prefix: &[u8]) {
+    let Some(root) = &cfg.cache.root else {
+        return;
+    };
+    disk_usage()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(root);
+    fn remove_matches(dir: &Path, prefix: &[u8]) {
+        let Ok(read) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => remove_matches(&path, prefix),
+                Ok(ft) if ft.is_file() => {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.ends_with(".body.tmp") || name.ends_with(".meta.tmp") {
+                        let _ = fs::remove_file(&path);
+                    } else if name.ends_with(".meta") {
+                        let key = fs::read(&path).ok().and_then(|data| decode_meta_key(&data));
+                        let prefix_matches = key
+                            .as_deref()
+                            .map(|key| key.starts_with(prefix))
+                            .unwrap_or(false);
+                        if vapache_verified::cache_invalidation_remove_admit(
+                            key.is_some(),
+                            prefix_matches,
+                        ) {
+                            if let Some(stem) = disk_stem(&path) {
+                                remove_disk_stem_files(&stem);
+                            }
+                        }
+                    } else if name.ends_with(".body") {
+                        let Some(stem) = disk_stem(&path) else {
+                            // The `.body` suffix guarantees a nonempty stem.
+                            continue; // coverage:ignore-line - suffix guarantees a stem
+                        };
+                        if !stem.with_extension("meta").is_file() {
+                            remove_disk_stem_files(&stem);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    remove_matches(root, prefix);
+}
+
 pub fn invalidate(cfg: &Config, host: &str, path: &str) {
     // Keep the prefix in the same lossless encoding as `base_key`; a lossy
     // `display()` prefix no longer matches keys and would leave stale entries
@@ -1472,7 +1550,7 @@ pub fn invalidate(cfg: &Config, host: &str, path: &str) {
     let mut guard = entries().lock().unwrap_or_else(|e| e.into_inner());
     guard.retain(|key, _| !key.starts_with(&prefix));
     drop(guard);
-    invalidate_disk(cfg);
+    invalidate_disk_prefix(cfg, prefix.as_bytes());
 }
 
 #[cfg(test)]
@@ -1567,6 +1645,7 @@ mod tests {
             80,
             false,
             "warm.test",
+            "/path",
             "/path",
             b"",
             target,
@@ -2160,6 +2239,7 @@ AddHandler cgi-script .cgi\n\
                 https,
                 host,
                 path,
+                path,
                 query,
                 target,
                 fingerprint,
@@ -2278,6 +2358,23 @@ AddHandler cgi-script .cgi\n\
         for (index, variant) in variants.iter().enumerate() {
             assert_ne!(baseline, *variant, "cache key input {index} is not bound");
         }
+        assert_ne!(
+            baseline,
+            base_key(
+                &cfg,
+                None,
+                "127.0.0.1",
+                8080,
+                false,
+                "example.test",
+                "/x",
+                "/x/index.html",
+                b"",
+                target,
+                [7u8; 32],
+            ),
+            "selected representation path is not independently bound"
+        );
 
         let original_root = cfg.server_root.clone();
         cfg.server_root = dir.join("other-root");
@@ -2443,6 +2540,7 @@ AddHandler cgi-script .cgi\n\
                 80,
                 false,
                 "example.test",
+                "/index.php",
                 "/index.php",
                 query,
                 target,
@@ -2948,6 +3046,18 @@ CacheIgnoreQueryString On\n\
 
         assert_eq!(vapache_verified::cache_disk_projected(10, 20, 3), 3);
         assert_eq!(vapache_verified::cache_disk_evict(10, 20), 0);
+        assert!(vapache_verified::cache_disk_key_admit(true, true));
+        assert!(!vapache_verified::cache_disk_key_admit(false, true));
+        assert!(!vapache_verified::cache_disk_key_admit(true, false));
+        assert!(vapache_verified::cache_invalidation_remove_admit(
+            false, false
+        ));
+        assert!(vapache_verified::cache_invalidation_remove_admit(
+            true, true
+        ));
+        assert!(!vapache_verified::cache_invalidation_remove_admit(
+            true, false
+        ));
     }
 
     fn disk_test_config(name: &str) -> (std::path::PathBuf, Config) {
@@ -2980,6 +3090,94 @@ CacheIgnoreQueryString On\n\
             epoch: current_epoch(),
             vary: Vec::new(),
         }
+    }
+
+    #[test]
+    fn unsafe_method_invalidation_is_canonical_and_targeted() {
+        let (dir, mut cfg) = disk_test_config("targeted-invalidation");
+        cfg.cache.max_disk_size = 1_000_000;
+        prepare(&cfg);
+        let fingerprint = [7u8; 32];
+        let target = Path::new("/srv/index.html");
+        let selected_index = base_key(
+            &cfg,
+            None,
+            "127.0.0.1",
+            80,
+            false,
+            "example.test",
+            "/dir",
+            "/dir/index.html",
+            b"",
+            target,
+            fingerprint,
+        );
+        let unrelated = base_key(
+            &cfg,
+            None,
+            "127.0.0.1",
+            80,
+            false,
+            "example.test",
+            "/other",
+            "/other/index.html",
+            b"",
+            target,
+            fingerprint,
+        );
+        let entry = disk_entry(b"cached", unix_now() + 60);
+        disk_store(&cfg, &selected_index, &entry);
+        disk_store(&cfg, &unrelated, &entry);
+        let selected_stem = cache_stem(&cfg, &selected_index).unwrap();
+        let unrelated_stem = cache_stem(&cfg, &unrelated).unwrap();
+        entries()
+            .lock()
+            .unwrap()
+            .insert(selected_index.clone(), vec![entry.clone()]);
+        entries()
+            .lock()
+            .unwrap()
+            .insert(unrelated.clone(), vec![entry.clone()]);
+        let root = cfg.cache.root.clone().unwrap();
+        fs::write(root.join("orphan.body.tmp"), b"partial").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("missing-target", root.join("unrelated-link")).unwrap();
+
+        invalidate(&cfg, "example.test", "/dir");
+
+        assert!(!selected_stem.with_extension("meta").exists());
+        assert!(!selected_stem.with_extension("body").exists());
+        assert!(unrelated_stem.with_extension("meta").exists());
+        assert!(unrelated_stem.with_extension("body").exists());
+        assert!(!entries().lock().unwrap().contains_key(&selected_index));
+        assert!(entries().lock().unwrap().contains_key(&unrelated));
+        assert!(disk_load(&cfg, &unrelated).is_some());
+        assert!(!root.join("orphan.body.tmp").exists());
+        #[cfg(unix)]
+        assert!(root.join("unrelated-link").is_symlink());
+
+        let mismatched = "metadata-key-mismatch";
+        disk_store(&cfg, mismatched, &entry);
+        let mismatch_stem = cache_stem(&cfg, mismatched).unwrap();
+        fs::write(
+            mismatch_stem.with_extension("meta"),
+            encode_meta("different-key", &entry),
+        )
+        .unwrap();
+        assert!(disk_load(&cfg, mismatched).is_none());
+        assert!(!mismatch_stem.with_extension("body").exists());
+
+        let corrupt = "keyed-corrupt-metadata";
+        disk_store(&cfg, corrupt, &entry);
+        let corrupt_stem = cache_stem(&cfg, corrupt).unwrap();
+        fs::write(
+            corrupt_stem.with_extension("meta"),
+            format!("V4\nK {}\n", STANDARD.encode(corrupt.as_bytes())),
+        )
+        .unwrap();
+        assert!(disk_load(&cfg, corrupt).is_none());
+        assert!(!corrupt_stem.with_extension("body").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3137,6 +3335,7 @@ CacheIgnoreQueryString On\n\
             80,
             false,
             "host",
+            "/x",
             "/x",
             b"query",
             Path::new("/tmp/target"),
@@ -3369,6 +3568,8 @@ CacheIgnoreQueryString On\n\
             .as_bytes()
         )
         .is_some());
+        assert!(decode_meta(b"not-a-metadata-version\n").is_none());
+        assert!(decode_meta_key(b"V4\nS 200\n").is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3438,6 +3639,7 @@ CacheIgnoreQueryString On\n\
         let mut bad_root = no_root;
         bad_root.cache.root = Some(root_file);
         invalidate_disk(&bad_root);
+        invalidate(&bad_root, "host", "/x");
         let _ = fs::remove_dir_all(&dir);
     }
 

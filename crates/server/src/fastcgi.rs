@@ -260,17 +260,7 @@ fn split_path_info(
 }
 
 fn prefix_suffix<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
-    if path == prefix {
-        Some("")
-    } else if let Some(rest) = path.strip_prefix(prefix) {
-        if rest.starts_with('/') {
-            Some(rest.trim_start_matches('/'))
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+    crate::util::route_prefix_suffix(prefix, path)
 }
 
 /// Match a `ProxyPassMatch` (or a prefix `ProxyPass` with a FastCGI backend)
@@ -1325,6 +1315,8 @@ mod tests {
 
         assert_eq!(prefix_suffix("/x", "/x"), Some(""));
         assert_eq!(prefix_suffix("/x", "/x/y"), Some("y"));
+        assert_eq!(prefix_suffix("/app/", "/app/index.php"), Some("index.php"));
+        assert_eq!(prefix_suffix("/", "/index.php"), Some("index.php"));
         assert_eq!(prefix_suffix("/x", "/xy"), None);
         assert_eq!(prefix_suffix("/x", "/other"), None);
 

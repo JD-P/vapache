@@ -99,6 +99,24 @@ pub fn system_time_secs(t: SystemTime) -> i64 {
     }
 }
 
+/// Return the descendant suffix of a component-aware route prefix.
+/// Prefixes ending in `/` already include their boundary, so `/app/` and `/`
+/// both match child paths without requiring a second slash.
+pub fn route_prefix_suffix<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
+    let exact = path == prefix;
+    let rest = path.strip_prefix(prefix);
+    let admitted = vapache_verified::proxy_prefix_match_admit(
+        exact,
+        rest.is_some(),
+        prefix.ends_with('/'),
+        rest.is_some_and(|value| value.starts_with('/')),
+    );
+    if !admitted {
+        return None;
+    }
+    Some(rest.unwrap_or("").trim_start_matches('/'))
+}
+
 const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -511,5 +529,12 @@ mod tests {
         assert_eq!(parse_u64(b""), None);
         assert_eq!(parse_u64(b"x"), None);
         assert_eq!(parse_u64(b"18446744073709551616"), None);
+
+        assert_eq!(route_prefix_suffix("/x", "/x"), Some(""));
+        assert_eq!(route_prefix_suffix("/x", "/x/y"), Some("y"));
+        assert_eq!(route_prefix_suffix("/app/", "/app/child"), Some("child"));
+        assert_eq!(route_prefix_suffix("/", "/child"), Some("child"));
+        assert_eq!(route_prefix_suffix("/x", "/xy"), None);
+        assert_eq!(route_prefix_suffix("/app/", "/app"), None);
     }
 }

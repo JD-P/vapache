@@ -1107,6 +1107,7 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
     let mut status = 200u16;
     let mut headers = Headers::default();
     let mut location: Option<Vec<u8>> = None;
+    let mut connection_tokens: Vec<String> = Vec::new();
     let mut saw_status = false;
     for line in head.split(|b| *b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -1129,23 +1130,55 @@ pub(crate) fn parse_cgi_response(data: &[u8], version: Version) -> Result<Respon
             let s = std::str::from_utf8(value).map_err(|_| ())?;
             let code = s.split_whitespace().next().ok_or(())?;
             status = code.parse().map_err(|_| ())?;
-            if !(100..=599).contains(&status) {
+            if !vapache_verified::cgi_response_status_admit(status) {
                 return Err(());
             }
             saw_status = true;
             continue;
         }
-        if lname == "content-length" || lname == "transfer-encoding" {
-            // Recompute; never trust the script's framing.
+        if lname == "connection" {
+            connection_tokens.extend(
+                String::from_utf8_lossy(value)
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|token| {
+                        !token.is_empty()
+                            && token
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    })
+                    .map(str::to_ascii_lowercase),
+            );
+            continue;
+        }
+        let framing = lname == "content-length" || lname == "transfer-encoding";
+        let hop_by_hop = matches!(
+            lname.as_str(),
+            "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "upgrade"
+        );
+        if !vapache_verified::cgi_response_header_admit(framing, hop_by_hop, false) {
             continue;
         }
         if lname == "location" {
             location = Some(value.to_vec());
         }
-        if lname == "connection" || lname == "keep-alive" || lname == "proxy-authenticate" {
-            continue;
-        }
         headers.push(&lname, value.to_vec());
+    }
+    for token in &connection_tokens {
+        if !vapache_verified::cgi_response_header_admit(false, false, true) {
+            headers.remove(token);
+        }
+    }
+    if connection_tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("location"))
+    {
+        location = None;
     }
     if let Some(loc) = location {
         if !saw_status {
@@ -1792,6 +1825,7 @@ mod tests {
             &b"Bad_Name: x\r\n\r\n"[..],
             b"X: a\rb\r\n\r\n",
             b"Status: 99 Nope\r\n\r\n",
+            b"Status: 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
             b"Status: nope\r\n\r\n",
             b"MissingColon\r\n\r\n",
         ] {
@@ -1806,6 +1840,28 @@ mod tests {
         assert_eq!(framed.status, 200);
         assert!(response_header(&framed, "content-length").is_none());
         assert!(response_header(&framed, "connection").is_none());
+
+        let hop = parse_cgi_response(
+            b"Connection: X-Secret, Upgrade\r\nX-Secret: leak\r\nUpgrade: websocket\r\nTE: trailers\r\nProxy-Authorization: secret\r\nContent-Type: text/plain\r\n\r\nbody",
+            Version::Http11,
+        )
+        .unwrap();
+        for name in [
+            "connection",
+            "x-secret",
+            "upgrade",
+            "te",
+            "proxy-authorization",
+        ] {
+            assert!(response_header(&hop, name).is_none(), "{name}");
+        }
+        let nominated_location = parse_cgi_response(
+            b"Connection: Location\r\nLocation: /hidden\r\n\r\nbody",
+            Version::Http11,
+        )
+        .unwrap();
+        assert_eq!(nominated_location.status, 200);
+        assert!(response_header(&nominated_location, "location").is_none());
 
         let location = parse_cgi_response(b"Location: /next\r\n\r\n", Version::Http11).unwrap();
         assert_eq!(location.status, 302);

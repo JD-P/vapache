@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "updated": "2026-10-27",
+  "updated": "2026-10-28",
   "verus": {
-    "verified_functions": 343,
+    "verified_functions": 373,
     "errors": 0
   },
   "obligations": [
@@ -130,7 +130,7 @@
       "title": "Require providers consume exactly the post-not operand",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "parse_require uses rest.first() for env and rest.join(' ') for expr; Require::Expr and Require::ValidUser both carry negation; unit and HTTP-level tests cover not env, not env NAME=VALUE, not expr and not valid-user"
+      "evidence": "parse_require uses rest.first() for env and rest.join(' ') for expr; the verified require_env_operand_admit rejects empty or NAME=VALUE operands, require_method_operand_admit accepts only exact supported method tokens, and expression variables are load-time validated; Require::Expr and Require::ValidUser both carry negation; unit and HTTP-level tests cover the provider and negation shapes"
     },
     {
       "id": "directive_effect_completeness",
@@ -172,7 +172,7 @@
       "title": "Cache keys bind request inputs that select authorization branches",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "cache_policy_material destructures Scope and hashes every policy slice (rewrite maps canonicalized); cache_policy_fingerprint frames each exact field with the verified injective cache_fingerprint_field and uses a 256-bit SHA-256 digest instead of the old 64-bit DefaultHasher; the digest also binds all request headers, peer, method and target and is stored base64 in V3 metadata. The unit matrix mutates every policy field plus listener/vhost/URL/query/target/header dimensions, and F34 replay verifies header partitioning"
+      "evidence": "cache_policy_material destructures Scope and hashes every policy slice (rewrite maps canonicalized); cache_policy_fingerprint frames each exact field with the verified injective cache_fingerprint_field and uses a 256-bit SHA-256 digest instead of the old 64-bit DefaultHasher; the digest also binds all request headers, peer, method and target. V4 disk metadata stores the complete base key, lookup consumes cache_disk_key_admit for an exact metadata-key match, and canonical unsafe-method invalidation consumes cache_invalidation_remove_admit so unrelated keyed entries survive. The unit matrix mutates every policy field plus listener/vhost/URL/query/target/header dimensions, and F34 replay verifies header partitioning"
     },
     {
       "id": "proxy_serialization_safety",
@@ -568,6 +568,14 @@
     "Rewrite original-policy retention and final-target reauthorization obligation",
     "Generalized policy bit meet (bits_meet) with no-broadening and order algebra",
     "Component-aware containment reflexivity and transitivity across path identities",
-    "Generalized percent encoding (percent_encode_from) with identity and no-raw-masked-byte guarantees"
+    "Generalized percent encoding (percent_encode_from) with identity and no-raw-masked-byte guarantees",
+    "RewriteMap program deadline/output admission and BNE exclusion-aware escaping",
+    "Exact HTTP method and environment Require operand admission",
+    "Known expression-variable admission without generic HTTP-prefix fallback",
+    "HTTP/2 pseudo-target identity admission",
+    "CGI status and response-header framing admission",
+    "First-existing AccessFileName selection and FileETag None emission",
+    "Exact V4 disk-cache metadata key admission",
+    "Canonical targeted cache-invalidation admission"
   ]
 }

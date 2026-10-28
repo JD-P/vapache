@@ -276,7 +276,6 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
             ctx.req.header_str(&header).unwrap_or("").to_string(),
         ));
     }
-    let empty = String::new();
     let now = crate::util::unix_now();
     let days = now.div_euclid(86_400);
     let sod = now.rem_euclid(86_400);
@@ -335,13 +334,7 @@ fn var(ctx: &Context<'_>, name: &str) -> Result<Value, String> {
                 ))
             }
         },
-        other => {
-            if other.starts_with("http") {
-                empty
-            } else {
-                return Err(format!("unknown expression variable '%{{{name}}}'"));
-            }
-        }
+        _ => return Err(format!("unknown expression variable '%{{{name}}}'")),
     }))
 }
 
@@ -1505,7 +1498,7 @@ mod tests {
         assert_eq!(var(&c, "env:foo").unwrap().string(), "bar");
         assert_eq!(var(&c, "http_x_test").unwrap().string(), "Header");
         assert_eq!(var(&c, "server_name").unwrap().string(), "example.test");
-        assert_eq!(var(&c, "httpfoo").unwrap().string(), "");
+        assert!(var(&c, "httpfoo").is_err());
         assert!(var(&c, "unknown_variable").is_err());
         assert_eq!(var(&c, "tolower:ABC").unwrap().string(), "abc");
         assert_eq!(var(&c, "escape:a b").unwrap().string(), "a%20b");
@@ -1743,6 +1736,7 @@ mod pass11_kernel_tests {
     fn validate_vars_rejects_unknown_variables_in_every_position() {
         // A plain Var node.
         assert!(validate_vars(&parse("%{NOSUCHVAR} == 'x'").unwrap()).is_err());
+        assert!(validate_vars(&parse("%{HTTPX_BLOCK} == 'yes'").unwrap()).is_err());
         // A %{...} reference inside a string literal.
         assert!(validate_vars(&parse("'%{NOSUCHVAR}' != ''").unwrap()).is_err());
         // Inside a transform argument (recursed).

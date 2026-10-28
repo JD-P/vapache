@@ -24,6 +24,7 @@ pub enum Access {
     Allowed,
     Denied,
     AuthRequired,
+    Misconfigured,
 }
 
 /// The concrete object and request context covered by an access decision.
@@ -233,6 +234,12 @@ pub fn check(
     url_path: &str,
     fs_path: Option<&Path>,
 ) -> Access {
+    if !vapache_verified::authz_configuration_admit(
+        scope.authorization.auth_type.is_some(),
+        scope.authorization.requires.is_some(),
+    ) {
+        return Access::Misconfigured;
+    }
     let host = scope
         .authorization
         .legacy
@@ -806,6 +813,48 @@ mod tests {
                 None,
                 "/x",
                 None
+            ),
+            Access::Allowed
+        );
+    }
+
+    #[test]
+    fn auth_type_without_effective_require_is_misconfigured() {
+        let mut scope = Scope::default();
+        assert_eq!(
+            check(
+                &scope,
+                &req("GET"),
+                "127.0.0.1".parse().unwrap(),
+                None,
+                "/x",
+                None,
+            ),
+            Access::Allowed
+        );
+
+        scope.authorization.auth_type = Some("Basic".into());
+        assert_eq!(
+            check(
+                &scope,
+                &req("GET"),
+                "127.0.0.1".parse().unwrap(),
+                None,
+                "/x",
+                None,
+            ),
+            Access::Misconfigured
+        );
+
+        scope.authorization.requires = reqs(vec![Require::AllGranted]);
+        assert_eq!(
+            check(
+                &scope,
+                &req("GET"),
+                "127.0.0.1".parse().unwrap(),
+                None,
+                "/x",
+                None,
             ),
             Access::Allowed
         );

@@ -22,10 +22,16 @@
 use crate::config::{RewriteCond, RewriteMap, RewriteRule, Scope};
 use crate::http::Request;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::IpAddr;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+const PRG_MAP_TIMEOUT: Duration = Duration::from_secs(2);
+const PRG_MAP_MAX_OUTPUT: usize = 8 * 1024;
 
 pub struct Context<'a> {
     pub url_path: &'a str,
@@ -1145,54 +1151,122 @@ fn write_prg_key(stdin: &mut impl Write, key: &str) -> bool {
 }
 
 fn run_prg_map(program: &str, key: &str) -> String {
+    run_prg_map_timeout(program, key, PRG_MAP_TIMEOUT)
+}
+
+fn run_prg_map_timeout(program: &str, key: &str, timeout: Duration) -> String {
     let mut parts = program.split_whitespace();
     let Some(command) = parts.next() else {
         return String::new();
     };
-    let mut child = match Command::new(command)
+    let mut command = Command::new(command);
+    command
         .args(parts)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    // A separate process group lets the timeout close stdout held by a
+    // helper's descendants as well as terminating the direct child.
+    // coverage:ignore-start - runs in the forked child before coverage can flush
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    // coverage:ignore-stop
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return String::new(),
     };
     let stdin = child.stdin.take();
-    finish_prg_map(child, stdin, key)
+    finish_prg_map(child, stdin, key, timeout)
 }
 
 fn finish_prg_map(
     mut child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     key: &str,
+    timeout: Duration,
 ) -> String {
     let Some(mut stdin) = stdin else {
-        return wait_prg_output(child);
+        return wait_prg_output(child, timeout);
     };
     if !write_prg_key(&mut stdin, key) {
         return abort_prg_map(child);
     }
     drop(stdin);
-    wait_prg_output(child)
+    wait_prg_output(child, timeout)
 }
 
 fn abort_prg_map(mut child: std::process::Child) -> String {
+    let pid = child.id() as i32;
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
     let _ = child.kill();
     let _ = child.wait();
     String::new()
 }
 
-fn wait_prg_output(child: std::process::Child) -> String {
-    match child.wait_with_output() {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .to_string(),
-        _ => String::new(),
+fn wait_prg_output(mut child: std::process::Child, timeout: Duration) -> String {
+    let Some(stdout) = child.stdout.take() else {
+        return abort_prg_map(child);
+    };
+    let (tx, rx) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let _ = tx.send(read_prg_line(stdout));
+    });
+    let received = rx.recv_timeout(timeout);
+    let completed_before_deadline = received.is_ok();
+    let (line, complete) = received.unwrap_or_default();
+    let admitted = vapache_verified::rewrite_map_result_admit(
+        completed_before_deadline,
+        complete,
+        line.len() as u64,
+        PRG_MAP_MAX_OUTPUT as u64,
+    );
+    let running = child.try_wait().ok().flatten().is_none();
+    if running {
+        let pid = child.id() as i32;
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        let _ = child.kill();
     }
+    let status = child.wait().ok();
+    let _ = reader.join();
+    if !admitted || (status.is_some_and(|status| !status.success()) && !running) {
+        return String::new();
+    }
+    String::from_utf8_lossy(&line)
+        .trim_end_matches('\r')
+        .to_string()
+}
+
+fn read_prg_line(mut input: impl Read) -> (Vec<u8>, bool) {
+    let mut line = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    let mut complete = false;
+    while line.len() <= PRG_MAP_MAX_OUTPUT {
+        match input.read(&mut byte) {
+            Ok(0) => {
+                complete = true;
+                break;
+            }
+            Ok(_) if byte[0] == b'\n' => {
+                complete = true;
+                break;
+            }
+            Ok(_) => line.push(byte[0]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    (line, complete)
 }
 
 fn expand_caps(name: &str, caps: &[String], cond_caps: &[String]) -> String {
@@ -2211,6 +2285,7 @@ mod tests {
         };
         assert_eq!(run("[B]", "/x/a/b c\r"), "/x/a%2fb+c%0d");
         assert_eq!(run("[B,BNE=/]", "/x/a/b c\r"), "/x/a/b+c%0d");
+        assert_eq!(run("[BNE=/]", "/x/a/b c\r"), "/x/a/b+c%0d");
         assert_eq!(run("[BCTLS]", "/x/a/b c\r"), "/x/a/b+c%0d");
         assert_eq!(run("[B=/]", "/x/a/b c"), "/x/a%2fb c");
         assert_eq!(run("[B,BNP]", "/x/a b"), "/x/a%20b");
@@ -2990,6 +3065,18 @@ mod tests {
         assert_eq!(run_prg_map("no-such-program-xyz", "x"), "");
         assert_eq!(run_prg_map("/bin/cat", "abc"), "abc");
         assert_eq!(run_prg_map("/bin/false", "abc"), "");
+        struct InterruptedThenError(u8);
+        impl Read for InterruptedThenError {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                if self.0 == 1 {
+                    Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+                } else {
+                    Err(std::io::Error::other("reader failed"))
+                }
+            }
+        }
+        assert_eq!(read_prg_line(InterruptedThenError(0)), (Vec::new(), false));
         assert_eq!(map_value(None, "key"), "");
         let mut bad = ErrorWriter;
         assert!(!write_prg_key(&mut bad, "x"));
@@ -3000,14 +3087,20 @@ mod tests {
             .spawn()
             .unwrap();
         let dead_stdin = dead.stdin.take();
-        assert_eq!(finish_prg_map(dead, dead_stdin, "x"), "");
+        assert_eq!(
+            finish_prg_map(dead, dead_stdin, "x", Duration::from_millis(100)),
+            ""
+        );
         let no_stdin = Command::new("/bin/true")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        assert_eq!(finish_prg_map(no_stdin, None, "x"), "");
+        assert_eq!(
+            finish_prg_map(no_stdin, None, "x", Duration::from_millis(100)),
+            ""
+        );
         let sleeping = Command::new("/bin/sleep")
             .arg("5")
             .stdin(Stdio::null())
@@ -3026,7 +3119,50 @@ mod tests {
         let killed_stdin = killed.stdin.take();
         let _ = killed.kill();
         let _ = killed.wait();
-        assert_eq!(finish_prg_map(killed, killed_stdin, "x"), "");
+        assert_eq!(
+            finish_prg_map(killed, killed_stdin, "x", Duration::from_millis(100)),
+            ""
+        );
+
+        let timeout_script =
+            std::env::temp_dir().join(format!("vapache-prg-timeout-{}", std::process::id()));
+        fs::write(&timeout_script, "#!/bin/sh\nsleep 5\n").unwrap();
+        let mut mode = fs::metadata(&timeout_script).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        mode.set_mode(0o700);
+        fs::set_permissions(&timeout_script, mode).unwrap();
+        assert_eq!(
+            run_prg_map_timeout(
+                &timeout_script.to_string_lossy(),
+                "x",
+                Duration::from_millis(20),
+            ),
+            ""
+        );
+
+        let overflow_script =
+            std::env::temp_dir().join(format!("vapache-prg-overflow-{}", std::process::id()));
+        fs::write(&overflow_script, "#!/bin/sh\nprintf '%09000d' 0\n").unwrap();
+        let mut mode = fs::metadata(&overflow_script).unwrap().permissions();
+        mode.set_mode(0o700);
+        fs::set_permissions(&overflow_script, mode).unwrap();
+        assert_eq!(
+            run_prg_map_timeout(
+                &overflow_script.to_string_lossy(),
+                "x",
+                Duration::from_secs(1),
+            ),
+            ""
+        );
+        let no_stdout = Command::new("/bin/true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert_eq!(wait_prg_output(no_stdout, Duration::from_millis(100)), "");
+        let _ = fs::remove_file(timeout_script);
+        let _ = fs::remove_file(overflow_script);
 
         let caps = vec!["zero".to_string(), "one".to_string()];
         let cond = vec!["condzero".to_string(), "cond".to_string()];
