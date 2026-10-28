@@ -297,3 +297,21 @@ Apache rate look slightly better and therefore the reported ratio conservative.
 | hello.txt (1.1KB, keepalive) | 96773 | 188648 | 1.95x | 0.47 | 3 |
 | 10k.bin (10KB, keepalive) | 89396 | 154126 | 1.72x | 0.51 | 3 |
 | 1m.bin (1MB, keepalive) | 8850 | 12388 | 1.40x | 0.97 | 2 |
+
+## 2026-10-28T15:21:16.447042+00:00
+
+| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+|---|---:|---:|---:|---:|---:|
+| index.html (small, keepalive) | 97728 | 195297 | 2.00x | 0.42 | 2 |
+| hello.txt (1.1KB, keepalive) | 98451 | 189977 | 1.93x | 0.46 | 3 |
+| 10k.bin (10KB, keepalive) | 91945 | 158626 | 1.73x | 0.51 | 3 |
+| 1m.bin (1MB, keepalive) | 8614 | 11596 | 1.35x | 1.04 | 2 |
+
+## 2026-10-28T16:20:06.696779+00:00
+
+| scenario | apache req/s | vapache req/s | ratio | mean ms (v) | p99 ms (v) |
+|---|---:|---:|---:|---:|---:|
+| index.html (small, keepalive) | 86141 | 181089 | 2.10x | 0.47 | 3 |
+| hello.txt (1.1KB, keepalive) | 88745 | 175953 | 1.98x | 0.46 | 2 |
+| 10k.bin (10KB, keepalive) | 83626 | 161785 | 1.93x | 0.55 | 4 |
+| 1m.bin (1MB, keepalive) | 9299 | 11616 | 1.25x | 1.02 | 2 |

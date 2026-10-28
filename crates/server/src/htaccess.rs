@@ -694,6 +694,21 @@ fn stable_access_snapshot(
     mut opened: OpenedAccessFile,
 ) -> Result<(Vec<u8>, fs::Metadata), String> {
     let before = opened.meta;
+    // The descriptor was selected by pathname before this function ran.  If
+    // the name now resolves to a different inode/version, parsing the opened
+    // file would silently authorize a target the caller did not select.
+    let current = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !vapache_verified::descriptor_snapshot_admit(
+        before.is_file() && current.is_file(),
+        before.dev() == current.dev() && before.ino() == current.ino(),
+        same_access_file_version(&before, &current),
+        before.len() <= MAX_HTACCESS,
+    ) {
+        return Err(format!(
+            "{}: access file changed while it was being evaluated",
+            path.display()
+        ));
+    }
     let mut data = Vec::with_capacity((before.len().min(MAX_HTACCESS) as usize).saturating_add(1));
     opened
         .file

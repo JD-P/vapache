@@ -12,11 +12,11 @@ use crate::log::{AccessEntry, Logger};
 use crate::util::http_date_now;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, StatusCode};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::net::SocketAddr;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::io::AsRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -173,6 +173,94 @@ impl Drop for MmapBytes {
             libc::munmap(self.ptr, self.len);
         }
     }
+}
+
+/// Positional reader for a response body.  `read_at` avoids changing the
+/// descriptor offset (and the extra `lseek` syscall) when several streams or
+/// range requests share a file.  `Read::take` + `read_to_end` fill a
+/// `Vec::with_capacity` through the standard library's uninitialised spare
+/// capacity, so a large body does not first zero a same-sized buffer.
+struct FileAt<'a> {
+    file: &'a std::fs::File,
+    pos: u64,
+}
+
+impl Read for FileAt<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.file.read_at(buf, self.pos)?;
+        self.pos = self.pos.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
+/// Reuse file-body allocations across responses.  A fresh 1 MiB `Vec` is
+/// usually served by `mmap` in glibc, so allocating and freeing one per
+/// request makes the kernel zero and unmap a megabyte of pages each time.
+/// The pool keeps a bounded number of already-faulted buffers and returns one
+/// only after the last `Bytes` slice has been sent.
+const POOL_MIN_CAPACITY: usize = 64 * 1024;
+const POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
+const POOL_MAX_TOTAL: usize = 128 * 1024 * 1024;
+const POOL_MAX_ENTRIES: usize = 64;
+
+#[derive(Default)]
+struct BodyPool {
+    free: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+fn body_pool() -> &'static Mutex<BodyPool> {
+    static POOL: OnceLock<Mutex<BodyPool>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(BodyPool::default()))
+}
+
+fn take_body_buffer(len: usize) -> Vec<u8> {
+    let mut pool = body_pool().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(index) = pool.free.iter().position(|buf| {
+        buf.capacity() >= len && buf.capacity() <= len.saturating_mul(2).max(len + 4096)
+    }) {
+        let mut buf = pool.free.swap_remove(index);
+        pool.bytes = pool.bytes.saturating_sub(buf.capacity());
+        buf.clear();
+        return buf;
+    }
+    Vec::with_capacity(len)
+}
+
+struct PooledBuffer {
+    buf: Option<Vec<u8>>,
+}
+
+impl AsRef<[u8]> for PooledBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.as_deref().unwrap_or(&[])
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        let Some(buf) = self.buf.take() else {
+            return;
+        };
+        let capacity = buf.capacity();
+        if capacity < POOL_MIN_CAPACITY || capacity > POOL_MAX_CAPACITY {
+            return;
+        }
+        let mut pool = body_pool().lock().unwrap_or_else(|e| e.into_inner());
+        if pool.free.len() < POOL_MAX_ENTRIES
+            && pool.bytes.saturating_add(capacity) <= POOL_MAX_TOTAL
+        {
+            pool.bytes += capacity;
+            pool.free.push(buf);
+        }
+    }
+}
+
+fn read_range(file: &std::fs::File, offset: u64, len: usize) -> io::Result<Bytes> {
+    let mut buf = take_body_buffer(len);
+    let reader = FileAt { file, pos: offset };
+    reader.take(len as u64).read_to_end(&mut buf)?;
+    Ok(Bytes::from_owner(PooledBuffer { buf: Some(buf) }))
 }
 
 fn bad(status: u16, message: &str) -> Response {
@@ -465,11 +553,7 @@ async fn send_response(
                 .await?;
             }
         }
-        Body::File {
-            mut file,
-            offset,
-            len,
-        } => {
+        Body::File { file, offset, len } => {
             // A synchronous read on this connection's current-thread runtime
             // blocks every other stream on the same HTTP/2 connection.  For
             // the common large-file case, read the representation on the
@@ -498,45 +582,45 @@ async fn send_response(
                             }
                         }
                     }
-                    file.seek(SeekFrom::Start(offset))?;
-                    let mut buf = vec![0u8; len as usize];
-                    file.read_exact(&mut buf)?;
-                    Ok(Bytes::from(buf))
+                    let buf = read_range(&file, offset, len as usize)?;
+                    if buf.len() != len as usize {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "short HTTP/2 file read",
+                        ));
+                    }
+                    Ok(buf)
                 })
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
                 sent = data.len() as u64;
                 send_data_bounded(&mut send, data, true, send_timeout).await?;
             } else if len < OFFLOAD_MIN {
-                file.seek(SeekFrom::Start(offset))?;
-                let mut buf = vec![0u8; len as usize];
-                file.read_exact(&mut buf)?;
+                let buf = read_range(&file, offset, len as usize)?;
+                if buf.len() != len as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short HTTP/2 file read",
+                    ));
+                }
                 sent = buf.len() as u64;
-                send_data_bounded(&mut send, Bytes::from(buf), true, send_timeout).await?;
+                send_data_bounded(&mut send, buf, true, send_timeout).await?;
             } else {
-                file.seek(SeekFrom::Start(offset))?;
                 const BATCH: u64 = 1024 * 1024;
                 let mut left = len;
+                let mut pos = offset;
                 while left > 0 {
                     let want =
                         vapache_verified::h2_batch_len(left, BATCH).min(usize::MAX as u64) as usize;
-                    let mut buf = vec![0u8; want];
-                    let mut filled = 0usize;
-                    while filled < want {
-                        match file.read(&mut buf[filled..]) {
-                            Ok(0) => break,
-                            Ok(n) => filled += n,
-                            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                            Err(e) => return Err(e),
-                        }
-                    }
+                    let buf = read_range(&file, pos, want)?;
+                    let filled = buf.len();
                     if filled == 0 {
                         break;
                     }
                     left -= filled as u64;
+                    pos = pos.saturating_add(filled as u64);
                     sent += filled as u64;
-                    buf.truncate(filled);
-                    send_data_bounded(&mut send, Bytes::from(buf), left == 0, send_timeout).await?;
+                    send_data_bounded(&mut send, buf, left == 0, send_timeout).await?;
                 }
                 if sent == 0 {
                     send_data_bounded(&mut send, Bytes::new(), true, send_timeout).await?;
@@ -1827,6 +1911,25 @@ mod tests {
         let map = MmapBytes::new(&file, bytes.len()).unwrap();
         assert_eq!(map.as_ref(), &bytes[..]);
         drop(map);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn positional_read_range_does_not_depend_on_the_file_offset() {
+        let dir = std::env::temp_dir().join(format!("vapache-h2-range-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("body.bin");
+        fs::write(&path, b"0123456789").unwrap();
+        let file = File::open(&path).unwrap();
+
+        let middle = read_range(&file, 3, 5).unwrap();
+        assert_eq!(&middle[..], b"34567");
+        let whole = read_range(&file, 0, 10).unwrap();
+        assert_eq!(&whole[..], b"0123456789");
+        let short = read_range(&file, 8, 5).unwrap();
+        assert_eq!(&short[..], b"89");
+
         fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -596,7 +596,7 @@ def main():
             ),
             "- CGI now runs through a pool of small single-threaded worker processes. They are created only when the configuration can dispatch CGI; without CGI the server remains one process.",
             "- The process count above includes the 16 CGI workers started for this CGI-capable config. PSS still includes their shared pages.",
-            "- HTTP/2 large-file throughput uses mmap-backed bodies and blocking-pool reads so one stream does not stall the other streams on a connection. Apache was run with stock mod_http2 settings and was not tuned.",
+            "- HTTP/2 large-file throughput uses blocking-pool positional reads and bounded buffer reuse so one stream does not stall the other streams on a connection. mmap is used only when the verified ownership/mode predicate permits it. Apache was run with stock mod_http2 settings and was not tuned.",
             "- Not timed here: request-smuggling rejection, pipelining, HTTP/1.0, TLS 1.2/1.3, SNI certificate selection, graceful shutdown and log formatting. These are covered by `tests/conformance.py` (157 tests, all passing).",
         ]
         report = BENCH / ("FEATURE_RESULTS.md" if not args.only else f"FEATURE_RESULTS-{stamp}.md")

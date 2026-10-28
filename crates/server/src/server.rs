@@ -1800,6 +1800,41 @@ fn apply_scope_conditionals(
     );
 }
 
+/// Enforce the original URL's access policy against an already-evaluated
+/// scope.  The scope still came from the same dispatcher and the same
+/// access-file/config identities; this only avoids recomputing it when the
+/// rewrite did not change the request environment.
+#[allow(clippy::too_many_arguments)]
+fn authorize_original_scope(
+    cfg: &Config,
+    vhost: Option<&VHost>,
+    req: &Request,
+    url_path: &str,
+    fs_path: &Path,
+    local_port: u16,
+    server_name: &str,
+    peer: SocketAddr,
+    local_ip: &str,
+    scope: &Scope,
+) -> Result<(), Response> {
+    let mut original_resource =
+        access::ResourceKey::request(vhost, req, url_path, Some(fs_path), None);
+    helper_access_response(
+        cfg,
+        vhost,
+        scope,
+        req,
+        url_path,
+        fs_path,
+        local_port,
+        server_name,
+        peer.ip(),
+        local_ip,
+        &mut original_resource,
+    )
+    .map(|_| ())
+}
+
 /// Re-authorize the URL the client actually requested after an internal
 /// rewrite changed the target.  Apache keeps `<Location>`/`<LocationMatch>`
 /// policy for the original URL across internal rewrites, including when the
@@ -1853,24 +1888,19 @@ fn authorize_original_request(
         req,
         peer.ip(),
     );
-    let mut original_resource =
-        access::ResourceKey::request(vhost, req, url_path, Some(fs_path), None);
-    match helper_access_response(
+    authorize_original_scope(
         cfg,
         vhost,
-        &original_scope,
         req,
         url_path,
         fs_path,
         local_port,
         server_name,
-        peer.ip(),
+        peer,
         local_ip,
-        &mut original_resource,
-    ) {
-        Ok(_) => Ok(original_scope),
-        Err(r) => Err(r),
-    }
+        &original_scope,
+    )?;
+    Ok(original_scope)
 }
 
 fn dispatch_inner(
@@ -2016,6 +2046,11 @@ fn dispatch_inner(
     let mut stop_rewriting = false;
     let mut rewrite_effects = crate::rewrite::Effects::default();
     let mut rewrite_filesystem: Option<PathBuf> = None;
+    // The first loop iteration evaluates the original URL with no rewrite
+    // effects.  If a later internal rewrite leaves the environment and query
+    // unchanged, that exact scope can authorize the original URL again instead
+    // of rebuilding the same plan and access-file layers from disk.
+    let mut original_scope_snapshot: Option<Scope> = None;
     let https = local_port == 443 || vhost.map(|v| v.ssl.engine).unwrap_or(cfg.ssl.engine);
     let (mut root, mut rel, mut script_alias);
     let mut fs_path;
@@ -2169,7 +2204,27 @@ fn dispatch_inner(
                     || original_req.query != current_req.query
                     || !rewrite_effects.is_empty()
                 {
-                    if let Err(r) = authorize_original_request(
+                    let reusable = rewrite_effects.is_empty()
+                        && current_req.query == original_req.query
+                        && original_scope_snapshot.is_some();
+                    if reusable {
+                        let original_scope =
+                            original_scope_snapshot.as_ref().expect("checked above");
+                        if let Err(r) = authorize_original_scope(
+                            cfg,
+                            vhost,
+                            original_req,
+                            &original_url_path,
+                            &original_fs_path,
+                            local_port,
+                            &server_name,
+                            peer,
+                            local_ip,
+                            original_scope,
+                        ) {
+                            return r; // coverage:ignore-line - filesystem race
+                        }
+                    } else if let Err(r) = authorize_original_request(
                         cfg,
                         vhost,
                         original_req,
@@ -2221,7 +2276,27 @@ fn dispatch_inner(
                         || original_req.query != current_req.query
                         || !rewrite_effects.is_empty())
                 {
-                    if let Err(r) = authorize_original_request(
+                    let reusable = rewrite_effects.is_empty()
+                        && current_req.query == original_req.query
+                        && original_scope_snapshot.is_some();
+                    if reusable {
+                        let original_scope =
+                            original_scope_snapshot.as_ref().expect("checked above");
+                        if let Err(r) = authorize_original_scope(
+                            cfg,
+                            vhost,
+                            original_req,
+                            &original_url_path,
+                            &original_fs_path,
+                            local_port,
+                            &server_name,
+                            peer,
+                            local_ip,
+                            original_scope,
+                        ) {
+                            return r; // coverage:ignore-line - filesystem race
+                        }
+                    } else if let Err(r) = authorize_original_request(
                         cfg,
                         vhost,
                         original_req,
@@ -2277,6 +2352,7 @@ fn dispatch_inner(
                 // The filesystem override is per-round: a later round without
                 // a file target must clear the earlier round's target so only
                 // the final round's filesystem selection can be applied (F68).
+                let round_effects_empty = effects.is_empty();
                 rewrite_filesystem = filesystem;
                 rewrite_effects.merge(effects);
                 rewrite_rounds += 1;
@@ -2310,6 +2386,20 @@ fn dispatch_inner(
                 };
                 if canonical == url_path && query == current_req.query {
                     break;
+                }
+                if original_scope_snapshot.is_none()
+                    && round_effects_empty
+                    && rewrite_effects.is_empty()
+                    && url_path == original_url_path
+                    && fs_path == original_fs_path
+                    && current_req.query == original_req.query
+                {
+                    // This is still the first round and no `[E=...]` effect or
+                    // query mutation has changed the environment.  Reuse the
+                    // exact scope already used for rewrite selection instead
+                    // of walking the same configuration and access files again
+                    // after the loop.
+                    original_scope_snapshot = Some(std::mem::take(&mut scope));
                 }
                 if query != current_req.query {
                     let mut r = current_req.clone();
@@ -2423,23 +2513,46 @@ fn dispatch_inner(
         || original_req.query != req.query
         || !rewrite_effects.is_empty()
     {
-        let original_scope = match authorize_original_request(
-            cfg,
-            vhost,
-            original_req,
-            &original_url_path,
-            &original_fs_path,
-            &original_root,
-            local_port,
-            &server_name,
-            peer,
-            local_ip,
-            &rewrite_effects,
-        ) {
-            Ok(scope) => scope,
-            // The original scope was successfully evaluated before rewrite;
-            // this can differ only if an access file changes concurrently.
-            Err(r) => return r, // coverage:ignore-line - filesystem race
+        let snapshot = if rewrite_effects.is_empty() && req.query == original_req.query {
+            original_scope_snapshot.take()
+        } else {
+            None
+        };
+        let original_scope = if let Some(original_scope) = snapshot {
+            if let Err(r) = authorize_original_scope(
+                cfg,
+                vhost,
+                original_req,
+                &original_url_path,
+                &original_fs_path,
+                local_port,
+                &server_name,
+                peer,
+                local_ip,
+                &original_scope,
+            ) {
+                return r; // coverage:ignore-line - filesystem race
+            }
+            original_scope
+        } else {
+            match authorize_original_request(
+                cfg,
+                vhost,
+                original_req,
+                &original_url_path,
+                &original_fs_path,
+                &original_root,
+                local_port,
+                &server_name,
+                peer,
+                local_ip,
+                &rewrite_effects,
+            ) {
+                Ok(scope) => scope,
+                // The original scope was successfully evaluated before rewrite;
+                // this can differ only if an access file changes concurrently.
+                Err(r) => return r, // coverage:ignore-line - filesystem race
+            }
         };
         // An internal rewrite may change the URL, but it must not launder the
         // original URL's execution/listing policy.  Conjoin policy (not the
@@ -2635,14 +2748,14 @@ fn dispatch_inner(
             // Re-authorize and bind the actual opened target before selecting
             // any handler.  A symlink must not inherit the lexical URL's
             // policy (F41/I39).
-            let actual_path = crate::files::fd_path(&file).unwrap_or_else(|| fs_path.clone());
+            let actual_path = crate::files::fd_path_cow(&file, &fs_path);
             let (target_grant, target_resource, target_scope) = match bind_target_grant(
                 cfg,
                 vhost,
                 &scope,
                 &grant,
                 &fs_path,
-                &actual_path,
+                actual_path.as_ref(),
                 &root,
                 &meta,
                 &url_path,
@@ -2677,7 +2790,7 @@ fn dispatch_inner(
                     .map(|n| n.as_encoded_bytes())
                     .unwrap_or(b"");
             debug_assert!(vapache_verified::handler_identity_lexical_admit(
-                actual_path != fs_path,
+                actual_path.as_ref() != fs_path.as_path(),
                 name_is_lexical,
             ));
             let script_root = actual_path.parent().unwrap_or(root.as_path()).to_path_buf();
@@ -2706,9 +2819,13 @@ fn dispatch_inner(
                     local_ip,
                 );
             }
-            if let Some(target) =
-                fastcgi::handler_target_for_file(scope, &root, &url_path, &actual_path, name)
-            {
+            if let Some(target) = fastcgi::handler_target_for_file(
+                scope,
+                &root,
+                &url_path,
+                actual_path.as_ref(),
+                name,
+            ) {
                 return run_fastcgi(
                     cfg,
                     vhost,
@@ -2810,7 +2927,7 @@ fn dispatch_inner(
                 req,
                 file,
                 &meta,
-                &actual_path,
+                actual_path.as_ref(),
                 name,
                 peer.ip(),
                 local_ip,
@@ -2878,14 +2995,14 @@ fn dispatch_inner(
                 );
                 return internal_dispatch(cfg, req, &index_url, peer, local_ip, local_port);
             }
-            let actual_path = crate::files::fd_path(&file).unwrap_or_else(|| fs_path.clone());
+            let actual_path = crate::files::fd_path_cow(&file, &fs_path);
             let (target_grant, target_resource, target_scope) = match bind_target_grant(
                 cfg,
                 vhost,
                 &scope,
                 &grant,
                 &fs_path,
-                &actual_path,
+                actual_path.as_ref(),
                 &root,
                 &meta,
                 &auth_url,
@@ -2906,7 +3023,7 @@ fn dispatch_inner(
                 req,
                 file,
                 &meta,
-                &actual_path,
+                actual_path.as_ref(),
                 &url_path,
                 &req.raw_path,
                 &server_name,
@@ -2939,8 +3056,8 @@ fn dispatch_inner(
             // CGI script.  Policy is then re-evaluated for the actual script
             // path before the script inode is executed.
             if let Some(st) = cgi::find_script_checked(&root, &rel, follow, owner_match_only) {
-                let actual_path =
-                    crate::files::fd_path(&st.file).unwrap_or_else(|| root.join(&st.rel_script));
+                let lexical_script = root.join(&st.rel_script);
+                let actual_path = crate::files::fd_path_cow(&st.file, &lexical_script);
                 let actual_name = st
                     .rel_script
                     .file_name()
@@ -2948,7 +3065,7 @@ fn dispatch_inner(
                     .map(|n| n.as_encoded_bytes())
                     .unwrap_or(b"");
                 debug_assert!(vapache_verified::handler_identity_lexical_admit(
-                    actual_path != root.join(&st.rel_script),
+                    actual_path.as_ref() != lexical_script.as_path(),
                     actual_name
                         == st
                             .rel_script
@@ -2978,7 +3095,7 @@ fn dispatch_inner(
                             vhost,
                             req,
                             peer.ip(),
-                            &actual_path,
+                            actual_path.as_ref(),
                             &script_name,
                             &scope,
                             None,
@@ -3539,13 +3656,15 @@ fn apply_rewrite_effects(scope: &mut crate::config::Scope, effects: &crate::rewr
             .rewrite_unset_env
             .retain(|entry| entry.value != *name);
         match value {
-            Some(value) => scope
-                .environment_policy
-                .rewrite_env
-                .push(crate::scope_policy::Originated::main((
-                    name.clone(),
-                    value.clone(),
-                ))),
+            Some(value) => {
+                scope
+                    .environment_policy
+                    .rewrite_env
+                    .push(crate::scope_policy::Originated::main((
+                        name.clone(),
+                        value.clone(),
+                    )))
+            }
             None => scope
                 .environment_policy
                 .rewrite_unset_env
@@ -3563,20 +3682,21 @@ fn apply_rewrite_effects(scope: &mut crate::config::Scope, effects: &crate::rewr
             .rewrite_late_unset_env
             .retain(|entry| entry.value != *name || entry.origin != effect.origin);
         match value {
-            Some(value) => scope
-                .environment_policy
-                .rewrite_late_env
-                .push(crate::scope_policy::Originated {
-                    origin: effect.origin,
-                    value: (name.clone(), value.clone()),
-                }),
-            None => scope
-                .environment_policy
-                .rewrite_late_unset_env
-                .push(crate::scope_policy::Originated {
+            Some(value) => {
+                scope
+                    .environment_policy
+                    .rewrite_late_env
+                    .push(crate::scope_policy::Originated {
+                        origin: effect.origin,
+                        value: (name.clone(), value.clone()),
+                    })
+            }
+            None => scope.environment_policy.rewrite_late_unset_env.push(
+                crate::scope_policy::Originated {
                     origin: effect.origin,
                     value: name.clone(),
-                }),
+                },
+            ),
         }
     }
     for name in &effects.vary {
@@ -4204,7 +4324,10 @@ mod tests {
         scope
             .environment_policy
             .set_env
-            .push(crate::scope_policy::Originated::main(("OLD".into(), "1".into())));
+            .push(crate::scope_policy::Originated::main((
+                "OLD".into(),
+                "1".into(),
+            )));
         scope
             .environment_policy
             .unset_env
@@ -4426,10 +4549,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(
-            cov_status(&String::from_utf8_lossy(&raw_conn.output)),
-            400
-        );
+        assert_eq!(cov_status(&String::from_utf8_lossy(&raw_conn.output)), 400);
 
         let map_cfg = cov_config(&dir, "AliasMatch \"^/escape(.*)$\" \"$1\"\n");
         let (text, result) = cov_run_conn(&map_cfg, &cov_ws_request("/escape/tmp/elsewhere"), 80);

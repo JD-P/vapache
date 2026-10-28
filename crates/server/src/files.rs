@@ -13,15 +13,15 @@ use crate::verified::{parse_byte_range, RangeDecision};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fmt::Write as _;
 use std::fs::{File, Metadata};
 use std::io;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[repr(C)]
 struct OpenHow {
@@ -41,11 +41,93 @@ pub enum Target {
     Forbidden,
 }
 
+/// Directory descriptor for `/proc/self/fd`, opened once.  `readlinkat` on a
+/// bare descriptor number avoids re-walking the `/proc/self/fd` prefix for
+/// every target.  If procfs is unavailable we fall back to `read_link`.
+fn proc_fd_dir() -> Option<&'static File> {
+    static DIR: OnceLock<Option<File>> = OnceLock::new();
+    DIR.get_or_init(|| File::open("/proc/self/fd").ok())
+        .as_ref()
+}
+
+/// Render a non-negative descriptor as a NUL-terminated component name.
+fn fd_component(fd: libc::c_int, buf: &mut [u8; 24]) -> &CStr {
+    let mut pos = buf.len() - 1;
+    buf[pos] = 0;
+    let mut value = fd as u32;
+    loop {
+        pos -= 1;
+        buf[pos] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    CStr::from_bytes_with_nul(&buf[pos..]).expect("fd component is NUL terminated")
+}
+
+/// Read the descriptor's `/proc/self/fd` link into a stack buffer and hand the
+/// bytes to `f`.  Keeping the buffer local lets callers compare the resolved
+/// path with the lexical target without allocating.
+fn with_fd_link<R>(file: &File, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    let mut buf = [0u8; 4096];
+    let fd = file.as_raw_fd();
+    let Some(dir) = proc_fd_dir() else {
+        let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+        let bytes = path.into_os_string().into_vec();
+        return Some(f(&bytes));
+    };
+    let mut component = [0u8; 24];
+    let name = fd_component(fd, &mut component);
+    let n = unsafe {
+        libc::readlinkat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return None;
+    }
+    let n = n as usize;
+    if n == 0 {
+        return None;
+    }
+    if n >= buf.len() {
+        // A procfs link can exceed PATH_MAX once the kernel appends a
+        // " (deleted)" suffix.  Preserve `read_link`'s growing allocation for
+        // that rare case rather than falling back to the lexical path.
+        let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+        let bytes = path.into_os_string().into_vec();
+        return Some(f(&bytes));
+    }
+    Some(f(&buf[..n]))
+}
+
 /// Resolve the absolute path of an already-opened descriptor.  Used to bind
 /// authorization to the object actually opened rather than only to the URL
 /// path that selected it.
 pub fn fd_path(file: &File) -> Option<PathBuf> {
-    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+    with_fd_link(file, |bytes| {
+        PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
+    })
+}
+
+/// Resolve an opened descriptor while borrowing `expected` when the kernel
+/// reports the same path.  This is the common case for non-symlink targets and
+/// preserves the previous fail-closed fallback when the link cannot be read.
+pub fn fd_path_cow<'a>(file: &File, expected: &'a Path) -> Cow<'a, Path> {
+    match with_fd_link(file, |bytes| {
+        if bytes == expected.as_os_str().as_bytes() {
+            None
+        } else {
+            Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+        }
+    }) {
+        Some(Some(path)) => Cow::Owned(path),
+        _ => Cow::Borrowed(expected),
+    }
 }
 
 /// Open `root/rel` without ever escaping `root`.
@@ -1704,6 +1786,29 @@ mod tests {
             .iter()
             .any(|(n, v)| { n.eq_ignore_ascii_case("cache-control") && v == b"no-cache" }));
         assert!(!error_message(431, "/").is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn fd_path_cow_borrows_the_lexical_target_and_owns_symlink_targets() {
+        let (root, _) = config("fd-path-cow");
+        let target = root.join("plain.txt");
+        std::fs::write(&target, b"hello").unwrap();
+
+        let file = File::open(&target).unwrap();
+        assert_eq!(fd_path(&file).unwrap(), target);
+        match fd_path_cow(&file, &target) {
+            Cow::Borrowed(path) => assert_eq!(path, target),
+            Cow::Owned(path) => panic!("matching target allocated {path:?}"),
+        }
+
+        let link = root.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let linked = File::open(&link).unwrap();
+        match fd_path_cow(&linked, &link) {
+            Cow::Owned(path) => assert_eq!(path, target),
+            Cow::Borrowed(path) => panic!("symlink target was not resolved: {path:?}"),
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
