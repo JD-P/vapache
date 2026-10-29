@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fmt::Write as _;
 use std::fs::{File, Metadata};
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -50,10 +50,10 @@ fn openat2_file(dir: &File, path: &CStr, how: &OpenHow) -> io::Result<File> {
 }
 
 pub fn make_admin_dir_root_owned(dir: &File, mode: libc::mode_t) -> io::Result<()> {
+    if effective_uid() != 0 {
+        return Ok(());
+    }
     let failed = unsafe {
-        if libc::geteuid() != 0 {
-            return Ok(());
-        }
         libc::fchown(dir.as_raw_fd(), 0, 0) != 0 || libc::fchmod(dir.as_raw_fd(), mode) != 0
     };
     if failed {
@@ -61,6 +61,10 @@ pub fn make_admin_dir_root_owned(dir: &File, mode: libc::mode_t) -> io::Result<(
     } else {
         Ok(())
     }
+}
+
+fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
 }
 
 #[cfg(test)]
@@ -97,6 +101,49 @@ pub fn open_admin_path(path: &Path, flags: libc::c_int, mode: libc::mode_t) -> i
         resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
     };
     openat2_file(&root, &rel_c, &how)
+}
+
+/// Read a bounded administrative input through the same no-symlink resolver
+/// used for privileged outputs.  Configuration, certificate and map files are
+/// not allowed to be FIFOs/devices, to grow while being read, or to live in a
+/// service-writable tree when the daemon is still privileged.
+pub fn read_admin_file(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let mut file = open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("administrative input must be a regular file no larger than {max_bytes} bytes"),
+        ));
+    }
+    if effective_uid() == 0 {
+        validate_admin_parents(path, u32::MAX)?;
+        if before.uid() != 0 || before.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "privileged administrative input is not root-owned and non-writable by group/other",
+            ));
+        }
+    }
+    let mut data = Vec::with_capacity(before.len().min(max_bytes) as usize);
+    file.by_ref().take(max_bytes + 1).read_to_end(&mut data)?;
+    let after = file.metadata()?;
+    if data.len() as u64 > max_bytes
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+        || before.mode() != after.mode()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "administrative input changed while it was being read",
+        ));
+    }
+    Ok(data)
 }
 
 /// Reject an absolute administrative output whose directory entry could be
@@ -1552,8 +1599,7 @@ mod tests {
         }
 
         let fifo = root.join("fifo");
-        let fifo_c = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        make_test_fifo(&fifo).unwrap();
         assert!(matches!(
             resolve_target_checked(&root, Path::new("fifo"), true, false),
             Target::Forbidden
@@ -2163,6 +2209,24 @@ mod tests {
         assert!(validate_admin_parents(&root.join("state"), service_uid).is_err());
         let safe = validate_admin_parents(Path::new("/dev/null"), u32::MAX);
         assert!(safe.is_ok(), "{safe:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn administrative_inputs_are_bounded_regular_and_no_follow() {
+        let (root, _cfg) = config("admin-input");
+        let regular = root.join("input");
+        std::fs::write(&regular, b"safe").unwrap();
+        assert_eq!(read_admin_file(&regular, 4).unwrap(), b"safe");
+        assert!(read_admin_file(&regular, 3).is_err());
+
+        let linked = root.join("linked-input");
+        std::os::unix::fs::symlink(&regular, &linked).unwrap();
+        assert!(read_admin_file(&linked, 4).is_err());
+
+        let fifo = root.join("input-fifo");
+        make_test_fifo(&fifo).unwrap();
+        assert!(read_admin_file(&fifo, 4).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 }

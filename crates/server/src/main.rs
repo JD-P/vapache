@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -254,8 +256,12 @@ fn expand_env(value: &str, vars: &HashMap<String, String>) -> String {
 }
 
 fn load_envvars(path: &Path) -> HashMap<String, String> {
+    const MAX_ENVVARS_BYTES: u64 = 1024 * 1024;
     let mut vars: HashMap<String, String> = std::env::vars().collect();
-    let Ok(data) = std::fs::read_to_string(path) else {
+    let Ok(data) = vapached::files::read_admin_file(path, MAX_ENVVARS_BYTES) else {
+        return vars;
+    };
+    let Ok(data) = String::from_utf8(data) else {
         return vars;
     };
     for raw in data.lines() {
@@ -293,37 +299,58 @@ fn user_ids(user: &str, group: &str) -> Result<(libc::uid_t, libc::gid_t, CStrin
     let uid = if let Ok(n) = user.parse::<u32>() {
         n
     } else {
-        let pw = unsafe { libc::getpwnam(cuser.as_ptr()) };
-        if pw.is_null() {
-            return Err(format!("user '{user}' not found"));
+        unsafe {
+            let pw = libc::getpwnam(cuser.as_ptr());
+            if pw.is_null() {
+                return Err(format!("user '{user}' not found"));
+            }
+            (*pw).pw_uid
         }
-        unsafe { (*pw).pw_uid }
     };
     let gid = if let Ok(n) = group.parse::<u32>() {
         n
     } else {
-        let gr = unsafe { libc::getgrnam(cgroup.as_ptr()) };
-        if gr.is_null() {
-            return Err(format!("group '{group}' not found"));
+        unsafe {
+            let gr = libc::getgrnam(cgroup.as_ptr());
+            if gr.is_null() {
+                return Err(format!("group '{group}' not found"));
+            }
+            (*gr).gr_gid
         }
-        unsafe { (*gr).gr_gid }
     };
     Ok((uid, gid, cuser))
 }
 
+fn effective_ids() -> (u32, u32) {
+    unsafe { (libc::geteuid(), libc::getegid()) }
+}
+
 fn effective_uid() -> u32 {
-    unsafe { libc::geteuid() }
+    effective_ids().0
+}
+
+fn validate_service_identity(euid: u32, egid: u32, uid: u32, gid: u32) -> Result<(), String> {
+    if !vapache_verified::service_identity_admit(euid, egid, uid, gid) {
+        if uid == 0 || gid == 0 {
+            return Err("refusing to run the request-serving process as root user/group".into());
+        }
+        return Err(format!(
+                "cannot switch unprivileged process from uid/gid {euid}/{egid} to configured {uid}/{gid}"
+            ));
+    }
+    Ok(())
 }
 
 fn drop_privileges(user: &str, group: &str) -> Result<(), String> {
     let (uid, gid, cuser) = user_ids(user, group)?;
-    let euid = effective_uid();
+    let (euid, egid) = effective_ids();
+    validate_service_identity(euid, egid, uid, gid)?;
     if euid != 0 {
-        let cur = unsafe { libc::getuid() };
-        if cur != uid {
-            eprintln!(
-                "vapached: warning: not running as root; cannot switch from uid {cur} to {uid}"
-            );
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(format!(
+                "cannot set no_new_privs: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         return Ok(());
     }
@@ -339,24 +366,30 @@ fn drop_privileges(user: &str, group: &str) -> Result<(), String> {
             // coverage:ignore-stop
         }
         // coverage:ignore-start - privileged syscall failure
-        if libc::setgid(gid) != 0 {
+        if libc::setresgid(gid, gid, gid) != 0 {
             // A root process with a resolved gid cannot deterministically
             // induce this kernel failure without syscall fault injection.
             return Err(format!(
-                "setgid failed: {}",
+                "setresgid failed: {}",
                 std::io::Error::last_os_error()
             ));
             // coverage:ignore-stop
         }
         // coverage:ignore-start - privileged syscall failure
-        if libc::setuid(uid) != 0 {
+        if libc::setresuid(uid, uid, uid) != 0 {
             // As above, retain the fail-closed branch for kernel/capability
             // changes while excluding an uninjectable syscall failure.
             return Err(format!(
-                "setuid failed: {}",
+                "setresuid failed: {}",
                 std::io::Error::last_os_error()
             ));
             // coverage:ignore-stop
+        }
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(format!(
+                "cannot set no_new_privs: {}",
+                std::io::Error::last_os_error()
+            ));
         }
     }
     Ok(()) // coverage:ignore-line - root-only successful privilege drop
@@ -398,7 +431,157 @@ fn daemonize() -> Result<(), String> {
     Ok(())
 }
 
-fn write_pid(path: &Path, service_uid: Option<u32>) -> Result<(), String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: i32,
+    start_time: u64,
+    uid: u32,
+    executable_dev: u64,
+    executable_ino: u64,
+    boot_id: String,
+}
+
+struct PidFileGuard {
+    path: PathBuf,
+    identity_path: PathBuf,
+    pid_file: std::fs::File,
+    identity_file: std::fs::File,
+}
+
+impl PidFileGuard {
+    fn refresh_identity(&mut self) -> Result<(), String> {
+        let identity = process_identity(std::process::id() as i32)?;
+        self.identity_file
+            .set_len(0)
+            .and_then(|()| self.identity_file.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| {
+                self.identity_file
+                    .write_all(serialize_process_identity(&identity).as_bytes())
+            })
+            .and_then(|()| self.identity_file.sync_data())
+            .map_err(|error| {
+                format!(
+                    "cannot update PID identity {}: {error}",
+                    self.identity_path.display()
+                )
+            })
+    }
+
+    fn clear(&mut self) {
+        let _ = self.pid_file.set_len(0);
+        let _ = self.pid_file.sync_data();
+        let _ = self.identity_file.set_len(0);
+        let _ = self.identity_file.sync_data();
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(&self.identity_path);
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+fn pid_identity_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".vapache-identity");
+    PathBuf::from(name)
+}
+
+fn read_bounded_text(path: &Path, limit: u64) -> Result<String, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut data = Vec::new();
+    Read::by_ref(&mut file)
+        .take(limit + 1)
+        .read_to_end(&mut data)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if data.len() as u64 > limit {
+        return Err(format!("{} exceeds the {limit} byte limit", path.display()));
+    }
+    String::from_utf8(data).map_err(|_| format!("{} is not valid UTF-8", path.display()))
+}
+
+fn process_identity(pid: i32) -> Result<ProcessIdentity, String> {
+    if pid <= 1 {
+        return Err(format!("refusing unsafe pid {pid}"));
+    }
+    let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let stat = read_bounded_text(&stat_path, 4096)?;
+    let close = stat
+        .rfind(')')
+        .ok_or_else(|| format!("invalid process stat for pid {pid}"))?;
+    let start_time = stat[close + 1..]
+        .split_ascii_whitespace()
+        .nth(19)
+        .ok_or_else(|| format!("missing process start time for pid {pid}"))?
+        .parse::<u64>()
+        .map_err(|_| format!("invalid process start time for pid {pid}"))?;
+    let process = std::fs::metadata(format!("/proc/{pid}"))
+        .map_err(|error| format!("cannot inspect pid {pid}: {error}"))?;
+    let executable = std::fs::metadata(format!("/proc/{pid}/exe"))
+        .map_err(|error| format!("cannot inspect executable for pid {pid}: {error}"))?;
+    let boot_id = read_bounded_text(Path::new("/proc/sys/kernel/random/boot_id"), 128)?
+        .trim()
+        .to_string();
+    if boot_id.is_empty() || boot_id.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err("invalid kernel boot identity".into());
+    }
+    Ok(ProcessIdentity {
+        pid,
+        start_time,
+        uid: process.uid(),
+        executable_dev: executable.dev(),
+        executable_ino: executable.ino(),
+        boot_id,
+    })
+}
+
+fn serialize_process_identity(identity: &ProcessIdentity) -> String {
+    format!(
+        "{} {} {} {} {} {}\n",
+        identity.pid,
+        identity.start_time,
+        identity.uid,
+        identity.executable_dev,
+        identity.executable_ino,
+        identity.boot_id
+    )
+}
+
+fn parse_process_identity(text: &str) -> Result<ProcessIdentity, String> {
+    let fields: Vec<&str> = text.split_ascii_whitespace().collect();
+    if fields.len() != 6 {
+        return Err("invalid PID identity record".into());
+    }
+    let number = |index: usize, name: &str| {
+        fields[index]
+            .parse::<u64>()
+            .map_err(|_| format!("invalid {name} in PID identity record"))
+    };
+    let pid = fields[0]
+        .parse::<i32>()
+        .map_err(|_| "invalid pid in PID identity record".to_string())?;
+    if pid <= 1 {
+        return Err(format!("refusing unsafe pid {pid}"));
+    }
+    Ok(ProcessIdentity {
+        pid,
+        start_time: number(1, "start time")?,
+        uid: u32::try_from(number(2, "uid")?)
+            .map_err(|_| "uid out of range in PID identity record".to_string())?,
+        executable_dev: number(3, "executable device")?,
+        executable_ino: number(4, "executable inode")?,
+        boot_id: fields[5].to_string(),
+    })
+}
+
+fn open_pid_output(
+    path: &Path,
+    mode: u32,
+    service_uid: Option<u32>,
+) -> Result<std::fs::File, String> {
     if let Some(parent) = path.parent() {
         vapached::files::ensure_admin_dir(parent, 0o755)
             .map_err(|e| format!("cannot prepare PidFile directory {}: {e}", parent.display()))?;
@@ -407,55 +590,161 @@ fn write_pid(path: &Path, service_uid: Option<u32>) -> Result<(), String> {
         vapached::files::validate_admin_parents(path, service_uid)
             .map_err(|e| format!("insecure PidFile path {}: {e}", path.display()))?;
     }
-    let mut file = vapached::files::open_admin_path(
+    let file = vapached::files::open_admin_path(
         path,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NONBLOCK,
-        0o644,
+        libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK,
+        mode,
     )
     .map_err(|e| format!("cannot open PidFile {}: {e}", path.display()))?;
-    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect PidFile {}: {error}", path.display()))?;
+    if !metadata.is_file() {
         return Err(format!("PidFile {} is not a regular file", path.display()));
     }
-    file.write_all(format!("{}\n", std::process::id()).as_bytes())
-        .map_err(|e| format!("cannot write PidFile {}: {e}", path.display()))
+    if service_uid.is_some() && (metadata.uid() != 0 || metadata.mode() & 0o022 != 0) {
+        return Err(format!(
+            "PidFile {} must be root-owned and non-writable by group/other",
+            path.display()
+        ));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(|error| format!("cannot secure PidFile {}: {error}", path.display()))?;
+    Ok(file)
 }
 
-fn read_pid(path: &Path, service_uid: Option<u32>) -> Result<i32, String> {
+fn write_pid(path: &Path, service_uid: Option<u32>) -> Result<PidFileGuard, String> {
+    let identity = process_identity(std::process::id() as i32)?;
+    let identity_path = pid_identity_path(path);
+    let mut pid_file = open_pid_output(path, 0o644, service_uid)?;
+    let mut identity_file = open_pid_output(&identity_path, 0o600, service_uid)?;
+    pid_file
+        .set_len(0)
+        .and_then(|()| pid_file.seek(SeekFrom::Start(0)).map(|_| ()))
+        .and_then(|()| pid_file.write_all(format!("{}\n", identity.pid).as_bytes()))
+        .and_then(|()| pid_file.sync_data())
+        .map_err(|error| format!("cannot write PidFile {}: {error}", path.display()))?;
+    identity_file
+        .set_len(0)
+        .and_then(|()| identity_file.seek(SeekFrom::Start(0)).map(|_| ()))
+        .and_then(|()| identity_file.write_all(serialize_process_identity(&identity).as_bytes()))
+        .and_then(|()| identity_file.sync_data())
+        .map_err(|error| {
+            format!(
+                "cannot write PID identity {}: {error}",
+                identity_path.display()
+            )
+        })?;
+    Ok(PidFileGuard {
+        path: path.to_path_buf(),
+        identity_path,
+        pid_file,
+        identity_file,
+    })
+}
+
+fn read_pid_record(path: &Path, service_uid: Option<u32>) -> Result<ProcessIdentity, String> {
     if let Some(service_uid) = service_uid {
         vapached::files::validate_admin_parents(path, service_uid)
             .map_err(|e| format!("insecure PidFile path {}: {e}", path.display()))?;
     }
-    let mut file = vapached::files::open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0)
-        .map_err(|e| format!("cannot read PidFile {}: {e}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|e| format!("cannot inspect PidFile {}: {e}", path.display()))?;
-    if !metadata.is_file() || metadata.len() > 64 {
-        return Err(format!(
-            "PidFile {} is not a small regular file",
-            path.display()
-        ));
+    let pid_bytes = vapached::files::read_admin_file(path, 64)
+        .map_err(|error| format!("cannot read PidFile {}: {error}", path.display()))?;
+    let pid_text = std::str::from_utf8(&pid_bytes)
+        .map_err(|_| format!("invalid pid in {}", path.display()))?;
+    let pid = pid_text
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| format!("invalid pid in {}", path.display()))?;
+    if pid <= 1 {
+        return Err(format!("refusing unsafe pid {pid} in {}", path.display()));
     }
-    let mut s = String::new();
-    Read::by_ref(&mut file)
-        .take(65)
-        .read_to_string(&mut s)
-        .map_err(|e| format!("cannot read PidFile {}: {e}", path.display()))?;
-    s.trim()
-        .parse()
-        .map_err(|_| format!("invalid pid in {}", path.display()))
+    let identity_path = pid_identity_path(path);
+    if let Some(service_uid) = service_uid {
+        vapached::files::validate_admin_parents(&identity_path, service_uid).map_err(|error| {
+            format!(
+                "insecure PID identity path {}: {error}",
+                identity_path.display()
+            )
+        })?;
+    }
+    let identity_bytes =
+        vapached::files::read_admin_file(&identity_path, 512).map_err(|error| {
+            format!(
+                "cannot read PID identity {}: {error}",
+                identity_path.display()
+            )
+        })?;
+    let identity = parse_process_identity(
+        std::str::from_utf8(&identity_bytes)
+            .map_err(|_| format!("invalid PID identity {}", identity_path.display()))?,
+    )?;
+    if identity.pid != pid {
+        return Err("PID file and identity record disagree".into());
+    }
+    Ok(identity)
 }
 
-fn kill_action(path: &Path, service_uid: Option<u32>, sig: libc::c_int) -> Result<(), String> {
-    let pid = read_pid(path, service_uid)?;
-    let rc = unsafe { libc::kill(pid, sig) };
-    if rc != 0 {
+fn open_verified_pid(
+    path: &Path,
+    service_uid: Option<u32>,
+) -> Result<(std::fs::File, ProcessIdentity), String> {
+    let expected = read_pid_record(path, service_uid)?;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, expected.pid, 0) as libc::c_int };
+    if fd < 0 {
         return Err(format!(
-            "kill({pid}) failed: {}",
+            "pidfd_open({}) failed: {}",
+            expected.pid,
             std::io::Error::last_os_error()
         ));
     }
-    Ok(())
+    let pidfd = unsafe { std::fs::File::from_raw_fd(fd) };
+    let actual = process_identity(expected.pid)?;
+    if !vapache_verified::pid_control_admit(
+        expected.pid as i64,
+        actual.pid as i64,
+        expected.uid,
+        actual.uid,
+        actual == expected,
+    ) {
+        return Err(format!(
+            "refusing pid {} because its process identity changed",
+            expected.pid
+        ));
+    }
+    if service_uid.is_some_and(|uid| actual.uid != uid) {
+        return Err(format!(
+            "refusing pid {} owned by unexpected uid {}",
+            actual.pid, actual.uid
+        ));
+    }
+    Ok((pidfd, actual))
+}
+
+#[cfg(test)]
+fn read_pid(path: &Path, service_uid: Option<u32>) -> Result<i32, String> {
+    open_verified_pid(path, service_uid).map(|(_, identity)| identity.pid)
+}
+
+fn kill_action(path: &Path, service_uid: Option<u32>, sig: libc::c_int) -> Result<i32, String> {
+    let (pidfd, identity) = open_verified_pid(path, service_uid)?;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            sig,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "pidfd_send_signal({}) failed: {}",
+            identity.pid,
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(identity.pid)
 }
 
 fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
@@ -776,13 +1065,18 @@ fn main() {
         return;
     }
 
-    let service_uid = match user_ids(&cfg.user, &cfg.group) {
-        Ok((uid, _, _)) => uid,
+    let (service_uid, service_gid) = match user_ids(&cfg.user, &cfg.group) {
+        Ok((uid, gid, _)) => (uid, gid),
         Err(error) => {
             eprintln!("vapached: {error}");
             std::process::exit(1);
         }
     };
+    let (euid, egid) = effective_ids();
+    if let Err(error) = validate_service_identity(euid, egid, service_uid, service_gid) {
+        eprintln!("vapached: {error}");
+        std::process::exit(1);
+    }
     let admin_service_uid = (effective_uid() == 0).then_some(service_uid);
 
     match args.action.as_deref() {
@@ -807,8 +1101,8 @@ fn main() {
             }
             return;
         }
-        Some("status") => match read_pid(&cfg.pid_file, admin_service_uid) {
-            Ok(pid) if unsafe { libc::kill(pid, 0) } == 0 => {
+        Some("status") => match kill_action(&cfg.pid_file, admin_service_uid, 0) {
+            Ok(pid) => {
                 println!("vapached is running (pid {pid})");
                 return;
             }
@@ -864,18 +1158,23 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if let Err(e) = write_pid(&cfg.pid_file, admin_service_uid) {
-        eprintln!("vapached: {e}");
-        std::process::exit(1);
-    }
     if !args.foreground {
         if let Err(e) = daemonize() {
             eprintln!("vapached: {e}");
             std::process::exit(1);
         }
-        // PID changes after fork; rewrite the pid file.
-        let _ = write_pid(&cfg.pid_file, admin_service_uid);
     }
+    if let Err(e) = server::activate_background(&cfg, &mut bound) {
+        eprintln!("vapached: cannot start background services: {e}");
+        std::process::exit(1);
+    }
+    let mut pid_guard = match write_pid(&cfg.pid_file, admin_service_uid) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("vapached: {e}");
+            std::process::exit(1);
+        }
+    };
     if cfg.has_cgi() {
         if let Err(e) = vapached::cgi::init_pool(&cfg) {
             // coverage:ignore-start - root-only configured identity failure
@@ -885,7 +1184,12 @@ fn main() {
     logger.prepare_permissions(&cfg);
     if let Err(e) = drop_privileges(&cfg.user, &cfg.group) {
         eprintln!("vapached: {e}");
-        let _ = std::fs::remove_file(&cfg.pid_file);
+        pid_guard.clear();
+        std::process::exit(1);
+    }
+    if let Err(e) = pid_guard.refresh_identity() {
+        eprintln!("vapached: {e}");
+        pid_guard.clear();
         std::process::exit(1);
     }
     unsafe {
@@ -972,16 +1276,8 @@ fn main() {
         logger.info("configuration reloaded; cache generation invalidated");
     }
     vapached::cgi::shutdown_pool();
-    let _ = std::fs::remove_file(read_pid_path());
+    pid_guard.clear();
     let _ = std::io::stderr().flush();
-}
-
-fn read_pid_path() -> PathBuf {
-    // The pid file has already been unlinked by the time this is called if
-    // configuration failed; use the environment as a best effort.
-    PathBuf::from(
-        std::env::var("APACHE_PID_FILE").unwrap_or_else(|_| "/var/run/apache2/apache2.pid".into()),
-    )
 }
 
 #[cfg(test)]
@@ -1030,12 +1326,26 @@ mod tests {
     #[test]
     fn pid_file_roundtrip() {
         let path = temp("pid");
-        write_pid(&path, None).unwrap();
+        let mut guard = write_pid(&path, None).unwrap();
         assert_eq!(read_pid(&path, None).unwrap(), std::process::id() as i32);
         // signal 0 only checks for existence/permission
         kill_action(&path, None, 0).unwrap();
+        let mut forged = process_identity(std::process::id() as i32).unwrap();
+        forged.start_time = forged.start_time.saturating_add(1);
+        std::fs::write(
+            pid_identity_path(&path),
+            serialize_process_identity(&forged),
+        )
+        .unwrap();
+        assert!(read_pid(&path, None).is_err());
+        guard.refresh_identity().unwrap();
+        assert_eq!(read_pid(&path, None).unwrap(), std::process::id() as i32);
         std::fs::write(&path, "not-a-pid\n").unwrap();
         assert!(read_pid(&path, None).is_err());
+        std::fs::write(&path, "-1\n").unwrap();
+        assert!(kill_action(&path, None, libc::SIGTERM).is_err());
+        std::fs::write(&path, "0\n").unwrap();
+        assert!(kill_action(&path, None, libc::SIGTERM).is_err());
         assert!(kill_action(&temp("missing-pid"), None, 0).is_err());
         std::fs::write(&path, "2147483647\n").unwrap();
         assert!(kill_action(&path, None, 0).is_err());
@@ -1046,8 +1356,19 @@ mod tests {
         assert!(write_pid(&path, None).is_err());
         assert!(read_pid(&path, None).is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+        guard.clear();
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(victim);
+    }
+
+    #[test]
+    fn privileged_pid_file_must_itself_be_safe() {
+        let path = temp("unsafe-pid");
+        std::fs::write(&path, b"unchanged").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(write_pid(&path, Some(u32::MAX)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"unchanged");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1059,21 +1380,23 @@ mod tests {
         assert!(user_ids("bad\0name", "0").is_err());
         assert!(user_ids("0", "bad\0group").is_err());
 
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-        assert!(drop_privileges(&uid.to_string(), &gid.to_string()).is_ok());
+        let (uid, gid) = effective_ids();
+        assert!(validate_service_identity(0, 0, 0, 0).is_err());
+        assert!(validate_service_identity(0, 0, 1, 0).is_err());
         if uid != 0 {
-            assert!(drop_privileges(&u32::MAX.to_string(), &gid.to_string()).is_ok());
+            assert!(drop_privileges(&uid.to_string(), &gid.to_string()).is_ok());
+            assert!(drop_privileges(&u32::MAX.to_string(), &gid.to_string()).is_err());
         }
     }
 
     #[test]
-    fn root_privilege_drop_success_and_initgroups_failure() {
-        if unsafe { libc::geteuid() } != 0 {
-            return;
-        }
-        assert!(drop_privileges(&u32::MAX.to_string(), "nogroup").is_err());
-        assert!(drop_privileges("nobody", "nogroup").is_ok());
+    fn service_identity_validation_is_fail_closed() {
+        assert!(validate_service_identity(0, 0, 0, 65534).is_err());
+        assert!(validate_service_identity(0, 0, 65534, 0).is_err());
+        assert!(validate_service_identity(1000, 1000, 1001, 1000).is_err());
+        assert!(validate_service_identity(1000, 1000, 1000, 1001).is_err());
+        assert!(validate_service_identity(0, 0, 65534, 65534).is_ok());
+        assert!(validate_service_identity(1000, 1000, 1000, 1000).is_ok());
     }
 
     #[test]
@@ -1244,13 +1567,6 @@ mod tests {
         args.explain = Some("/sub/file.txt".into());
         assert!(explain_config(&no_override, &args).is_ok());
 
-        std::env::set_var("APACHE_PID_FILE", dir.join("custom.pid"));
-        assert_eq!(read_pid_path(), dir.join("custom.pid"));
-        std::env::remove_var("APACHE_PID_FILE");
-        assert_eq!(
-            read_pid_path(),
-            PathBuf::from("/var/run/apache2/apache2.pid")
-        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -311,6 +311,13 @@ fn cli_information_explain_and_startup_failures() {
     fs::write(&user_config, missing_user).unwrap();
     assert!(!output(&root, &user_config, &["-X"]).status.success());
 
+    let root_user_config = root.join("root-user.conf");
+    let root_user = config_text(&root, free_port(), "")
+        .replace(&format!("User {}", service_ids().0), "User 0")
+        .replace(&format!("Group {}", service_ids().1), "Group 0");
+    fs::write(&root_user_config, root_user).unwrap();
+    assert!(!output(&root, &root_user_config, &["-X"]).status.success());
+
     let _ = fs::remove_dir_all(root);
 }
 

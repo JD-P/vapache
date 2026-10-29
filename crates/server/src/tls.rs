@@ -20,6 +20,8 @@ use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 type SharedKey = Arc<RwLock<Arc<CertifiedKey>>>;
+const MAX_TLS_CERTIFICATE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_TLS_PRIVATE_KEY_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]
 struct SniResolver {
@@ -86,7 +88,7 @@ impl ResolvesServerCert for SniResolver {
 fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
     crate::fault::hit("tls.cert.read")
         .map_err(|e| format!("cannot open certificate {}: {e}", path.display()))?;
-    let data = std::fs::read(path)
+    let data = crate::files::read_admin_file(path, MAX_TLS_CERTIFICATE_BYTES)
         .map_err(|e| format!("cannot open certificate {}: {e}", path.display()))?;
     let certs = CertificateDer::pem_slice_iter(&data)
         .collect::<Result<Vec<_>, _>>()
@@ -100,7 +102,7 @@ fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
 fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
     crate::fault::hit("tls.key.read")
         .map_err(|e| format!("cannot open private key {}: {e}", path.display()))?;
-    let data = std::fs::read(path)
+    let data = crate::files::read_admin_file(path, MAX_TLS_PRIVATE_KEY_BYTES)
         .map_err(|e| format!("cannot open private key {}: {e}", path.display()))?;
     PrivateKeyDer::from_pem_slice(&data).map_err(|e| match e {
         PemError::NoItemsFound => format!("no PEM private key found in {}", path.display()),
@@ -112,6 +114,15 @@ fn load_key(
     ssl: &SslConfig,
     provider: &CryptoProvider,
     cache_dir: Option<&Path>,
+) -> Result<(Arc<CertifiedKey>, Option<OcspRefresh>), String> {
+    load_key_with_ocsp(ssl, provider, cache_dir, true)
+}
+
+fn load_key_with_ocsp(
+    ssl: &SslConfig,
+    provider: &CryptoProvider,
+    cache_dir: Option<&Path>,
+    enable_ocsp: bool,
 ) -> Result<(Arc<CertifiedKey>, Option<OcspRefresh>), String> {
     let cert_file = ssl
         .cert_file
@@ -126,7 +137,7 @@ fn load_key(
     let key_file = ssl.key_file.as_ref().unwrap_or(cert_file);
     let key = read_key(key_file)?;
     let mut refresh = None;
-    let ocsp = if ssl.stapling {
+    let ocsp = if ssl.stapling && enable_ocsp {
         let timeout = if ssl.stapling_responder_timeout.is_zero() {
             Duration::from_secs(5)
         } else {
@@ -365,6 +376,26 @@ pub fn server_config(
     port: u16,
     local_ip: Option<IpAddr>,
 ) -> Result<Option<Arc<ServerConfig>>, String> {
+    server_config_inner(cfg, port, local_ip, true)
+}
+
+/// Build the pre-fork TLS generation without starting OCSP refresh threads.
+/// The daemon replaces it with a background-enabled generation immediately
+/// after daemonization and before dropping privileges.
+pub(crate) fn server_config_without_background(
+    cfg: &Config,
+    port: u16,
+    local_ip: Option<IpAddr>,
+) -> Result<Option<Arc<ServerConfig>>, String> {
+    server_config_inner(cfg, port, local_ip, false)
+}
+
+fn server_config_inner(
+    cfg: &Config,
+    port: u16,
+    local_ip: Option<IpAddr>,
+    start_background: bool,
+) -> Result<Option<Arc<ServerConfig>>, String> {
     let provider = Arc::new(ring::default_provider());
     let mut vhosts: Vec<&VHost> = cfg
         .vhosts
@@ -394,11 +425,18 @@ pub fn server_config(
     // not below a legacy logs directory that older releases handed to the
     // service account.
     let ocsp_cache_dir = cfg.server_root.join(".vapache-ocsp-cache");
-    let (default_cert, default_refresh) = load_key(default_ssl, &provider, Some(&ocsp_cache_dir))?;
+    let (default_cert, default_refresh) = load_key_with_ocsp(
+        default_ssl,
+        &provider,
+        Some(&ocsp_cache_dir),
+        start_background,
+    )?;
     let default_key: SharedKey = Arc::new(RwLock::new(default_cert));
-    if let Some(mut refresh) = default_refresh {
-        refresh.key = Arc::downgrade(&default_key);
-        let _ = spawn_ocsp_refresh(refresh);
+    if start_background {
+        if let Some(mut refresh) = default_refresh {
+            refresh.key = Arc::downgrade(&default_key);
+            let _ = spawn_ocsp_refresh(refresh);
+        }
     }
     let mut resolver = SniResolver {
         default: default_key.clone(),
@@ -413,11 +451,14 @@ pub fn server_config(
             let key = if std::ptr::eq(&v.ssl, default_ssl) {
                 default_key.clone()
             } else {
-                let (cert, refresh) = load_key(&v.ssl, &provider, Some(&ocsp_cache_dir))?;
+                let (cert, refresh) =
+                    load_key_with_ocsp(&v.ssl, &provider, Some(&ocsp_cache_dir), start_background)?;
                 let shared = Arc::new(RwLock::new(cert));
-                if let Some(mut refresh) = refresh {
-                    refresh.key = Arc::downgrade(&shared);
-                    let _ = spawn_ocsp_refresh(refresh);
+                if start_background {
+                    if let Some(mut refresh) = refresh {
+                        refresh.key = Arc::downgrade(&shared);
+                        let _ = spawn_ocsp_refresh(refresh);
+                    }
                 }
                 shared
             };

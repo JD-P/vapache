@@ -1083,7 +1083,7 @@ where
                 let (request, mut respond) =
                     result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let stream_id = respond.stream_id().as_u32() as u64;
-                let process_stream = match cfg.resource_budget.try_h2_stream() {
+                let process_stream = match cfg.resource_budget.try_h2_stream_for(peer.ip()) {
                     Ok(lease) => lease,
                     Err(_) => {
                         respond.send_reset(h2::Reason::REFUSED_STREAM);

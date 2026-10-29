@@ -38,6 +38,10 @@ use std::time::Duration;
 
 pub(crate) use crate::config_frontend::tokenize_config;
 
+const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_CONFIG_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TYPES_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ConfigError {
     pub file: String,
@@ -2157,7 +2161,7 @@ impl MimeMap {
         if !vapache_verified::text_identity_admit(path.to_str().is_some()) {
             return Err("TypesConfig path is not valid UTF-8".into());
         }
-        let data = std::fs::read(path)
+        let data = crate::files::read_admin_file(path, MAX_TYPES_CONFIG_BYTES)
             .map_err(|e| format!("cannot read TypesConfig {}: {e}", path.display()))?;
         let text = std::str::from_utf8(&data)
             .map_err(|_| format!("TypesConfig {} is not valid UTF-8", path.display()))?;
@@ -2726,6 +2730,7 @@ impl Config {
             errors: Vec::new(),
             server_root: server_root.to_path_buf(),
             include_count: 0,
+            config_bytes: 0,
         };
         p.parse_file(path, true);
         if let Some((open, _, _)) = p.section_stack.last() {
@@ -2790,6 +2795,7 @@ struct ParserState {
     errors: Vec<ConfigError>,
     server_root: PathBuf,
     include_count: usize,
+    config_bytes: u64,
 }
 
 fn norm_module(name: &str) -> String {
@@ -3072,7 +3078,7 @@ impl ParserState {
             self.error(&loc, "Include nesting too deep");
             return;
         }
-        let data = match std::fs::read(path) {
+        let data = match crate::files::read_admin_file(path, MAX_CONFIG_FILE_BYTES) {
             Ok(d) => d,
             Err(e) => {
                 if required {
@@ -3085,6 +3091,26 @@ impl ParserState {
                 return;
             }
         };
+        let Some(total) = self.config_bytes.checked_add(data.len() as u64) else {
+            let loc = SourceLoc {
+                file: path.display().to_string(),
+                line: 0,
+            };
+            self.error(&loc, "aggregate configuration size overflow");
+            return;
+        };
+        if total > MAX_CONFIG_TOTAL_BYTES {
+            let loc = SourceLoc {
+                file: path.display().to_string(),
+                line: 0,
+            };
+            self.error(
+                &loc,
+                format!("aggregate configuration exceeds the {MAX_CONFIG_TOTAL_BYTES} byte limit"),
+            );
+            return;
+        }
+        self.config_bytes = total;
         let text = match std::str::from_utf8(&data) {
             Ok(text) => text,
             Err(_) => {
@@ -3725,33 +3751,21 @@ impl Compile {
         kind: &str,
         path: &Path,
     ) -> Option<String> {
-        let md = match std::fs::metadata(path) {
-            Ok(md) => md,
-            Err(e) => {
-                self.errors.push(ConfigError {
-                    file: loc.file.clone(),
-                    line: loc.line,
-                    msg: format!(
-                        "RewriteMap '{name}': cannot read {kind} map file {}: {e}",
-                        path.display()
-                    ),
-                });
-                return None;
-            }
-        };
-        if md.len() > MAX_REWRITEMAP {
-            self.errors.push(ConfigError {
-                file: loc.file.clone(),
-                line: loc.line,
-                msg: format!(
-                    "RewriteMap '{name}': {kind} map file {} exceeds the {MAX_REWRITEMAP} byte limit",
-                    path.display()
-                ),
-            });
-            return None;
-        }
-        match std::fs::read_to_string(path) {
-            Ok(data) => Some(data),
+        match crate::files::read_admin_file(path, MAX_REWRITEMAP) {
+            Ok(data) => match String::from_utf8(data) {
+                Ok(data) => Some(data),
+                Err(_) => {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!(
+                            "RewriteMap '{name}': {kind} map file {} is not valid UTF-8",
+                            path.display()
+                        ),
+                    });
+                    None
+                }
+            },
             Err(e) => {
                 self.errors.push(ConfigError {
                     file: loc.file.clone(),
@@ -11254,7 +11268,35 @@ ServerName localhost\n\
             errors: Vec::new(),
             server_root: root.to_path_buf(),
             include_count: 0,
+            config_bytes: 0,
         }
+    }
+
+    #[test]
+    fn configuration_inputs_enforce_per_file_and_aggregate_limits() {
+        let root =
+            std::env::temp_dir().join(format!("vapache-config-limits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let oversized = root.join("oversized.conf");
+        std::fs::write(&oversized, vec![b'#'; MAX_CONFIG_FILE_BYTES as usize + 1]).unwrap();
+        let mut parser = parser_state(&root);
+        parser.parse_file(&oversized, true);
+        assert!(parser
+            .errors
+            .iter()
+            .any(|error| error.msg.contains("could not open config file")));
+
+        let small = root.join("small.conf");
+        std::fs::write(&small, b"Listen 127.0.0.1:8080\n").unwrap();
+        let mut parser = parser_state(&root);
+        parser.config_bytes = MAX_CONFIG_TOTAL_BYTES;
+        parser.parse_file(&small, true);
+        assert!(parser
+            .errors
+            .iter()
+            .any(|error| error.msg.contains("aggregate configuration exceeds")));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

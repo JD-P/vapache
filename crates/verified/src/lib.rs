@@ -5321,6 +5321,84 @@ pub fn connection_admit(active: u64, max: u64) -> (ok: bool)
     active < max
 }
 
+/// The request-serving identity must never retain uid/gid zero.  A privileged
+/// launcher may switch to the configured pair; an already-unprivileged launch
+/// is admitted only when both effective IDs already match exactly.
+pub open spec fn service_identity_spec(euid: u32, egid: u32, uid: u32, gid: u32) -> bool {
+    uid != 0 && gid != 0 && (euid == 0 || (euid == uid && egid == gid))
+}
+
+pub fn service_identity_admit(euid: u32, egid: u32, uid: u32, gid: u32) -> (ok: bool)
+    ensures ok == service_identity_spec(euid, egid, uid, gid),
+{
+    uid != 0 && gid != 0 && (euid == 0 || (euid == uid && egid == gid))
+}
+
+pub proof fn service_identity_rejects_root(euid: u32, egid: u32, gid: u32)
+    ensures
+        !service_identity_spec(euid, egid, 0, gid),
+        !service_identity_spec(euid, egid, gid, 0),
+{
+}
+
+pub proof fn unprivileged_identity_must_match(euid: u32, egid: u32, uid: u32, gid: u32)
+    requires euid != 0,
+    ensures service_identity_spec(euid, egid, uid, gid) ==> (euid == uid && egid == gid),
+{
+}
+
+/// A process-control record is usable only for a non-special positive pid and
+/// only while the pidfd-pinned process still has the exact recorded identity.
+pub open spec fn pid_control_spec(
+    pid: i64,
+    actual_pid: i64,
+    expected_uid: u32,
+    actual_uid: u32,
+    identity_matches: bool,
+) -> bool {
+    pid > 1
+        && pid == actual_pid
+        && expected_uid == actual_uid
+        && identity_matches
+}
+
+pub fn pid_control_admit(
+    pid: i64,
+    actual_pid: i64,
+    expected_uid: u32,
+    actual_uid: u32,
+    identity_matches: bool,
+) -> (ok: bool)
+    ensures ok == pid_control_spec(pid, actual_pid, expected_uid, actual_uid, identity_matches),
+{
+    pid > 1
+        && pid == actual_pid
+        && expected_uid == actual_uid
+        && identity_matches
+}
+
+pub proof fn pid_control_rejects_special_pid(
+    pid: i64,
+    actual_pid: i64,
+    expected_uid: u32,
+    actual_uid: u32,
+    identity_matches: bool,
+)
+    requires pid <= 1,
+    ensures !pid_control_spec(pid, actual_pid, expected_uid, actual_uid, identity_matches),
+{
+}
+
+pub proof fn pid_control_rejects_identity_change(
+    pid: i64,
+    actual_pid: i64,
+    expected_uid: u32,
+    actual_uid: u32,
+)
+    ensures !pid_control_spec(pid, actual_pid, expected_uid, actual_uid, false),
+{
+}
+
 /// Bound check for a length-prefixed CGI worker protocol field.
 pub fn cgi_field_len_ok(len: u32, limit: u32) -> (ok: bool)
     ensures ok == (len <= limit),

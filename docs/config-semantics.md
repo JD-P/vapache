@@ -552,7 +552,9 @@ CGI output/stderr               : capped
 proxy response head/body/trailer: capped
 proxy chunk arithmetic          : checked_add and MAX_PROXY_BODY
 proxy DNS / TLS CA              : bounded queue/deadline; CA parsed once per generation
-WebSocket tunnels               : 64 process slots plus idle/write deadline
+accepted connections            : MaxRequestWorkers plus per-source half-budget/32 cap
+HTTP/2 streams                  : 256 process slots, 64 per source
+WebSocket tunnels               : 64 process slots, 8 per effective client, plus idle/write deadline
 handlers/descriptors            : only stdio + script fd cross exec
 ```
 
@@ -967,11 +969,12 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | FastCGI response head | bounded prefix/header scan before body streaming |
 | Aggregate dynamic I/O | RAII byte/file reservations across request, response, CGI-worker and FastCGI/proxy spools; 128 MiB request and response resident ceilings; shared CGI/FastCGI concurrency slots; 32 blocking reads |
 | HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error |
-| HTTP/2 | verified settings, header-state, flow-control and reset budgets; at most 32 streams per connection and 256 process-wide, each with a 64 KiB resident body prefix before using the shared request-spool quota |
+| HTTP/2 | verified settings, header-state, flow-control and reset budgets; at most 32 streams per connection, 64 per source and 256 process-wide, each with a 64 KiB resident body prefix before using the shared request-spool quota |
 | Compression/PCRE/password hashing | fixed input/cost bounds and a shared 32-operation CPU-work admission gate; optional compression falls back to identity under pressure |
 | Autoindex | at most 4096 examined directory records (including filtered names), 4096 rendered entries and 4 MiB of generated HTML |
 | DNS authorization | eight resolver workers, queue length 64, two-second caller deadline and bounded copied host operands |
 | Expression `file()` | confined regular descriptor, `O_NONBLOCK`/`O_NOFOLLOW`, 64 KiB read ceiling |
+| Administrative inputs | no-symlink regular descriptors with stable before/after metadata; 4 MiB per configuration/certificate/TypesConfig file, 1 MiB per key/envvars file, existing RewriteMap limit, and 16 MiB aggregate configuration text |
 
 A malformed or over-limit stream produces an error response or connection
 close; request-spool exhaustion specifically produces `503` and releases its

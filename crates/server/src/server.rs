@@ -17,6 +17,7 @@ use crate::proxy;
 use crate::request_plan::{CanonicalTarget, RequestPlan};
 use crate::util::is_canonical_path;
 use crate::verified::{normalize_uri_path, percent_decode_path};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -25,7 +26,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -57,7 +58,6 @@ pub fn bind(cfg: &Config) -> io::Result<Vec<Bound>> {
     crate::files::require_secure_path_resolution()?;
     crate::cache::prepare(cfg);
     crate::ocsp::prepare_cache_dir(&cfg.server_root.join(".vapache-ocsp-cache"))?;
-    crate::proxy::start_health_checks(cfg);
     let mut out = Vec::new();
     for l in &cfg.listeners {
         let addr_str = if l.addr == "*" { "0.0.0.0" } else { &l.addr };
@@ -68,7 +68,7 @@ pub fn bind(cfg: &Config) -> io::Result<Vec<Bound>> {
             let addrs = (addr_str, l.port).to_socket_addrs()?;
             first_resolved_addr(addrs)?
         };
-        let tls = crate::tls::server_config(cfg, l.port, listener_local_ip(l))
+        let tls = crate::tls::server_config_without_background(cfg, l.port, listener_local_ip(l))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let listener = bind_reuse(sock_addr, cfg.listen_backlog)?;
         out.push(Bound {
@@ -79,6 +79,30 @@ pub fn bind(cfg: &Config) -> io::Result<Vec<Bound>> {
         });
     }
     Ok(out)
+}
+
+/// Start every background subsystem only after daemonization has completed.
+/// Forking a Rust process after OCSP/health-check threads exist can strand
+/// locked mutexes in the child and always discards those worker threads.
+pub fn activate_background(cfg: &Config, bound: &mut [Bound]) -> io::Result<()> {
+    if cfg.listeners.len() != bound.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "listener set changed before background activation",
+        ));
+    }
+    for (listener, active) in cfg.listeners.iter().zip(bound.iter_mut()) {
+        if listener.port != active.port || listener.addr != active.addr {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "listener identity changed before background activation",
+            ));
+        }
+        active.tls = crate::tls::server_config(cfg, listener.port, listener_local_ip(listener))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    }
+    crate::proxy::start_health_checks(cfg);
+    Ok(())
 }
 
 /// Rebuild per-generation listener handles against an existing bound set.
@@ -223,6 +247,8 @@ fn sockaddr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_
 }
 
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_CONNECTION_CLIENTS: OnceLock<Mutex<HashMap<IpAddr, usize>>> = OnceLock::new();
+const MAX_CONNECTIONS_PER_CLIENT: usize = 32;
 
 pub fn active_connections() -> usize {
     ACTIVE_CONNECTIONS.load(Ordering::Relaxed)
@@ -294,7 +320,9 @@ impl Server {
                             let cfg = self.cfg.clone();
                             let logger = self.logger.clone();
                             let worker_limit = cfg.max_request_workers.max(1);
-                            let Some(active_guard) = try_reserve_connection(worker_limit) else {
+                            let Some(active_guard) =
+                                try_reserve_connection(peer.ip(), worker_limit)
+                            else {
                                 reject_busy_connection(stream, b.tls.is_some(), &self.cfg);
                                 continue;
                             };
@@ -343,17 +371,35 @@ impl Server {
     }
 }
 
-struct ActiveGuard;
+struct ActiveGuard {
+    client: IpAddr,
+}
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
+        let mut clients = ACTIVE_CONNECTION_CLIENTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(count) = clients.get_mut(&self.client) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                clients.remove(&self.client);
+            }
+        }
+        drop(clients);
         ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-fn try_reserve_connection(limit: usize) -> Option<ActiveGuard> {
+fn per_client_connection_limit(limit: usize) -> usize {
+    (limit / 2 + limit % 2).clamp(1, MAX_CONNECTIONS_PER_CLIENT)
+}
+
+fn try_reserve_connection(client: IpAddr, limit: usize) -> Option<ActiveGuard> {
+    let limit = limit.max(1);
     let mut current = ACTIVE_CONNECTIONS.load(Ordering::Acquire);
     loop {
-        if !vapache_verified::connection_admit(current as u64, limit.max(1) as u64) {
+        if !vapache_verified::connection_admit(current as u64, limit as u64) {
             return None;
         }
         match ACTIVE_CONNECTIONS.compare_exchange_weak(
@@ -362,10 +408,23 @@ fn try_reserve_connection(limit: usize) -> Option<ActiveGuard> {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => return Some(ActiveGuard),
+            Ok(_) => break,
             Err(observed) => current = observed,
         }
     }
+    let mut clients = ACTIVE_CONNECTION_CLIENTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let count = clients.entry(client).or_default();
+    if !vapache_verified::connection_admit(*count as u64, per_client_connection_limit(limit) as u64)
+    {
+        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+        return None;
+    }
+    *count += 1;
+    drop(clients);
+    Some(ActiveGuard { client })
 }
 
 fn spawn_connection_thread<F>(work: F) -> io::Result<std::thread::JoinHandle<()>>
@@ -4720,7 +4779,7 @@ mod tests {
     #[test]
     fn connection_spawn_failure_releases_reserved_slot() {
         let before = active_connections();
-        let guard = try_reserve_connection(usize::MAX).unwrap();
+        let guard = try_reserve_connection(IpAddr::from([192, 0, 2, 1]), usize::MAX).unwrap();
         crate::fault::configure(
             "server.connection.spawn",
             0,
@@ -4729,6 +4788,26 @@ mod tests {
         assert!(spawn_connection_thread(move || drop(guard)).is_err());
         assert_eq!(active_connections(), before);
         crate::fault::clear();
+    }
+
+    #[test]
+    fn per_client_connection_limit_is_enforced_and_released() {
+        assert_eq!(per_client_connection_limit(0), 1);
+        assert_eq!(per_client_connection_limit(1), 1);
+        assert_eq!(per_client_connection_limit(2), 1);
+        assert_eq!(per_client_connection_limit(3), 2);
+        assert_eq!(per_client_connection_limit(64), 32);
+        assert_eq!(per_client_connection_limit(usize::MAX), 32);
+        let client = IpAddr::from([192, 0, 2, 99]);
+        let other = IpAddr::from([192, 0, 2, 100]);
+        let limit = usize::MAX;
+        let leases: Vec<_> = (0..per_client_connection_limit(limit))
+            .map(|_| try_reserve_connection(client, limit).unwrap())
+            .collect();
+        assert!(try_reserve_connection(client, limit).is_none());
+        assert!(try_reserve_connection(other, limit).is_some());
+        drop(leases);
+        assert!(try_reserve_connection(client, limit).is_some());
     }
 
     fn cov_ws_request(path: &str) -> String {

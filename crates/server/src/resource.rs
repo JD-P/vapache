@@ -16,6 +16,7 @@ pub struct ResourceBudget {
     spool_files: AtomicU64,
     dynamic_requests: AtomicU64,
     h2_streams: AtomicU64,
+    h2_clients: Mutex<HashMap<IpAddr, u64>>,
     request_bytes: AtomicU64,
     response_bytes: AtomicU64,
     blocking_reads: AtomicU64,
@@ -30,6 +31,7 @@ pub struct ResourceBudget {
 pub const MAX_EXPENSIVE_OPS: u64 = 32;
 pub const MAX_BLOCKING_READS: u64 = 32;
 pub const MAX_H2_STREAMS: u64 = 256;
+pub const MAX_H2_STREAMS_PER_CLIENT: u64 = 64;
 pub const MAX_REQUEST_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_RESPONSE_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_WEBSOCKET_TUNNELS: u64 = 64;
@@ -133,15 +135,30 @@ impl ResourceBudget {
         })
     }
 
-    pub fn try_h2_stream(self: &Arc<Self>) -> io::Result<H2StreamLease> {
+    pub fn try_h2_stream_for(self: &Arc<Self>, client: IpAddr) -> io::Result<H2StreamLease> {
         if !try_add(&self.h2_streams, 1, MAX_H2_STREAMS) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "process-wide HTTP/2 stream limit reached",
             ));
         }
+        let mut clients = self
+            .h2_clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let count = clients.entry(client).or_default();
+        if !vapache_verified::resource_budget_admit(*count, 1, MAX_H2_STREAMS_PER_CLIENT) {
+            self.h2_streams.fetch_sub(1, Ordering::AcqRel);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "per-client HTTP/2 stream limit reached",
+            ));
+        }
+        *count += 1;
+        drop(clients);
         Ok(H2StreamLease {
             budget: self.clone(),
+            client,
             active: true,
         })
     }
@@ -288,12 +305,25 @@ impl Drop for ResidentLease {
 #[derive(Debug)]
 pub struct H2StreamLease {
     budget: Arc<ResourceBudget>,
+    client: IpAddr,
     active: bool,
 }
 
 impl Drop for H2StreamLease {
     fn drop(&mut self) {
         if self.active {
+            let mut clients = self
+                .budget
+                .h2_clients
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(count) = clients.get_mut(&self.client) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    clients.remove(&self.client);
+                }
+            }
+            drop(clients);
             self.budget.h2_streams.fetch_sub(1, Ordering::AcqRel);
             self.active = false;
         }
@@ -439,7 +469,9 @@ mod tests {
     #[test]
     fn process_wide_stream_memory_and_blocking_leases_release() {
         let budget = Arc::new(ResourceBudget::default());
-        let stream = budget.try_h2_stream().unwrap();
+        let stream = budget
+            .try_h2_stream_for(IpAddr::from([192, 0, 2, 1]))
+            .unwrap();
         let mut request = budget.try_request_bytes();
         let mut response = budget.try_response_bytes();
         let blocking = budget.try_blocking_read().unwrap();
@@ -454,11 +486,39 @@ mod tests {
     fn process_wide_h2_stream_limit_is_enforced_and_recovers() {
         let budget = Arc::new(ResourceBudget::default());
         let leases: Vec<_> = (0..MAX_H2_STREAMS)
-            .map(|_| budget.try_h2_stream().unwrap())
+            .map(|index| {
+                budget
+                    .try_h2_stream_for(IpAddr::from([
+                        192,
+                        0,
+                        2 + (index / MAX_H2_STREAMS_PER_CLIENT) as u8,
+                        1,
+                    ]))
+                    .unwrap()
+            })
             .collect();
-        assert!(budget.try_h2_stream().is_err());
+        assert!(budget
+            .try_h2_stream_for(IpAddr::from([198, 51, 100, 1]))
+            .is_err());
         drop(leases);
-        assert!(budget.try_h2_stream().is_ok());
+        assert!(budget
+            .try_h2_stream_for(IpAddr::from([198, 51, 100, 1]))
+            .is_ok());
+    }
+
+    #[test]
+    fn per_client_h2_stream_limit_is_enforced_and_recovers() {
+        let budget = Arc::new(ResourceBudget::default());
+        let client = IpAddr::from([192, 0, 2, 77]);
+        let leases: Vec<_> = (0..MAX_H2_STREAMS_PER_CLIENT)
+            .map(|_| budget.try_h2_stream_for(client).unwrap())
+            .collect();
+        assert!(budget.try_h2_stream_for(client).is_err());
+        assert!(budget
+            .try_h2_stream_for(IpAddr::from([192, 0, 2, 78]))
+            .is_ok());
+        drop(leases);
+        assert!(budget.try_h2_stream_for(client).is_ok());
     }
 
     #[test]

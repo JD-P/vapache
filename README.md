@@ -153,7 +153,8 @@ Implemented today:
   `RequestReadTimeout` header/body deadlines and header `MinRate`, configurable
   `MaxRequestWorkers`/`ListenBacklog`, graceful `SIGHUP` reload with listener
   reuse, `SIGUSR1` log reopen, `-k graceful`/`graceful-stop` with connection
-  draining, reload cache isolation, hard absolute body deadlines, and
+  draining, pidfd-based control actions bound to the daemon's boot/start/exe
+  identity, pre-thread daemonization, reload cache isolation, hard absolute body deadlines, and
   request-body spooling for fixed HTTP/1 bodies declared above 1 MB after a
   64 KiB actual-byte prefix (also 64 KiB for chunked HTTP/1 and HTTP/2).
 - Bounded-memory proxy and FastCGI traffic: large fixed-length upstream
@@ -162,8 +163,10 @@ Implemented today:
   request bodies are spooled before forwarding. Proxy responses are capped at
   64 MiB and local CGI output at 8 MiB. Request and proxy chunk sizes, trailer
   counts/bytes, proxy head sizes and CGI/FastCGI output are explicitly bounded.
-- Process-wide overload control: at most 256 HTTP/2 streams, 64 WebSocket
-  tunnels, 128 MiB each of retained request and response bytes, 32 blocking
+- Process-wide overload control: at most 256 HTTP/2 streams (64 per source),
+  64 WebSocket tunnels (8 per effective client), and 32 accepted connections
+  per source (or half of a smaller `MaxRequestWorkers` budget), plus 128 MiB
+  each of retained request and response bytes and 32 blocking
   response reads, and 32
   concurrent CPU-heavy regex/hash/compression/access-file operations. DNS
   authorization and outbound proxy resolution use bounded worker queues and
@@ -172,6 +175,12 @@ Implemented today:
   policy, access-file, password-file and disk-cache metadata indexes are
   byte/count bounded and evict individual entries rather than clearing or
   rescanning an attacker-amplifiable working set.
+- Privileged startup refuses uid/gid 0 and fails when an unprivileged launch
+  does not already match the configured identity. Configuration/includes,
+  TLS material, environment files, `TypesConfig`, and file-backed rewrite maps
+  are regular, no-symlink administrative inputs with per-file bounds and
+  stable descriptor snapshots; aggregate configuration text is capped at
+  16 MiB.
 - Unsupported security-sensitive directives (`SSLRequire*`,
   `SecRuleEngine On`) fail closed even in
   compatibility mode rather than silently weakening access or TLS policy.
