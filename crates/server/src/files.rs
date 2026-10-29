@@ -99,6 +99,68 @@ pub fn open_admin_path(path: &Path, flags: libc::c_int, mode: libc::mode_t) -> i
     openat2_file(&root, &rel_c, &how)
 }
 
+/// Reject an absolute administrative output whose directory entry could be
+/// replaced by the account the daemon later runs as. Group-writable parents
+/// are rejected conservatively because NSS supplementary group membership is
+/// mutable outside the configuration file.
+pub fn validate_admin_parents(path: &Path, service_uid: u32) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "administrative path is not absolute",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "administrative path has no parent",
+        )
+    })?;
+    let mut current = PathBuf::from("/");
+    let mut parent_metadata = File::open("/")?.metadata()?;
+    for component in parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            if matches!(component, std::path::Component::RootDir) {
+                continue;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid administrative path component",
+            ));
+        };
+        current.push(component);
+        let directory = open_admin_path(&current, libc::O_PATH | libc::O_DIRECTORY, 0)?;
+        let metadata = directory.metadata()?;
+        let parent_mode = parent_metadata.mode();
+        let parent_writable = (parent_metadata.uid() == service_uid && parent_mode & 0o200 != 0)
+            || parent_mode & 0o022 != 0;
+        let sticky_protects_entry = parent_mode & libc::S_ISVTX != 0
+            && parent_metadata.uid() != service_uid
+            && metadata.uid() != service_uid;
+        if parent_writable && !sticky_protects_entry {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "administrative path component {} can be replaced by the service account",
+                    current.display()
+                ),
+            ));
+        }
+        parent_metadata = metadata;
+    }
+    let mode = parent_metadata.mode();
+    if (parent_metadata.uid() == service_uid && mode & 0o200 != 0) || mode & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "administrative path parent {} is writable by the service account",
+                parent.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Create/open every directory component from a retained descriptor.  No
 /// pathname fallback is provided: the daemon already requires `openat2`, and
 /// weakening privileged output creation would reintroduce the exact rename
@@ -2091,6 +2153,16 @@ mod tests {
         std::os::unix::fs::symlink(real.join("state"), root.join("final-link")).unwrap();
         assert!(open_admin_path(&root.join("final-link"), libc::O_RDONLY, 0).is_err());
         assert_eq!(std::fs::read(real.join("state")).unwrap(), b"safe");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn administrative_paths_reject_service_writable_parents() {
+        let (root, _cfg) = config("admin-parent-mode");
+        let service_uid = std::fs::metadata(&root).unwrap().uid();
+        assert!(validate_admin_parents(&root.join("state"), service_uid).is_err());
+        let safe = validate_admin_parents(Path::new("/dev/null"), u32::MAX);
+        assert!(safe.is_ok(), "{safe:?}");
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -5954,7 +5954,14 @@ impl Compile {
             }
             "user" => self.cfg.user = first(),
             "group" => self.cfg.group = first(),
-            "pidfile" => self.cfg.pid_file = PathBuf::from(first()),
+            "pidfile" => {
+                let path = PathBuf::from(first());
+                self.cfg.pid_file = if path.is_absolute() {
+                    path
+                } else {
+                    self.cfg.server_root.join(path)
+                };
+            }
             "errorlog" => {
                 let p = first();
                 if let Some(i) = self.current_vhost {
@@ -8726,6 +8733,15 @@ mod tests {
 
     fn load_text_default(text: &str) -> Result<Config, Vec<ConfigError>> {
         load_text_with_prelude("", text, false, false)
+    }
+
+    #[test]
+    fn relative_pid_file_is_resolved_below_server_root() {
+        let config = load_text("Listen 127.0.0.1:0\nPidFile run/vapached.pid\n", false).unwrap();
+        assert_eq!(
+            config.pid_file,
+            std::env::temp_dir().join("run/vapached.pid")
+        );
     }
 
     #[test]

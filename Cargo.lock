@@ -1113,6 +1113,7 @@ dependencies = [
  "regex",
  "ring",
  "rustls",
+ "rustls-webpki",
  "sha1",
  "tokio",
  "tokio-rustls",

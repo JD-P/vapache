@@ -136,11 +136,11 @@ fn load_key(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| std::env::temp_dir().join("vapache-ocsp-cache"));
         let cache_path = crate::ocsp::cache_path(&dir, &chain, ssl.stapling_force_url.as_deref());
-        let cached = crate::ocsp::load_cached(&cache_path);
+        let cached = crate::ocsp::load_cached(&cache_path, &chain);
         let fetched =
             crate::ocsp::staple_response(&chain, ssl.stapling_force_url.as_deref(), timeout);
         let response = if let Some(fresh) = fetched {
-            crate::ocsp::save_cached(&cache_path, &fresh);
+            crate::ocsp::save_cached(&cache_path, &chain, &fresh);
             Some(fresh)
         } else {
             cached
@@ -177,10 +177,13 @@ fn load_key(
 }
 
 fn apply_ocsp_response(refresh: &OcspRefresh, response: Vec<u8>) -> bool {
+    if !crate::ocsp::valid_response(&refresh.chain, &response) {
+        return true;
+    }
     let Some(shared) = refresh.key.upgrade() else {
         return false;
     };
-    crate::ocsp::save_cached(&refresh.cache_path, &response);
+    crate::ocsp::save_cached(&refresh.cache_path, &refresh.chain, &response);
     let mut guard = shared.write().unwrap_or_else(|e| e.into_inner());
     let mut key = (**guard).clone();
     key.ocsp = Some(response);
@@ -630,11 +633,17 @@ mod tests {
     fn load_key_uses_cached_ocsp_and_zero_timeout_defaults() {
         let dir = tempdir("ocsp");
         let (cert, key) = make_cert(&dir);
-        let chain = read_certs(&cert).unwrap();
+        let mut chain = read_certs(&cert).unwrap();
+        chain.extend(read_certs(&cert).unwrap());
         let force_url = Some("http://127.0.0.1:1/");
         let cache_dir = dir.join("cache");
         let cache_path = crate::ocsp::cache_path(&cache_dir, &chain, force_url);
-        crate::ocsp::save_cached(&cache_path, &crate::ocsp::test_successful_response());
+        let response = crate::ocsp::test_valid_response(&chain, &key);
+        assert!(crate::ocsp::valid_response(&chain, &response));
+        let mut tampered = response.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(!crate::ocsp::valid_response(&chain, &tampered));
+        crate::ocsp::save_cached(&cache_path, &chain, &response);
         let ssl = SslConfig {
             engine: true,
             cert_file: Some(cert.clone()),
@@ -674,10 +683,14 @@ mod tests {
     fn ocsp_refresh_loop_applies_a_response_and_spawn_is_bounded() {
         let dir = tempdir("ocsp-loop");
         let (cert, key) = make_cert(&dir);
+        let mut chain = read_certs(&cert).unwrap();
+        chain.extend(read_certs(&cert).unwrap());
+        let response = crate::ocsp::test_valid_response(&chain, &key);
         let ssl = SslConfig {
             engine: true,
-            cert_file: Some(cert),
+            cert_file: Some(cert.clone()),
             key_file: Some(key),
+            chain_file: Some(cert),
             stapling: true,
             stapling_responder_timeout: Duration::from_millis(1),
             stapling_standard_cache_timeout: Duration::from_millis(1),
@@ -692,7 +705,7 @@ mod tests {
         let mut iterations = 0;
         ocsp_refresh_loop(
             refresh,
-            |_| Some(crate::ocsp::test_successful_response()),
+            |_| Some(response.clone()),
             |_| {
                 iterations += 1;
                 iterations == 1

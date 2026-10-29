@@ -4,9 +4,11 @@
 //! or short client connection therefore releases its bytes/slot without every
 //! caller having to remember a matching decrement.
 
+use std::collections::HashMap;
 use std::io;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Default)]
 pub struct ResourceBudget {
@@ -18,6 +20,7 @@ pub struct ResourceBudget {
     response_bytes: AtomicU64,
     blocking_reads: AtomicU64,
     websocket_tunnels: AtomicU64,
+    websocket_clients: Mutex<HashMap<IpAddr, u64>>,
 }
 
 /// Process-wide ceilings for work whose callers do not carry a `Config`
@@ -30,6 +33,7 @@ pub const MAX_H2_STREAMS: u64 = 256;
 pub const MAX_REQUEST_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_RESPONSE_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_WEBSOCKET_TUNNELS: u64 = 64;
+pub const MAX_WEBSOCKETS_PER_CLIENT: u64 = 8;
 
 static EXPENSIVE_OPS: AtomicU64 = AtomicU64::new(0);
 
@@ -171,15 +175,30 @@ impl ResourceBudget {
         })
     }
 
-    pub fn try_websocket(self: &Arc<Self>) -> io::Result<WebsocketLease> {
+    pub fn try_websocket_for(self: &Arc<Self>, client: IpAddr) -> io::Result<WebsocketLease> {
         if !try_add(&self.websocket_tunnels, 1, MAX_WEBSOCKET_TUNNELS) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "process-wide WebSocket tunnel limit reached",
             ));
         }
+        let mut clients = self
+            .websocket_clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let count = clients.entry(client).or_default();
+        if !vapache_verified::resource_budget_admit(*count, 1, MAX_WEBSOCKETS_PER_CLIENT) {
+            self.websocket_tunnels.fetch_sub(1, Ordering::AcqRel);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "per-client WebSocket tunnel limit reached",
+            ));
+        }
+        *count += 1;
+        drop(clients);
         Ok(WebsocketLease {
             budget: self.clone(),
+            client,
             active: true,
         })
     }
@@ -290,12 +309,25 @@ pub struct BlockingReadLease {
 #[derive(Debug)]
 pub struct WebsocketLease {
     budget: Arc<ResourceBudget>,
+    client: IpAddr,
     active: bool,
 }
 
 impl Drop for WebsocketLease {
     fn drop(&mut self) {
         if self.active {
+            let mut clients = self
+                .budget
+                .websocket_clients
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(count) = clients.get_mut(&self.client) {
+                *count -= 1;
+                if *count == 0 {
+                    clients.remove(&self.client);
+                }
+            }
+            drop(clients);
             self.budget.websocket_tunnels.fetch_sub(1, Ordering::AcqRel);
             self.active = false;
         }
@@ -433,13 +465,36 @@ mod tests {
     fn process_wide_websocket_limit_is_enforced_and_recovers() {
         let budget = Arc::new(ResourceBudget::default());
         let leases: Vec<_> = (0..MAX_WEBSOCKET_TUNNELS)
-            .map(|_| budget.try_websocket().unwrap())
+            .map(|index| {
+                budget
+                    .try_websocket_for(IpAddr::from([127, 0, (index / 255) as u8, index as u8]))
+                    .unwrap()
+            })
             .collect();
         assert_eq!(budget.websocket_usage(), MAX_WEBSOCKET_TUNNELS);
-        assert!(budget.try_websocket().is_err());
+        assert!(budget
+            .try_websocket_for(IpAddr::from([192, 0, 2, 1]))
+            .is_err());
         drop(leases);
         assert_eq!(budget.websocket_usage(), 0);
-        assert!(budget.try_websocket().is_ok());
+        assert!(budget
+            .try_websocket_for(IpAddr::from([192, 0, 2, 1]))
+            .is_ok());
+    }
+
+    #[test]
+    fn per_client_websocket_limit_is_enforced_and_recovers() {
+        let budget = Arc::new(ResourceBudget::default());
+        let client = IpAddr::from([192, 0, 2, 42]);
+        let leases: Vec<_> = (0..MAX_WEBSOCKETS_PER_CLIENT)
+            .map(|_| budget.try_websocket_for(client).unwrap())
+            .collect();
+        assert!(budget.try_websocket_for(client).is_err());
+        assert!(budget
+            .try_websocket_for(IpAddr::from([192, 0, 2, 43]))
+            .is_ok());
+        drop(leases);
+        assert!(budget.try_websocket_for(client).is_ok());
     }
 
     #[test]

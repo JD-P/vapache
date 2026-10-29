@@ -60,6 +60,7 @@ pub struct Logger {
     error: Mutex<Box<dyn Write + Send>>,
     error_path: String,
     root: PathBuf,
+    service_uid: Option<u32>,
     level: Level,
     access: Vec<AccessLog>,
     pub errors: Mutex<Vec<String>>,
@@ -92,7 +93,33 @@ pub struct AccessEntry<'a> {
     pub started: Instant,
 }
 
-fn open_log(path: &str, server_root: &Path) -> std::io::Result<Box<dyn Write + Send>> {
+fn configured_user_id(user: &str) -> std::io::Result<u32> {
+    if let Ok(uid) = user.parse::<u32>() {
+        return Ok(uid);
+    }
+    let user = std::ffi::CString::new(user)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid User"))?;
+    let uid = unsafe {
+        let entry = libc::getpwnam(user.as_ptr());
+        (!entry.is_null()).then(|| (*entry).pw_uid)
+    };
+    uid.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "configured User does not exist",
+        )
+    })
+}
+
+fn running_privileged() -> bool {
+    (unsafe { libc::geteuid() }) == 0
+}
+
+fn open_log(
+    path: &str,
+    server_root: &Path,
+    service_uid: Option<u32>,
+) -> std::io::Result<Box<dyn Write + Send>> {
     if let Some(rest) = path.strip_prefix("syslog:") {
         let _ = rest;
         // Syslog is not implemented; write to stderr rather than silently drop.
@@ -125,6 +152,8 @@ fn open_log(path: &str, server_root: &Path) -> std::io::Result<Box<dyn Write + S
                 let directory = crate::files::ensure_admin_dir(&current, 0o755)?;
                 crate::files::make_admin_dir_root_owned(&directory, 0o755)?;
             }
+        } else if let Some(service_uid) = service_uid {
+            crate::files::validate_admin_parents(&full, service_uid)?;
         }
     }
     let f = crate::files::open_admin_path(
@@ -145,10 +174,13 @@ fn open_log(path: &str, server_root: &Path) -> std::io::Result<Box<dyn Write + S
 
 impl Logger {
     pub fn new(cfg: &Config) -> std::io::Result<Logger> {
-        let error = open_log(&cfg.error_log, &cfg.server_root)?;
+        let service_uid = running_privileged()
+            .then(|| configured_user_id(&cfg.user))
+            .transpose()?;
+        let error = open_log(&cfg.error_log, &cfg.server_root, service_uid)?;
         let mut access = Vec::new();
         let mut add = |cl: &CustomLog, vhost: Option<usize>| -> std::io::Result<()> {
-            let w = open_log(&cl.path, &cfg.server_root)?;
+            let w = open_log(&cl.path, &cfg.server_root, service_uid)?;
             let fmt = if cl.format.starts_with('"') && cl.format.ends_with('"') {
                 cl.format[1..cl.format.len() - 1].to_string()
             } else {
@@ -178,6 +210,7 @@ impl Logger {
             error: Mutex::new(error),
             error_path: cfg.error_log.clone(),
             root: cfg.server_root.clone(),
+            service_uid,
             level: Level::parse(&cfg.log_level),
             access,
             errors: Mutex::new(Vec::new()),
@@ -191,15 +224,12 @@ impl Logger {
         #[cfg(unix)]
         {
             use std::ffi::CString;
-            if unsafe { libc::geteuid() } != 0 {
+            if !running_privileged() {
                 return;
             }
-            let user = CString::new(cfg.user.as_str()).ok(); // coverage:ignore-start - root-only ownership handoff
+            // coverage:ignore-start - root-only ownership handoff
             let group = CString::new(cfg.group.as_str()).ok();
-            let uid = user.as_ref().and_then(|u| unsafe {
-                let pw = libc::getpwnam(u.as_ptr());
-                (!pw.is_null()).then(|| (*pw).pw_uid)
-            });
+            let uid = configured_user_id(&cfg.user).ok();
             let gid = group.as_ref().and_then(|g| unsafe {
                 let gr = libc::getgrnam(g.as_ptr());
                 (!gr.is_null()).then(|| (*gr).gr_gid)
@@ -237,10 +267,10 @@ impl Logger {
 
     /// Reopen error/access logs after log rotation (`SIGUSR1`).
     pub fn reopen(&self) -> std::io::Result<()> {
-        let error = open_log(&self.error_path, &self.root)?;
+        let error = open_log(&self.error_path, &self.root, self.service_uid)?;
         let mut access_writers = Vec::new();
         for entry in &self.access {
-            access_writers.push(open_log(&entry.path, &self.root)?);
+            access_writers.push(open_log(&entry.path, &self.root, self.service_uid)?);
         }
         *self.error.lock().unwrap_or_else(|e| e.into_inner()) = error;
         for (entry, writer) in self.access.iter().zip(access_writers) {
@@ -777,7 +807,7 @@ mod tests {
             .unwrap()
             .contains("192.0.2.1 200 5"));
 
-        assert!(open_log("syslog:local0", &dir).is_ok());
+        assert!(open_log("syslog:local0", &dir, None).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

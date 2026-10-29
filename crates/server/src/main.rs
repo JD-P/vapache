@@ -311,9 +311,13 @@ fn user_ids(user: &str, group: &str) -> Result<(libc::uid_t, libc::gid_t, CStrin
     Ok((uid, gid, cuser))
 }
 
+fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
 fn drop_privileges(user: &str, group: &str) -> Result<(), String> {
     let (uid, gid, cuser) = user_ids(user, group)?;
-    let euid = unsafe { libc::geteuid() };
+    let euid = effective_uid();
     if euid != 0 {
         let cur = unsafe { libc::getuid() };
         if cur != uid {
@@ -394,10 +398,14 @@ fn daemonize() -> Result<(), String> {
     Ok(())
 }
 
-fn write_pid(path: &Path) -> Result<(), String> {
+fn write_pid(path: &Path, service_uid: Option<u32>) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         vapached::files::ensure_admin_dir(parent, 0o755)
             .map_err(|e| format!("cannot prepare PidFile directory {}: {e}", parent.display()))?;
+    }
+    if let Some(service_uid) = service_uid {
+        vapached::files::validate_admin_parents(path, service_uid)
+            .map_err(|e| format!("insecure PidFile path {}: {e}", path.display()))?;
     }
     let mut file = vapached::files::open_admin_path(
         path,
@@ -412,7 +420,11 @@ fn write_pid(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot write PidFile {}: {e}", path.display()))
 }
 
-fn read_pid(path: &Path) -> Result<i32, String> {
+fn read_pid(path: &Path, service_uid: Option<u32>) -> Result<i32, String> {
+    if let Some(service_uid) = service_uid {
+        vapached::files::validate_admin_parents(path, service_uid)
+            .map_err(|e| format!("insecure PidFile path {}: {e}", path.display()))?;
+    }
     let mut file = vapached::files::open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0)
         .map_err(|e| format!("cannot read PidFile {}: {e}", path.display()))?;
     let metadata = file
@@ -434,8 +446,8 @@ fn read_pid(path: &Path) -> Result<i32, String> {
         .map_err(|_| format!("invalid pid in {}", path.display()))
 }
 
-fn kill_action(path: &Path, sig: libc::c_int) -> Result<(), String> {
-    let pid = read_pid(path)?;
+fn kill_action(path: &Path, service_uid: Option<u32>, sig: libc::c_int) -> Result<(), String> {
+    let pid = read_pid(path, service_uid)?;
     let rc = unsafe { libc::kill(pid, sig) };
     if rc != 0 {
         return Err(format!(
@@ -571,6 +583,26 @@ fn explain_config(cfg: &Config, args: &Args) -> Result<(), String> {
 
 fn main() {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
+    if raw_args.get(1).map(OsString::as_os_str) == Some(OsStr::new("--vapache-resolver-worker")) {
+        let result = raw_args
+            .get(2)
+            .and_then(|host| host.to_str())
+            .zip(
+                raw_args
+                    .get(3)
+                    .and_then(|port| port.to_str())
+                    .and_then(|port| port.parse::<u16>().ok()),
+            )
+            .filter(|_| raw_args.len() == 4)
+            .ok_or_else(|| "invalid resolver worker arguments".to_string())
+            .and_then(|(host, port)| {
+                vapached::proxy::resolver_worker_main(host, port).map_err(|error| error.to_string())
+            });
+        if result.is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
     if raw_args.get(1).map(OsString::as_os_str) == Some(OsStr::new("--cgi-worker")) {
         let uid = raw_args
             .get(2)
@@ -744,29 +776,38 @@ fn main() {
         return;
     }
 
+    let service_uid = match user_ids(&cfg.user, &cfg.group) {
+        Ok((uid, _, _)) => uid,
+        Err(error) => {
+            eprintln!("vapached: {error}");
+            std::process::exit(1);
+        }
+    };
+    let admin_service_uid = (effective_uid() == 0).then_some(service_uid);
+
     match args.action.as_deref() {
         Some("stop") => {
-            if let Err(e) = kill_action(&cfg.pid_file, libc::SIGTERM) {
+            if let Err(e) = kill_action(&cfg.pid_file, admin_service_uid, libc::SIGTERM) {
                 eprintln!("vapached: {e}");
                 std::process::exit(1);
             }
             return;
         }
         Some("graceful") => {
-            if let Err(e) = kill_action(&cfg.pid_file, libc::SIGHUP) {
+            if let Err(e) = kill_action(&cfg.pid_file, admin_service_uid, libc::SIGHUP) {
                 eprintln!("vapached: {e}");
                 std::process::exit(1);
             }
             return;
         }
         Some("graceful-stop") => {
-            if let Err(e) = kill_action(&cfg.pid_file, libc::SIGTERM) {
+            if let Err(e) = kill_action(&cfg.pid_file, admin_service_uid, libc::SIGTERM) {
                 eprintln!("vapached: {e}");
                 std::process::exit(1);
             }
             return;
         }
-        Some("status") => match read_pid(&cfg.pid_file) {
+        Some("status") => match read_pid(&cfg.pid_file, admin_service_uid) {
             Ok(pid) if unsafe { libc::kill(pid, 0) } == 0 => {
                 println!("vapached is running (pid {pid})");
                 return;
@@ -823,7 +864,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if let Err(e) = write_pid(&cfg.pid_file) {
+    if let Err(e) = write_pid(&cfg.pid_file, admin_service_uid) {
         eprintln!("vapached: {e}");
         std::process::exit(1);
     }
@@ -833,7 +874,7 @@ fn main() {
             std::process::exit(1);
         }
         // PID changes after fork; rewrite the pid file.
-        let _ = write_pid(&cfg.pid_file);
+        let _ = write_pid(&cfg.pid_file, admin_service_uid);
     }
     if cfg.has_cgi() {
         if let Err(e) = vapached::cgi::init_pool(&cfg) {
@@ -989,21 +1030,21 @@ mod tests {
     #[test]
     fn pid_file_roundtrip() {
         let path = temp("pid");
-        write_pid(&path).unwrap();
-        assert_eq!(read_pid(&path).unwrap(), std::process::id() as i32);
+        write_pid(&path, None).unwrap();
+        assert_eq!(read_pid(&path, None).unwrap(), std::process::id() as i32);
         // signal 0 only checks for existence/permission
-        kill_action(&path, 0).unwrap();
+        kill_action(&path, None, 0).unwrap();
         std::fs::write(&path, "not-a-pid\n").unwrap();
-        assert!(read_pid(&path).is_err());
-        assert!(kill_action(&temp("missing-pid"), 0).is_err());
+        assert!(read_pid(&path, None).is_err());
+        assert!(kill_action(&temp("missing-pid"), None, 0).is_err());
         std::fs::write(&path, "2147483647\n").unwrap();
-        assert!(kill_action(&path, 0).is_err());
+        assert!(kill_action(&path, None, 0).is_err());
         let _ = std::fs::remove_file(&path);
         let victim = temp("pid-victim");
         std::fs::write(&victim, b"unchanged").unwrap();
         std::os::unix::fs::symlink(&victim, &path).unwrap();
-        assert!(write_pid(&path).is_err());
-        assert!(read_pid(&path).is_err());
+        assert!(write_pid(&path, None).is_err());
+        assert!(read_pid(&path, None).is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(victim);

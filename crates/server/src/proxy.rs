@@ -18,6 +18,7 @@ use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1259,7 +1260,100 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 struct DnsJob {
     host: String,
     port: u16,
+    deadline: Instant,
     reply: mpsc::Sender<std::io::Result<Vec<SocketAddr>>>,
+}
+
+fn isolated_dns_lookup(
+    job: &DnsJob,
+    unreaped: &mut Vec<std::process::Child>,
+) -> std::io::Result<Vec<SocketAddr>> {
+    unreaped.retain_mut(|child| match child.try_wait() {
+        Ok(Some(_)) => false,
+        Ok(None) | Err(_) => true,
+    });
+    if unreaped.len() >= 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "too many unreaped resolver helpers",
+        ));
+    }
+    let remaining = job.deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "proxy DNS request expired in queue",
+        ));
+    }
+    let current_executable = std::env::current_exe()?;
+    // Unit tests run from target/*/deps/vapached-<hash>; the sibling daemon
+    // binary still owns the hidden resolver entrypoint.
+    let executable = current_executable
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "deps"))
+        .and_then(Path::parent)
+        .map(|parent| parent.join("vapached"))
+        .filter(|candidate| candidate.is_file())
+        .unwrap_or(current_executable);
+    let mut child = std::process::Command::new(executable)
+        .arg("--vapache-resolver-worker")
+        .arg(&job.host)
+        .arg(job.port.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "proxy DNS lookup failed",
+                ));
+            }
+            let output = child.wait_with_output()?;
+            let text = std::str::from_utf8(&output.stdout).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid resolver output")
+            })?;
+            let mut addresses = Vec::new();
+            for line in text.lines() {
+                if addresses.len() == MAX_PROXY_ADDRESSES {
+                    break;
+                }
+                let address = line.parse::<SocketAddr>().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid resolver address")
+                })?;
+                if address.port() != job.port {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "resolver returned the wrong port",
+                    ));
+                }
+                addresses.push(address);
+            }
+            if addresses.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "proxy DNS lookup returned no addresses",
+                ));
+            }
+            return Ok(addresses);
+        }
+        if Instant::now() >= job.deadline {
+            let _ = child.kill();
+            // Never block the fixed worker waiting for a wedged system
+            // resolver. Reap immediately when possible; otherwise retain a
+            // bounded handle and retry before this worker's next job.
+            if !child.try_wait().is_ok_and(|status| status.is_some()) {
+                unreaped.push(child);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "proxy DNS timeout",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn dns_sender() -> &'static SyncSender<DnsJob> {
@@ -1271,18 +1365,19 @@ fn dns_sender() -> &'static SyncSender<DnsJob> {
             let rx = rx.clone();
             let _ = std::thread::Builder::new()
                 .name(format!("proxy-dns-{index}"))
-                .spawn(move || loop {
-                    let job = {
-                        let guard = rx.lock().unwrap_or_else(|error| error.into_inner());
-                        guard.recv()
-                    };
-                    let Ok(job) = job else {
-                        break;
-                    };
-                    let result = (job.host.as_str(), job.port)
-                        .to_socket_addrs()
-                        .map(|addresses| addresses.take(MAX_PROXY_ADDRESSES).collect());
-                    let _ = job.reply.send(result);
+                .spawn(move || {
+                    let mut unreaped = Vec::new();
+                    loop {
+                        let job = {
+                            let guard = rx.lock().unwrap_or_else(|error| error.into_inner());
+                            guard.recv()
+                        };
+                        let Ok(job) = job else {
+                            break;
+                        };
+                        let result = isolated_dns_lookup(&job, &mut unreaped);
+                        let _ = job.reply.send(result);
+                    }
                 });
         }
         tx
@@ -1300,12 +1395,14 @@ fn literal_backend_addrs(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
 fn submit_dns(
     host: &str,
     port: u16,
+    timeout: Duration,
 ) -> std::io::Result<Receiver<std::io::Result<Vec<SocketAddr>>>> {
     let (reply, rx) = mpsc::channel();
     dns_sender()
         .try_send(DnsJob {
             host: host.to_string(),
             port,
+            deadline: Instant::now() + timeout,
             reply,
         })
         .map_err(|error| match error {
@@ -1328,7 +1425,7 @@ fn resolve_backend_addrs(
     if let Some(addresses) = literal_backend_addrs(host, port) {
         return Ok(addresses);
     }
-    submit_dns(host, port)?
+    submit_dns(host, port, timeout)?
         .recv_timeout(timeout)
         .map_err(|error| match error {
             mpsc::RecvTimeoutError::Timeout => {
@@ -1348,7 +1445,7 @@ async fn resolve_backend_addrs_async(
     if let Some(addresses) = literal_backend_addrs(host, port) {
         return Ok(addresses);
     }
-    let rx = submit_dns(host, port)?;
+    let rx = submit_dns(host, port, timeout)?;
     let deadline = Instant::now() + timeout;
     loop {
         match rx.try_recv() {
@@ -1370,6 +1467,34 @@ async fn resolve_backend_addrs_async(
         }
         tokio::time::sleep(remaining.min(Duration::from_millis(5))).await;
     }
+}
+
+/// Entrypoint for the disposable resolver process. The parent validates this
+/// line-oriented protocol and kills the process if libc's resolver wedges.
+pub fn resolver_worker_main(host: &str, port: u16) -> std::io::Result<()> {
+    if host.is_empty()
+        || host.len() > 253
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid resolver hostname",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for address in (host, port).to_socket_addrs()?.take(MAX_PROXY_ADDRESSES) {
+        if seen.insert(address) {
+            println!("{address}");
+        }
+    }
+    (!seen.is_empty()).then_some(()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "resolver returned no addresses",
+        )
+    })
 }
 
 async fn connect_async(
@@ -1503,7 +1628,8 @@ where
             "access grant does not cover websocket target",
         ));
     }
-    let _websocket_lease = cfg.resource_budget.try_websocket()?;
+    let client_ip = crate::access::canonical_ip(peer.ip());
+    let _websocket_lease = cfg.resource_budget.try_websocket_for(client_ip)?;
     let timeout = cfg.timeout.max(Duration::from_secs(5));
     let mut upstream = connect_async(&target.backend, scope, timeout).await?;
     let mut path = target.path.as_bytes().to_vec();
@@ -5376,6 +5502,29 @@ mod coverage_tests {
         assert_eq!(
             resolve_backend_addrs("[::1]", 8080, Duration::ZERO).unwrap(),
             vec!["[::1]:8080".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn proxy_dns_isolated_worker_and_expired_jobs_are_bounded() {
+        let addresses = resolve_backend_addrs("localhost", 8080, Duration::from_secs(2)).unwrap();
+        assert!(!addresses.is_empty());
+        assert!(addresses.len() <= MAX_PROXY_ADDRESSES);
+        assert!(addresses.iter().all(|address| address.port() == 8080));
+        assert!(resolver_worker_main("bad host", 8080).is_err());
+
+        let (reply, _rx) = mpsc::channel();
+        let expired = DnsJob {
+            host: "localhost".into(),
+            port: 8080,
+            deadline: Instant::now() - Duration::from_millis(1),
+            reply,
+        };
+        assert_eq!(
+            isolated_dns_lookup(&expired, &mut Vec::new())
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
         );
     }
 
