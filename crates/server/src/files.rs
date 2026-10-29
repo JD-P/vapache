@@ -35,6 +35,118 @@ const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 
+fn openat2_file(dir: &File, path: &CStr, how: &OpenHow) -> io::Result<File> {
+    let file = unsafe {
+        let fd = libc::syscall(
+            libc::SYS_openat2,
+            dir.as_raw_fd(),
+            path.as_ptr(),
+            how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        );
+        (fd >= 0).then(|| File::from_raw_fd(fd as i32))
+    };
+    file.ok_or_else(io::Error::last_os_error)
+}
+
+pub fn make_admin_dir_root_owned(dir: &File, mode: libc::mode_t) -> io::Result<()> {
+    let failed = unsafe {
+        if libc::geteuid() != 0 {
+            return Ok(());
+        }
+        libc::fchown(dir.as_raw_fd(), 0, 0) != 0 || libc::fchmod(dir.as_raw_fd(), mode) != 0
+    };
+    if failed {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn make_test_fifo(path: &Path) -> io::Result<()> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Open an absolute or cwd-relative administrative path without following a
+/// symlink in any component.  Runtime content paths use `open_beneath`; this
+/// variant is for privileged outputs such as logs and OCSP/cache state, where
+/// following a service-user-planted parent symlink on the next root startup
+/// would cross the privilege boundary.
+pub fn open_admin_path(path: &Path, flags: libc::c_int, mode: libc::mode_t) -> io::Result<File> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let rel = absolute
+        .strip_prefix("/")
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let rel_c = CString::new(rel.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let root = File::open("/")?;
+    let how = OpenHow {
+        flags: (flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
+        mode: mode as u64,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+    };
+    openat2_file(&root, &rel_c, &how)
+}
+
+/// Create/open every directory component from a retained descriptor.  No
+/// pathname fallback is provided: the daemon already requires `openat2`, and
+/// weakening privileged output creation would reintroduce the exact rename
+/// race that content serving rejects.
+pub fn ensure_admin_dir(path: &Path, mode: libc::mode_t) -> io::Result<File> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut current = File::open("/")?;
+    for component in absolute.components() {
+        use std::path::Component;
+        let Component::Normal(name) = component else {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        };
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let open_component = || {
+            let how = OpenHow {
+                flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                    as u64,
+                mode: 0,
+                resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+            };
+            openat2_file(&current, &name, &how)
+        };
+        current = match open_component() {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let rc = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), mode) };
+                if rc != 0 {
+                    let create_error = io::Error::last_os_error();
+                    if create_error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(create_error);
+                    }
+                }
+                open_component()?
+            }
+            Err(error) => return Err(error),
+        };
+    }
+    Ok(current)
+}
+
 pub enum Target {
     File { file: File, meta: Metadata },
     Directory { file: File, meta: Metadata },
@@ -323,19 +435,7 @@ fn open_beneath(root: &Path, rel: &Path, flags: u64, follow: bool) -> OpenResult
     if !follow {
         how.resolve |= RESOLVE_NO_SYMLINKS;
     }
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root_file.as_raw_fd(),
-            rel_c.as_ptr(),
-            &how as *const OpenHow,
-            std::mem::size_of::<OpenHow>(),
-        )
-    };
-    if fd >= 0 {
-        return Ok(unsafe { File::from_raw_fd(fd as i32) });
-    }
-    Err(io::Error::last_os_error())
+    openat2_file(&root_file, &rel_c, &how)
 }
 
 /// Refuse to serve when the kernel cannot enforce descriptor-relative path
@@ -365,19 +465,7 @@ fn open_at(dir: &File, name: &[u8], follow: bool) -> OpenResult {
     if !follow {
         how.resolve |= RESOLVE_NO_SYMLINKS;
     }
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            dir.as_raw_fd(),
-            c.as_ptr(),
-            &how as *const OpenHow,
-            std::mem::size_of::<OpenHow>(),
-        )
-    };
-    if fd >= 0 {
-        return Ok(unsafe { File::from_raw_fd(fd as i32) });
-    }
-    Err(io::Error::last_os_error())
+    openat2_file(dir, &c, &how)
 }
 
 pub fn mime_type(cfg: &Config, scope: &Scope, name: &[u8]) -> Option<String> {
@@ -669,7 +757,7 @@ pub fn serve_file(
         return error_response(cfg, None, scope, 500, req, "", 0, "", peer, local_ip);
     }
     let mut r = serve_file_inner(cfg, scope, req, file, meta, mime_name, peer, local_ip);
-    crate::compression::finalize(scope, req, &mut r, mime_name);
+    crate::compression::finalize_budgeted(scope, req, &mut r, mime_name, &cfg.resource_budget);
     r
 }
 
@@ -951,7 +1039,13 @@ pub fn serve_directory(
         cfg, vhost, scope, req, dir, url_path, raw_path, host, port, peer, local_ip,
     );
     scope.header_policy.apply(&mut r.headers, r.status < 400);
-    crate::compression::finalize(scope, req, &mut r, url_path.as_bytes());
+    crate::compression::finalize_budgeted(
+        scope,
+        req,
+        &mut r,
+        url_path.as_bytes(),
+        &cfg.resource_budget,
+    );
     r
 }
 
@@ -964,6 +1058,31 @@ fn autoindex(
     port: u16,
 ) -> Response {
     if entries.len() > MAX_AUTOINDEX_ENTRIES {
+        return Response::bytes(
+            503,
+            "text/html; charset=UTF-8",
+            b"Directory listing capacity is temporarily exhausted\n".to_vec(),
+        );
+    }
+    // Compute a conservative expansion bound before constructing attacker-
+    // influenced names and rows. A byte can expand to at most three bytes in
+    // the href and five in HTML text; fixed row/document overhead and the
+    // optional signature fit in the margin.
+    let estimated = entries.iter().try_fold(
+        (64 * 1024usize).saturating_add(url_path.len().saturating_mul(6)),
+        |total, (name, _, _)| total.checked_add(name.len().saturating_mul(9).saturating_add(128)),
+    );
+    let Some(estimated) =
+        estimated.filter(|size| *size <= MAX_AUTOINDEX_BYTES.saturating_add(64 * 1024))
+    else {
+        return Response::bytes(
+            503,
+            "text/html; charset=UTF-8",
+            b"Directory listing capacity is temporarily exhausted\n".to_vec(),
+        );
+    };
+    let mut resident = cfg.resource_budget.try_response_bytes();
+    if resident.reserve(estimated as u64).is_err() {
         return Response::bytes(
             503,
             "text/html; charset=UTF-8",
@@ -1018,7 +1137,9 @@ fn autoindex(
     body.push_str("  </table>\n");
     add_signature(&mut body, cfg, host, port);
     body.push_str(" </body>\n</html>\n");
-    Response::bytes(200, "text/html; charset=UTF-8", body.into_bytes())
+    let mut response = Response::bytes(200, "text/html; charset=UTF-8", body.into_bytes());
+    response.hold_resident(resident);
+    response
 }
 
 fn add_signature(body: &mut String, cfg: &Config, host: &str, port: u16) {
@@ -1124,7 +1245,13 @@ pub fn error_response(
     );
     // Only `Header always` applies to error responses.
     scope.header_policy.apply(&mut r.headers, false);
-    crate::compression::finalize(scope, req, &mut r, url_path.as_bytes());
+    crate::compression::finalize_budgeted(
+        scope,
+        req,
+        &mut r,
+        url_path.as_bytes(),
+        &cfg.resource_budget,
+    );
     r
 }
 
@@ -1949,5 +2076,21 @@ mod tests {
             Cow::Borrowed(path) => panic!("symlink target was not resolved: {path:?}"),
         }
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn administrative_paths_never_follow_parent_or_final_symlinks() {
+        let (root, _cfg) = config("admin-path");
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("state"), b"safe").unwrap();
+        std::os::unix::fs::symlink(&real, root.join("linked")).unwrap();
+
+        assert!(ensure_admin_dir(&root.join("linked/child"), 0o700).is_err());
+        assert!(open_admin_path(&root.join("linked/state"), libc::O_RDONLY, 0).is_err());
+        std::os::unix::fs::symlink(real.join("state"), root.join("final-link")).unwrap();
+        assert!(open_admin_path(&root.join("final-link"), libc::O_RDONLY, 0).is_err());
+        assert_eq!(std::fs::read(real.join("state")).unwrap(), b"safe");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

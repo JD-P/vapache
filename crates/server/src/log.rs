@@ -7,8 +7,9 @@ use crate::config::{Config, CustomLog};
 use crate::util::{http_date, unix_now};
 use std::cell::RefCell;
 use std::fmt::Write as _;
-use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -98,15 +99,47 @@ fn open_log(path: &str, server_root: &Path) -> std::io::Result<Box<dyn Write + S
         return Ok(Box::new(std::io::stderr()));
     }
     let p = PathBuf::from(path);
-    let full = if p.is_absolute() {
-        p
-    } else {
-        server_root.join(p)
-    };
+    let relative = !p.is_absolute();
+    let full = if !relative { p } else { server_root.join(p) };
     if let Some(parent) = full.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        // The service account must be able to traverse the root-owned parent
+        // when reopening an already-owned log after privilege drop, but it
+        // must not be able to replace directory entries.
+        crate::files::ensure_admin_dir(parent, 0o755)?;
+        if relative {
+            let below_root = parent.strip_prefix(server_root).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "relative log target escaped ServerRoot",
+                )
+            })?;
+            let mut current = server_root.to_path_buf();
+            for component in below_root.components() {
+                let std::path::Component::Normal(component) = component else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid relative log directory",
+                    ));
+                };
+                current.push(component);
+                let directory = crate::files::ensure_admin_dir(&current, 0o755)?;
+                crate::files::make_admin_dir_root_owned(&directory, 0o755)?;
+            }
+        }
     }
-    let f = OpenOptions::new().create(true).append(true).open(&full)?;
+    let f = crate::files::open_admin_path(
+        &full,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_NONBLOCK,
+        0o640,
+    )?;
+    let metadata = f.metadata()?;
+    let explicit_null = full == Path::new("/dev/null") && metadata.file_type().is_char_device();
+    if !metadata.is_file() && !explicit_null {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "log target is not a regular file",
+        ));
+    }
     Ok(Box::new(std::io::BufWriter::new(f)))
 }
 
@@ -163,13 +196,13 @@ impl Logger {
             }
             let user = CString::new(cfg.user.as_str()).ok(); // coverage:ignore-start - root-only ownership handoff
             let group = CString::new(cfg.group.as_str()).ok();
-            let uid = user.as_ref().and_then(|u| {
-                let pw = unsafe { libc::getpwnam(u.as_ptr()) };
-                (!pw.is_null()).then(|| unsafe { (*pw).pw_uid })
+            let uid = user.as_ref().and_then(|u| unsafe {
+                let pw = libc::getpwnam(u.as_ptr());
+                (!pw.is_null()).then(|| (*pw).pw_uid)
             });
-            let gid = group.as_ref().and_then(|g| {
-                let gr = unsafe { libc::getgrnam(g.as_ptr()) };
-                (!gr.is_null()).then(|| unsafe { (*gr).gr_gid })
+            let gid = group.as_ref().and_then(|g| unsafe {
+                let gr = libc::getgrnam(g.as_ptr());
+                (!gr.is_null()).then(|| (*gr).gr_gid)
             });
             let Some(uid) = uid else { return };
             let full = |path: &str| {
@@ -183,15 +216,21 @@ impl Logger {
             let mut paths = vec![full(&self.error_path)];
             paths.extend(self.access.iter().map(|a| full(&a.path)));
             for path in paths {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                    let _ = std::os::unix::fs::chown(parent, Some(uid), gid);
-                }
-                let _ = std::os::unix::fs::chown(&path, Some(uid), gid);
-                let _ = std::fs::set_permissions(
+                let Ok(file) = crate::files::open_admin_path(
                     &path,
-                    std::os::unix::fs::PermissionsExt::from_mode(0o640), // coverage:ignore-stop
-                );
+                    libc::O_WRONLY | libc::O_APPEND | libc::O_NONBLOCK,
+                    0,
+                ) else {
+                    continue;
+                };
+                if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+                    continue;
+                }
+                let gid = gid.unwrap_or(u32::MAX);
+                unsafe {
+                    let _ = libc::fchown(file.as_raw_fd(), uid, gid);
+                    let _ = libc::fchmod(file.as_raw_fd(), 0o640); // coverage:ignore-stop
+                }
             }
         }
     }

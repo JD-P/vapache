@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 type SharedKey = Arc<RwLock<Arc<CertifiedKey>>>;
 
@@ -38,7 +38,8 @@ struct OcspRefresh {
     timeout: Duration,
     interval: Duration,
     cache_path: PathBuf,
-    key: SharedKey,
+    // A refresher must not keep a retired TLS generation alive forever.
+    key: Weak<RwLock<Arc<CertifiedKey>>>,
 }
 
 fn normalize_name(name: &str) -> String {
@@ -170,33 +171,54 @@ fn load_key(
         timeout,
         interval,
         cache_path,
-        key: Arc::new(RwLock::new(certified.clone())),
+        key: Weak::new(),
     });
     Ok((certified, refresh))
 }
 
-fn apply_ocsp_response(refresh: &OcspRefresh, response: Vec<u8>) {
+fn apply_ocsp_response(refresh: &OcspRefresh, response: Vec<u8>) -> bool {
+    let Some(shared) = refresh.key.upgrade() else {
+        return false;
+    };
     crate::ocsp::save_cached(&refresh.cache_path, &response);
-    let mut guard = refresh.key.write().unwrap_or_else(|e| e.into_inner());
+    let mut guard = shared.write().unwrap_or_else(|e| e.into_inner());
     let mut key = (**guard).clone();
     key.ocsp = Some(response);
     *guard = Arc::new(key);
+    true
+}
+
+fn wait_for_refresh(refresh: &OcspRefresh) -> bool {
+    let deadline = Instant::now() + refresh.interval;
+    loop {
+        if refresh.key.upgrade().is_none() {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        // Poll generation liveness so reloads do not leave hour-long sleeper
+        // threads behind.  This is not a network polling interval.
+        std::thread::sleep(remaining.min(Duration::from_secs(1)));
+    }
 }
 
 fn ocsp_refresh_loop<F, G>(refresh: OcspRefresh, mut fetch: F, mut keep_going: G)
 where
     F: FnMut(&OcspRefresh) -> Option<Vec<u8>>,
-    G: FnMut() -> bool,
+    G: FnMut(&OcspRefresh) -> bool,
 {
-    while keep_going() {
-        std::thread::sleep(refresh.interval);
+    while keep_going(&refresh) {
         if let Some(response) = fetch(&refresh) {
-            apply_ocsp_response(&refresh, response);
+            if !apply_ocsp_response(&refresh, response) {
+                break;
+            }
         }
     }
 }
 
-fn spawn_ocsp_refresh(refresh: OcspRefresh) {
+fn spawn_ocsp_refresh(refresh: OcspRefresh) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         ocsp_refresh_loop(
             refresh,
@@ -207,9 +229,9 @@ fn spawn_ocsp_refresh(refresh: OcspRefresh) {
                     refresh.timeout,
                 )
             },
-            || true,
+            wait_for_refresh,
         )
-    });
+    })
 }
 
 fn protocol_versions(spec: Option<&str>) -> Result<Vec<&'static SupportedProtocolVersion>, String> {
@@ -365,12 +387,15 @@ pub fn server_config(
     } else {
         &vhosts[0].ssl
     };
-    let ocsp_cache_dir = cfg.server_root.join("logs").join("ocsp-cache");
+    // Keep privileged stapling state directly below the root-owned ServerRoot,
+    // not below a legacy logs directory that older releases handed to the
+    // service account.
+    let ocsp_cache_dir = cfg.server_root.join(".vapache-ocsp-cache");
     let (default_cert, default_refresh) = load_key(default_ssl, &provider, Some(&ocsp_cache_dir))?;
     let default_key: SharedKey = Arc::new(RwLock::new(default_cert));
     if let Some(mut refresh) = default_refresh {
-        refresh.key = default_key.clone();
-        spawn_ocsp_refresh(refresh);
+        refresh.key = Arc::downgrade(&default_key);
+        let _ = spawn_ocsp_refresh(refresh);
     }
     let mut resolver = SniResolver {
         default: default_key.clone(),
@@ -388,8 +413,8 @@ pub fn server_config(
                 let (cert, refresh) = load_key(&v.ssl, &provider, Some(&ocsp_cache_dir))?;
                 let shared = Arc::new(RwLock::new(cert));
                 if let Some(mut refresh) = refresh {
-                    refresh.key = shared.clone();
-                    spawn_ocsp_refresh(refresh);
+                    refresh.key = Arc::downgrade(&shared);
+                    let _ = spawn_ocsp_refresh(refresh);
                 }
                 shared
             };
@@ -609,7 +634,7 @@ mod tests {
         let force_url = Some("http://127.0.0.1:1/");
         let cache_dir = dir.join("cache");
         let cache_path = crate::ocsp::cache_path(&cache_dir, &chain, force_url);
-        crate::ocsp::save_cached(&cache_path, &[0x30, 0x03, 0x0a, 0x01, 0x00]);
+        crate::ocsp::save_cached(&cache_path, &crate::ocsp::test_successful_response());
         let ssl = SslConfig {
             engine: true,
             cert_file: Some(cert.clone()),
@@ -659,14 +684,16 @@ mod tests {
             ..SslConfig::default()
         };
         let provider = ring::default_provider();
-        let (_certified, refresh) = load_key(&ssl, &provider, Some(&dir)).unwrap();
+        let (certified, refresh) = load_key(&ssl, &provider, Some(&dir)).unwrap();
         let mut refresh = refresh.expect("refresh handle");
+        let shared = Arc::new(RwLock::new(certified));
+        refresh.key = Arc::downgrade(&shared);
         refresh.interval = Duration::ZERO;
         let mut iterations = 0;
         ocsp_refresh_loop(
             refresh,
-            |_| Some(vec![0x30, 0x03, 0x0a, 0x01, 0x00]),
-            || {
+            |_| Some(crate::ocsp::test_successful_response()),
+            |_| {
                 iterations += 1;
                 iterations == 1
             },
@@ -685,8 +712,12 @@ mod tests {
             ..SslConfig::default()
         };
         let (_certified, refresh) = load_key(&ssl, &provider, Some(&dir)).unwrap();
-        if let Some(refresh) = refresh {
-            spawn_ocsp_refresh(refresh);
+        if let Some(mut refresh) = refresh {
+            let shared = Arc::new(RwLock::new(_certified));
+            refresh.key = Arc::downgrade(&shared);
+            let thread = spawn_ocsp_refresh(refresh);
+            drop(shared);
+            thread.join().unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

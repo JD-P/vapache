@@ -11,11 +11,19 @@ use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::os::unix::fs::MetadataExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 const MAX_OCSP_HTTP_LINE: usize = 16 * 1024;
 const MAX_OCSP_HTTP_HEAD: usize = 64 * 1024;
+const MAX_OCSP_RESPONSE: u64 = 2 * 1024 * 1024;
+
+pub fn prepare_cache_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let dir = crate::files::ensure_admin_dir(path, 0o750)?;
+    crate::files::make_admin_dir_root_owned(&dir, 0o750)
+}
 
 #[derive(Clone, Copy)]
 struct Tlv {
@@ -373,9 +381,87 @@ fn successful_response(data: &[u8]) -> bool {
     let Some(status) = parse_tlv(data, outer.content_start) else {
         return false;
     };
-    status.tag == 0x0a
-        && status.content_end - status.content_start == 1
-        && data[status.content_start] == 0
+    if status.tag != 0x0a
+        || status.content_end - status.content_start != 1
+        || data[status.content_start] != 0
+    {
+        return false;
+    }
+    // A successful status without ResponseBytes is not a staple. Require an
+    // id-pkix-ocsp-basic payload with the complete BasicOCSPResponse signed
+    // shape so a five-byte `successful` status injected on the plaintext AIA
+    // transport cannot replace a working staple with malformed bytes. TLS
+    // clients still perform the cryptographic certificate/status validation.
+    let Some(wrapper) = parse_tlv(data, status.end) else {
+        return false;
+    };
+    if outer.end != data.len() || wrapper.tag != 0xa0 || wrapper.end != outer.content_end {
+        return false;
+    }
+    let Some(response_bytes) = parse_tlv(data, wrapper.content_start) else {
+        return false;
+    };
+    if response_bytes.tag != 0x30 || response_bytes.end != wrapper.content_end {
+        return false;
+    }
+    let Some(kind) = parse_tlv(data, response_bytes.content_start) else {
+        return false;
+    };
+    const BASIC_OCSP_OID: &[u8] = &[
+        0x06, 0x09, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01,
+    ];
+    if raw(data, kind) != BASIC_OCSP_OID {
+        return false;
+    }
+    let Some(encoded) = parse_tlv(data, kind.end) else {
+        return false;
+    };
+    if encoded.tag != 0x04 || encoded.end != response_bytes.content_end {
+        return false;
+    }
+    let basic_bytes = &data[encoded.content_start..encoded.content_end];
+    let Some(basic) = parse_tlv(basic_bytes, 0) else {
+        return false;
+    };
+    if basic.tag != 0x30 || basic.end != basic_bytes.len() {
+        return false;
+    }
+    let Some(tbs) = parse_tlv(basic_bytes, basic.content_start) else {
+        return false;
+    };
+    let Some(algorithm) = parse_tlv(basic_bytes, tbs.end) else {
+        return false;
+    };
+    let Some(signature) = parse_tlv(basic_bytes, algorithm.end) else {
+        return false;
+    };
+    tbs.tag == 0x30
+        && algorithm.tag == 0x30
+        && signature.tag == 0x03
+        && signature.content_end > signature.content_start + 1
+        && basic_bytes[signature.content_start] == 0
+}
+
+#[cfg(test)]
+pub(crate) fn test_successful_response() -> Vec<u8> {
+    let basic = der(
+        0x30,
+        &[der(0x30, &[]), der(0x30, &[]), der(0x03, &[0, 1])].concat(),
+    );
+    let response_bytes = der(
+        0x30,
+        &[
+            vec![
+                0x06, 0x09, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01,
+            ],
+            der(0x04, &basic),
+        ]
+        .concat(),
+    );
+    der(
+        0x30,
+        &[der(0x0a, &[0]), der(0xa0, &response_bytes)].concat(),
+    )
 }
 
 /// Bound the handwritten DER and HTTP-URL parsers with arbitrary certificate
@@ -423,7 +509,20 @@ pub fn cache_path(
 }
 
 pub fn load_cached(path: &std::path::Path) -> Option<Vec<u8>> {
-    let data = std::fs::read(path).ok()?;
+    let mut file =
+        crate::files::open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_OCSP_RESPONSE {
+        return None;
+    }
+    let mut data = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_OCSP_RESPONSE + 1)
+        .read_to_end(&mut data)
+        .ok()?;
+    if data.len() as u64 > MAX_OCSP_RESPONSE {
+        return None;
+    }
     if successful_response(&data) {
         Some(data)
     } else {
@@ -432,12 +531,47 @@ pub fn load_cached(path: &std::path::Path) -> Option<Vec<u8>> {
 }
 
 pub fn save_cached(path: &std::path::Path, response: &[u8]) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if response.len() as u64 > MAX_OCSP_RESPONSE || !successful_response(response) {
+        return;
     }
-    let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, response).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if crate::files::ensure_admin_dir(parent, 0o770).is_err() {
+        return;
+    }
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    for _ in 0..16 {
+        let nonce = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".{name}.{}.{nonce}.tmp", std::process::id()));
+        let Ok(mut file) = crate::files::open_admin_path(
+            &tmp,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NONBLOCK,
+            0o600,
+        ) else {
+            continue;
+        };
+        let identity = file
+            .metadata()
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        if file.write_all(response).is_ok()
+            && file.sync_data().is_ok()
+            && identity.is_some()
+            && crate::files::open_admin_path(&tmp, libc::O_RDONLY | libc::O_NONBLOCK, 0)
+                .ok()
+                .and_then(|candidate| candidate.metadata().ok())
+                .is_some_and(|metadata| {
+                    metadata.is_file() && Some((metadata.dev(), metadata.ino())) == identity
+                })
+            && std::fs::rename(&tmp, path).is_ok()
+        {
+            return;
+        }
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -568,12 +702,39 @@ mod tests {
     fn cached_responses_must_be_successful() {
         let dir = std::env::temp_dir().join(format!("vapache-ocsp-cache-{}", std::process::id()));
         let path = dir.join("response.ocsp");
-        let good = [0x30, 0x03, 0x0a, 0x01, 0x00];
+        let good = test_successful_response();
         save_cached(&path, &good);
         assert_eq!(load_cached(&path).as_deref(), Some(good.as_slice()));
         let bad = [0x30, 0x03, 0x0a, 0x01, 0x01];
         save_cached(&path, &bad);
+        assert_eq!(load_cached(&path).as_deref(), Some(good.as_slice()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_rejects_links_fifos_and_oversized_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir =
+            std::env::temp_dir().join(format!("vapache-ocsp-cache-objects-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        let path = dir.join("response.ocsp");
+        symlink(&victim, &path).unwrap();
         assert!(load_cached(&path).is_none());
+        save_cached(&path, &test_successful_response());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+        assert!(load_cached(&path).is_some());
+
+        let fifo = dir.join("fifo.ocsp");
+        crate::files::make_test_fifo(&fifo).unwrap();
+        assert!(load_cached(&fifo).is_none());
+
+        let oversized = dir.join("oversized.ocsp");
+        std::fs::write(&oversized, vec![0u8; MAX_OCSP_RESPONSE as usize + 1]).unwrap();
+        assert!(load_cached(&oversized).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -732,7 +893,7 @@ mod tests {
         assert!(staple_response(&chain, Some(&bad_staple_url), Duration::from_secs(2)).is_none());
         bad_staple_thread.join().unwrap();
 
-        let good = der(0x30, &der(0x0a, &[0]));
+        let good = test_successful_response();
         let (fresh_url, fresh_thread) = responder(good.clone());
         assert_eq!(
             fetch_fresh(&chain, Some(&fresh_url), Duration::from_secs(2)),

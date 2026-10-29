@@ -551,11 +551,21 @@ CGI/FastCGI body                : spool above threshold; do not materialize Limi
 CGI output/stderr               : capped
 proxy response head/body/trailer: capped
 proxy chunk arithmetic          : checked_add and MAX_PROXY_BODY
+proxy DNS / TLS CA              : bounded queue/deadline; CA parsed once per generation
+WebSocket tunnels               : 64 process slots plus idle/write deadline
 handlers/descriptors            : only stdio + script fd cross exec
 ```
 
 Exceeding a bound is an error response or connection close, never an
 unbounded allocation or an indefinitely pinned worker.
+
+Resident-byte and compression reservations are made before extending request,
+proxy, autoindex or encoded-response buffers. HTTP/1 retains the reservation
+through dispatch in the request headers; HTTP/2 does the same through stream
+completion. An ambiguous proxy failure, including a configured failed-status
+response, can select another member only for an idempotent method. The
+`proxy_retry_admit` Verus gate proves unsafe methods cannot cross that seam
+after a send may have begun.
 
 ### I18 — Response-header policy
 
@@ -1623,7 +1633,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **467 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **486 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -2040,7 +2050,7 @@ The current ledger (2026-10-29) is:
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **467 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **486 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

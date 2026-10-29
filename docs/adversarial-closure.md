@@ -416,7 +416,7 @@ fuzzer now varies aggregate byte/file quotas, including zero, and asserts that
 fragmentation produces the same result and every lease returns to zero. Unit,
 adapter and property regressions cover byte-accurate accounting, release on
 failure, HTTP/1 `503`, HTTP/2 spill exhaustion, cache eviction, proxy ACL
-provenance and `<IfFile>` phase order. Verus verifies 483 functions with zero
+provenance and `<IfFile>` phase order. Verus verifies 486 functions with zero
 errors.
 
 ## Post-P20 denial-of-service hardening
@@ -457,6 +457,38 @@ The executable Verus gates are `cache_invalidation_status_admit`,
 fault-injection and property regressions cover process lease release,
 invalidation, bounded policy caches, hidden autoindex entries, proxy
 spooling/oversize responses, bcrypt extremes and connection spawn failure.
+
+## Pre-adversarial seam hardening
+
+The follow-up seam review closes six additional attack surfaces:
+
+- privileged log, PID, disk-cache and OCSP paths are descriptor-walked with
+  `openat2`, `RESOLVE_BENEATH` and no symlinks. OCSP cache objects are bounded
+  regular files installed by verified temporary-file identity and atomic
+  rename; malformed refresh data preserves the last accepted staple;
+- balancer retry admission distinguishes failure before connection/send from
+  an ambiguous or completed send. POST/PATCH and other unsafe methods cannot
+  be replayed after an upstream attempt or `failonstatus` response, while
+  idempotent methods retain failover;
+- request, proxy-response, autoindex and compression working sets reserve
+  process-wide bytes before allocation. The leases remain attached through
+  dispatch/send and release on every error path;
+- OCSP refresh workers hold only weak TLS-generation references and poll that
+  liveness while waiting, so reload retires old threads within one second;
+- proxy DNS is contained by eight workers, a queue of 64, 32 returned
+  addresses and one absolute resolve/connect deadline (including the async
+  TLS handshake used by WebSocket). Custom CA
+  files are regular, no-symlink, 4 MiB-capped snapshots parsed once per policy
+  generation;
+- WebSocket upgrades consume one of 64 process slots and the bidirectional
+  tunnel applies independent 60-second read/write idle deadlines. After a
+  `101`, tunnel errors close the transport instead of injecting an HTTP error
+  into the upgraded byte stream.
+
+`proxy_retry_admit` and its two proofs pin the retry boundary in Verus. Runtime
+regressions cover unsafe-method admission, TLS-policy reuse, literal resolver
+bypass, WebSocket slot/idle release, OCSP object types and retired refresh
+workers.
 
 ## Transform-to-sink and filesystem-race closure
 

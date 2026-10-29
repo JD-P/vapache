@@ -72,6 +72,16 @@ proptest! {
     }
 
     #[test]
+    fn ambiguous_proxy_retries_require_idempotency(
+        request_may_have_started in any::<bool>(), idempotent in any::<bool>(),
+    ) {
+        prop_assert_eq!(
+            vapached::verified::proxy_retry_admit(request_may_have_started, idempotent),
+            !request_may_have_started || idempotent
+        );
+    }
+
+    #[test]
     fn bcrypt_cost_is_limited_to_htpasswd_range(cost in any::<u32>()) {
         prop_assert_eq!(vapached::verified::bcrypt_cost_admit(cost), (4..=17).contains(&cost));
     }

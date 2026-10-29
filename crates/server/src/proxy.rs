@@ -19,18 +19,23 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_PROXY_HEAD: usize = 64 * 1024;
 const MAX_PROXY_BODY: usize = 64 * 1024 * 1024;
 const MAX_PROXY_BODY_IN_MEMORY: usize = 256 * 1024;
+const MAX_PROXY_CA_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PROXY_ADDRESSES: usize = 32;
+const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct ProxyBodyCollector {
     memory: Vec<u8>,
     file: Option<std::fs::File>,
     lease: Option<crate::resource::SpoolLease>,
+    resident: Option<crate::resource::ResidentLease>,
     len: usize,
     budget: Arc<crate::resource::ResourceBudget>,
     max_spool_bytes: u64,
@@ -47,6 +52,7 @@ impl ProxyBodyCollector {
             memory: Vec::new(),
             file: None,
             lease: None,
+            resident: Some(budget.try_response_bytes()),
             len: 0,
             budget,
             max_spool_bytes,
@@ -63,6 +69,10 @@ impl ProxyBodyCollector {
                 std::io::Error::new(std::io::ErrorKind::FileTooLarge, "proxy body too large")
             })?;
         if self.file.is_none() && next <= MAX_PROXY_BODY_IN_MEMORY {
+            self.resident
+                .as_mut()
+                .expect("in-memory proxy body owns a resident lease")
+                .reserve(bytes.len() as u64)?;
             self.memory.extend_from_slice(bytes);
             self.len = next;
             return Ok(());
@@ -92,7 +102,13 @@ impl ProxyBodyCollector {
         Ok(())
     }
 
-    fn finish(mut self) -> std::io::Result<(Body, Option<crate::resource::SpoolLease>)> {
+    fn finish(
+        mut self,
+    ) -> std::io::Result<(
+        Body,
+        Option<crate::resource::SpoolLease>,
+        Option<crate::resource::ResidentLease>,
+    )> {
         match (self.file.take(), self.lease.take()) {
             (Some(mut file), Some(lease)) => {
                 file.seek(SeekFrom::Start(0))?;
@@ -103,10 +119,15 @@ impl ProxyBodyCollector {
                         len: self.len as u64,
                     },
                     Some(lease),
+                    None,
                 ))
             }
-            (None, None) if self.memory.is_empty() => Ok((Body::Empty, None)),
-            (None, None) => Ok((Body::Bytes(self.memory), None)),
+            (None, None) if self.memory.is_empty() => Ok((Body::Empty, None, None)),
+            (None, None) => Ok((
+                Body::Bytes(std::mem::take(&mut self.memory)),
+                None,
+                self.resident.take(),
+            )),
             _ => unreachable!("proxy spool file and lease are created together"),
         }
     }
@@ -1235,14 +1256,135 @@ async fn read_async_head<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Resul
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
+struct DnsJob {
+    host: String,
+    port: u16,
+    reply: mpsc::Sender<std::io::Result<Vec<SocketAddr>>>,
+}
+
+fn dns_sender() -> &'static SyncSender<DnsJob> {
+    static DNS: OnceLock<SyncSender<DnsJob>> = OnceLock::new();
+    DNS.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<DnsJob>(64);
+        let rx = Arc::new(Mutex::new(rx));
+        for index in 0..8 {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("proxy-dns-{index}"))
+                .spawn(move || loop {
+                    let job = {
+                        let guard = rx.lock().unwrap_or_else(|error| error.into_inner());
+                        guard.recv()
+                    };
+                    let Ok(job) = job else {
+                        break;
+                    };
+                    let result = (job.host.as_str(), job.port)
+                        .to_socket_addrs()
+                        .map(|addresses| addresses.take(MAX_PROXY_ADDRESSES).collect());
+                    let _ = job.reply.send(result);
+                });
+        }
+        tx
+    })
+}
+
+fn literal_backend_addrs(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| vec![SocketAddr::new(ip, port)])
+}
+
+fn submit_dns(
+    host: &str,
+    port: u16,
+) -> std::io::Result<Receiver<std::io::Result<Vec<SocketAddr>>>> {
+    let (reply, rx) = mpsc::channel();
+    dns_sender()
+        .try_send(DnsJob {
+            host: host.to_string(),
+            port,
+            reply,
+        })
+        .map_err(|error| match error {
+            TrySendError::Full(_) => {
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, "proxy DNS queue is full")
+            }
+            TrySendError::Disconnected(_) => std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "proxy DNS workers are unavailable",
+            ),
+        })?;
+    Ok(rx)
+}
+
+fn resolve_backend_addrs(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> std::io::Result<Vec<SocketAddr>> {
+    if let Some(addresses) = literal_backend_addrs(host, port) {
+        return Ok(addresses);
+    }
+    submit_dns(host, port)?
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy DNS timeout")
+            }
+            mpsc::RecvTimeoutError::Disconnected => {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "proxy DNS worker stopped")
+            }
+        })?
+}
+
+async fn resolve_backend_addrs_async(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> std::io::Result<Vec<SocketAddr>> {
+    if let Some(addresses) = literal_backend_addrs(host, port) {
+        return Ok(addresses);
+    }
+    let rx = submit_dns(host, port)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return result,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "proxy DNS worker stopped",
+                ))
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "proxy DNS timeout",
+            ));
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(5))).await;
+    }
+}
+
 async fn connect_async(
     backend: &HttpBackend,
     scope: &Scope,
     timeout: Duration,
 ) -> std::io::Result<Box<dyn AsyncReadWrite>> {
+    let deadline = Instant::now() + timeout;
     let mut stream = None;
-    for addr in tokio::net::lookup_host((backend.host.as_str(), backend.port)).await? {
-        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+    for addr in resolve_backend_addrs_async(&backend.host, backend.port, timeout).await? {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, tokio::net::TcpStream::connect(addr)).await {
             Ok(Ok(s)) => {
                 stream = Some(s);
                 break;
@@ -1260,12 +1402,68 @@ async fn connect_async(
     let name = ServerName::try_from(backend.host.clone())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad TLS host"))?;
     let connector = tokio_rustls::TlsConnector::from(client_config(scope)?);
-    let tls = tokio::time::timeout(timeout, connector.connect(name, stream))
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "proxy connection timeout",
+        ));
+    }
+    let tls = tokio::time::timeout(remaining, connector.connect(name, stream))
         .await
         .map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timeout")
         })??;
     Ok(Box::new(tls))
+}
+
+async fn websocket_copy_idle<A, B>(
+    client: &mut A,
+    upstream: &mut B,
+    idle: Duration,
+) -> std::io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let mut client_buf = [0u8; 16 * 1024];
+    let mut upstream_buf = [0u8; 16 * 1024];
+    loop {
+        tokio::select! {
+            result = client.read(&mut client_buf) => {
+                let read = result?;
+                if read == 0 {
+                    let _ = upstream.shutdown().await;
+                    return Ok(());
+                }
+                tokio::time::timeout(idle, upstream.write_all(&client_buf[..read]))
+                    .await
+                    .map_err(|_| std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "WebSocket upstream write timeout",
+                    ))??;
+            }
+            result = upstream.read(&mut upstream_buf) => {
+                let read = result?;
+                if read == 0 {
+                    let _ = client.shutdown().await;
+                    return Ok(());
+                }
+                tokio::time::timeout(idle, client.write_all(&upstream_buf[..read]))
+                    .await
+                    .map_err(|_| std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "WebSocket client write timeout",
+                    ))??;
+            }
+            _ = tokio::time::sleep(idle) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "WebSocket tunnel idle timeout",
+                ));
+            }
+        }
+    }
 }
 
 /// Tunnel a WebSocket upgrade over any combination of clear/TLS client and
@@ -1305,6 +1503,7 @@ where
             "access grant does not cover websocket target",
         ));
     }
+    let _websocket_lease = cfg.resource_budget.try_websocket()?;
     let timeout = cfg.timeout.max(Duration::from_secs(5));
     let mut upstream = connect_async(&target.backend, scope, timeout).await?;
     let mut path = target.path.as_bytes().to_vec();
@@ -1359,8 +1558,16 @@ where
         &target.backend,
         if host.is_empty() { None } else { Some(host) },
     )?;
-    upstream.write_all(head.as_bytes()).await?;
-    let response = read_async_head(&mut upstream).await?;
+    tokio::time::timeout(timeout, upstream.write_all(head.as_bytes()))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "WebSocket request timeout")
+        })??;
+    let response = tokio::time::timeout(timeout, read_async_head(&mut upstream))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "WebSocket handshake timeout")
+        })??;
     let status = response
         .split(|byte| *byte == b'\n')
         .next()
@@ -1399,27 +1606,69 @@ where
             ));
         }
     }
-    client.write_all(&response).await?;
+    tokio::time::timeout(timeout, client.write_all(&response))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "WebSocket response timeout")
+        })??;
     if status != 101 {
         return Ok(());
     }
     if !initial.is_empty() {
-        upstream.write_all(initial).await?;
+        tokio::time::timeout(timeout, upstream.write_all(initial))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "WebSocket initial data timeout",
+                )
+            })??;
     }
     client.flush().await?;
-    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    // Once 101 has reached the client an HTTP error can no longer be sent.
+    // Tunnel closure (including the idle deadline) is the protocol-correct
+    // failure signal, so consume the transport error here.
+    let _ = websocket_copy_idle(&mut client, upstream.as_mut(), WEBSOCKET_IDLE_TIMEOUT).await;
     Ok(())
 }
 
-fn client_config(scope: &Scope) -> std::io::Result<Arc<rustls::ClientConfig>> {
+fn build_client_config(scope: &Scope) -> Result<Arc<rustls::ClientConfig>, String> {
     let mut roots = RootCertStore::empty();
     if let Some(path) = &scope.proxy_policy.proxy_ca_file {
-        let data = std::fs::read(path)?;
+        let mut file = crate::files::open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0)
+            .map_err(|error| format!("cannot open proxy CA {}: {error}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("cannot inspect proxy CA {}: {error}", path.display()))?;
+        if !metadata.is_file() || metadata.len() > MAX_PROXY_CA_BYTES {
+            return Err(format!(
+                "proxy CA {} is not a regular file within the {} byte limit",
+                path.display(),
+                MAX_PROXY_CA_BYTES
+            ));
+        }
+        let mut data = Vec::with_capacity(metadata.len() as usize);
+        Read::by_ref(&mut file)
+            .take(MAX_PROXY_CA_BYTES + 1)
+            .read_to_end(&mut data)
+            .map_err(|error| format!("cannot read proxy CA {}: {error}", path.display()))?;
+        if data.len() as u64 > MAX_PROXY_CA_BYTES {
+            return Err(format!("proxy CA {} is too large", path.display()));
+        }
+        let mut added = 0usize;
         for cert in CertificateDer::pem_slice_iter(&data) {
-            let cert = cert.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let cert =
+                cert.map_err(|error| format!("cannot parse proxy CA {}: {error}", path.display()))?;
             roots
                 .add(cert)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                .map_err(|error| format!("cannot add proxy CA {}: {error}", path.display()))?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(format!(
+                "proxy CA {} contains no certificates",
+                path.display()
+            ));
         }
     } else {
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -1431,12 +1680,25 @@ fn client_config(scope: &Scope) -> std::io::Result<Arc<rustls::ClientConfig>> {
     Ok(Arc::new(config))
 }
 
+fn client_config(scope: &Scope) -> std::io::Result<Arc<rustls::ClientConfig>> {
+    scope
+        .proxy_policy
+        .tls_config_cache
+        .get_or_init(|| build_client_config(scope))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 fn connect_tcp(backend: &HttpBackend, timeout: Duration) -> std::io::Result<TcpStream> {
     crate::fault::hit("proxy.connect")?;
+    let deadline = Instant::now() + timeout;
     let mut tcp = None;
     let mut last = None;
-    for addr in (backend.host.as_str(), backend.port).to_socket_addrs()? {
-        match TcpStream::connect_timeout(&addr, timeout) {
+    for addr in resolve_backend_addrs(&backend.host, backend.port, timeout)? {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&addr, remaining) {
             Ok(s) => {
                 tcp = Some(s);
                 break;
@@ -1447,8 +1709,15 @@ fn connect_tcp(backend: &HttpBackend, timeout: Duration) -> std::io::Result<TcpS
     let tcp = tcp.ok_or_else(|| {
         last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address"))
     })?;
-    tcp.set_read_timeout(Some(timeout))?;
-    tcp.set_write_timeout(Some(timeout))?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "proxy connection timeout",
+        ));
+    }
+    tcp.set_read_timeout(Some(remaining))?;
+    tcp.set_write_timeout(Some(remaining))?;
     Ok(tcp)
 }
 
@@ -1474,6 +1743,13 @@ fn backend_key(backend: &HttpBackend) -> String {
         backend.host,
         backend.port,
         if backend.tls { "tls" } else { "plain" }
+    )
+}
+
+fn proxy_method_is_idempotent(method: &str) -> bool {
+    matches!(
+        method,
+        "GET" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "TRACE"
     )
 }
 
@@ -1824,13 +2100,20 @@ fn proxy_once_budgeted(
             scope
                 .header_policy
                 .apply(&mut response.headers, response.status < 400);
-            crate::compression::finalize(scope, req, &mut response, url_path.as_bytes());
+            crate::compression::finalize_budgeted(
+                scope,
+                req,
+                &mut response,
+                url_path.as_bytes(),
+                resource_budget,
+            );
             return Ok((response, None));
         }
     }
     let mut body = Vec::new();
     let mut collected_body = None;
     let mut spool_lease = None;
+    let mut response_resident = None;
     if !no_body {
         if chunked {
             let mut collector = ProxyBodyCollector::new(
@@ -1839,12 +2122,16 @@ fn proxy_once_budgeted(
                 max_spool_files,
             );
             read_chunked(&mut reader, &mut collector)?;
-            let (collected, lease) = collector.finish()?;
+            let (collected, lease, resident) = collector.finish()?;
             collected_body = Some(collected);
             spool_lease = lease;
+            response_resident = resident;
         } else if let Some(n) = content_length {
+            let mut resident = resource_budget.try_response_bytes();
+            resident.reserve(n as u64)?;
             body.resize(n, 0);
             reader.read_exact(&mut body)?;
+            response_resident = Some(resident);
         } else {
             let mut collector = ProxyBodyCollector::new(
                 Arc::clone(resource_budget),
@@ -1859,9 +2146,10 @@ fn proxy_once_budgeted(
                 }
                 collector.push(&chunk[..read])?;
             }
-            let (collected, lease) = collector.finish()?;
+            let (collected, lease, resident) = collector.finish()?;
             collected_body = Some(collected);
             spool_lease = lease;
+            response_resident = resident;
         }
     }
     let mut response = Response::new(status);
@@ -1879,10 +2167,19 @@ fn proxy_once_budgeted(
     if let Some(lease) = spool_lease {
         response.hold_spool(lease);
     }
+    if let Some(lease) = response_resident {
+        response.hold_resident(lease);
+    }
     scope
         .header_policy
         .apply(&mut response.headers, response.status < 400);
-    crate::compression::finalize(scope, req, &mut response, url_path.as_bytes());
+    crate::compression::finalize_budgeted(
+        scope,
+        req,
+        &mut response,
+        url_path.as_bytes(),
+        resource_budget,
+    );
     Ok((response, None))
 }
 
@@ -2123,28 +2420,41 @@ pub fn execute(
             "proxy failover grant/identity drift"
         );
         tried.insert(backend_key(&current.backend));
-        let result = match connect(&current.backend, &active_scope, timeout) {
-            Ok(stream) => proxy_once_budgeted(
-                stream,
-                &cfg.resource_budget,
-                cfg.max_spool_bytes,
-                cfg.max_spool_files,
-                &current,
-                req,
-                &active_scope,
-                url_path,
-                peer,
-                https,
-                host,
-            )
-            .map(|(response, _)| response),
-            Err(e) => Err(e),
-        };
+        let (result, request_may_have_started) =
+            match connect(&current.backend, &active_scope, timeout) {
+                Ok(stream) => (
+                    proxy_once_budgeted(
+                        stream,
+                        &cfg.resource_budget,
+                        cfg.max_spool_bytes,
+                        cfg.max_spool_files,
+                        &current,
+                        req,
+                        &active_scope,
+                        url_path,
+                        peer,
+                        https,
+                        host,
+                    )
+                    .map(|(response, _)| response),
+                    true,
+                ),
+                Err(e) => (Err(e), false),
+            };
         match result {
             Ok(response) => {
                 let failed_status =
                     current.balancer.is_some() && current.fail_on_status.contains(&response.status);
                 if failed_status {
+                    // A complete upstream response proves the request was
+                    // transmitted.  `failonstatus` must not turn POST/PATCH
+                    // into implicit at-least-twice delivery.
+                    if !vapache_verified::proxy_retry_admit(
+                        true,
+                        proxy_method_is_idempotent(&req.method),
+                    ) {
+                        return response;
+                    }
                     if let Some(name) = &current.balancer {
                         mark_dead(
                             name,
@@ -2227,6 +2537,22 @@ pub fn execute(
                     mark_dead(
                         name,
                         &format!("{}:{}", current.backend.host, current.backend.port),
+                    );
+                }
+                if !vapache_verified::proxy_retry_admit(
+                    request_may_have_started,
+                    proxy_method_is_idempotent(&req.method),
+                ) {
+                    return error(
+                        cfg,
+                        vhost,
+                        &active_scope,
+                        req,
+                        url_path,
+                        local_port,
+                        host,
+                        peer.ip(),
+                        local_ip,
                     );
                 }
                 if let Some(next) = alternate_target(cfg, &current, &tried, req) {
@@ -5010,5 +5336,60 @@ mod coverage_tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         let _ = upstream.await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambiguous_failover_never_replays_unsafe_methods() {
+        for method in ["POST", "PATCH", "CONNECT", "PROPFIND"] {
+            assert!(!proxy_method_is_idempotent(method));
+            assert!(!vapache_verified::proxy_retry_admit(
+                true,
+                proxy_method_is_idempotent(method)
+            ));
+            assert!(vapache_verified::proxy_retry_admit(
+                false,
+                proxy_method_is_idempotent(method)
+            ));
+        }
+        for method in ["GET", "HEAD", "PUT", "DELETE", "OPTIONS"] {
+            assert!(vapache_verified::proxy_retry_admit(
+                true,
+                proxy_method_is_idempotent(method)
+            ));
+        }
+    }
+
+    #[test]
+    fn proxy_tls_configuration_is_built_once_per_policy() {
+        let scope = Scope::default();
+        let first = client_config(&scope).unwrap();
+        let second = client_config(&scope).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn literal_proxy_resolution_is_bounded_without_dns() {
+        assert_eq!(
+            resolve_backend_addrs("127.0.0.1", 8080, Duration::ZERO).unwrap(),
+            vec!["127.0.0.1:8080".parse().unwrap()]
+        );
+        assert_eq!(
+            resolve_backend_addrs("[::1]", 8080, Duration::ZERO).unwrap(),
+            vec!["[::1]:8080".parse().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_tunnel_has_an_idle_deadline() {
+        let (mut client_tunnel, _client_peer) = tokio::io::duplex(64);
+        let (mut upstream_tunnel, _upstream_peer) = tokio::io::duplex(64);
+        let error = websocket_copy_idle(
+            &mut client_tunnel,
+            &mut upstream_tunnel,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 }

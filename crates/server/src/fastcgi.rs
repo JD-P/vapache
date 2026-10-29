@@ -1223,7 +1223,13 @@ fn execute_inner(
 
     match result {
         Ok(mut r) => {
-            crate::compression::finalize(scope, base.req, &mut r, target.script_name.as_bytes());
+            crate::compression::finalize_budgeted(
+                scope,
+                base.req,
+                &mut r,
+                target.script_name.as_bytes(),
+                &base.cfg.resource_budget,
+            );
             r
         }
         Err(e) => {

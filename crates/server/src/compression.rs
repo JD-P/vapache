@@ -11,6 +11,7 @@ use crate::config::{AlterEtag, CompressionKind, CompressionRule, Scope};
 use crate::http::{Body, Request, Response};
 use std::borrow::Cow;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 
 const MAX_COMPRESS_BODY: u64 = 8 * 1024 * 1024;
 const DEFAULT_DEFLATE_LEVEL: u32 = 6;
@@ -279,6 +280,28 @@ fn brotli(data: &[u8], quality: u32) -> Vec<u8> {
 /// rules.  The function is idempotent: responses already carrying a
 /// `Content-Encoding` are left alone.
 pub fn finalize(scope: &Scope, req: &Request, resp: &mut Response, path: &[u8]) {
+    finalize_inner(scope, req, resp, path, None);
+}
+
+/// Production entry point.  Reserve the worst-case transient footprint before
+/// materializing a file body or allocating the encoded representation.
+pub fn finalize_budgeted(
+    scope: &Scope,
+    req: &Request,
+    resp: &mut Response,
+    path: &[u8],
+    budget: &Arc<crate::resource::ResourceBudget>,
+) {
+    finalize_inner(scope, req, resp, path, Some(budget));
+}
+
+fn finalize_inner(
+    scope: &Scope,
+    req: &Request,
+    resp: &mut Response,
+    path: &[u8],
+    budget: Option<&Arc<crate::resource::ResourceBudget>>,
+) {
     for value in &scope.header_policy.vary {
         add_vary_value(resp, value);
     }
@@ -344,6 +367,16 @@ pub fn finalize(scope: &Scope, req: &Request, resp: &mut Response, path: &[u8]) 
         // identity representation instead of queueing more expensive work.
         return;
     };
+    let mut compression_lease = budget.map(|budget| {
+        let mut lease = budget.try_response_bytes();
+        let peak = resp.body_len().saturating_mul(2).saturating_add(64 * 1024);
+        lease.reserve(peak).map(|()| lease)
+    });
+    if compression_lease.as_ref().is_some_and(Result::is_err) {
+        // Compression is optional; preserve the identity representation when
+        // admitting its transient working set would exceed the process cap.
+        return;
+    }
     let body = std::mem::replace(&mut resp.body, Body::Empty);
     let raw = match read_body(body) {
         Ok(v) => v,
@@ -382,6 +415,9 @@ pub fn finalize(scope: &Scope, req: &Request, resp: &mut Response, path: &[u8]) 
     set_header(resp, "Content-Length", len.to_string().into_bytes());
     set_header(resp, "Accept-Ranges", b"none".to_vec());
     alter_etag(resp, kind, scope);
+    if let Some(Ok(lease)) = compression_lease.take() {
+        resp.hold_resident(lease);
+    }
 }
 
 #[cfg(test)]

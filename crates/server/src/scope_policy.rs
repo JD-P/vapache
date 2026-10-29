@@ -927,12 +927,41 @@ impl CompressionPolicy {
 
 /// Proxy policy.  Backend containers/rules append; CA file uses child
 /// presence.
+pub struct ProxyTlsConfigCache(
+    std::sync::OnceLock<Result<std::sync::Arc<rustls::ClientConfig>, String>>,
+);
+
+impl Default for ProxyTlsConfigCache {
+    fn default() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+}
+
+impl std::fmt::Debug for ProxyTlsConfigCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProxyTlsConfigCache")
+    }
+}
+
+impl ProxyTlsConfigCache {
+    pub(crate) fn get_or_init(
+        &self,
+        build: impl FnOnce() -> Result<std::sync::Arc<rustls::ClientConfig>, String>,
+    ) -> Result<std::sync::Arc<rustls::ClientConfig>, String> {
+        match self.0.get_or_init(build) {
+            Ok(config) => Ok(config.clone()),
+            Err(error) => Err(error.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ProxyPolicy {
     pub proxy_rules: Vec<crate::config::ProxyRule>,
     pub proxy_passes: Vec<crate::config::ProxyPassRule>,
     pub proxy_reverses: Vec<crate::config::ProxyReverseRule>,
     pub proxy_ca_file: Option<std::path::PathBuf>,
+    pub(crate) tls_config_cache: std::sync::Arc<ProxyTlsConfigCache>,
 }
 
 impl ProxyPolicy {
@@ -942,6 +971,7 @@ impl ProxyPolicy {
         crate::verified::append_vec(&mut self.proxy_reverses, &child.proxy_reverses);
         if child.proxy_ca_file.is_some() {
             self.proxy_ca_file = child.proxy_ca_file.clone();
+            self.tls_config_cache = child.tls_config_cache.clone();
         }
     }
 }

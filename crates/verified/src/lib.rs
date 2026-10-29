@@ -2188,6 +2188,30 @@ pub fn proxy_operator_acl_admit(proxy_selected: bool, operator_allowed: bool) ->
     !proxy_selected || operator_allowed
 }
 
+/// Automatic balancer failover may replay an idempotent request, or any
+/// request that provably failed before a backend connection was established.
+/// Once an unsafe request might have reached a member, an ambiguous transport
+/// error must be returned to the client instead of executing it again.
+pub open spec fn proxy_retry_spec(request_may_have_started: bool, idempotent: bool) -> bool {
+    !request_may_have_started || idempotent
+}
+
+pub fn proxy_retry_admit(request_may_have_started: bool, idempotent: bool) -> (ok: bool)
+    ensures ok == proxy_retry_spec(request_may_have_started, idempotent),
+{
+    !request_may_have_started || idempotent
+}
+
+pub proof fn proxy_retry_rejects_ambiguous_unsafe()
+    ensures !proxy_retry_spec(true, false),
+{
+}
+
+pub proof fn proxy_retry_allows_preconnect_failure(idempotent: bool)
+    ensures proxy_retry_spec(false, idempotent),
+{
+}
+
 /// Request-time `file()` expressions admit only a regular descriptor whose
 /// observed size fits the fixed read ceiling. The runtime additionally uses a
 /// bounded reader so a concurrent growth cannot exceed this allowance.

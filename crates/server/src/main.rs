@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -396,14 +396,38 @@ fn daemonize() -> Result<(), String> {
 
 fn write_pid(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        vapached::files::ensure_admin_dir(parent, 0o755)
+            .map_err(|e| format!("cannot prepare PidFile directory {}: {e}", parent.display()))?;
     }
-    std::fs::write(path, format!("{}\n", std::process::id()))
+    let mut file = vapached::files::open_admin_path(
+        path,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NONBLOCK,
+        0o644,
+    )
+    .map_err(|e| format!("cannot open PidFile {}: {e}", path.display()))?;
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return Err(format!("PidFile {} is not a regular file", path.display()));
+    }
+    file.write_all(format!("{}\n", std::process::id()).as_bytes())
         .map_err(|e| format!("cannot write PidFile {}: {e}", path.display()))
 }
 
 fn read_pid(path: &Path) -> Result<i32, String> {
-    let s = std::fs::read_to_string(path)
+    let mut file = vapached::files::open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0)
+        .map_err(|e| format!("cannot read PidFile {}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect PidFile {}: {e}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > 64 {
+        return Err(format!(
+            "PidFile {} is not a small regular file",
+            path.display()
+        ));
+    }
+    let mut s = String::new();
+    Read::by_ref(&mut file)
+        .take(65)
+        .read_to_string(&mut s)
         .map_err(|e| format!("cannot read PidFile {}: {e}", path.display()))?;
     s.trim()
         .parse()
@@ -974,7 +998,15 @@ mod tests {
         assert!(kill_action(&temp("missing-pid"), 0).is_err());
         std::fs::write(&path, "2147483647\n").unwrap();
         assert!(kill_action(&path, 0).is_err());
+        let _ = std::fs::remove_file(&path);
+        let victim = temp("pid-victim");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        assert!(write_pid(&path).is_err());
+        assert!(read_pid(&path).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(victim);
     }
 
     #[test]

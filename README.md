@@ -103,7 +103,12 @@ Implemented today:
   routes share one configuration-ordered route table, and `<Proxy>` sections
   match both the configured `balancer://` identity and the concrete member;
   failover re-authorizes the next member and atomically replaces the
-  grant/resource binding instead of reusing the first member's grant.
+  grant/resource binding instead of reusing the first member's grant. A
+  request is retried after an ambiguous send or `failonstatus` response only
+  for an idempotent method; connection failures before a send may still move
+  any method to another member. Proxy DNS uses a bounded worker queue and one
+  absolute connect deadline, and custom CA bundles are parsed once per policy
+  generation.
 - TLS client-certificate authentication (`SSLVerifyClient`,
   `SSLCACertificateFile`), and OCSP stapling with AIA or
   `SSLStaplingForceURL` responders, startup warm-start persistence and
@@ -157,11 +162,13 @@ Implemented today:
   request bodies are spooled before forwarding. Proxy responses are capped at
   64 MiB and local CGI output at 8 MiB. Request and proxy chunk sizes, trailer
   counts/bytes, proxy head sizes and CGI/FastCGI output are explicitly bounded.
-- Process-wide overload control: at most 256 HTTP/2 streams, 128 MiB each of
-  retained request and response bytes, 32 blocking response reads, and 32
+- Process-wide overload control: at most 256 HTTP/2 streams, 64 WebSocket
+  tunnels, 128 MiB each of retained request and response bytes, 32 blocking
+  response reads, and 32
   concurrent CPU-heavy regex/hash/compression/access-file operations. DNS
-  authorization uses an eight-worker bounded queue and timeout. Autoindex
-  scans at most 4096 directory records and renders at most 4 MiB. Request
+  authorization and outbound proxy resolution use bounded worker queues and
+  deadlines; WebSocket tunnels have an independent idle/write deadline.
+  Autoindex scans at most 4096 directory records and renders at most 4 MiB. Request
   policy, access-file, password-file and disk-cache metadata indexes are
   byte/count bounded and evict individual entries rather than clearing or
   rescanning an attacker-amplifiable working set.
@@ -212,7 +219,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **467 verified functions, 0 errors** (percent-decoding,
+Current result: **486 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -380,7 +387,7 @@ Current ledger: **53.8% weighted obligations**, **6/6 proof debt**,
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **108 adversarial replay cases** covering the findings classes,
-and **467 Verus functions with 0 errors** (including the I3 fast-path
+and **486 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -537,9 +544,9 @@ failure races and privileged-kernel failures are excluded from that metric.
 
 Latest snapshot: **20,020/20,548 executable server production lines (97.43%)**;
 the new aggregate-resource module is **62/62 (100%)**. The current suite is
-471 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
+492 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
 integration tests, 165 conformance tests and 339 fixed configuration cases.
-The separate Verus gate proves 467 functions with 0 errors; proof-only code is
+The separate Verus gate proves 486 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

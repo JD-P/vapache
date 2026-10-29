@@ -321,6 +321,7 @@ async fn read_body(
     resource_budget: Arc<crate::resource::ResourceBudget>,
     max_spool_bytes: u64,
     max_spool_files: u64,
+    resident: &mut crate::resource::ResidentLease,
 ) -> Result<H2RequestBody, H2ReadFailure> {
     // HTTP/2 can run many request bodies concurrently on one connection.  A
     // small per-stream prefix keeps ordinary forms cheap while the process-
@@ -362,9 +363,12 @@ async fn read_body(
             return Err(H2ReadFailure::Response(bad(413, "request body too large")));
         };
         budget = next_budget;
-        if let Err(error) = body.push(&chunk) {
-            let response = if error.kind() == io::ErrorKind::StorageFull {
-                bad(503, "request-body spool capacity exhausted")
+        if let Err(error) = body.push_with_resident(&chunk, resident) {
+            let response = if matches!(
+                error.kind(),
+                io::ErrorKind::StorageFull | io::ErrorKind::OutOfMemory
+            ) {
+                bad(503, "request-body capacity exhausted")
             } else {
                 bad(500, "cannot spool request body")
             };
@@ -799,16 +803,17 @@ async fn handle_stream(
     let body_timeout = cfg
         .request_body_timeout
         .max(std::time::Duration::from_secs(1));
-    let body_future = read_body(
-        recv,
-        max_body,
-        body_timeout,
-        cfg.resource_budget.clone(),
-        cfg.max_spool_bytes,
-        cfg.max_spool_files,
-    );
-    tokio::pin!(body_future);
     let body_result = {
+        let body_future = read_body(
+            recv,
+            max_body,
+            body_timeout,
+            cfg.resource_budget.clone(),
+            cfg.max_spool_bytes,
+            cfg.max_spool_files,
+            &mut request_resident,
+        );
+        tokio::pin!(body_future);
         // `SendResponse::poll_reset` is the h2 API for a client RST_STREAM
         // before response headers.  Race it against body consumption so a
         // reset that arrives while the body is still open is projected into
@@ -833,16 +838,6 @@ async fn handle_stream(
             Some(resp),
         ),
     };
-    if request_resident.reserve(body.bytes.len() as u64).is_err() {
-        return send_response(
-            respond,
-            &cfg,
-            bad(503, "request memory capacity exhausted"),
-            false,
-        )
-        .await
-        .is_err();
-    }
     if let Some(declared) = declared {
         if declared != body.len && early.is_none() {
             // h2 enforces the declared DATA length before clean end-of-stream.
@@ -854,6 +849,7 @@ async fn handle_stream(
         }
     }
 
+    headers.hold_resident(request_resident);
     let req = Request {
         method,
         target,

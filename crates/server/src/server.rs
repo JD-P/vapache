@@ -56,7 +56,7 @@ fn first_resolved_addr(mut addrs: impl Iterator<Item = SocketAddr>) -> io::Resul
 pub fn bind(cfg: &Config) -> io::Result<Vec<Bound>> {
     crate::files::require_secure_path_resolution()?;
     crate::cache::prepare(cfg);
-    crate::cache::prepare_dir(cfg, &cfg.server_root.join("logs").join("ocsp-cache"));
+    crate::ocsp::prepare_cache_dir(&cfg.server_root.join(".vapache-ocsp-cache"))?;
     crate::proxy::start_health_checks(cfg);
     let mut out = Vec::new();
     for l in &cfg.listeners {
@@ -110,7 +110,7 @@ pub fn rebind(cfg: &Config, previous: &[Bound]) -> io::Result<Vec<Bound>> {
         });
     }
     crate::cache::prepare(cfg);
-    crate::cache::prepare_dir(cfg, &cfg.server_root.join("logs").join("ocsp-cache"));
+    crate::ocsp::prepare_cache_dir(&cfg.server_root.join(".vapache-ocsp-cache"))?;
     crate::proxy::start_health_checks(cfg);
     Ok(out)
 }
@@ -529,7 +529,12 @@ fn handle_connection<C: Conn + ResponseWrite>(
         }) {
             Ok(Some(r)) => r,
             Ok(None) => return Ok(()),
-            Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::StorageFull => {
+            Err(ReadError::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::StorageFull | io::ErrorKind::OutOfMemory
+                ) =>
+            {
                 // Aggregate request-body capacity is a temporary service
                 // condition, not a malformed connection.  Report it
                 // explicitly so clients can retry instead of observing a
@@ -574,37 +579,6 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 return Ok(());
             }
         };
-        let mut request_resident = cfg.resource_budget.try_request_bytes();
-        let request_resident_bytes = req.headers.iter().fold(
-            req.target.len().saturating_add(req.body.len()) as u64,
-            |total, (name, value)| {
-                total
-                    .saturating_add(name.len() as u64)
-                    .saturating_add(value.len() as u64)
-            },
-        );
-        if request_resident.reserve(request_resident_bytes).is_err() {
-            let mut response = Response::bytes(
-                503,
-                "text/html; charset=iso-8859-1",
-                b"Request memory capacity is temporarily exhausted\n".to_vec(),
-            );
-            response
-                .headers
-                .push(("Connection".into(), b"close".to_vec()));
-            let _ = write_response(
-                stream,
-                &mut response,
-                &ResponseOptions {
-                    server_header: &cfg.server_header(),
-                    keep_alive: false,
-                    head_only: false,
-                    protocol: Version::Http11,
-                    request_keep_alive: false,
-                },
-            );
-            return Ok(());
-        }
         let peer = cfg.client_addr(peer, &req);
         let remote_ip = peer.ip().to_string();
         let bytes_in = req.target.len() as u64 + req.body_len();
@@ -827,8 +801,13 @@ fn handle_connection<C: Conn + ResponseWrite>(
                         )
                         .await
                     });
-                    if let Err(_) = result {
-                        let _ = write_ws_error(stream, &cfg, 502, b"WebSocket upstream failed");
+                    if let Err(error) = result {
+                        let status = if error.kind() == io::ErrorKind::WouldBlock {
+                            503
+                        } else {
+                            502
+                        };
+                        let _ = write_ws_error(stream, &cfg, status, b"WebSocket upstream failed");
                     }
                     return Ok(());
                 }
@@ -2451,7 +2430,13 @@ fn dispatch_inner(
                     r.body = Body::Empty;
                 }
                 scope.header_policy.apply(&mut r.headers, r.status < 400);
-                crate::compression::finalize(&scope, current_req, &mut r, url_path.as_bytes());
+                crate::compression::finalize_budgeted(
+                    &scope,
+                    current_req,
+                    &mut r,
+                    url_path.as_bytes(),
+                    &cfg.resource_budget,
+                );
                 return r;
             }
             crate::rewrite::Outcome::Internal {
@@ -2697,7 +2682,13 @@ fn dispatch_inner(
             r.body = Body::Empty;
         }
         scope.header_policy.apply(&mut r.headers, r.status < 400);
-        crate::compression::finalize(&scope, req, &mut r, url_path.as_bytes());
+        crate::compression::finalize_budgeted(
+            &scope,
+            req,
+            &mut r,
+            url_path.as_bytes(),
+            &cfg.resource_budget,
+        );
         return r;
     }
 
@@ -3874,7 +3865,13 @@ fn run_cgi(
     };
     let mut r = cgi::execute(&ctx);
     scope.header_policy.apply(&mut r.headers, r.status < 400);
-    crate::compression::finalize(scope, req, &mut r, script_name.as_bytes());
+    crate::compression::finalize_budgeted(
+        scope,
+        req,
+        &mut r,
+        script_name.as_bytes(),
+        &cfg.resource_budget,
+    );
     r
 }
 

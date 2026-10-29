@@ -17,6 +17,7 @@ pub struct ResourceBudget {
     request_bytes: AtomicU64,
     response_bytes: AtomicU64,
     blocking_reads: AtomicU64,
+    websocket_tunnels: AtomicU64,
 }
 
 /// Process-wide ceilings for work whose callers do not carry a `Config`
@@ -28,6 +29,7 @@ pub const MAX_BLOCKING_READS: u64 = 32;
 pub const MAX_H2_STREAMS: u64 = 256;
 pub const MAX_REQUEST_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_RESPONSE_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_WEBSOCKET_TUNNELS: u64 = 64;
 
 static EXPENSIVE_OPS: AtomicU64 = AtomicU64::new(0);
 
@@ -169,6 +171,19 @@ impl ResourceBudget {
         })
     }
 
+    pub fn try_websocket(self: &Arc<Self>) -> io::Result<WebsocketLease> {
+        if !try_add(&self.websocket_tunnels, 1, MAX_WEBSOCKET_TUNNELS) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "process-wide WebSocket tunnel limit reached",
+            ));
+        }
+        Ok(WebsocketLease {
+            budget: self.clone(),
+            active: true,
+        })
+    }
+
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn usage(&self) -> (u64, u64, u64) {
         (
@@ -186,6 +201,11 @@ impl ResourceBudget {
             self.response_bytes.load(Ordering::Acquire),
             self.blocking_reads.load(Ordering::Acquire),
         )
+    }
+
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn websocket_usage(&self) -> u64 {
+        self.websocket_tunnels.load(Ordering::Acquire)
     }
 }
 
@@ -265,6 +285,21 @@ impl Drop for H2StreamLease {
 pub struct BlockingReadLease {
     budget: Arc<ResourceBudget>,
     active: bool,
+}
+
+#[derive(Debug)]
+pub struct WebsocketLease {
+    budget: Arc<ResourceBudget>,
+    active: bool,
+}
+
+impl Drop for WebsocketLease {
+    fn drop(&mut self) {
+        if self.active {
+            self.budget.websocket_tunnels.fetch_sub(1, Ordering::AcqRel);
+            self.active = false;
+        }
+    }
 }
 
 impl Drop for BlockingReadLease {
@@ -392,6 +427,19 @@ mod tests {
         assert!(budget.try_h2_stream().is_err());
         drop(leases);
         assert!(budget.try_h2_stream().is_ok());
+    }
+
+    #[test]
+    fn process_wide_websocket_limit_is_enforced_and_recovers() {
+        let budget = Arc::new(ResourceBudget::default());
+        let leases: Vec<_> = (0..MAX_WEBSOCKET_TUNNELS)
+            .map(|_| budget.try_websocket().unwrap())
+            .collect();
+        assert_eq!(budget.websocket_usage(), MAX_WEBSOCKET_TUNNELS);
+        assert!(budget.try_websocket().is_err());
+        drop(leases);
+        assert_eq!(budget.websocket_usage(), 0);
+        assert!(budget.try_websocket().is_ok());
     }
 
     #[test]

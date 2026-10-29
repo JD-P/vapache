@@ -6358,6 +6358,8 @@ impl Compile {
                 } else {
                     self.cfg.server_root.join(p)
                 });
+                scope.proxy_policy.tls_config_cache =
+                    std::sync::Arc::new(crate::scope_policy::ProxyTlsConfigCache::default());
             }
             "balancermember" => {
                 let Some(i) = self.current_balancer else {

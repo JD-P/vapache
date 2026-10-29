@@ -21,6 +21,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::IpAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1209,30 +1210,32 @@ fn response_body_bytes(
 }
 
 pub fn prepare_dir(cfg: &Config, dir: &std::path::Path) {
-    if fs::create_dir_all(dir).is_err() {
+    let Ok(opened) = crate::files::ensure_admin_dir(dir, 0o755) else {
         return;
-    }
+    };
     // The daemon drops privileges after binding, so hand the cache directory
     // to the configured account while we are still privileged.
     #[cfg(unix)]
     {
         use std::ffi::CString;
-        use std::os::unix::fs::PermissionsExt;
         if unsafe { libc::geteuid() } == 0 {
             let user = CString::new(cfg.user.as_str()).ok(); // coverage:ignore-start - root-only ownership handoff
             let group = CString::new(cfg.group.as_str()).ok();
-            let uid = user.as_ref().and_then(|u| {
-                let pw = unsafe { libc::getpwnam(u.as_ptr()) };
-                (!pw.is_null()).then(|| unsafe { (*pw).pw_uid })
+            let uid = user.as_ref().and_then(|u| unsafe {
+                let pw = libc::getpwnam(u.as_ptr());
+                (!pw.is_null()).then(|| (*pw).pw_uid)
             });
-            let gid = group.as_ref().and_then(|g| {
-                let gr = unsafe { libc::getgrnam(g.as_ptr()) };
-                (!gr.is_null()).then(|| unsafe { (*gr).gr_gid })
+            let gid = group.as_ref().and_then(|g| unsafe {
+                let gr = libc::getgrnam(g.as_ptr());
+                (!gr.is_null()).then(|| (*gr).gr_gid)
             });
-            if let Some(uid) = uid {
-                let _ = std::os::unix::fs::chown(dir, Some(uid), gid);
+            unsafe {
+                if let Some(uid) = uid {
+                    let gid = gid.unwrap_or(u32::MAX);
+                    let _ = libc::fchown(opened.as_raw_fd(), uid, gid);
+                }
+                let _ = libc::fchmod(opened.as_raw_fd(), 0o770); // coverage:ignore-stop
             }
-            let _ = fs::set_permissions(dir, PermissionsExt::from_mode(0o775)); // coverage:ignore-stop
         }
     }
 }

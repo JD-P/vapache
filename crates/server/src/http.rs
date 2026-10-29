@@ -65,6 +65,10 @@ impl From<HttpVersion> for Version {
 #[derive(Clone, Debug, Default)]
 pub struct Headers {
     entries: Vec<(String, Vec<u8>)>,
+    // Clones of a request's headers share the same reservation.  This keeps
+    // the charge alive through dispatch without adding a lease field to every
+    // synthetic Request initializer in tests and modules.
+    resident_lease: Option<std::sync::Arc<ResidentLease>>,
 }
 
 impl Headers {
@@ -103,6 +107,10 @@ impl Headers {
 
     pub fn push(&mut self, name: &str, value: impl Into<Vec<u8>>) {
         self.entries.push((name.to_ascii_lowercase(), value.into()));
+    }
+
+    pub(crate) fn hold_resident(&mut self, lease: ResidentLease) {
+        self.resident_lease = Some(std::sync::Arc::new(lease));
     }
 }
 
@@ -177,6 +185,20 @@ impl BodyAccumulator {
     }
 
     pub(crate) fn push(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.push_inner(bytes, None)
+    }
+
+    /// Reserve resident memory before extending the in-memory prefix.  Bytes
+    /// written to the bounded spool file do not consume resident capacity.
+    pub(crate) fn push_with_resident(
+        &mut self,
+        bytes: &[u8],
+        resident: &mut ResidentLease,
+    ) -> io::Result<()> {
+        self.push_inner(bytes, Some(resident))
+    }
+
+    fn push_inner(&mut self, bytes: &[u8], resident: Option<&mut ResidentLease>) -> io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -188,6 +210,9 @@ impl BodyAccumulator {
         if self.file.is_none()
             && vapache_verified::request_body_memory_admit(self.len, add, self.memory_limit)
         {
+            if let Some(resident) = resident {
+                resident.reserve(add)?;
+            }
             self.body.extend_from_slice(bytes);
             self.len = next;
             return Ok(());
@@ -234,6 +259,22 @@ impl BodyAccumulator {
             (None, None) => (std::mem::take(&mut self.body), None),
             _ => unreachable!("spool file and lease are created together"),
         }
+    }
+}
+
+struct ResidentBodyWriter<'a> {
+    body: &'a mut BodyAccumulator,
+    resident: &'a mut ResidentLease,
+}
+
+impl Write for ResidentBodyWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.body.push_with_resident(bytes, self.resident)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -405,6 +446,10 @@ pub fn read_request<R: Read + Write>(
     limits: &Limits,
     on_headers: impl FnOnce(&mut R),
 ) -> Result<Option<Request>, ReadError> {
+    let mut request_resident = limits.resource_budget.try_request_bytes();
+    // Pipelined bytes left by the previous request remain resident while this
+    // request is dispatched, so they enter the new request's reservation.
+    request_resident.reserve(buf.len() as u64)?;
     let header_started = Instant::now();
     let head_end = loop {
         if let Some(end) = find_head_end(buf) {
@@ -435,7 +480,10 @@ pub fn read_request<R: Read + Write>(
                     "unexpected EOF in request headers",
                 )));
             }
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                request_resident.reserve(n as u64)?;
+                buf.extend_from_slice(&chunk[..n]);
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(ReadError::Io(e)),
         }
@@ -443,6 +491,11 @@ pub fn read_request<R: Read + Write>(
             return Err(ReadError::Parse(ParseError::HeadersTooLarge));
         }
     };
+
+    // Charge before the verified parser creates owned copies of the target
+    // and headers.  The factor of two conservatively covers both the retained
+    // connection bytes and the owned representation during parsing.
+    request_resident.reserve(head_end as u64)?;
 
     // Parse directly from the connection buffer; the verified parser returns
     // owned request fields and does not retain a borrow of the head.
@@ -485,7 +538,7 @@ pub fn read_request<R: Read + Write>(
                     limits.max_spool_files,
                 );
                 let take = (n as usize).min(buf.len());
-                body.push(&buf[..take])?;
+                body.push_with_resident(&buf[..take], &mut request_resident)?;
                 buf.drain(..take);
                 let mut remaining = n - take as u64;
                 let mut chunk = vec![0u8; 64 * 1024];
@@ -505,13 +558,14 @@ pub fn read_request<R: Read + Write>(
                             "EOF in request body",
                         )));
                     }
-                    body.push(&chunk[..got])?;
+                    body.push_with_resident(&chunk[..got], &mut request_resident)?;
                     remaining -= got as u64;
                 }
                 let (bytes, spool) = body.finish();
                 req.body = bytes;
                 req.body_spool = spool;
             } else {
+                request_resident.reserve(n)?;
                 read_exact_into(
                     stream,
                     buf,
@@ -530,10 +584,14 @@ pub fn read_request<R: Read + Write>(
                 limits.max_spool_files,
             );
             let chunk_deadline = Instant::now() + limits.body_timeout;
+            let mut writer = ResidentBodyWriter {
+                body: &mut body,
+                resident: &mut request_resident,
+            };
             let len = read_chunked_to_writer_budgeted(
                 stream,
                 buf,
-                &mut body,
+                &mut writer,
                 limits.body,
                 chunk_deadline,
                 None,
@@ -552,6 +610,7 @@ pub fn read_request<R: Read + Write>(
             req.body_spool = spool;
         }
     }
+    req.headers.hold_resident(request_resident);
     Ok(Some(req))
 }
 
@@ -860,7 +919,10 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
         raw_path,
         query,
         version: version.into(),
-        headers: Headers { entries },
+        headers: Headers {
+            entries,
+            resident_lease: None,
+        },
         body: Vec::new(),
         body_spool: None,
         keep_alive,
