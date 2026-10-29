@@ -211,11 +211,11 @@ pub fn resolve_target_checked(
 type OpenResult = Result<File, io::Error>;
 
 thread_local! {
-    /// Opening the document root on every request is an avoidable syscall.
-    /// A document root is normally stable for the life of the process, and
-    /// each connection thread serves a small set of roots (vhosts/aliases).
-    static ROOT_FDS: RefCell<Vec<(PathBuf, Arc<File>)>> =
-        const { RefCell::new(Vec::new()) };
+    /// Directory descriptors may be reused only within one request.  Keeping
+    /// one across requests would pin a keep-alive worker to an old directory
+    /// after an atomic `current -> release-N` deployment switch.
+    static REQUEST_ROOT_FDS: RefCell<Option<Vec<(PathBuf, Arc<File>)>>> =
+        const { RefCell::new(None) };
 
     /// Per-request metadata memoization.  Dispatch, policy construction and
     /// handler selection repeatedly ask the same question (is this path a
@@ -232,12 +232,14 @@ pub(crate) struct RequestMetadataGuard;
 
 impl Drop for RequestMetadataGuard {
     fn drop(&mut self) {
+        REQUEST_ROOT_FDS.with(|cache| *cache.borrow_mut() = None);
         REQUEST_METADATA.with(|cache| *cache.borrow_mut() = None);
         REQUEST_SYMLINK_METADATA.with(|cache| *cache.borrow_mut() = None);
     }
 }
 
 pub(crate) fn request_metadata_scope() -> RequestMetadataGuard {
+    REQUEST_ROOT_FDS.with(|cache| *cache.borrow_mut() = Some(Vec::new()));
     REQUEST_METADATA.with(|cache| *cache.borrow_mut() = Some(HashMap::new()));
     REQUEST_SYMLINK_METADATA.with(|cache| *cache.borrow_mut() = Some(HashMap::new()));
     RequestMetadataGuard
@@ -283,17 +285,27 @@ pub(crate) fn is_dir_cached(path: &Path) -> bool {
 }
 
 fn root_file(root: &Path) -> io::Result<Arc<File>> {
-    ROOT_FDS.with(|cache| {
+    // A pathname can be atomically rebound to another directory between
+    // requests (the common `current -> release-N` deployment shape).  Caching
+    // this descriptor by pathname across requests would keep a connection
+    // thread pinned to the old tree after authorization and metadata walks
+    // had moved to the new one.  A request-local cache retains a consistent
+    // root for multi-step dispatch, then the guard drops it before the next
+    // keep-alive request.
+    REQUEST_ROOT_FDS.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some((_, f)) = cache.iter().find(|(p, _)| p == root) {
-            return Ok(f.clone());
+        let Some(cache) = cache.as_mut() else {
+            return File::open(root).map(Arc::new);
+        };
+        if let Some((_, file)) = cache.iter().find(|(path, _)| path == root) {
+            return Ok(file.clone());
         }
-        let f = Arc::new(File::open(root)?);
+        let file = Arc::new(File::open(root)?);
         if cache.len() >= 16 {
             cache.remove(0);
         }
-        cache.push((root.to_path_buf(), f.clone()));
-        Ok(f)
+        cache.push((root.to_path_buf(), file.clone()));
+        Ok(file)
     })
 }
 
@@ -1162,6 +1174,7 @@ mod tests {
     use super::*;
     use crate::http::{Headers, Version};
     use std::collections::HashMap;
+    use std::io::Read;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn request(method: &str, path: &[u8]) -> Request {
@@ -1196,6 +1209,41 @@ mod tests {
         .unwrap();
         let cfg = Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
         (dir, cfg)
+    }
+
+    #[test]
+    fn root_descriptor_tracks_atomic_symlink_replacement() {
+        let (base, _) = config("root-symlink-swap");
+        let first_root = base.join("release-1");
+        let second_root = base.join("release-2");
+        std::fs::create_dir(&first_root).unwrap();
+        std::fs::create_dir(&second_root).unwrap();
+        std::fs::write(first_root.join("file.txt"), b"first").unwrap();
+        std::fs::write(second_root.join("file.txt"), b"second").unwrap();
+
+        let current = base.join("current");
+        std::os::unix::fs::symlink(&first_root, &current).unwrap();
+        let flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64;
+        let mut body = String::new();
+        {
+            let _request = request_metadata_scope();
+            let mut first = open_beneath(&current, Path::new("file.txt"), flags, true).unwrap();
+            first.read_to_string(&mut body).unwrap();
+        }
+        assert_eq!(body, "first");
+
+        let replacement = base.join("replacement");
+        std::os::unix::fs::symlink(&second_root, &replacement).unwrap();
+        std::fs::rename(&replacement, &current).unwrap();
+
+        body.clear();
+        {
+            let _request = request_metadata_scope();
+            let mut second = open_beneath(&current, Path::new("file.txt"), flags, true).unwrap();
+            second.read_to_string(&mut body).unwrap();
+        }
+        assert_eq!(body, "second");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1318,12 +1366,6 @@ mod tests {
         assert!(symlink_metadata_cached(&root.join("same-owner-link")).is_ok());
         assert!(symlink_metadata_cached(&root.join("same-owner-link")).is_ok());
         assert!(is_dir_cached(&root.join("sub")));
-
-        for i in 0..18 {
-            let p = root.join(format!("root-{i}"));
-            std::fs::create_dir(&p).unwrap();
-            assert!(root_file(&p).is_ok());
-        }
 
         cfg.mime.types.insert("txt".into(), "text/plain".into());
         let mut scope = Scope::default();
