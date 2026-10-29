@@ -13,16 +13,17 @@ use base64::Engine;
 use md5::Md5;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const MAX_PASSWORD_FILE: u64 = 4 * 1024 * 1024;
 const MAX_AUTH_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_AUTH_CACHE_ENTRIES: usize = 128;
+const AUTH_FAILURE_CACHE_TTL: Duration = Duration::from_millis(250);
 
 const CRYPT_ALPHABET: &[u8; 64] =
     b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -92,6 +93,7 @@ struct AuthFileKey {
 #[derive(Default)]
 struct AuthFileCache {
     entries: HashMap<AuthFileKey, (Arc<String>, usize)>,
+    failures: HashMap<PathBuf, Instant>,
     bytes: usize,
 }
 
@@ -114,7 +116,37 @@ fn auth_key(path: &Path, meta: &std::fs::Metadata) -> AuthFileKey {
 }
 
 fn read_small(path: &Path) -> Option<Arc<String>> {
-    let file = File::open(path).ok()?;
+    let now = Instant::now();
+    {
+        let mut cache = auth_file_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        cache
+            .failures
+            .retain(|_, failed| now.saturating_duration_since(*failed) < AUTH_FAILURE_CACHE_TTL);
+        if cache.failures.contains_key(path) {
+            return None;
+        }
+    }
+    let data = read_small_uncached(path);
+    if data.is_none() {
+        let mut cache = auth_file_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if cache.failures.len() >= MAX_AUTH_CACHE_ENTRIES {
+            if let Some(victim) = cache.failures.keys().next().cloned() {
+                cache.failures.remove(&victim);
+            }
+        }
+        cache.failures.insert(path.to_path_buf(), Instant::now());
+    }
+    data
+}
+
+fn read_small_uncached(path: &Path) -> Option<Arc<String>> {
+    // O_NONBLOCK is security-significant: opening an attacker-selected FIFO
+    // must not park a request worker before the regular-file check runs.
+    let file = crate::files::open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0).ok()?;
     let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > MAX_PASSWORD_FILE {
         return None;
@@ -127,11 +159,11 @@ fn read_small(path: &Path) -> Option<Arc<String>> {
         .get(&key)
         .map(|(data, _)| Arc::clone(data))
     {
-        return Some(data);
+        return path_names_key(path, &key).then_some(data);
     }
     let data = Arc::new(read_bounded(&file)?);
     let after = file.metadata().ok()?;
-    if auth_key(path, &after) != key {
+    if auth_key(path, &after) != key || !path_names_key(path, &key) {
         return None;
     }
     let weight = data
@@ -167,6 +199,16 @@ fn read_small(path: &Path) -> Option<Arc<String>> {
         cache.entries.insert(key, (Arc::clone(&data), weight));
     }
     Some(data)
+}
+
+fn path_names_key(path: &Path, key: &AuthFileKey) -> bool {
+    let Ok(file) = crate::files::open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    meta.is_file() && meta.dev() == key.dev && meta.ino() == key.ino
 }
 
 fn read_bounded(reader: impl Read) -> Option<String> {
@@ -482,6 +524,25 @@ mod tests {
         assert!(!md5_crypt_matches(b"x", "$1$x$bad", "$apr1$"));
         assert!(!md5_crypt_matches(b"x", "$apr1$missing", "$apr1$"));
         assert!(!md5_crypt_matches(b"x", "$apr1$123456789$bad", "$apr1$"));
+    }
+
+    #[test]
+    fn authentication_files_reject_fifos_and_symlinks_without_blocking() {
+        let fifo = temp_path("fifo");
+        crate::files::make_test_fifo(&fifo).unwrap();
+        let started = Instant::now();
+        assert!(read_small(&fifo).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let regular = temp_path("symlink-target");
+        let linked = temp_path("symlink");
+        std::fs::write(&regular, "alice:hash\n").unwrap();
+        std::os::unix::fs::symlink(&regular, &linked).unwrap();
+        assert!(read_small(&linked).is_none());
+
+        std::fs::remove_file(fifo).unwrap();
+        std::fs::remove_file(linked).unwrap();
+        std::fs::remove_file(regular).unwrap();
     }
 
     #[test]

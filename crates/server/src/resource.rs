@@ -37,6 +37,17 @@ pub const MAX_RESPONSE_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_WEBSOCKET_TUNNELS: u64 = 64;
 pub const MAX_WEBSOCKETS_PER_CLIENT: u64 = 8;
 
+/// Collapse IPv6 interface identifiers into their /64 allocation while
+/// retaining exact IPv4 identities. IPv4-mapped IPv6 is canonicalized first.
+pub fn client_quota_key(client: IpAddr) -> IpAddr {
+    match crate::access::canonical_ip(client) {
+        IpAddr::V4(ip) => IpAddr::V4(ip),
+        IpAddr::V6(ip) => IpAddr::V6(std::net::Ipv6Addr::from(
+            vapache_verified::client_quota_ipv6_key(u128::from(ip)),
+        )),
+    }
+}
+
 static EXPENSIVE_OPS: AtomicU64 = AtomicU64::new(0);
 
 fn try_add(counter: &AtomicU64, amount: u64, limit: u64) -> bool {
@@ -135,20 +146,27 @@ impl ResourceBudget {
         })
     }
 
-    pub fn try_h2_stream_for(self: &Arc<Self>, client: IpAddr) -> io::Result<H2StreamLease> {
+    pub fn try_h2_stream(self: &Arc<Self>) -> io::Result<H2StreamLease> {
         if !try_add(&self.h2_streams, 1, MAX_H2_STREAMS) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "process-wide HTTP/2 stream limit reached",
             ));
         }
+        Ok(H2StreamLease {
+            budget: self.clone(),
+            active: true,
+        })
+    }
+
+    pub fn try_h2_client_for(self: &Arc<Self>, client: IpAddr) -> io::Result<H2ClientLease> {
+        let client = client_quota_key(client);
         let mut clients = self
             .h2_clients
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let count = clients.entry(client).or_default();
         if !vapache_verified::resource_budget_admit(*count, 1, MAX_H2_STREAMS_PER_CLIENT) {
-            self.h2_streams.fetch_sub(1, Ordering::AcqRel);
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "per-client HTTP/2 stream limit reached",
@@ -156,10 +174,20 @@ impl ResourceBudget {
         }
         *count += 1;
         drop(clients);
-        Ok(H2StreamLease {
+        Ok(H2ClientLease {
             budget: self.clone(),
             client,
             active: true,
+        })
+    }
+
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn try_h2_stream_for(self: &Arc<Self>, client: IpAddr) -> io::Result<CombinedH2Lease> {
+        let stream = self.try_h2_stream()?;
+        let client = self.try_h2_client_for(client)?;
+        Ok(CombinedH2Lease {
+            _stream: stream,
+            _client: client,
         })
     }
 
@@ -193,6 +221,7 @@ impl ResourceBudget {
     }
 
     pub fn try_websocket_for(self: &Arc<Self>, client: IpAddr) -> io::Result<WebsocketLease> {
+        let client = client_quota_key(client);
         if !try_add(&self.websocket_tunnels, 1, MAX_WEBSOCKET_TUNNELS) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -305,11 +334,26 @@ impl Drop for ResidentLease {
 #[derive(Debug)]
 pub struct H2StreamLease {
     budget: Arc<ResourceBudget>,
-    client: IpAddr,
     active: bool,
 }
 
 impl Drop for H2StreamLease {
+    fn drop(&mut self) {
+        if self.active {
+            self.budget.h2_streams.fetch_sub(1, Ordering::AcqRel);
+            self.active = false;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct H2ClientLease {
+    budget: Arc<ResourceBudget>,
+    client: IpAddr,
+    active: bool,
+}
+
+impl Drop for H2ClientLease {
     fn drop(&mut self) {
         if self.active {
             let mut clients = self
@@ -323,11 +367,16 @@ impl Drop for H2StreamLease {
                     clients.remove(&self.client);
                 }
             }
-            drop(clients);
-            self.budget.h2_streams.fetch_sub(1, Ordering::AcqRel);
             self.active = false;
         }
     }
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+#[derive(Debug)]
+pub struct CombinedH2Lease {
+    _stream: H2StreamLease,
+    _client: H2ClientLease,
 }
 
 #[derive(Debug)]
@@ -519,6 +568,27 @@ mod tests {
             .is_ok());
         drop(leases);
         assert!(budget.try_h2_stream_for(client).is_ok());
+    }
+
+    #[test]
+    fn ipv6_quota_identity_is_a_prefix_not_an_interface_address() {
+        let first: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let rotated: IpAddr = "2001:db8:1:2:ffff::beef".parse().unwrap();
+        let other_prefix: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(client_quota_key(first), client_quota_key(rotated));
+        assert_ne!(client_quota_key(first), client_quota_key(other_prefix));
+        assert_eq!(
+            client_quota_key("::ffff:192.0.2.9".parse().unwrap()),
+            IpAddr::from([192, 0, 2, 9])
+        );
+
+        let budget = Arc::new(ResourceBudget::default());
+        let leases: Vec<_> = (0..MAX_H2_STREAMS_PER_CLIENT)
+            .map(|_| budget.try_h2_stream_for(first).unwrap())
+            .collect();
+        assert!(budget.try_h2_stream_for(rotated).is_err());
+        assert!(budget.try_h2_stream_for(other_prefix).is_ok());
+        drop(leases);
     }
 
     #[test]

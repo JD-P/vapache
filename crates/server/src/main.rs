@@ -1077,6 +1077,10 @@ fn main() {
         eprintln!("vapached: {error}");
         std::process::exit(1);
     }
+    if let Err(error) = cfg.validate_admin_input_parents(service_uid) {
+        eprintln!("vapached: {error}");
+        std::process::exit(1);
+    }
     let admin_service_uid = (effective_uid() == 0).then_some(service_uid);
 
     match args.action.as_deref() {
@@ -1164,6 +1168,10 @@ fn main() {
             std::process::exit(1);
         }
     }
+    if let Err(e) = vapached::tls::install_privileged_file_broker(&cfg, service_uid) {
+        eprintln!("vapached: cannot start privileged TLS broker: {e}");
+        std::process::exit(1);
+    }
     if let Err(e) = server::activate_background(&cfg, &mut bound) {
         eprintln!("vapached: cannot start background services: {e}");
         std::process::exit(1);
@@ -1236,17 +1244,34 @@ fn main() {
             break; // coverage:ignore-line - external fd failure
         }
         logger.info("SIGHUP received; reloading configuration");
-        let mut new_cfg =
-            match Config::load(&config_path, &server_root, &env, &args.defines, args.strict) {
-                Ok(c) => c,
-                Err(errors) => {
-                    for e in errors {
-                        logger.error(&format!("reload rejected: {e}"));
-                    }
-                    logger.error("reload rejected; continuing with previous configuration");
-                    continue;
+        let mut new_cfg = match Config::load_for_reload(
+            &config_path,
+            &server_root,
+            &env,
+            &args.defines,
+            args.strict,
+            &cfg,
+            service_uid,
+        ) {
+            Ok(c) => c,
+            Err(errors) => {
+                for e in errors {
+                    logger.error(&format!("reload rejected: {e}"));
                 }
-            };
+                logger.error("reload rejected; continuing with previous configuration");
+                continue;
+            }
+        };
+        if let Err(error) = new_cfg.validate_admin_input_parents(service_uid) {
+            logger.error(&format!("reload rejected: {error}"));
+            logger.error("reload rejected; continuing with previous configuration");
+            continue;
+        }
+        if let Err(error) = new_cfg.validate_reload_from(&cfg) {
+            logger.error(&format!("reload rejected: {error}"));
+            logger.error("reload rejected; continuing with previous configuration");
+            continue;
+        }
         // Old keep-alive requests can overlap a graceful reload.  Share the
         // usage counters so the aggregate limits remain process-wide across
         // both configuration generations.
@@ -1276,6 +1301,7 @@ fn main() {
         logger.info("configuration reloaded; cache generation invalidated");
     }
     vapached::cgi::shutdown_pool();
+    vapached::tls::shutdown_privileged_file_broker();
     pid_guard.clear();
     let _ = std::io::stderr().flush();
 }

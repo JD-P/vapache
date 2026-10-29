@@ -786,6 +786,20 @@ async fn handle_stream(
     if let Some(resp) = head_error {
         return send_response(respond, &cfg, resp, false).await.is_err();
     }
+    let quota_peer = cfg.client_addr_from_headers(peer, &headers);
+    let _client_stream = match cfg.resource_budget.try_h2_client_for(quota_peer.ip()) {
+        Ok(lease) => lease,
+        Err(_) => {
+            return send_response(
+                respond,
+                &cfg,
+                bad(503, "per-client HTTP/2 stream limit reached"),
+                false,
+            )
+            .await
+            .is_err();
+        }
+    };
 
     let declared = match declared_content_length(&headers) {
         Ok(declared) => declared,
@@ -1083,7 +1097,7 @@ where
                 let (request, mut respond) =
                     result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let stream_id = respond.stream_id().as_u32() as u64;
-                let process_stream = match cfg.resource_budget.try_h2_stream_for(peer.ip()) {
+                let process_stream = match cfg.resource_budget.try_h2_stream() {
                     Ok(lease) => lease,
                     Err(_) => {
                         respond.send_reset(h2::Reason::REFUSED_STREAM);

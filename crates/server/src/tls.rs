@@ -13,15 +13,276 @@ use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{RootCertStore, ServerConfig, SupportedProtocolVersion};
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::net::IpAddr;
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 type SharedKey = Arc<RwLock<Arc<CertifiedKey>>>;
 const MAX_TLS_CERTIFICATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_TLS_PRIVATE_KEY_BYTES: u64 = 1024 * 1024;
+const MAX_BROKER_ERROR_BYTES: u64 = 1024;
+const BROKER_SHUTDOWN: u32 = u32::MAX;
+
+struct PrivilegedFileBroker {
+    stream: UnixStream,
+    paths: HashMap<PathBuf, u32>,
+    pid: libc::pid_t,
+}
+
+static PRIVILEGED_FILE_BROKER: OnceLock<Mutex<PrivilegedFileBroker>> = OnceLock::new();
+
+fn tls_file_specs(cfg: &Config) -> Vec<(PathBuf, u64)> {
+    fn add(specs: &mut HashMap<PathBuf, u64>, path: &Option<PathBuf>, limit: u64) {
+        if let Some(path) = path {
+            specs
+                .entry(path.clone())
+                .and_modify(|known| *known = (*known).max(limit))
+                .or_insert(limit);
+        }
+    }
+
+    fn add_ssl(specs: &mut HashMap<PathBuf, u64>, ssl: &SslConfig) {
+        add(specs, &ssl.cert_file, MAX_TLS_CERTIFICATE_BYTES);
+        add(specs, &ssl.key_file, MAX_TLS_PRIVATE_KEY_BYTES);
+        add(specs, &ssl.chain_file, MAX_TLS_CERTIFICATE_BYTES);
+        add(specs, &ssl.ca_file, MAX_TLS_CERTIFICATE_BYTES);
+    }
+
+    let mut specs = HashMap::new();
+    add_ssl(&mut specs, &cfg.ssl);
+    for vhost in &cfg.vhosts {
+        add_ssl(&mut specs, &vhost.ssl);
+    }
+    let mut specs: Vec<_> = specs.into_iter().collect();
+    specs.sort_by(|(a, _), (b, _)| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+    specs
+}
+
+/// Fork a minimal root file broker before background threads start. The
+/// unprivileged request process can ask only for TLS paths authorized by the
+/// root-owned startup configuration, never for an arbitrary pathname.
+pub fn install_privileged_file_broker(cfg: &Config, service_uid: u32) -> Result<(), String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    if PRIVILEGED_FILE_BROKER.get().is_some() {
+        return Err("privileged TLS broker was already installed".to_string());
+    }
+    let specs = tls_file_specs(cfg);
+    if specs.is_empty() {
+        return Ok(());
+    }
+    for (path, _) in &specs {
+        crate::files::validate_admin_parents(path, service_uid).map_err(|error| {
+            format!("unsafe TLS administrative path {}: {error}", path.display())
+        })?;
+    }
+
+    let mut sockets = [-1; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            sockets.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(format!(
+            "cannot create privileged TLS broker socket: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let parent_pid = unsafe { libc::getpid() };
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        unsafe {
+            libc::close(sockets[0]);
+            libc::close(sockets[1]);
+        }
+        return Err(format!(
+            "cannot fork privileged TLS broker: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if child == 0 {
+        unsafe {
+            libc::close(sockets[0]);
+        }
+        privileged_broker_child(sockets[1], parent_pid, specs.clone(), service_uid);
+    }
+
+    unsafe {
+        libc::close(sockets[1]);
+    }
+    let stream = unsafe { UnixStream::from_raw_fd(sockets[0]) };
+    let paths = specs
+        .iter()
+        .enumerate()
+        .map(|(index, (path, _))| (path.clone(), index as u32))
+        .collect();
+    match PRIVILEGED_FILE_BROKER.set(Mutex::new(PrivilegedFileBroker {
+        stream,
+        paths,
+        pid: child,
+    })) {
+        Ok(()) => Ok(()),
+        Err(broker) => {
+            let mut broker = broker
+                .into_inner()
+                .unwrap_or_else(|error| error.into_inner());
+            let _ = broker.stream.write_all(&BROKER_SHUTDOWN.to_ne_bytes());
+            let _ = broker.stream.shutdown(std::net::Shutdown::Both);
+            unsafe {
+                libc::waitpid(broker.pid, std::ptr::null_mut(), 0);
+            }
+            Err("privileged TLS broker was already installed".to_string())
+        }
+    }
+}
+
+fn privileged_broker_child(
+    fd: libc::c_int,
+    parent_pid: libc::pid_t,
+    specs: Vec<(PathBuf, u64)>,
+    service_uid: u32,
+) -> ! {
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0
+            || libc::getppid() != parent_pid
+        {
+            libc::_exit(1);
+        }
+        if fd != 3 {
+            if libc::dup2(fd, 3) < 0 {
+                libc::_exit(1);
+            }
+            libc::close(fd);
+        }
+        if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) < 0 {
+            for inherited in 4..65_536 {
+                libc::close(inherited);
+            }
+        }
+        let mut stream = UnixStream::from_raw_fd(3);
+        privileged_broker_loop(&mut stream, &specs, service_uid);
+        libc::_exit(0);
+    }
+}
+
+fn privileged_broker_loop(stream: &mut UnixStream, specs: &[(PathBuf, u64)], service_uid: u32) {
+    loop {
+        let mut request = [0u8; 4];
+        if stream.read_exact(&mut request).is_err() {
+            return;
+        }
+        let id = u32::from_ne_bytes(request);
+        if id == BROKER_SHUTDOWN {
+            return;
+        }
+        let result = specs
+            .get(id as usize)
+            .ok_or_else(|| "unrecognized privileged TLS file id".to_string())
+            .and_then(|(path, limit)| {
+                crate::files::validate_admin_parents(path, service_uid)
+                    .map_err(|error| format!("unsafe TLS path {}: {error}", path.display()))?;
+                crate::files::read_admin_file_with_trust(
+                    path,
+                    *limit,
+                    crate::files::AdminFileTrust::RootOwned,
+                )
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))
+            });
+        let (status, data) = match result {
+            Ok(data) => (0u8, data),
+            Err(error) => {
+                let mut data = error.into_bytes();
+                data.truncate(MAX_BROKER_ERROR_BYTES as usize);
+                (1u8, data)
+            }
+        };
+        let mut header = [0u8; 9];
+        header[0] = status;
+        header[1..].copy_from_slice(&(data.len() as u64).to_ne_bytes());
+        if stream
+            .write_all(&header)
+            .and_then(|()| stream.write_all(&data))
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn read_tls_admin_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+    let Some(broker) = PRIVILEGED_FILE_BROKER.get() else {
+        return crate::files::read_admin_file(path, max_bytes).map_err(|error| error.to_string());
+    };
+    let mut broker = broker.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(id) = broker.paths.get(path).copied() else {
+        return Err(format!(
+            "TLS path {} was not authorized at startup; a full restart is required",
+            path.display()
+        ));
+    };
+    privileged_broker_read(&mut broker.stream, id, max_bytes)
+}
+
+fn privileged_broker_read(
+    stream: &mut UnixStream,
+    id: u32,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    stream
+        .write_all(&id.to_ne_bytes())
+        .map_err(|error| format!("privileged TLS broker request failed: {error}"))?;
+    let mut header = [0u8; 9];
+    stream
+        .read_exact(&mut header)
+        .map_err(|error| format!("privileged TLS broker response failed: {error}"))?;
+    let len = u64::from_ne_bytes(header[1..].try_into().expect("fixed broker header"));
+    let response_limit = if header[0] == 0 {
+        max_bytes
+    } else {
+        MAX_BROKER_ERROR_BYTES
+    };
+    // Drain every bounded response before reporting a caller-specific size
+    // violation. A configured path can serve more than one TLS role with
+    // different limits, and leaving its payload unread would frame the next
+    // broker response at the wrong byte.
+    if len > MAX_TLS_CERTIFICATE_BYTES.max(MAX_BROKER_ERROR_BYTES) {
+        return Err("privileged TLS broker returned an oversized response".into());
+    }
+    let mut data = vec![0; len as usize];
+    stream
+        .read_exact(&mut data)
+        .map_err(|error| format!("privileged TLS broker response failed: {error}"))?;
+    if len > response_limit {
+        return Err("privileged TLS broker returned an oversized response".into());
+    }
+    if header[0] == 0 {
+        Ok(data)
+    } else {
+        Err(String::from_utf8_lossy(&data).into_owned())
+    }
+}
+
+pub fn shutdown_privileged_file_broker() {
+    let Some(broker) = PRIVILEGED_FILE_BROKER.get() else {
+        return;
+    };
+    let mut broker = broker.lock().unwrap_or_else(|error| error.into_inner());
+    let _ = broker.stream.write_all(&BROKER_SHUTDOWN.to_ne_bytes());
+    let _ = broker.stream.shutdown(std::net::Shutdown::Both);
+    unsafe {
+        libc::waitpid(broker.pid, std::ptr::null_mut(), 0);
+    }
+}
 
 #[derive(Debug)]
 struct SniResolver {
@@ -88,7 +349,7 @@ impl ResolvesServerCert for SniResolver {
 fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
     crate::fault::hit("tls.cert.read")
         .map_err(|e| format!("cannot open certificate {}: {e}", path.display()))?;
-    let data = crate::files::read_admin_file(path, MAX_TLS_CERTIFICATE_BYTES)
+    let data = read_tls_admin_file(path, MAX_TLS_CERTIFICATE_BYTES)
         .map_err(|e| format!("cannot open certificate {}: {e}", path.display()))?;
     let certs = CertificateDer::pem_slice_iter(&data)
         .collect::<Result<Vec<_>, _>>()
@@ -102,7 +363,7 @@ fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
 fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
     crate::fault::hit("tls.key.read")
         .map_err(|e| format!("cannot open private key {}: {e}", path.display()))?;
-    let data = crate::files::read_admin_file(path, MAX_TLS_PRIVATE_KEY_BYTES)
+    let data = read_tls_admin_file(path, MAX_TLS_PRIVATE_KEY_BYTES)
         .map_err(|e| format!("cannot open private key {}: {e}", path.display()))?;
     PrivateKeyDer::from_pem_slice(&data).map_err(|e| match e {
         PemError::NoItemsFound => format!("no PEM private key found in {}", path.display()),
@@ -528,6 +789,7 @@ fn server_config_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn protocol_selection_is_safe() {
@@ -543,6 +805,67 @@ mod tests {
                 == 2
         );
         assert!(protocol_versions(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn privileged_broker_protocol_rejects_unknown_file_ids() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let helper = std::thread::spawn(move || privileged_broker_loop(&mut server, &[], u32::MAX));
+        client.write_all(&0u32.to_ne_bytes()).unwrap();
+        let mut header = [0u8; 9];
+        client.read_exact(&mut header).unwrap();
+        assert_eq!(header[0], 1);
+        let len = u64::from_ne_bytes(header[1..].try_into().unwrap());
+        assert!(len <= MAX_BROKER_ERROR_BYTES);
+        let mut error = vec![0; len as usize];
+        client.read_exact(&mut error).unwrap();
+        assert!(String::from_utf8(error).unwrap().contains("unrecognized"));
+        client.write_all(&BROKER_SHUTDOWN.to_ne_bytes()).unwrap();
+        helper.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_broker_response_is_drained_before_the_next_request() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let helper = std::thread::spawn(move || {
+            for (expected_id, data) in [(7u32, b"too large".as_slice()), (8, b"ok".as_slice())] {
+                let mut request = [0u8; 4];
+                server.read_exact(&mut request).unwrap();
+                assert_eq!(u32::from_ne_bytes(request), expected_id);
+                let mut header = [0u8; 9];
+                header[1..].copy_from_slice(&(data.len() as u64).to_ne_bytes());
+                server.write_all(&header).unwrap();
+                server.write_all(data).unwrap();
+            }
+        });
+        assert!(privileged_broker_read(&mut client, 7, 2).is_err());
+        assert_eq!(privileged_broker_read(&mut client, 8, 2).unwrap(), b"ok");
+        helper.join().unwrap();
+    }
+
+    #[test]
+    fn privileged_broker_rechecks_service_owned_parents_on_each_read() {
+        let dir = tempdir("broker-parent-recheck");
+        let key = dir.join("key.pem");
+        std::fs::write(&key, b"secret").unwrap();
+        let service_uid = std::fs::metadata(&dir).unwrap().uid();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let helper = std::thread::spawn(move || {
+            privileged_broker_loop(&mut server, &[(key, 16)], service_uid)
+        });
+        client.write_all(&0u32.to_ne_bytes()).unwrap();
+        let mut header = [0u8; 9];
+        client.read_exact(&mut header).unwrap();
+        assert_eq!(header[0], 1);
+        let len = u64::from_ne_bytes(header[1..].try_into().unwrap());
+        let mut error = vec![0; len as usize];
+        client.read_exact(&mut error).unwrap();
+        assert!(String::from_utf8(error)
+            .unwrap()
+            .contains("unsafe TLS path"));
+        client.write_all(&BROKER_SHUTDOWN.to_ne_bytes()).unwrap();
+        helper.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -651,6 +974,33 @@ mod tests {
         let path = dir.join("httpd.conf");
         std::fs::write(&path, text).unwrap();
         Config::load(&path, dir, &Default::default(), &Default::default(), false).unwrap()
+    }
+
+    #[test]
+    fn broker_allowlist_is_exact_deduplicated_and_bounded() {
+        let dir = tempdir("broker-allowlist");
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let cfg = test_config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:443\nSSLEngine On\nSSLCertificateFile {}\nSSLCertificateKeyFile {}\nSSLCertificateChainFile {}\n",
+                cert.display(),
+                key.display(),
+                cert.display()
+            ),
+        );
+        let specs = tls_file_specs(&cfg);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(
+            specs.iter().find(|(path, _)| path == &cert).unwrap().1,
+            MAX_TLS_CERTIFICATE_BYTES
+        );
+        assert_eq!(
+            specs.iter().find(|(path, _)| path == &key).unwrap().1,
+            MAX_TLS_PRIVATE_KEY_BYTES
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

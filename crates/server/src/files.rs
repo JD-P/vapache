@@ -67,6 +67,30 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Trust policy captured when an administrative configuration generation is
+/// first loaded.  A daemon that starts privileged must continue requiring
+/// root-controlled inputs after its request process drops privileges; using
+/// the current euid at reload time would silently weaken that boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminFileTrust {
+    ProcessOwned,
+    RootOwned,
+}
+
+impl AdminFileTrust {
+    pub fn for_current_process() -> Self {
+        if effective_uid() == 0 {
+            Self::RootOwned
+        } else {
+            Self::ProcessOwned
+        }
+    }
+
+    fn requires_root(self) -> bool {
+        self == Self::RootOwned
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn make_test_fifo(path: &Path) -> io::Result<()> {
     let path = CString::new(path.as_os_str().as_bytes())
@@ -108,6 +132,17 @@ pub fn open_admin_path(path: &Path, flags: libc::c_int, mode: libc::mode_t) -> i
 /// not allowed to be FIFOs/devices, to grow while being read, or to live in a
 /// service-writable tree when the daemon is still privileged.
 pub fn read_admin_file(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    read_admin_file_with_trust(path, max_bytes, AdminFileTrust::for_current_process())
+}
+
+/// Read an administrative input under an explicitly retained trust policy.
+/// In particular, `RootOwned` does not become weaker merely because the
+/// caller has already changed its effective uid.
+pub fn read_admin_file_with_trust(
+    path: &Path,
+    max_bytes: u64,
+    trust: AdminFileTrust,
+) -> io::Result<Vec<u8>> {
     let mut file = open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
     let before = file.metadata()?;
     if !before.is_file() || before.len() > max_bytes {
@@ -116,7 +151,7 @@ pub fn read_admin_file(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
             format!("administrative input must be a regular file no larger than {max_bytes} bytes"),
         ));
     }
-    if effective_uid() == 0 {
+    if trust.requires_root() {
         validate_admin_parents(path, u32::MAX)?;
         if before.uid() != 0 || before.mode() & 0o022 != 0 {
             return Err(io::Error::new(
@@ -1466,6 +1501,7 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Read;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::os::unix::fs::PermissionsExt;
 
     fn request(method: &str, path: &[u8]) -> Request {
         Request {
@@ -2227,6 +2263,23 @@ mod tests {
         let fifo = root.join("input-fifo");
         make_test_fifo(&fifo).unwrap();
         assert!(read_admin_file(&fifo, 4).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_root_trust_does_not_follow_the_current_euid() {
+        let (root, _cfg) = config("admin-retained-trust");
+        let input = root.join("input");
+        std::fs::write(&input, b"safe").unwrap();
+        assert_eq!(
+            read_admin_file_with_trust(&input, 4, AdminFileTrust::ProcessOwned).unwrap(),
+            b"safe"
+        );
+        assert!(read_admin_file_with_trust(&input, 4, AdminFileTrust::RootOwned).is_err());
+        let mut mode = std::fs::metadata(&input).unwrap().permissions();
+        mode.set_mode(0o666);
+        std::fs::set_permissions(&input, mode).unwrap();
+        assert!(read_admin_file_with_trust(&input, 4, AdminFileTrust::RootOwned).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 }

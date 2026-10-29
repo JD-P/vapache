@@ -320,8 +320,9 @@ impl Server {
                             let cfg = self.cfg.clone();
                             let logger = self.logger.clone();
                             let worker_limit = cfg.max_request_workers.max(1);
+                            let trusted_proxy = cfg.transport_peer_is_trusted_proxy(peer.ip());
                             let Some(active_guard) =
-                                try_reserve_connection(peer.ip(), worker_limit)
+                                try_reserve_connection(peer.ip(), worker_limit, trusted_proxy)
                             else {
                                 reject_busy_connection(stream, b.tls.is_some(), &self.cfg);
                                 continue;
@@ -391,11 +392,20 @@ impl Drop for ActiveGuard {
     }
 }
 
-fn per_client_connection_limit(limit: usize) -> usize {
-    (limit / 2 + limit % 2).clamp(1, MAX_CONNECTIONS_PER_CLIENT)
+fn per_client_connection_limit(limit: usize, trusted_proxy: bool) -> usize {
+    if trusted_proxy {
+        limit.max(1)
+    } else {
+        (limit / 2 + limit % 2).clamp(1, MAX_CONNECTIONS_PER_CLIENT)
+    }
 }
 
-fn try_reserve_connection(client: IpAddr, limit: usize) -> Option<ActiveGuard> {
+fn try_reserve_connection(
+    client: IpAddr,
+    limit: usize,
+    trusted_proxy: bool,
+) -> Option<ActiveGuard> {
+    let client = crate::resource::client_quota_key(client);
     let limit = limit.max(1);
     let mut current = ACTIVE_CONNECTIONS.load(Ordering::Acquire);
     loop {
@@ -417,8 +427,10 @@ fn try_reserve_connection(client: IpAddr, limit: usize) -> Option<ActiveGuard> {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let count = clients.entry(client).or_default();
-    if !vapache_verified::connection_admit(*count as u64, per_client_connection_limit(limit) as u64)
-    {
+    if !vapache_verified::connection_admit(
+        *count as u64,
+        per_client_connection_limit(limit, trusted_proxy) as u64,
+    ) {
         ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
         return None;
     }
@@ -4779,7 +4791,8 @@ mod tests {
     #[test]
     fn connection_spawn_failure_releases_reserved_slot() {
         let before = active_connections();
-        let guard = try_reserve_connection(IpAddr::from([192, 0, 2, 1]), usize::MAX).unwrap();
+        let guard =
+            try_reserve_connection(IpAddr::from([192, 0, 2, 1]), usize::MAX, false).unwrap();
         crate::fault::configure(
             "server.connection.spawn",
             0,
@@ -4792,22 +4805,33 @@ mod tests {
 
     #[test]
     fn per_client_connection_limit_is_enforced_and_released() {
-        assert_eq!(per_client_connection_limit(0), 1);
-        assert_eq!(per_client_connection_limit(1), 1);
-        assert_eq!(per_client_connection_limit(2), 1);
-        assert_eq!(per_client_connection_limit(3), 2);
-        assert_eq!(per_client_connection_limit(64), 32);
-        assert_eq!(per_client_connection_limit(usize::MAX), 32);
+        assert_eq!(per_client_connection_limit(0, false), 1);
+        assert_eq!(per_client_connection_limit(1, false), 1);
+        assert_eq!(per_client_connection_limit(2, false), 1);
+        assert_eq!(per_client_connection_limit(3, false), 2);
+        assert_eq!(per_client_connection_limit(64, false), 32);
+        assert_eq!(per_client_connection_limit(usize::MAX, false), 32);
+        assert_eq!(per_client_connection_limit(64, true), 64);
         let client = IpAddr::from([192, 0, 2, 99]);
         let other = IpAddr::from([192, 0, 2, 100]);
         let limit = usize::MAX;
-        let leases: Vec<_> = (0..per_client_connection_limit(limit))
-            .map(|_| try_reserve_connection(client, limit).unwrap())
+        let leases: Vec<_> = (0..per_client_connection_limit(limit, false))
+            .map(|_| try_reserve_connection(client, limit, false).unwrap())
             .collect();
-        assert!(try_reserve_connection(client, limit).is_none());
-        assert!(try_reserve_connection(other, limit).is_some());
+        assert!(try_reserve_connection(client, limit, false).is_none());
+        assert!(try_reserve_connection(other, limit, false).is_some());
         drop(leases);
-        assert!(try_reserve_connection(client, limit).is_some());
+        assert!(try_reserve_connection(client, limit, false).is_some());
+
+        let ipv6: IpAddr = "2001:db8:10:20::1".parse().unwrap();
+        let rotated: IpAddr = "2001:db8:10:20:ffff::1".parse().unwrap();
+        let other_prefix: IpAddr = "2001:db8:10:21::1".parse().unwrap();
+        let leases: Vec<_> = (0..per_client_connection_limit(limit, false))
+            .map(|_| try_reserve_connection(ipv6, limit, false).unwrap())
+            .collect();
+        assert!(try_reserve_connection(rotated, limit, false).is_none());
+        assert!(try_reserve_connection(other_prefix, limit, false).is_some());
+        drop(leases);
     }
 
     fn cov_ws_request(path: &str) -> String {

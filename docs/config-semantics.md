@@ -630,6 +630,36 @@ authorization shortcut.  A directory URL additionally resolves its
 fingerprint then describe that selected file/script rather than the directory
 (I49).
 
+### Reload trust continuity
+
+```text
+Reload(old, candidate) is admitted only if
+    candidate.admin_input_trust == old.admin_input_trust
+    && every discovered administrative parent is not service-writable
+    && candidate.{User, Group, PidFile, ServerRoot,
+                  ListenBacklog, Listen}
+       == old.{User, Group, PidFile, ServerRoot,
+               ListenBacklog, Listen}
+```
+
+A privileged startup captures root-owned input trust before dropping uid and
+retains it for every later parse. Includes (including empty optional globs or
+directories), TLS files, `TypesConfig`, and file-backed rewrite maps are all
+part of the generation's administrative-input manifest. A SIGHUP therefore
+cannot reinterpret service-owned input as trusted merely because the request
+process is now unprivileged. Directives whose effects live in process identity,
+the pid guard, path base or kernel listeners require a full restart instead of
+creating a configuration/runtime split.
+
+TLS is the one root-only input that must support same-path rotation during a
+graceful reload. Before threads and privilege drop, the parent forks a broker
+with an exact numeric allowlist of TLS paths compiled from the startup
+configuration. The helper accepts no pathname from the request process, closes
+unrelated inherited descriptors, rechecks root ownership, type, size and stable
+metadata on every read, and exits when its parent does. A reload may replace
+the contents at an already-authorized path; adding a different TLS pathname
+requires a full restart.
+
 ### I21 — Alias root identity
 
 ```text
@@ -969,12 +999,12 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | FastCGI response head | bounded prefix/header scan before body streaming |
 | Aggregate dynamic I/O | RAII byte/file reservations across request, response, CGI-worker and FastCGI/proxy spools; 128 MiB request and response resident ceilings; shared CGI/FastCGI concurrency slots; 32 blocking reads |
 | HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error |
-| HTTP/2 | verified settings, header-state, flow-control and reset budgets; at most 32 streams per connection, 64 per source and 256 process-wide, each with a 64 KiB resident body prefix before using the shared request-spool quota |
+| HTTP/2 | verified settings, header-state, flow-control and reset budgets; at most 32 streams per connection, 64 per validated effective-client quota key and 256 process-wide, each with a 64 KiB resident body prefix before using the shared request-spool quota |
 | Compression/PCRE/password hashing | fixed input/cost bounds and a shared 32-operation CPU-work admission gate; optional compression falls back to identity under pressure |
 | Autoindex | at most 4096 examined directory records (including filtered names), 4096 rendered entries and 4 MiB of generated HTML |
 | DNS authorization | eight resolver workers, queue length 64, two-second caller deadline and bounded copied host operands |
 | Expression `file()` | confined regular descriptor, `O_NONBLOCK`/`O_NOFOLLOW`, 64 KiB read ceiling |
-| Administrative inputs | no-symlink regular descriptors with stable before/after metadata; 4 MiB per configuration/certificate/TypesConfig file, 1 MiB per key/envvars file, existing RewriteMap limit, and 16 MiB aggregate configuration text |
+| Administrative inputs | no-symlink regular descriptors with stable before/after metadata; retained root trust and service-nonwritable parents across reload; 4 MiB per configuration/certificate/TypesConfig file, 1 MiB per key/envvars file, existing RewriteMap limit, and 16 MiB aggregate configuration text |
 
 A malformed or over-limit stream produces an error response or connection
 close; request-spool exhaustion specifically produces `503` and releases its
@@ -988,7 +1018,12 @@ large cached bodies remain file-backed on warm hits, and request-policy,
 access-file and password-file caches have independent byte and entry ceilings.
 Connection admission uses an atomic reserve/release guard, including thread
 spawn failure, and descriptor-exhaustion accept errors back off instead of
-spinning.
+spinning. Per-client accounting canonicalizes IPv4-mapped addresses, keeps
+IPv4 exact, and maps IPv6 to a Verus-verified `/64` key so rotating interface
+identifiers cannot evade connection, HTTP/2 or WebSocket ceilings. HTTP/2 and
+WebSocket admission use the validated effective RemoteIP identity. A transport
+peer explicitly trusted to present many such identities is still bounded by
+the process-wide worker ceiling, but is not charged as one ordinary client.
 
 ### I34 — Main-configuration directive disposition closure
 

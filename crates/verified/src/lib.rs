@@ -5321,6 +5321,34 @@ pub fn connection_admit(active: u64, max: u64) -> (ok: bool)
     active < max
 }
 
+/// Fairness identity for IPv6 clients. Hosts normally receive at least a /64,
+/// so counting all 128 bits lets one client evade every per-client ceiling by
+/// rotating interface identifiers. IPv4 remains exact in the caller.
+pub open spec fn client_quota_ipv6_key_spec(ip: u128) -> u128 {
+    ip & 0xffff_ffff_ffff_ffff_0000_0000_0000_0000u128
+}
+
+pub fn client_quota_ipv6_key(ip: u128) -> (key: u128)
+    ensures key == client_quota_ipv6_key_spec(ip),
+{
+    ip & 0xffff_ffff_ffff_ffff_0000_0000_0000_0000u128
+}
+
+pub proof fn client_quota_ipv6_key_has_zero_host(ip: u128)
+    ensures
+        client_quota_ipv6_key_spec(ip) & 0x0000_0000_0000_0000_ffff_ffff_ffff_ffffu128 == 0,
+{
+    assert((ip & 0xffff_ffff_ffff_ffff_0000_0000_0000_0000u128)
+        & 0x0000_0000_0000_0000_ffff_ffff_ffff_ffffu128 == 0) by (bit_vector);
+}
+
+pub proof fn client_quota_ipv6_key_preserves_prefix(ip: u128)
+    ensures client_quota_ipv6_key_spec(ip) >> 64 == ip >> 64,
+{
+    assert((ip & 0xffff_ffff_ffff_ffff_0000_0000_0000_0000u128) >> 64 == ip >> 64)
+        by (bit_vector);
+}
+
 /// The request-serving identity must never retain uid/gid zero.  A privileged
 /// launcher may switch to the configured pair; an already-unprivileged launch
 /// is admitted only when both effective IDs already match exactly.

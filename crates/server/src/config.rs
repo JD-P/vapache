@@ -2158,10 +2158,18 @@ impl MimeMap {
     }
 
     pub fn load_types_file(&mut self, path: &Path) -> Result<(), String> {
+        self.load_types_file_with_trust(path, crate::files::AdminFileTrust::for_current_process())
+    }
+
+    fn load_types_file_with_trust(
+        &mut self,
+        path: &Path,
+        trust: crate::files::AdminFileTrust,
+    ) -> Result<(), String> {
         if !vapache_verified::text_identity_admit(path.to_str().is_some()) {
             return Err("TypesConfig path is not valid UTF-8".into());
         }
-        let data = crate::files::read_admin_file(path, MAX_TYPES_CONFIG_BYTES)
+        let data = crate::files::read_admin_file_with_trust(path, MAX_TYPES_CONFIG_BYTES, trust)
             .map_err(|e| format!("cannot read TypesConfig {}: {e}", path.display()))?;
         let text = std::str::from_utf8(&data)
             .map_err(|_| format!("TypesConfig {} is not valid UTF-8", path.display()))?;
@@ -2645,11 +2653,57 @@ pub struct Config {
     pub server_software: String,
     pub ssl: SslConfig,
     pub cache: CacheConfig,
+    /// Trust captured before privilege drop and retained by every reload.
+    admin_file_trust: crate::files::AdminFileTrust,
+    /// File-shaped targets whose parent chain must remain outside the service
+    /// account's control. Include globs and directories are represented by a
+    /// synthetic child so an empty directory is still checked.
+    admin_input_targets: Vec<PathBuf>,
     policy_cache: Arc<RwLock<BoundedPolicyCache<CachedPolicy>>>,
     dir_scope_cache: Arc<RwLock<BoundedPolicyCache<Scope>>>,
 }
 
 impl Config {
+    /// Reject directives whose startup effects cannot be changed by swapping
+    /// an in-memory configuration generation. Accepting them would make the
+    /// reported configuration disagree with the process identity, pid guard,
+    /// path base, or kernel listener state.
+    pub fn validate_reload_from(&self, previous: &Config) -> Result<(), String> {
+        let mut changed = Vec::new();
+        if self.user != previous.user {
+            changed.push("User");
+        }
+        if self.group != previous.group {
+            changed.push("Group");
+        }
+        if self.pid_file != previous.pid_file {
+            changed.push("PidFile");
+        }
+        if self.server_root != previous.server_root {
+            changed.push("ServerRoot");
+        }
+        if self.listen_backlog != previous.listen_backlog {
+            changed.push("ListenBacklog");
+        }
+        let listeners_changed = self.listeners.len() != previous.listeners.len()
+            || self
+                .listeners
+                .iter()
+                .zip(&previous.listeners)
+                .any(|(a, b)| a.addr != b.addr || a.port != b.port || a.raw != b.raw);
+        if listeners_changed {
+            changed.push("Listen");
+        }
+        if changed.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "changing {} requires a full restart",
+                changed.join(", ")
+            ))
+        }
+    }
+
     pub fn capability_enabled(&self, capability: Capability) -> bool {
         self.capabilities.contains(capability)
     }
@@ -2694,7 +2748,57 @@ impl Config {
         defines: &HashMap<String, String>,
         strict: bool,
     ) -> Result<Config, Vec<ConfigError>> {
-        Self::load_mode(path, server_root, env, defines, strict, false)
+        Self::load_mode(
+            path,
+            server_root,
+            env,
+            defines,
+            strict,
+            false,
+            crate::files::AdminFileTrust::for_current_process(),
+            None,
+        )
+    }
+
+    /// Reload while retaining the trust boundary captured by the original
+    /// configuration generation. `service_uid` is the identity of the
+    /// request process, not the euid performing this parse.
+    pub fn load_for_reload(
+        path: &Path,
+        server_root: &Path,
+        env: &HashMap<String, String>,
+        defines: &HashMap<String, String>,
+        strict: bool,
+        previous: &Config,
+        service_uid: u32,
+    ) -> Result<Config, Vec<ConfigError>> {
+        Self::load_mode(
+            path,
+            server_root,
+            env,
+            defines,
+            strict,
+            false,
+            previous.admin_file_trust,
+            Some(service_uid),
+        )
+    }
+
+    /// Validate paths discovered before the configured service identity was
+    /// resolved. This closes the empty-IncludeOptional case at initial start.
+    pub fn validate_admin_input_parents(&self, service_uid: u32) -> Result<(), String> {
+        if self.admin_file_trust != crate::files::AdminFileTrust::RootOwned {
+            return Ok(());
+        }
+        for target in &self.admin_input_targets {
+            crate::files::validate_admin_parents(target, service_uid).map_err(|error| {
+                format!(
+                    "administrative input parent for {} is unsafe: {error}",
+                    target.display()
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// Parse a configuration for capability migration reporting. Missing
@@ -2707,7 +2811,16 @@ impl Config {
         defines: &HashMap<String, String>,
         strict: bool,
     ) -> Result<Config, Vec<ConfigError>> {
-        Self::load_mode(path, server_root, env, defines, strict, true)
+        Self::load_mode(
+            path,
+            server_root,
+            env,
+            defines,
+            strict,
+            true,
+            crate::files::AdminFileTrust::for_current_process(),
+            None,
+        )
     }
 
     fn load_mode(
@@ -2717,6 +2830,8 @@ impl Config {
         defines: &HashMap<String, String>,
         strict: bool,
         capability_audit: bool,
+        admin_file_trust: crate::files::AdminFileTrust,
+        admin_service_uid: Option<u32>,
     ) -> Result<Config, Vec<ConfigError>> {
         let mut p = ParserState {
             events: Vec::new(),
@@ -2731,6 +2846,9 @@ impl Config {
             server_root: server_root.to_path_buf(),
             include_count: 0,
             config_bytes: 0,
+            admin_file_trust,
+            admin_service_uid,
+            admin_input_targets: Vec::new(),
         };
         p.parse_file(path, true);
         if let Some((open, _, _)) = p.section_stack.last() {
@@ -2796,6 +2914,9 @@ struct ParserState {
     server_root: PathBuf,
     include_count: usize,
     config_bytes: u64,
+    admin_file_trust: crate::files::AdminFileTrust,
+    admin_service_uid: Option<u32>,
+    admin_input_targets: Vec<PathBuf>,
 }
 
 fn norm_module(name: &str) -> String {
@@ -3013,6 +3134,27 @@ impl ParserState {
         }
     }
 
+    fn register_admin_input(&mut self, target: &Path, loc: &SourceLoc) -> bool {
+        if !self.admin_input_targets.iter().any(|known| known == target) {
+            self.admin_input_targets.push(target.to_path_buf());
+        }
+        if self.admin_file_trust == crate::files::AdminFileTrust::RootOwned {
+            if let Some(service_uid) = self.admin_service_uid {
+                if let Err(error) = crate::files::validate_admin_parents(target, service_uid) {
+                    self.error(
+                        loc,
+                        format!(
+                            "administrative input parent for {} is unsafe: {error}",
+                            target.display()
+                        ),
+                    );
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn expand_vars(&mut self, args: &[String], loc: &SourceLoc) -> Option<Vec<String>> {
         let mut out = Vec::with_capacity(args.len());
         for a in args {
@@ -3062,6 +3204,13 @@ impl ParserState {
     }
 
     fn parse_file(&mut self, path: &Path, required: bool) {
+        let path_loc = SourceLoc {
+            file: path.display().to_string(),
+            line: 0,
+        };
+        if !self.register_admin_input(path, &path_loc) {
+            return;
+        }
         if !vapache_verified::text_identity_admit(path.to_str().is_some()) {
             let loc = SourceLoc {
                 file: path.display().to_string(),
@@ -3078,7 +3227,11 @@ impl ParserState {
             self.error(&loc, "Include nesting too deep");
             return;
         }
-        let data = match crate::files::read_admin_file(path, MAX_CONFIG_FILE_BYTES) {
+        let data = match crate::files::read_admin_file_with_trust(
+            path,
+            MAX_CONFIG_FILE_BYTES,
+            self.admin_file_trust,
+        ) {
             Ok(d) => d,
             Err(e) => {
                 if required {
@@ -3274,7 +3427,16 @@ impl ParserState {
             self.error(loc, "Include path is not valid UTF-8");
             return;
         };
-        if s.contains('*') || s.contains('?') || s.contains('[') {
+        let has_glob = s.contains('*') || s.contains('?') || s.contains('[');
+        let trust_target = if !has_glob && full.is_dir() {
+            full.join(".vapache-include-entry")
+        } else {
+            full.clone()
+        };
+        if !self.register_admin_input(&trust_target, loc) {
+            return;
+        }
+        if has_glob {
             let (dir, pat) = match s.rfind('/') {
                 Some(i) => (&s[..i], &s[i + 1..]),
                 None => (".", s.as_str()),
@@ -3592,6 +3754,8 @@ struct Compile {
 impl Compile {
     fn new(p: ParserState, strict: bool, capability_audit: bool) -> Self {
         let server_root = p.server_root.clone();
+        let admin_file_trust = p.admin_file_trust;
+        let admin_input_targets = p.admin_input_targets.clone();
         let config_defines: HashSet<String> = p.defines.keys().cloned().collect();
         let modules: Vec<String> = {
             let mut v: Vec<String> = p.modules.into_iter().collect();
@@ -3663,6 +3827,8 @@ impl Compile {
             server_software: "Apache".into(),
             ssl: SslConfig::default(),
             cache: CacheConfig::default(),
+            admin_file_trust,
+            admin_input_targets,
             policy_cache: Arc::new(RwLock::new(BoundedPolicyCache::default())),
             dir_scope_cache: Arc::new(RwLock::new(BoundedPolicyCache::default())),
         };
@@ -3751,7 +3917,19 @@ impl Compile {
         kind: &str,
         path: &Path,
     ) -> Option<String> {
-        match crate::files::read_admin_file(path, MAX_REWRITEMAP) {
+        if !self
+            .cfg
+            .admin_input_targets
+            .iter()
+            .any(|known| known == path)
+        {
+            self.cfg.admin_input_targets.push(path.to_path_buf());
+        }
+        match crate::files::read_admin_file_with_trust(
+            path,
+            MAX_REWRITEMAP,
+            self.cfg.admin_file_trust,
+        ) {
             Ok(data) => match String::from_utf8(data) {
                 Ok(data) => Some(data),
                 Err(_) => {
@@ -3864,6 +4042,34 @@ impl Compile {
             }
         }
         self.cfg.vhosts = self.vhosts_raw;
+        let mut tls_inputs = Vec::new();
+        let mut collect_tls = |ssl: &SslConfig| {
+            tls_inputs.extend(
+                [
+                    ssl.cert_file.as_ref(),
+                    ssl.key_file.as_ref(),
+                    ssl.chain_file.as_ref(),
+                    ssl.ca_file.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .cloned(),
+            );
+        };
+        collect_tls(&self.cfg.ssl);
+        for vhost in &self.cfg.vhosts {
+            collect_tls(&vhost.ssl);
+        }
+        for path in tls_inputs {
+            if !self
+                .cfg
+                .admin_input_targets
+                .iter()
+                .any(|known| known == &path)
+            {
+                self.cfg.admin_input_targets.push(path);
+            }
+        }
         self.cfg.warnings = std::mem::take(&mut self.warnings);
         Ok(self.cfg)
     }
@@ -5645,7 +5851,19 @@ impl Compile {
                 } else {
                     self.cfg.server_root.join(p)
                 };
-                if let Err(e) = self.cfg.mime.load_types_file(&full) {
+                if !self
+                    .cfg
+                    .admin_input_targets
+                    .iter()
+                    .any(|known| known == &full)
+                {
+                    self.cfg.admin_input_targets.push(full.clone());
+                }
+                if let Err(e) = self
+                    .cfg
+                    .mime
+                    .load_types_file_with_trust(&full, self.cfg.admin_file_trust)
+                {
                     self.errors.push(ConfigError {
                         file: loc.file.clone(),
                         line: loc.line,
@@ -11188,6 +11406,8 @@ ServerName localhost\n\
         assert_eq!(trusted.remoteip_proxies.len(), 1);
         assert!(!trusted.remoteip_proxies[0].internal);
         let peer: std::net::SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        assert!(trusted.transport_peer_is_trusted_proxy(peer.ip()));
+        assert!(!trusted.transport_peer_is_trusted_proxy("127.0.0.2".parse().unwrap()));
         for spoof in [
             "10.1.2.3",
             "8.8.8.8, 10.1.2.3",
@@ -11208,6 +11428,10 @@ ServerName localhost\n\
             .insert("x-forwarded-for", b"8.8.8.8".to_vec());
         assert_eq!(
             trusted.client_addr(peer, &public),
+            "8.8.8.8:1234".parse().unwrap()
+        );
+        assert_eq!(
+            trusted.client_addr_from_headers(peer, &public.headers),
             "8.8.8.8:1234".parse().unwrap()
         );
 
@@ -11269,6 +11493,9 @@ ServerName localhost\n\
             server_root: root.to_path_buf(),
             include_count: 0,
             config_bytes: 0,
+            admin_file_trust: crate::files::AdminFileTrust::for_current_process(),
+            admin_service_uid: None,
+            admin_input_targets: Vec::new(),
         }
     }
 
@@ -11449,6 +11676,58 @@ ServerName localhost\n\
             false
         )
         .is_ok());
+    }
+
+    #[test]
+    fn empty_optional_include_parent_is_part_of_the_trust_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "vapache-config-empty-include-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("includes")).unwrap();
+        let conf = root.join("httpd.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "Listen 127.0.0.1:0\nIncludeOptional {}/*.conf\n",
+                root.join("includes").display()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(&conf, &root, &HashMap::new(), &HashMap::new(), false).unwrap();
+        assert!(cfg
+            .admin_input_targets
+            .contains(&root.join("includes/*.conf")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reload_rejects_startup_only_directive_changes() {
+        let cfg = load_text(
+            "Listen 127.0.0.1:8080\nUser nobody\nGroup nogroup\nPidFile /tmp/old.pid\n",
+            false,
+        )
+        .unwrap();
+        let mut changed = cfg.clone();
+        changed.user = "other".into();
+        changed.group = "other".into();
+        changed.pid_file = "/tmp/new.pid".into();
+        changed.server_root = "/different".into();
+        changed.listen_backlog += 1;
+        changed.listeners[0].port = 8081;
+        let error = changed.validate_reload_from(&cfg).unwrap_err();
+        for directive in [
+            "User",
+            "Group",
+            "PidFile",
+            "ServerRoot",
+            "ListenBacklog",
+            "Listen",
+        ] {
+            assert!(error.contains(directive), "{error}");
+        }
+        assert!(cfg.validate_reload_from(&cfg).is_ok());
     }
 
     #[test]
@@ -13052,6 +13331,13 @@ impl Config {
             .unwrap_or(vapache_verified::RemoteIpProxyClass::Untrusted)
     }
 
+    /// Transport peers explicitly trusted to present RemoteIP identities are
+    /// gateways for many clients, not one client for fairness accounting.
+    pub fn transport_peer_is_trusted_proxy(&self, ip: IpAddr) -> bool {
+        self.remoteip_header.is_some()
+            && self.remoteip_proxy_class(ip) != vapache_verified::RemoteIpProxyClass::Untrusted
+    }
+
     /// Apache 2.4.69's exact external-chain address rule from
     /// `mod_remoteip.c`: reject five IPv4 private/local ranges and accept only
     /// IPv6 global-unicast 2000::/3. IPv4-mapped IPv6 is canonicalized first.
@@ -13078,15 +13364,40 @@ impl Config {
         peer: std::net::SocketAddr,
         req: &crate::http::Request,
     ) -> std::net::SocketAddr {
+        let value = self
+            .remoteip_header
+            .as_ref()
+            .and_then(|header| req.header(&header.to_ascii_lowercase()));
+        self.client_addr_with_remoteip_value(peer, value)
+    }
+
+    /// HTTP/2 needs the effective identity immediately after validating the
+    /// header block, before it admits a potentially slow request body.
+    pub fn client_addr_from_headers(
+        &self,
+        peer: std::net::SocketAddr,
+        headers: &crate::http::Headers,
+    ) -> std::net::SocketAddr {
+        let value = self
+            .remoteip_header
+            .as_ref()
+            .and_then(|header| headers.get(&header.to_ascii_lowercase()));
+        self.client_addr_with_remoteip_value(peer, value)
+    }
+
+    fn client_addr_with_remoteip_value(
+        &self,
+        peer: std::net::SocketAddr,
+        value: Option<&[u8]>,
+    ) -> std::net::SocketAddr {
         let peer = crate::access::canonical_socket_addr(peer);
-        let Some(header) = &self.remoteip_header else {
+        if self.remoteip_header.is_none() {
             return peer;
-        };
+        }
         if self.remoteip_proxies.is_empty() {
             return peer;
         }
-        let header = header.to_ascii_lowercase();
-        let Some(value) = req.header(&header) else {
+        let Some(value) = value else {
             return peer;
         };
         let text = String::from_utf8_lossy(value);

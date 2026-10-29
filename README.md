@@ -70,9 +70,15 @@ Implemented today:
 - HTTP Basic authentication (`AuthType Basic`, `AuthName`, `AuthUserFile`,
   `AuthGroupFile`, `Require valid-user`, `Require user` and `Require group`)
   with Apache-compatible `$apr1$`, `$1$`, bcrypt, `{SHA}` and `{SSHA}`
-  htpasswd hashes. Plaintext and unknown hash formats fail closed.
+  htpasswd hashes. Password/group files are opened nonblocking through the
+  no-symlink resolver, must be bounded regular files, and are accepted only
+  while the pathname still names the inode that was read. Plaintext and
+  unknown hash formats fail closed.
 - TLS 1.2/1.3 via Rustls with `SSLEngine`, certificate chains, SNI virtual-host
   certificate selection, ALPN and `-t` certificate validation on startup.
+  A root-started daemon retains a minimal pre-thread TLS file broker whose
+  numeric allowlist is fixed by the startup configuration, so SIGHUP can
+  rotate root-only keys without restoring arbitrary root pathname access.
 - HTTP/2 over TLS (ALPN `h2`) with bounded header/stream limits, Apache
   request/body limits, content-length validation, CGI POST, ranges and HEAD.
   Request bodies retain at most a 64 KiB prefix per stream and then use the
@@ -154,7 +160,10 @@ Implemented today:
   `MaxRequestWorkers`/`ListenBacklog`, graceful `SIGHUP` reload with listener
   reuse, `SIGUSR1` log reopen, `-k graceful`/`graceful-stop` with connection
   draining, pidfd-based control actions bound to the daemon's boot/start/exe
-  identity, pre-thread daemonization, reload cache isolation, hard absolute body deadlines, and
+  identity, pre-thread daemonization, reload cache isolation, retained
+  root-ownership/parent trust for every administrative input, and rejection
+  of reload-only changes to process identity, listeners, pid file, server root
+  or listen backlog. Hard absolute body deadlines and
   request-body spooling for fixed HTTP/1 bodies declared above 1 MB after a
   64 KiB actual-byte prefix (also 64 KiB for chunked HTTP/1 and HTTP/2).
 - Bounded-memory proxy and FastCGI traffic: large fixed-length upstream
@@ -174,13 +183,18 @@ Implemented today:
   Autoindex scans at most 4096 directory records and renders at most 4 MiB. Request
   policy, access-file, password-file and disk-cache metadata indexes are
   byte/count bounded and evict individual entries rather than clearing or
-  rescanning an attacker-amplifiable working set.
+  rescanning an attacker-amplifiable working set. Per-client identities use
+  exact IPv4 addresses and verified IPv6 `/64` keys; HTTP/2 and WebSocket
+  quotas use the validated `RemoteIPHeader` identity, while an explicitly
+  trusted transport proxy remains bounded by the process-wide worker ceiling
+  instead of being mistaken for a single end user.
 - Privileged startup refuses uid/gid 0 and fails when an unprivileged launch
   does not already match the configured identity. Configuration/includes,
   TLS material, environment files, `TypesConfig`, and file-backed rewrite maps
   are regular, no-symlink administrative inputs with per-file bounds and
-  stable descriptor snapshots; aggregate configuration text is capped at
-  16 MiB.
+  stable descriptor snapshots; their parent chains cannot be writable by the
+  service identity, including empty optional-include directories. Aggregate
+  configuration text is capped at 16 MiB.
 - Unsupported security-sensitive directives (`SSLRequire*`,
   `SecRuleEngine On`) fail closed even in
   compatibility mode rather than silently weakening access or TLS policy.
@@ -228,7 +242,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **486 verified functions, 0 errors** (percent-decoding,
+Current result: **494 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
