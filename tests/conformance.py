@@ -1107,6 +1107,7 @@ def common(port, root, apache, tls_port):
             "VapacheCapability RewriteProgram On",
             "VapacheCapability ServerStatus On",
             "VapacheCapability Trace On",
+            "VapacheCapability UnstableFastCgiPaths On",
         ]
     if not apache:
         # vapached records LoadModule names for <IfModule>; the paths are not

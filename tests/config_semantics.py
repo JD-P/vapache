@@ -168,6 +168,7 @@ def base_config(port: int, apache: bool) -> str:
             "VapacheCapability RewriteProgram On",
             "VapacheCapability ServerStatus On",
             "VapacheCapability Trace On",
+            "VapacheCapability UnstableFastCgiPaths On",
         ]
     lines += [
         f'ServerRoot "{BASE}"',

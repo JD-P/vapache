@@ -760,6 +760,11 @@ fn main() {
     }
 
     if args.test {
+        if let Err(e) = vapached::files::require_secure_path_resolution() {
+            eprintln!("vapached: {e}");
+            eprintln!("vapached: configuration test failed");
+            std::process::exit(1);
+        }
         // Apache's configtest also validates SSL certificate/key material.
         // Do this before printing Syntax OK so missing or unreadable TLS
         // files fail closed rather than at first HTTPS connection attempt.

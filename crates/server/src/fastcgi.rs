@@ -561,7 +561,17 @@ fn stable_policy_for<'a>(
     backend: &Backend,
 ) -> io::Result<Option<&'a FastCgiStablePathPolicy>> {
     let Some(policies) = &cfg.fastcgi_stable_paths else {
-        return Ok(None);
+        return if vapache_verified::capability_admit(
+            cfg.capability_enabled(crate::config::Capability::UnstableFastCgiPaths),
+            true,
+        ) {
+            Ok(None)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "FastCGI requires VapacheFastCGIStablePath; enabling UnstableFastCgiPaths explicitly accepts the external pathname race",
+            ))
+        };
     };
     policies
         .iter()
@@ -1232,7 +1242,11 @@ mod tests {
 
     fn config(root: &Path) -> Config {
         let path = root.join("httpd.conf");
-        fs::write(&path, "Listen 127.0.0.1:0\n").unwrap();
+        fs::write(
+            &path,
+            format!("{}Listen 127.0.0.1:0\n", crate::config::TEST_CAPABILITIES),
+        )
+        .unwrap();
         Config::load(&path, root, &HashMap::new(), &HashMap::new(), false).unwrap()
     }
 
@@ -1279,6 +1293,22 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn pathname_only_fastcgi_handoff_requires_explicit_capability() {
+        let root = std::env::temp_dir();
+        let mut cfg = config(&root);
+        let backend = parse_backend("fcgi://127.0.0.1:9000").unwrap();
+
+        cfg.capabilities
+            .set(crate::config::Capability::UnstableFastCgiPaths, false);
+        let error = stable_policy_for(&cfg, &backend).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        cfg.capabilities
+            .set(crate::config::Capability::UnstableFastCgiPaths, true);
+        assert!(stable_policy_for(&cfg, &backend).unwrap().is_none());
     }
 
     #[cfg(target_os = "linux")]

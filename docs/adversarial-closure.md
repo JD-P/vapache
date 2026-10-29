@@ -344,9 +344,12 @@ remediation battery with both exploit and `AuthConfig` parity controls.
 Four additional attack surfaces are closed before the next adversarial pass:
 
 - `VapacheFastCGIStablePath` is repeatable and keyed to one exact Unix socket.
-  Enabling it rejects every unregistered backend, authenticates the socket by
-  type, owner and inode before and after connect, and rejects TCP because a
-  loopback address does not authenticate the process that owns it.
+  FastCGI requires an exact policy by default, rejects every unregistered
+  backend, authenticates the socket by type, owner and inode before and after
+  connect, and rejects TCP because a loopback address does not authenticate
+  the process that owns it. `UnstableFastCgiPaths` is the explicit,
+  process-global escape hatch for deployments that accept the external
+  pathname race and enforce an equivalent immutable-tree invariant.
 - Stable script and socket paths reject POSIX ACLs as well as backend-owned or
   group/other-writable components. Concurrent atomic-swap tests exercise both
   the final FastCGI inode binding and the access-file descriptor/pathname

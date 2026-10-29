@@ -4,7 +4,8 @@
 //! Every filesystem access goes through `openat2(root, ..., RESOLVE_BENEATH)`
 //! (with `RESOLVE_NO_SYMLINKS` when `Options -FollowSymLinks`).  This makes
 //! path traversal impossible even if URI normalization has a bug: the kernel
-//! refuses to resolve outside the document root.
+//! refuses to resolve outside the document root.  `openat2` is a mandatory
+//! startup requirement; there is no pathname-based compatibility fallback.
 
 use crate::config::{Config, ErrorDoc, Scope, ServerSignature, VHost, ETAG_ALL};
 use crate::http::{reason_phrase, Body, Request, Response};
@@ -334,26 +335,24 @@ fn open_beneath(root: &Path, rel: &Path, flags: u64, follow: bool) -> OpenResult
     if fd >= 0 {
         return Ok(unsafe { File::from_raw_fd(fd as i32) });
     }
-    let e = io::Error::last_os_error();
-    if e.raw_os_error() != Some(libc::ENOSYS) && e.raw_os_error() != Some(libc::EINVAL) {
-        return Err(e);
-    }
-    // Fallback for kernels without openat2.  Canonicalize and verify the
-    // prefix; this is TOCTOU-prone, so openat2 is strongly preferred.
-    let candidate = root.join(rel);
-    let canon_root = root.canonicalize()?;
-    let canon = candidate.canonicalize()?;
-    if !canon.starts_with(&canon_root) {
-        return Err(io::Error::from_raw_os_error(libc::EXDEV));
-    }
-    let mut o = std::fs::OpenOptions::new();
-    o.read(true);
-    if flags & libc::O_DIRECTORY as u64 != 0 {
-        if !canon.is_dir() {
-            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
-        }
-    }
-    o.open(canon)
+    Err(io::Error::last_os_error())
+}
+
+/// Refuse to serve when the kernel cannot enforce descriptor-relative path
+/// containment.  A canonicalize-then-open fallback has an unavoidable rename
+/// race and is not an acceptable security boundary.
+pub fn require_secure_path_resolution() -> io::Result<()> {
+    let flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY) as u64;
+    open_beneath(Path::new("/"), Path::new("."), flags, true)
+        .map(drop)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "secure path resolution requires Linux openat2 with RESOLVE_BENEATH and RESOLVE_NO_MAGICLINKS: {error}"
+                ),
+            )
+        })
 }
 
 fn open_at(dir: &File, name: &[u8], follow: bool) -> OpenResult {
@@ -1316,14 +1315,20 @@ mod tests {
             Target::Forbidden
         ));
 
+        assert!(require_secure_path_resolution().is_ok());
         let invalid_open_flag = 1u64 << 63;
-        let opened = open_beneath(&root, Path::new("plain.txt"), invalid_open_flag, true).unwrap();
-        assert_eq!(opened.metadata().unwrap().len(), 5);
+        assert_eq!(
+            open_beneath(&root, Path::new("plain.txt"), invalid_open_flag, true)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        let open_flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64;
         assert_eq!(
             open_beneath(
                 &root,
                 Path::new("plain.txt"),
-                invalid_open_flag | libc::O_DIRECTORY as u64,
+                open_flags | libc::O_DIRECTORY as u64,
                 true,
             )
             .unwrap_err()
@@ -1337,7 +1342,7 @@ mod tests {
             open_beneath(
                 &root,
                 Path::new("..").join(&outside_name).as_path(),
-                invalid_open_flag,
+                open_flags,
                 true,
             )
             .unwrap_err()

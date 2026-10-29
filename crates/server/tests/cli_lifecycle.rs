@@ -58,6 +58,7 @@ fn config_text(root: &Path, port: u16, extra: &str) -> String {
          VapacheCapability RewriteProgram On\n\
          VapacheCapability ServerStatus On\n\
          VapacheCapability Trace On\n\
+         VapacheCapability UnstableFastCgiPaths On\n\
          ServerRoot {root}\n\
          Listen 127.0.0.1:{port}\n\
          ServerName localhost\n\

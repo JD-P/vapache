@@ -162,7 +162,9 @@ Implemented today:
   HTTP/1.1 request-head parser/framer are Verus-verified; the server still
   cross-checks the canonical-path invariant at runtime, and all file opens go
   through `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`, optionally
-  `RESOLVE_NO_SYMLINKS`.
+  `RESOLVE_NO_SYMLINKS`. Linux `openat2` support is mandatory: configuration
+  testing and startup fail closed if the syscall or required resolution flags
+  are unavailable, and there is no canonicalize-then-open fallback.
 
 Not yet implemented: OCSP responder error-cache timeout tuning, rare
 expression forms such as `LogMessage` interpolation, `RewriteMap dbm`, exact
@@ -259,6 +261,7 @@ opts in with `VapacheCapability <name> On`:
 | `AutoIndex` | generated directory listings from `Options Indexes` |
 | `Cgi` | `ScriptAlias`, `cgi-script`, and `Options ExecCGI` execution |
 | `FastCgi` | FastCGI `ProxyPassMatch`/`ProxyPass` and handler execution |
+| `UnstableFastCgiPaths` | pathname-only FastCGI handoff without a stable-path policy |
 | `RewriteProgram` | external `RewriteMap prg` helpers |
 | `ServerStatus` | the generated `server-status` handler |
 | `AbsoluteRequestTarget` | HTTP/1 absolute-form request targets |
@@ -291,17 +294,17 @@ UserDir, DAV, forward proxying, external filters, LDAP/Digest/DBM auth,
 unconditionally unavailable. They do not receive opt-in switches that imply
 unsupported behavior is safe.
 
-For local FastCGI deployments, the optional global directive below turns the
-remaining pathname-stability deployment rule into a runtime admission check:
+FastCGI is default-safe at the external-process handoff. Every configured
+backend normally needs an exact global stable-path policy:
 
 ```apache
 # endpoint, PHP worker uid, Unix-socket owner uid, then trusted tree owners
 VapacheFastCGIStablePath On unix:/run/php/php8.4-fpm.sock 33 0 0 1001
 ```
 
-The directive is repeatable, once per backend. Turning it on is strict: a
-FastCGI request whose exact Unix socket is not registered is denied. The
-socket is checked before and after `connect()` for type, owner and inode
+The directive is repeatable, once per backend. A FastCGI request whose exact
+Unix socket is not registered is denied. The socket is checked before and
+after `connect()` for type, owner and inode
 stability independently of the configured PHP worker UID. TCP is rejected in
 strict mode because a loopback address does not authenticate the process that
 owns it; use a protected Unix socket for the verified backend-identity
@@ -314,7 +317,20 @@ owned by the backend, because its owner could restore write permission with
 `chmod`. POSIX ACLs are rejected rather than assuming the mode bits describe
 all writers. Symlink ownership and both sides of the mapping are checked. Root
 backends, relative paths and malformed identities are rejected.
-`VapacheFastCGIStablePath Off` disables the policy (the default).
+
+Deployments that cannot satisfy this policy—for example, a TCP or unusual
+chrooted backend—must separately and explicitly accept the external pathname
+race:
+
+```apache
+VapacheCapability UnstableFastCgiPaths On
+```
+
+`VapacheFastCGIStablePath Off` or an absent policy is otherwise rejected when
+FastCGI is configured, and the runtime sink checks the same condition again.
+The unsafe capability restores only the pathname handoff; the deployment must
+then keep the complete script tree immutable to the backend and every
+less-trusted process for the whole request lifetime.
 
 Aggregate dynamic-I/O limits are global directives and remain shared across a
 graceful reload:

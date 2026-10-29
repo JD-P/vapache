@@ -75,6 +75,12 @@ fn injected_secure_open_failure_never_returns_a_file() {
         Target::Forbidden | Target::NotFound
     ));
     vapached::fault::clear();
+
+    vapached::fault::configure("fs.open_beneath", 0, io::ErrorKind::Unsupported);
+    let error = vapached::files::require_secure_path_resolution().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert!(error.to_string().contains("requires Linux openat2"));
+    vapached::fault::clear();
     let _ = std::fs::remove_dir_all(root);
 }
 

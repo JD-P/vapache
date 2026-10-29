@@ -54,6 +54,7 @@ fn first_resolved_addr(mut addrs: impl Iterator<Item = SocketAddr>) -> io::Resul
 /// Bind all configured listeners.  Called while still privileged so ports
 /// below 1024 work, before dropping to the configured user.
 pub fn bind(cfg: &Config) -> io::Result<Vec<Bound>> {
+    crate::files::require_secure_path_resolution()?;
     crate::cache::prepare(cfg);
     crate::cache::prepare_dir(cfg, &cfg.server_root.join("logs").join("ocsp-cache"));
     crate::proxy::start_health_checks(cfg);

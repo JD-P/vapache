@@ -52,6 +52,7 @@ VapacheCapability RequestTrailers On
 VapacheCapability RewriteProgram On
 VapacheCapability ServerStatus On
 VapacheCapability Trace On
+VapacheCapability UnstableFastCgiPaths On
 """
 
 

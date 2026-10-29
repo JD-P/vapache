@@ -2380,7 +2380,7 @@ pub enum FastCgiEndpoint {
     Tcp { host: String, port: u16 },
 }
 
-/// Opt-in local filesystem stability contract for one exact FastCGI backend.
+/// Local filesystem stability contract for one exact FastCGI backend.
 /// `backend_uid` is the worker identity that must be unable to mutate the
 /// script path. `endpoint_owner_uid` independently authenticates a Unix socket
 /// pathname. Strict policies reject TCP because it cannot authenticate the
@@ -2409,10 +2409,11 @@ pub enum Capability {
     RewriteProgram,
     ServerStatus,
     Trace,
+    UnstableFastCgiPaths,
 }
 
 impl Capability {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::AbsoluteRequestTarget,
         Self::AccessFiles,
         Self::AutoIndex,
@@ -2423,6 +2424,7 @@ impl Capability {
         Self::RewriteProgram,
         Self::ServerStatus,
         Self::Trace,
+        Self::UnstableFastCgiPaths,
     ];
 
     pub fn name(self) -> &'static str {
@@ -2437,6 +2439,7 @@ impl Capability {
             Self::RewriteProgram => "RewriteProgram",
             Self::ServerStatus => "ServerStatus",
             Self::Trace => "Trace",
+            Self::UnstableFastCgiPaths => "UnstableFastCgiPaths",
         }
     }
 
@@ -2465,7 +2468,8 @@ VapacheCapability LegacyAuthz On\n\
 VapacheCapability RequestTrailers On\n\
 VapacheCapability RewriteProgram On\n\
 VapacheCapability ServerStatus On\n\
-VapacheCapability Trace On\n";
+VapacheCapability Trace On\n\
+VapacheCapability UnstableFastCgiPaths On\n";
 
 impl Capabilities {
     pub fn contains(self, capability: Capability) -> bool {
@@ -3603,6 +3607,25 @@ impl Compile {
     }
 
     fn validate_capabilities(&mut self) {
+        // FastCGI normally requires a strict endpoint/path policy.  Retaining
+        // the historical pathname-only handoff is a separate, explicit
+        // process-wide capability because the external backend reopens
+        // SCRIPT_FILENAME after vapache's final inode check.
+        if self.cfg.fastcgi_stable_paths.is_none() {
+            let unstable: Vec<_> = self
+                .required_capabilities
+                .iter()
+                .filter(|(capability, _, _)| *capability == Capability::FastCgi)
+                .map(|(_, loc, feature)| {
+                    (
+                        Capability::UnstableFastCgiPaths,
+                        loc.clone(),
+                        format!("{feature} without VapacheFastCGIStablePath"),
+                    )
+                })
+                .collect();
+            self.required_capabilities.extend(unstable);
+        }
         for (capability, loc, feature) in &self.required_capabilities {
             if !self.cfg.required_capabilities.contains(capability) {
                 self.cfg.required_capabilities.push(*capability);
@@ -8698,14 +8721,14 @@ mod tests {
                     .any(|error| error.msg.contains(&format!("VapacheCapability {name} On"))),
                 "missing {name} rejection: {errors:?}"
             );
+            let prelude = if name == "FastCgi" {
+                "VapacheCapability FastCgi On\nVapacheCapability UnstableFastCgiPaths On\n"
+                    .to_string()
+            } else {
+                format!("VapacheCapability {name} On\n")
+            };
             assert!(
-                load_text_with_prelude(
-                    &format!("VapacheCapability {name} On\n"),
-                    text,
-                    false,
-                    false,
-                )
-                .is_ok(),
+                load_text_with_prelude(&prelude, text, false, false).is_ok(),
                 "explicit {name} opt-in was rejected"
             );
         }
@@ -8752,6 +8775,40 @@ mod tests {
         assert!(!cfg.capability_enabled(Capability::AutoIndex));
         assert!(cfg.required_capabilities.contains(&Capability::Trace));
         assert!(cfg.required_capabilities.contains(&Capability::AutoIndex));
+    }
+
+    #[test]
+    fn fastcgi_requires_stable_paths_or_an_explicit_unsafe_capability() {
+        let route =
+            "Listen 127.0.0.1:0\nProxyPassMatch ^/(.*\\.php)$ unix:/run/php.sock|fcgi://localhost/srv/\n";
+        let errors = load_text_with_prelude("VapacheCapability FastCgi On\n", route, false, false)
+            .unwrap_err();
+        assert!(errors.iter().any(|error| error
+            .msg
+            .contains("VapacheCapability UnstableFastCgiPaths On")));
+
+        assert!(load_text_with_prelude(
+            "VapacheCapability FastCgi On\nVapacheCapability UnstableFastCgiPaths On\n",
+            route,
+            false,
+            false,
+        )
+        .is_ok());
+        assert!(load_text_with_prelude(
+            "VapacheCapability FastCgi On\nVapacheFastCGIStablePath On unix:/run/php.sock 33 0 0\n",
+            route,
+            false,
+            false,
+        )
+        .is_ok());
+
+        let audited = load_text_with_prelude("", route, false, true).unwrap();
+        assert!(!audited.capability_enabled(Capability::FastCgi));
+        assert!(!audited.capability_enabled(Capability::UnstableFastCgiPaths));
+        assert!(audited.required_capabilities.contains(&Capability::FastCgi));
+        assert!(audited
+            .required_capabilities
+            .contains(&Capability::UnstableFastCgiPaths));
     }
 
     #[test]

@@ -23,8 +23,8 @@ Compatibility features that expand parsing, filesystem discovery, generated
 content, or execution are off by default. `VapacheCapability NAME On` is valid
 only in global server context. The supported names are
 `AbsoluteRequestTarget`, `AccessFiles`, `AutoIndex`, `Cgi`, `FastCgi`,
-`LegacyAuthz`, `RequestTrailers`, `RewriteProgram`, `ServerStatus`, and
-`Trace`.
+`LegacyAuthz`, `RequestTrailers`, `RewriteProgram`, `ServerStatus`, `Trace`,
+and `UnstableFastCgiPaths`.
 
 The compiler records every effectful use, evaluates capability declarations
 independently of directive order, and refuses startup when the final global
@@ -37,6 +37,14 @@ acceptance and request dispatch obey the same invariant:
 ```text
 requested(feature) ==> globally_enabled(capability(feature))
 ```
+
+FastCGI has a second, independent boundary: each configured backend requires
+an exact `VapacheFastCGIStablePath On` policy. The historical pathname-only
+handoff is available only through the separately reviewable
+`UnstableFastCgiPaths` capability. Configuration compilation records that
+requirement and the final FastCGI sink consumes the verified capability gate
+again, so programmatically constructed or access-file-selected routes cannot
+bypass it.
 
 `--audit-capabilities` suppresses only missing-capability errors so an
 existing main configuration can report the opt-ins it requires. It does not
@@ -863,23 +871,24 @@ cannot override calculated names.  Request bodies stay on their spool file
 above the threshold; stdout/stderr, descriptors and deadlines are bounded.
 
 The FastCGI protocol has no descriptor-passing primitive: PHP-FPM opens
-`SCRIPT_FILENAME` after this final comparison. A deployment can make the
-pathname requirement machine-enforced with repeatable global entries:
+`SCRIPT_FILENAME` after this final comparison. Vapache therefore requires the
+pathname rule to be machine-enforced with repeatable global entries:
 
 ```text
 VapacheFastCGIStablePath On <unix-endpoint> <backend-uid> <endpoint-owner-uid> <trusted-owner-uid>...
 ```
 
-`endpoint` is an exact `unix:/path` transport identity. Once enabled, an
-unregistered backend is rejected. Unix socket type, owner and inode are
-validated before and after connect separately from the PHP worker UID. TCP
+`endpoint` is an exact `unix:/path` transport identity. Every backend must
+have an exact entry; an unregistered backend is rejected. Unix socket type,
+owner and inode are validated before and after connect separately from the
+PHP worker UID. TCP
 entries are rejected because a loopback address cannot authenticate the
 process that owns it. The lexical and canonical script paths are walked
 immediately before parameters are sent.
 Every component owner must be listed, group/other write bits and POSIX ACLs
 are rejected, and a non-symlink component cannot be owned by the backend (an
 owner could otherwise use `chmod` to regain write permission). Root backends
-and relative paths fail closed. `Off` is the default.
+and relative paths fail closed.
 
 `VapacheMaxSpoolBytes`, `VapacheMaxSpoolFiles`,
 `VapacheMaxDynamicRequests` and `VapacheMaxFastCGIOutput` provide process-wide
@@ -887,12 +896,13 @@ aggregate spool/concurrency budgets plus a per-request FastCGI output bound.
 RAII reservations cover request bodies, FastCGI responses and the worker-side
 CGI body copy and are shared across graceful reloads.
 
-Without that opt-in policy, a compliant deployment MUST
-make every FastCGI script and each ancestor directory non-writable by the
-backend and by any less-trusted process for the whole request lifetime. Use a
-read-only bind mount or immutable release tree, and keep uploads and other
-writable content outside every FastCGI handler mapping. If that invariant
-cannot be provided, FastCGI execution is outside the verified security
+An absent or `Off` policy is rejected unless the process explicitly enables
+`VapacheCapability UnstableFastCgiPaths On`. That escape hatch accepts the
+external pathname race and restores the deployment obligation: every FastCGI
+script and ancestor directory must remain non-writable by the backend and by
+every less-trusted process for the whole request lifetime. Use a read-only
+bind mount or immutable release tree, and keep uploads outside every FastCGI
+handler mapping. This capability is outside the default verified security
 boundary. Local CGI has no equivalent residual because it executes from the
 retained descriptor.
 
@@ -1876,7 +1886,7 @@ rewrite that changes the filesystem target re-evaluates
 Static file/directory/local-CGI grants carry the opened inode and symlink
 targets are reauthorized. FastCGI opens its script first, reauthorizes the
 descriptor path, binds both inode and backend, and performs a final pathname
-inode comparison before emitting parameters. The opt-in stable-path policy
+inode comparison before emitting parameters. The required stable-path policy
 additionally projects `fastcgi_stable_component_admit` over every lexical and
 canonical component using the configured backend and trusted-owner UIDs.
 Proxy and WebSocket grants are
@@ -1885,8 +1895,9 @@ the regex engine, expression leaf evaluators and the standard library's
 concrete sorting implementation remain outside Verus. The external backend
 must still open `SCRIPT_FILENAME` itself. With `VapacheFastCGIStablePath On`,
 the verified component predicate is enforced immediately before that handoff;
-with the default `Off`, the equivalent read-only-tree rule remains an explicit
-deployment assumption. Writable trees must not inherit a FastCGI handler.
+without it, FastCGI is rejected unless `UnstableFastCgiPaths` explicitly
+accepts the equivalent read-only-tree deployment assumption. Writable trees
+must not inherit a FastCGI handler.
 
 Security-sensitive unimplemented directives fail closed in compatibility mode.
 The classifier covers the auth/TLS/proxy/filter/DAV/LDAP/cache families by
@@ -1968,9 +1979,13 @@ comparison and glob semantics, and rewrite condition-chain folding are
 verified kernels. Parser payload translation, standard-library sorting and
 regex semantics are explicit assumptions, not hidden axioms. Filesystem
 objects used by protected sinks and access-file parsing are descriptor/inode
-bound. The external FastCGI backend's later open of `SCRIPT_FILENAME` is
-covered when the opt-in stable-path check admits both identities, or when the
-deployment provides the equivalent read-only requirement stated in I31.
+bound. Secure path opening requires Linux `openat2` with
+`RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`; configuration testing and startup
+fail closed if that kernel boundary is unavailable, with no pathname fallback.
+The external FastCGI backend's later open of `SCRIPT_FILENAME` is covered when
+the required stable-path check admits both identities. The equivalent
+read-only requirement stated in I31 applies only after the explicit
+`UnstableFastCgiPaths` escape hatch is enabled.
 
 ## 10b. Verification progress ledger
 
@@ -2093,9 +2108,10 @@ excludes test-only code from the denominator.
   `AccessGrant` at runtime.
 - FastCGI cannot pass its retained script descriptor through the protocol;
   the external backend's open of `SCRIPT_FILENAME` occurs after vapache's
-  final pathname-to-inode comparison. Enable `VapacheFastCGIStablePath` to
-  enforce trusted owners and backend write exclusion, or provide the
-  equivalent read-only release-tree invariant; never map writable content to
+  final pathname-to-inode comparison. Exact `VapacheFastCGIStablePath`
+  policies enforce trusted owners and backend write exclusion by default.
+  Only `UnstableFastCgiPaths` permits the equivalent read-only release-tree
+  invariant to remain a deployment assumption; never map writable content to
   FastCGI.
 
 ## 13. Apache CVE triage
