@@ -55,6 +55,18 @@ MODULES = [
     "expires_module",
 ]
 
+VAPACHE_CAPABILITIES = """VapacheCapability AbsoluteRequestTarget On
+VapacheCapability AccessFiles On
+VapacheCapability AutoIndex On
+VapacheCapability Cgi On
+VapacheCapability FastCgi On
+VapacheCapability LegacyAuthz On
+VapacheCapability RequestTrailers On
+VapacheCapability RewriteProgram On
+VapacheCapability ServerStatus On
+VapacheCapability Trace On
+"""
+
 
 def prefix(port: int) -> str:
     lines = []
@@ -316,7 +328,7 @@ def main():
             acfg = BASE / "apache.conf"
             vcfg = BASE / "vapache.conf"
             acfg.write_text(prefix(PORT) + snippet)
-            vcfg.write_text(prefix(PORT + 1) + snippet)
+            vcfg.write_text(VAPACHE_CAPABILITIES + prefix(PORT + 1) + snippet)
             a = run([APACHE, "-t", "-f", str(acfg)])
             v = run([str(VAPACHED), "-t", "-f", str(vcfg)])
             aok = a.returncode == 0
@@ -333,7 +345,7 @@ def main():
             acfg = BASE / "apache.conf"
             vcfg = BASE / "vapache.conf"
             acfg.write_text(prefix(PORT) + snippet)
-            vcfg.write_text(prefix(PORT + 1) + snippet)
+            vcfg.write_text(VAPACHE_CAPABILITIES + prefix(PORT + 1) + snippet)
             a = run([APACHE, "-t", "-f", str(acfg)])
             v = run([str(VAPACHED), "-t", "-f", str(vcfg)])
             s = run([str(VAPACHED), "-t", "--strict-config", "-f", str(vcfg)])

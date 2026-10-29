@@ -8,7 +8,7 @@
 use crate::config::{
     normalize_rewrite_base, parse_filter_tokens, parse_ip_net, parse_require, parse_rewrite_cond,
     parse_rewrite_rule, require_is_negated, require_node_is_negative, AlterEtag, AuthMerging,
-    CompressionRule, ConditionBranch, Config, ErrorDoc, HostSpec, MatchKind, MethodSet,
+    Capability, CompressionRule, ConditionBranch, Config, ErrorDoc, HostSpec, MatchKind, MethodSet,
     NonfatalMode, Options, Order, OverrideCategories, OverrideCategory, OverrideMode, Require,
     RequireNode, Satisfy, Scope, ScopeRule, VHost,
 };
@@ -2045,7 +2045,23 @@ fn apply_directive(
                 return Err("only the `file` AuthBasicProvider is supported".into());
             }
         }
-        "options" => apply_options(scope, args)?,
+        "options" => {
+            for arg in args {
+                if arg.starts_with('-') {
+                    continue;
+                }
+                match arg.trim_start_matches('+').to_ascii_lowercase().as_str() {
+                    "all" => {
+                        require_capability(cfg, Capability::AutoIndex, "Options All")?;
+                        require_capability(cfg, Capability::Cgi, "Options All")?;
+                    }
+                    "indexes" => require_capability(cfg, Capability::AutoIndex, "Options Indexes")?,
+                    "execcgi" => require_capability(cfg, Capability::Cgi, "Options ExecCGI")?,
+                    _ => {}
+                }
+            }
+            apply_options(scope, args)?
+        }
         "directoryindex" => scope.content_policy.directory_index = Some(args.to_vec()),
         "errordocument" => {
             if args.len() < 2 {
@@ -2080,6 +2096,7 @@ fn apply_directive(
             if args.len() < 2 {
                 return Ok(());
             }
+            require_handler_capability(cfg, &args[0], "AddHandler")?;
             for ext in &args[1..] {
                 scope
                     .mapping_policy
@@ -2101,6 +2118,7 @@ fn apply_directive(
             }
         }
         "sethandler" => {
+            require_handler_capability(cfg, first, "SetHandler")?;
             scope.mapping_policy.set_handler = Some(crate::config::SetHandler::parse(first));
         }
         "forcetype" => scope.content_policy.force_type = Some(first.to_string()),
@@ -2190,6 +2208,7 @@ fn apply_directive(
         "deflatefilternote" | "deflatebuffersize" | "deflatememlevel" | "deflatewindowssize" => {}
         "header" => apply_header(scope, args)?,
         "order" => {
+            require_capability(cfg, Capability::LegacyAuthz, "Order")?;
             let order = match first.to_ascii_lowercase().as_str() {
                 "allow,deny" | "mutual-failure" => Order::AllowDeny,
                 "deny,allow" => Order::DenyAllow,
@@ -2198,6 +2217,7 @@ fn apply_directive(
             scope.add_order(order, limit);
         }
         "allow" | "deny" => {
+            require_capability(cfg, Capability::LegacyAuthz, name)?;
             if !args
                 .first()
                 .map(|s| s.eq_ignore_ascii_case("from"))
@@ -2221,6 +2241,7 @@ fn apply_directive(
             }
         }
         "satisfy" => {
+            require_capability(cfg, Capability::LegacyAuthz, "Satisfy")?;
             let satisfy = match first.to_ascii_lowercase().as_str() {
                 "all" => Satisfy::All,
                 "any" => Satisfy::Any,
@@ -2262,6 +2283,9 @@ fn apply_directive(
                 .as_deref()
                 .unwrap_or(match_base);
             let mut rule = parse_rewrite_rule(args, match_base, true)?;
+            if let Some(handler) = rule.flags.handler.as_deref() {
+                require_handler_capability(cfg, handler, "RewriteRule")?;
+            }
             rule.access_file = true;
             rule.base = normalize_rewrite_base(subst_base);
             rule.conditions = std::mem::take(&mut scope.rewrite_policy.pending_rewrite_conds);
@@ -2356,6 +2380,34 @@ fn apply_directive(
         "addcharset" | "addlanguage" | "addencoding" | "removecharset" | "removeencoding"
         | "adddescription" | "indexoptions" | "readmefile" | "headername" => {}
         _ => return Err(format!("unsupported .htaccess directive '{name}'")),
+    }
+    Ok(())
+}
+
+fn require_capability(cfg: &Config, capability: Capability, feature: &str) -> Result<(), String> {
+    if vapache_verified::capability_admit(cfg.capability_enabled(capability), true) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{feature} requires global 'VapacheCapability {} On'",
+            capability.name()
+        ))
+    }
+}
+
+fn require_handler_capability(cfg: &Config, handler: &str, directive: &str) -> Result<(), String> {
+    if handler.eq_ignore_ascii_case("cgi-script") {
+        require_capability(cfg, Capability::Cgi, &format!("{directive} cgi-script"))?;
+    }
+    if handler.eq_ignore_ascii_case("server-status") {
+        require_capability(
+            cfg,
+            Capability::ServerStatus,
+            &format!("{directive} server-status"),
+        )?;
+    }
+    if handler.to_ascii_lowercase().contains("fcgi://") {
+        require_capability(cfg, Capability::FastCgi, &format!("{directive} FastCGI"))?;
     }
     Ok(())
 }
@@ -2600,7 +2652,7 @@ mod tests {
 
     fn config(root: &Path, text: &str) -> Config {
         let path = root.join("httpd.conf");
-        fs::write(&path, text).unwrap();
+        fs::write(&path, format!("{}{text}", crate::config::TEST_CAPABILITIES)).unwrap();
         Config::load(&path, root, &HashMap::new(), &HashMap::new(), false).unwrap()
     }
 
@@ -3455,6 +3507,7 @@ mod tests {
         let file = dir.join(".htaccess");
         for line in [
             "DefinitelyNotADirective on\n",
+            "VapacheCapability Trace On\n",
             "ProxyBlock 169.254.169.254\n",
             "AcceptPathInfo Off\n",
             "SetEnvIfExpr \"true\" X=1\n",
@@ -3475,6 +3528,46 @@ mod tests {
         fs::write(&file, "<IfDefine PROD>\nRequire all denied\n</IfDefine>\n").unwrap();
         let parsed = parse_file(&cfg, &file, OverrideMode::All, "/dir/").unwrap();
         assert!(parsed.scope.authorization.requires.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn htaccess_cannot_escalate_disabled_process_capabilities() {
+        let dir = tempdir("capability-escalation");
+        let conf = dir.join("httpd.conf");
+        fs::write(
+            &conf,
+            "VapacheCapability AccessFiles On\nListen 127.0.0.1:0\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();
+        let file = dir.join(".htaccess");
+        for (line, capability) in [
+            ("Options Indexes\n", "AutoIndex"),
+            ("Options ExecCGI\n", "Cgi"),
+            ("AddHandler cgi-script .cgi\n", "Cgi"),
+            ("SetHandler server-status\n", "ServerStatus"),
+            ("SetHandler proxy:fcgi://localhost\n", "FastCgi"),
+            ("RewriteRule ^x$ - [H=cgi-script]\n", "Cgi"),
+            ("RewriteRule ^x$ - [H=server-status]\n", "ServerStatus"),
+            (
+                "RewriteRule ^x$ - [H=proxy:fcgi://localhost]\n",
+                "FastCgi",
+            ),
+            ("Order deny,allow\n", "LegacyAuthz"),
+            ("Deny from all\n", "LegacyAuthz"),
+            ("Satisfy any\n", "LegacyAuthz"),
+        ] {
+            fs::write(&file, line).unwrap();
+            let error = match parse_file(&cfg, &file, OverrideMode::All, "/dir/") {
+                Ok(_) => panic!("{line:?} unexpectedly enabled a disabled capability"),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains(&format!("VapacheCapability {capability} On")),
+                "{line:?} did not report its disabled capability: {error}"
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4833,7 +4926,7 @@ mod compression_tests {
 
     fn config(root: &Path, text: &str) -> Config {
         let path = root.join("httpd.conf");
-        fs::write(&path, text).unwrap();
+        fs::write(&path, format!("{}{text}", crate::config::TEST_CAPABILITIES)).unwrap();
         Config::load(&path, root, &HashMap::new(), &HashMap::new(), false).unwrap()
     }
 

@@ -2,7 +2,7 @@
 
 use crate::access::{self, Access};
 use crate::cgi::{self, CgiContext};
-use crate::config::{Config, EncodedSlashes, Options, Scope, VHost};
+use crate::config::{Capability, Config, EncodedSlashes, Options, Scope, VHost};
 use crate::fastcgi;
 use crate::files::{
     directory_index_name, error_response, mime_type, resolve_target_checked, serve_directory,
@@ -262,6 +262,12 @@ impl Server {
     where
         F: FnMut(&mut [libc::pollfd]) -> io::Result<()>,
     {
+        if self.cfg.capability_audit_only {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "capability-audit configuration is not runnable",
+            ));
+        }
         for b in bound {
             b.listener.set_nonblocking(true)?;
         }
@@ -477,6 +483,8 @@ fn handle_connection<C: Conn + ResponseWrite>(
         resource_budget: cfg.resource_budget.clone(),
         max_spool_bytes: cfg.max_spool_bytes,
         max_spool_files: cfg.max_spool_files,
+        allow_absolute_request_target: cfg.capability_enabled(Capability::AbsoluteRequestTarget),
+        allow_request_trailers: cfg.capability_enabled(Capability::RequestTrailers),
     };
     // `Time out` applies to the first request; idle keep-alive connections use
     // `KeepAliveTimeout`.  Set the socket option once per connection instead of
@@ -974,7 +982,7 @@ fn host_header(req: &Request) -> Option<&str> {
 
 fn allowed_methods(cfg: &Config) -> Vec<&'static str> {
     let mut methods = vec!["GET", "HEAD", "POST", "OPTIONS"];
-    if cfg.trace_enable {
+    if cfg.trace_enable && cfg.capability_enabled(Capability::Trace) {
         methods.push("TRACE");
     }
     methods
@@ -1916,6 +1924,9 @@ fn dispatch_inner(
     server_name: &str,
     initial_plan: Option<RequestPlan>,
 ) -> Response {
+    if cfg.capability_audit_only {
+        return Response::new(500);
+    }
     // Methods we do not implement at all are 501, matching Apache.  Known
     // methods that are invalid for a particular resource (for example POST
     // to a static file) are handled below with 405.
@@ -1941,7 +1952,11 @@ fn dispatch_inner(
     }
 
     if req.method == "TRACE" {
-        if !cfg.trace_enable {
+        if !vapache_verified::capability_admit(
+            cfg.capability_enabled(Capability::Trace),
+            true,
+        ) || !cfg.trace_enable
+        {
             let mut r = error_response(
                 cfg,
                 vhost,
@@ -2680,6 +2695,23 @@ fn dispatch_inner(
             .iter()
             .any(|h| h.handler.eq_ignore_ascii_case("server-status"))
     {
+        if !vapache_verified::capability_admit(
+            cfg.capability_enabled(Capability::ServerStatus),
+            true,
+        ) {
+            return error_response(
+                cfg,
+                vhost,
+                &scope,
+                403,
+                req,
+                &url_path,
+                local_port,
+                &server_name,
+                peer.ip(),
+                local_ip,
+            );
+        }
         let auto = req.query.eq_ignore_ascii_case(b"auto");
         return crate::status::response(auto);
     }
@@ -3363,6 +3395,20 @@ fn run_fastcgi(
     _resource: &crate::access::ResourceKey,
     mapping_root: &Path,
 ) -> Response {
+    if !vapache_verified::capability_admit(cfg.capability_enabled(Capability::FastCgi), true) {
+        return error_response(
+            cfg,
+            vhost,
+            scope,
+            403,
+            req,
+            url_path,
+            local_port,
+            server_name,
+            peer.ip(),
+            local_ip,
+        );
+    }
     // `ProxyPassMatch`/`SetHandler` can resolve PATH_INFO to a real script
     // whose own `<Files>`/`<Directory>` policy differs from the requested URL.
     // Re-evaluate policy for the script target before binding the backend.
@@ -3555,6 +3601,20 @@ fn run_cgi(
     script_file: Option<&std::fs::File>,
     script_meta: Option<&std::fs::Metadata>,
 ) -> Response {
+    if !vapache_verified::capability_admit(cfg.capability_enabled(Capability::Cgi), true) {
+        return error_response(
+            cfg,
+            vhost,
+            scope,
+            403,
+            req,
+            url_path,
+            local_port,
+            server_name,
+            peer.ip(),
+            local_ip,
+        );
+    }
     // CGI is an execution sink: a pathname-only grant is never sufficient.
     // The descriptor and metadata originate from the same open, and the
     // verified sink gate requires the resulting inode-bound capability.
@@ -3809,9 +3869,10 @@ mod tests {
         std::fs::write(
             &conf,
             format!(
-                "Listen 127.0.0.1:0\n\
+                "{}Listen 127.0.0.1:0\n\
                  Alias /run \"{}\"\n\
                  ScriptAlias /exec \"{}\"\n",
+                crate::config::TEST_CAPABILITIES,
                 file.display(),
                 file.display()
             ),
@@ -3849,11 +3910,12 @@ mod tests {
         std::fs::write(
             &conf,
             format!(
-                "Listen 127.0.0.1:0\n\
+                "{}Listen 127.0.0.1:0\n\
                  AliasMatch \"^/wallet$\" \"{}/\"\n\
                  ScriptAliasMatch \"^/run$\" \"{}/\"\n\
                  AliasMatch \"^/wallet-noslash$\" \"{}\"\n\
                  ScriptAliasMatch \"^/run-noslash$\" \"{}\"\n",
+                crate::config::TEST_CAPABILITIES,
                 wallet.display(),
                 cgi.display(),
                 wallet.display(),
@@ -3932,7 +3994,7 @@ mod tests {
         std::fs::write(
             &conf,
             format!(
-                "ServerRoot \"{}\"\n\
+                "{}ServerRoot \"{}\"\n\
                  Listen 127.0.0.1:0\n\
                  ServerName localhost\n\
                  PidFile \"{}/httpd.pid\"\n\
@@ -3940,6 +4002,7 @@ mod tests {
                  LogLevel warn\n\
                  DocumentRoot \"{}/www\"\n\
                  {}",
+                crate::config::TEST_CAPABILITIES,
                 root.display(),
                 root.display(),
                 root.display(),
@@ -3949,6 +4012,28 @@ mod tests {
         )
         .unwrap();
         Config::load(&conf, root, &Default::default(), &Default::default(), false).unwrap()
+    }
+
+    fn cov_capability_audit_config(root: &Path, body: &str) -> Config {
+        let conf = root.join("httpd.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "ServerRoot \"{}\"\n\
+                 Listen 127.0.0.1:0\n\
+                 ServerName localhost\n\
+                 ErrorLog \"{}/error.log\"\n\
+                 DocumentRoot \"{}/www\"\n\
+                 {}",
+                root.display(),
+                root.display(),
+                root.display(),
+                body
+            ),
+        )
+        .unwrap();
+        Config::load_capability_audit(&conf, root, &Default::default(), &Default::default(), false)
+            .unwrap()
     }
 
     fn cov_req(method: &str, path: &str) -> Request {
@@ -4627,6 +4712,74 @@ mod tests {
     fn cov_dispatch(cfg: &Config, method: &str, path: &str) -> Response {
         let req = cov_req(method, path);
         dispatch(cfg, &req, cov_peer(), "127.0.0.1", 80)
+    }
+
+    #[test]
+    fn final_sinks_recheck_disabled_compatibility_capabilities() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = cov_dir("disabled-capability-sinks");
+        std::fs::create_dir_all(dir.join("www/listing")).unwrap();
+        std::fs::create_dir_all(dir.join("cgi-bin")).unwrap();
+        std::fs::write(dir.join("www/listing/item.txt"), "item\n").unwrap();
+        std::fs::write(dir.join("www/status"), "not status\n").unwrap();
+        std::fs::write(dir.join("www/script.php"), "<?php\n").unwrap();
+        let script = dir.join("cgi-bin/run.cgi");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nran\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "TraceEnable On\n\
+                 <Location /status>\nSetHandler server-status\n</Location>\n\
+                 <Directory \"{}/www/listing\">\nOptions Indexes\n</Directory>\n\
+                 ScriptAlias /cgi-bin/ \"{}/cgi-bin/\"\n\
+                 ProxyPassMatch ^/(.*\\.php)$ \"unix:/tmp/vapache-missing.sock|fcgi://localhost{}/www/\"\n",
+                dir.display(),
+                dir.display(),
+                dir.display(),
+            ),
+        );
+
+        let audit_only = cov_capability_audit_config(&dir, "TraceEnable On\n");
+        assert_eq!(cov_dispatch(&audit_only, "GET", "/").status, 500);
+        let audit_server = Server::new(
+            Arc::new(audit_only.clone()),
+            Arc::new(cov_logger(&audit_only)),
+        );
+        assert_eq!(
+            audit_server.run(&[]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let mut disabled = cfg.clone();
+        disabled.capabilities.set(Capability::Trace, false);
+        assert_eq!(cov_dispatch(&disabled, "TRACE", "/").status, 405);
+
+        let mut disabled = cfg.clone();
+        disabled.capabilities.set(Capability::ServerStatus, false);
+        assert_eq!(cov_dispatch(&disabled, "GET", "/status").status, 403);
+
+        let mut disabled = cfg.clone();
+        disabled.capabilities.set(Capability::AutoIndex, false);
+        assert_eq!(cov_dispatch(&disabled, "GET", "/listing/").status, 403);
+
+        let mut disabled = cfg.clone();
+        disabled.capabilities.set(Capability::Cgi, false);
+        assert_eq!(
+            cov_dispatch(&disabled, "GET", "/cgi-bin/run.cgi").status,
+            403
+        );
+
+        let mut disabled = cfg;
+        disabled.capabilities.set(Capability::FastCgi, false);
+        assert_eq!(cov_dispatch(&disabled, "GET", "/script.php").status, 403);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -9257,6 +9257,24 @@ pub proof fn handler_scope_lexical_when_resolved_differs(
 {
 }
 
+/// A compatibility surface may only be used when its process-global
+/// capability is enabled. Parser, access-file, and final-sink checks share
+/// this small contract so a secondary route cannot bypass the opt-in.
+pub open spec fn capability_spec(enabled: bool, requested: bool) -> bool {
+    !requested || enabled
+}
+
+pub fn capability_admit(enabled: bool, requested: bool) -> (ok: bool)
+    ensures ok == capability_spec(enabled, requested),
+{
+    !requested || enabled
+}
+
+pub proof fn disabled_capability_rejects_request()
+    ensures !capability_spec(false, true),
+{
+}
+
 /// P17 hardening: a pathname component is stable against a configured local
 /// FastCGI backend only when the backend is not root, the component has a
 /// trusted owner, and no untrusted write class can replace or modify it.

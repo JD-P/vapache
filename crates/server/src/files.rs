@@ -703,6 +703,10 @@ fn directory_action(
     if scope
         .effective_options()
         .contains(crate::config::Options::INDEXES)
+        && vapache_verified::capability_admit(
+            cfg.capability_enabled(crate::config::Capability::AutoIndex),
+            true,
+        )
     {
         let path = format!("/proc/self/fd/{}", dir.as_raw_fd());
         let mut entries: Vec<(Vec<u8>, bool, u64)> = Vec::new();
@@ -1182,7 +1186,11 @@ mod tests {
         let conf = dir.join("httpd.conf");
         std::fs::write(
             &conf,
-            format!("Listen 127.0.0.1:0\nDocumentRoot {}\n", dir.display()),
+            format!(
+                "{}Listen 127.0.0.1:0\nDocumentRoot {}\n",
+                crate::config::TEST_CAPABILITIES,
+                dir.display()
+            ),
         )
         .unwrap();
         let cfg = Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap();

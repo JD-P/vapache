@@ -48,7 +48,17 @@ fn service_ids() -> (u32, u32) {
 fn config_text(root: &Path, port: u16, extra: &str) -> String {
     let (uid, gid) = service_ids();
     format!(
-        "ServerRoot {root}\n\
+        "VapacheCapability AbsoluteRequestTarget On\n\
+         VapacheCapability AccessFiles On\n\
+         VapacheCapability AutoIndex On\n\
+         VapacheCapability Cgi On\n\
+         VapacheCapability FastCgi On\n\
+         VapacheCapability LegacyAuthz On\n\
+         VapacheCapability RequestTrailers On\n\
+         VapacheCapability RewriteProgram On\n\
+         VapacheCapability ServerStatus On\n\
+         VapacheCapability Trace On\n\
+         ServerRoot {root}\n\
          Listen 127.0.0.1:{port}\n\
          ServerName localhost\n\
          User {uid}\n\
@@ -155,6 +165,18 @@ fn cli_information_explain_and_startup_failures() {
         let result = output(&root, &config, args);
         assert!(result.status.success(), "{args:?}: {result:?}");
     }
+
+    let audit = output(&root, &config, &["--audit-capabilities"]);
+    assert!(audit.status.success(), "{audit:?}");
+    let audit_stdout = String::from_utf8_lossy(&audit.stdout);
+    assert!(audit_stdout.contains("explicitly enabled: AbsoluteRequestTarget"));
+    assert!(audit_stdout.contains("missing opt-ins: none"));
+
+    let missing_capability = root.join("missing-capability.conf");
+    fs::write(&missing_capability, "Listen 127.0.0.1:0\nTraceEnable On\n").unwrap();
+    let audit = output(&root, &missing_capability, &["--audit-capabilities"]);
+    assert!(audit.status.success(), "{audit:?}");
+    assert!(String::from_utf8_lossy(&audit.stdout).contains("VapacheCapability Trace On"));
 
     assert_eq!(
         output(&root, &config, &["-k", "status"]).status.code(),

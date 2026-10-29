@@ -126,7 +126,7 @@ def main():
             acfg = BASE / "grammar-apache.conf"
             vcfg = BASE / "grammar-vapache.conf"
             acfg.write_text(V.prefix(PORT) + snippet)
-            vcfg.write_text(V.prefix(PORT + 1) + snippet)
+            vcfg.write_text(V.VAPACHE_CAPABILITIES + V.prefix(PORT + 1) + snippet)
             a = run([APACHE, "-t", "-f", str(acfg)])
             v = run([str(VAPACHED), "-t", "-f", str(vcfg)])
             aok = a.returncode == 0

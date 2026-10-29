@@ -17,6 +17,34 @@ directive disposition and `.htaccess` layer-slot translation use verified
 helpers; raw parser tokenization remains the explicit parser-refinement
 assumption.
 
+## Process capability boundary
+
+Compatibility features that expand parsing, filesystem discovery, generated
+content, or execution are off by default. `VapacheCapability NAME On` is valid
+only in global server context. The supported names are
+`AbsoluteRequestTarget`, `AccessFiles`, `AutoIndex`, `Cgi`, `FastCgi`,
+`LegacyAuthz`, `RequestTrailers`, `RewriteProgram`, `ServerStatus`, and
+`Trace`.
+
+The compiler records every effectful use, evaluates capability declarations
+independently of directive order, and refuses startup when the final global
+set lacks a required capability. Access-file parsing has no capability
+directive and independently rejects gated options, handlers, and legacy
+authorization when their global gate is absent. Final TRACE, directory-list,
+CGI, FastCGI, and status sinks check the gate again. Thus configuration
+acceptance and request dispatch obey the same invariant:
+
+```text
+requested(feature) ==> globally_enabled(capability(feature))
+```
+
+`--audit-capabilities` suppresses only missing-capability errors so an
+existing main configuration can report the opt-ins it requires. It does not
+enable those capabilities and does not infer trust from access-file contents.
+The resulting audit artifact is marked non-runnable and rejected by request
+dispatch, so callers cannot use suppressed audit diagnostics as a startup
+bypass.
+
 ## 1. Scope of the model
 
 In scope:
@@ -1563,7 +1591,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **465 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **467 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1955,9 +1983,9 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus
 ```
 
-The current ledger (2026-10-28) is:
+The current ledger (2026-10-29) is:
 
-- weighted obligations: **34.5 / 65.0 (53.1%)** if partial obligations receive
+- weighted obligations: **35.5 / 66.0 (53.8%)** if partial obligations receive
   half credit;
 - proof debt: **6 / 6** — 0 named unverified security components, 0 partially
   bound sinks, 6 assumptions and 0 accepted unmodeled security-directive
@@ -1966,7 +1994,7 @@ The current ledger (2026-10-28) is:
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **465 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **467 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

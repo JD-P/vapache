@@ -2393,6 +2393,102 @@ pub struct FastCgiStablePathPolicy {
     pub trusted_owner_uids: Vec<u32>,
 }
 
+/// Individually reviewable gates for compatibility features that materially
+/// expand the request parser, filesystem walk, generated-content, or code
+/// execution surface. Every capability is off unless the global server
+/// configuration explicitly enables it with `VapacheCapability`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Capability {
+    AbsoluteRequestTarget,
+    AccessFiles,
+    AutoIndex,
+    Cgi,
+    FastCgi,
+    LegacyAuthz,
+    RequestTrailers,
+    RewriteProgram,
+    ServerStatus,
+    Trace,
+}
+
+impl Capability {
+    pub const ALL: [Self; 10] = [
+        Self::AbsoluteRequestTarget,
+        Self::AccessFiles,
+        Self::AutoIndex,
+        Self::Cgi,
+        Self::FastCgi,
+        Self::LegacyAuthz,
+        Self::RequestTrailers,
+        Self::RewriteProgram,
+        Self::ServerStatus,
+        Self::Trace,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AbsoluteRequestTarget => "AbsoluteRequestTarget",
+            Self::AccessFiles => "AccessFiles",
+            Self::AutoIndex => "AutoIndex",
+            Self::Cgi => "Cgi",
+            Self::FastCgi => "FastCgi",
+            Self::LegacyAuthz => "LegacyAuthz",
+            Self::RequestTrailers => "RequestTrailers",
+            Self::RewriteProgram => "RewriteProgram",
+            Self::ServerStatus => "ServerStatus",
+            Self::Trace => "Trace",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|capability| capability.name().eq_ignore_ascii_case(value))
+    }
+
+    const fn bit(self) -> u64 {
+        1u64 << self as u8
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capabilities(u64);
+
+#[cfg(test)]
+pub(crate) const TEST_CAPABILITIES: &str = "\
+VapacheCapability AbsoluteRequestTarget On\n\
+VapacheCapability AccessFiles On\n\
+VapacheCapability AutoIndex On\n\
+VapacheCapability Cgi On\n\
+VapacheCapability FastCgi On\n\
+VapacheCapability LegacyAuthz On\n\
+VapacheCapability RequestTrailers On\n\
+VapacheCapability RewriteProgram On\n\
+VapacheCapability ServerStatus On\n\
+VapacheCapability Trace On\n";
+
+impl Capabilities {
+    pub fn contains(self, capability: Capability) -> bool {
+        self.0 & capability.bit() != 0
+    }
+
+    pub(crate) fn set(&mut self, capability: Capability, enabled: bool) {
+        if enabled {
+            self.0 |= capability.bit();
+        } else {
+            self.0 &= !capability.bit();
+        }
+    }
+
+    pub fn enabled_names(self) -> Vec<&'static str> {
+        Capability::ALL
+            .into_iter()
+            .filter(|capability| self.contains(*capability))
+            .map(Capability::name)
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub server_root: PathBuf,
@@ -2411,6 +2507,15 @@ pub struct Config {
     pub server_tokens: ServerTokens,
     pub server_signature: ServerSignature,
     pub trace_enable: bool,
+    pub capabilities: Capabilities,
+    /// Capabilities required by effectful directives in the loaded main
+    /// configuration. Used by the migration audit; access-file contents are
+    /// deliberately not inferred or auto-enabled.
+    pub required_capabilities: Vec<Capability>,
+    /// Audit-mode configurations are report artifacts, not runnable server
+    /// configurations. This prevents deliberately suppressed capability
+    /// errors from becoming an execution path through the public loader.
+    pub(crate) capability_audit_only: bool,
     pub limit_request_line: usize,
     pub limit_request_fields: usize,
     pub limit_request_field_size: usize,
@@ -2473,6 +2578,10 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn capability_enabled(&self, capability: Capability) -> bool {
+        self.capabilities.contains(capability)
+    }
+
     pub(crate) fn module_loaded(&self, name: &str) -> bool {
         let wanted = norm_module(name);
         prelinked_module_names().contains(&wanted)
@@ -2513,6 +2622,30 @@ impl Config {
         defines: &HashMap<String, String>,
         strict: bool,
     ) -> Result<Config, Vec<ConfigError>> {
+        Self::load_mode(path, server_root, env, defines, strict, false)
+    }
+
+    /// Parse a configuration for capability migration reporting. Missing
+    /// capability declarations are collected instead of making the audit
+    /// itself fail; every other configuration error remains fatal.
+    pub fn load_capability_audit(
+        path: &Path,
+        server_root: &Path,
+        env: &HashMap<String, String>,
+        defines: &HashMap<String, String>,
+        strict: bool,
+    ) -> Result<Config, Vec<ConfigError>> {
+        Self::load_mode(path, server_root, env, defines, strict, true)
+    }
+
+    fn load_mode(
+        path: &Path,
+        server_root: &Path,
+        env: &HashMap<String, String>,
+        defines: &HashMap<String, String>,
+        strict: bool,
+        capability_audit: bool,
+    ) -> Result<Config, Vec<ConfigError>> {
         let mut p = ParserState {
             events: Vec::new(),
             section_stack: Vec::new(),
@@ -2539,7 +2672,7 @@ impl Config {
         if !p.errors.is_empty() {
             return Err(p.errors);
         }
-        match Compile::new(p, strict).compile() {
+        match Compile::new(p, strict, capability_audit).compile() {
             Ok(mut c) => {
                 c.override_enabled = c.override_scan();
                 let (prefixes, anywhere) = c.override_paths();
@@ -2675,6 +2808,7 @@ fn core_directive_exists(name: &str) -> bool {
             | "usecanonicalname"
             | "usecanonicalphysicalport"
             | "vapachefastcgistablepath"
+            | "vapachecapability"
             | "vapachemaxdynamicrequests"
             | "vapachemaxfastcgioutput"
             | "vapachemaxspoolbytes"
@@ -3357,10 +3491,12 @@ struct Compile {
     known: HashSet<&'static str>,
     next_condition_chain: usize,
     next_route: usize,
+    required_capabilities: Vec<(Capability, SourceLoc, String)>,
+    capability_audit: bool,
 }
 
 impl Compile {
-    fn new(p: ParserState, strict: bool) -> Self {
+    fn new(p: ParserState, strict: bool, capability_audit: bool) -> Self {
         let server_root = p.server_root.clone();
         let config_defines: HashSet<String> = p.defines.keys().cloned().collect();
         let modules: Vec<String> = {
@@ -3385,6 +3521,9 @@ impl Compile {
             server_tokens: ServerTokens::Full,
             server_signature: ServerSignature::On,
             trace_enable: false,
+            capabilities: Capabilities::default(),
+            required_capabilities: Vec::new(),
+            capability_audit_only: capability_audit,
             limit_request_line: 8190,
             limit_request_fields: 100,
             limit_request_field_size: 8190,
@@ -3448,6 +3587,36 @@ impl Compile {
             known,
             next_condition_chain: 0,
             next_route: 0,
+            required_capabilities: Vec::new(),
+            capability_audit,
+        }
+    }
+
+    fn require_capability(
+        &mut self,
+        capability: Capability,
+        loc: &SourceLoc,
+        feature: impl Into<String>,
+    ) {
+        self.required_capabilities
+            .push((capability, loc.clone(), feature.into()));
+    }
+
+    fn validate_capabilities(&mut self) {
+        for (capability, loc, feature) in &self.required_capabilities {
+            if !self.cfg.required_capabilities.contains(capability) {
+                self.cfg.required_capabilities.push(*capability);
+            }
+            if !self.capability_audit && !self.cfg.capabilities.contains(*capability) {
+                self.errors.push(ConfigError {
+                    file: loc.file.clone(),
+                    line: loc.line,
+                    msg: format!(
+                        "{feature} requires 'VapacheCapability {} On' in global server context",
+                        capability.name()
+                    ),
+                });
+            }
         }
     }
 
@@ -3538,6 +3707,7 @@ impl Compile {
             None,
             SectionKind::Server,
         );
+        self.validate_capabilities();
         if let Some(e) = self.errors.into_iter().next() {
             return Err(e);
         }
@@ -4263,6 +4433,45 @@ impl Compile {
         let first = || args.first().cloned().unwrap_or_default();
         let joined = || args.join(" ");
         match name {
+            "vapachecapability" => {
+                if section != SectionKind::Server || inside_vhost {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "VapacheCapability is only allowed in global server context".into(),
+                    });
+                    return;
+                }
+                if args.len() != 2 {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "VapacheCapability requires '<name> On|Off'".into(),
+                    });
+                    return;
+                }
+                let Some(capability) = Capability::parse(&args[0]) else {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("unknown vapache capability '{}'", args[0]),
+                    });
+                    return;
+                };
+                let enabled = if args[1].eq_ignore_ascii_case("on") {
+                    true
+                } else if args[1].eq_ignore_ascii_case("off") {
+                    false
+                } else {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "VapacheCapability requires On or Off".into(),
+                    });
+                    return;
+                };
+                self.cfg.capabilities.set(capability, enabled);
+            }
             "serverroot" => {
                 if let Some(a) = args.first() {
                     self.cfg.server_root = PathBuf::from(a);
@@ -4467,6 +4676,24 @@ impl Compile {
                     .extend(args.iter().cloned());
             }
             "options" => {
+                for arg in args {
+                    if arg.starts_with('-') {
+                        continue;
+                    }
+                    match arg.trim_start_matches('+').to_ascii_lowercase().as_str() {
+                        "all" => {
+                            self.require_capability(Capability::AutoIndex, loc, "Options All");
+                            self.require_capability(Capability::Cgi, loc, "Options All");
+                        }
+                        "indexes" => {
+                            self.require_capability(Capability::AutoIndex, loc, "Options Indexes")
+                        }
+                        "execcgi" => {
+                            self.require_capability(Capability::Cgi, loc, "Options ExecCGI")
+                        }
+                        _ => {}
+                    }
+                }
                 if args.is_empty() {
                     scope.options.push_set(Options::empty().0);
                 }
@@ -4653,6 +4880,9 @@ impl Compile {
                 } else {
                     OverrideMode::Categories(flags)
                 });
+                if all || (!none && flags.0 != 0) {
+                    self.require_capability(Capability::AccessFiles, loc, "enabled AllowOverride");
+                }
                 scope.override_policy.set_nonfatal(nonfatal);
                 if !all && !none && flags.0 == 0 {
                     // Silently turning all overrides off here would make a
@@ -4731,6 +4961,13 @@ impl Compile {
                 scope
                     .override_policy
                     .set_allow_list(if none { Vec::new() } else { list });
+                if !none {
+                    self.require_capability(
+                        Capability::AccessFiles,
+                        loc,
+                        "enabled AllowOverrideList",
+                    );
+                }
             }
             "require" => {
                 let provider = parse_require(args);
@@ -4755,6 +4992,7 @@ impl Compile {
                 scope.add_require(RequireNode::Provider(provider), limit);
             }
             "order" => {
+                self.require_capability(Capability::LegacyAuthz, loc, "Order");
                 let order = match first().to_ascii_lowercase().as_str() {
                     "allow,deny" | "mutual-failure" => Order::AllowDeny,
                     "deny,allow" => Order::DenyAllow,
@@ -4770,6 +5008,7 @@ impl Compile {
                 scope.add_order(order, limit);
             }
             "allow" | "deny" => {
+                self.require_capability(Capability::LegacyAuthz, loc, name);
                 if !args
                     .first()
                     .map(|s| s.eq_ignore_ascii_case("from"))
@@ -4831,6 +5070,9 @@ impl Compile {
                     return;
                 }
                 let vpath = args[0].clone();
+                if name == "scriptalias" {
+                    self.require_capability(Capability::Cgi, loc, "ScriptAlias");
+                }
                 let mut fpath = PathBuf::from(&args[1]);
                 if !fpath.is_absolute() {
                     fpath = self.cfg.server_root.join(fpath);
@@ -4843,6 +5085,9 @@ impl Compile {
             }
             "aliasmatch" | "scriptaliasmatch" => {
                 if args.len() >= 2 {
+                    if name == "scriptaliasmatch" {
+                        self.require_capability(Capability::Cgi, loc, "ScriptAliasMatch");
+                    }
                     match compile_regex(&args[0]) {
                         Ok(regex) => scope.mapping_policy.aliases.push(Alias::regex(
                             Arc::new(regex),
@@ -4990,6 +5235,7 @@ impl Compile {
                             .push((name, RewriteMap::Rnd(map)));
                     }
                     "prg" => {
+                        self.require_capability(Capability::RewriteProgram, loc, "RewriteMap prg");
                         // Resolve and retain the executable descriptor at load
                         // time. Runtime execution uses that descriptor and
                         // refuses a pathname/version mismatch, so replacing a
@@ -5078,6 +5324,29 @@ impl Compile {
                 let base = scope.rewrite_policy.rewrite_base.as_deref().unwrap_or("/");
                 match parse_rewrite_rule(args, base, false) {
                     Ok(mut rule) => {
+                        if let Some(handler) = rule.flags.handler.as_deref() {
+                            if handler.eq_ignore_ascii_case("cgi-script") {
+                                self.require_capability(
+                                    Capability::Cgi,
+                                    loc,
+                                    "RewriteRule cgi-script handler",
+                                );
+                            }
+                            if handler.eq_ignore_ascii_case("server-status") {
+                                self.require_capability(
+                                    Capability::ServerStatus,
+                                    loc,
+                                    "RewriteRule server-status handler",
+                                );
+                            }
+                            if handler.to_ascii_lowercase().contains("fcgi://") {
+                                self.require_capability(
+                                    Capability::FastCgi,
+                                    loc,
+                                    "RewriteRule FastCGI handler",
+                                );
+                            }
+                        }
                         // Deliberately inert since the F32 remediation; accepted
                         // for Apache compatibility but must not be silent.
                         if rule.flags.unsafe_prefix_stat {
@@ -5135,6 +5404,19 @@ impl Compile {
                     );
                     return;
                 }
+                if args[0].eq_ignore_ascii_case("cgi-script") {
+                    self.require_capability(Capability::Cgi, loc, "AddHandler cgi-script");
+                }
+                if args[0].eq_ignore_ascii_case("server-status") {
+                    self.require_capability(
+                        Capability::ServerStatus,
+                        loc,
+                        "AddHandler server-status",
+                    );
+                }
+                if args[0].to_ascii_lowercase().contains("fcgi://") {
+                    self.require_capability(Capability::FastCgi, loc, "AddHandler FastCGI");
+                }
                 for ext in &args[1..] {
                     scope.mapping_policy.handlers.push(Handler::add(
                         normalize_handler_extension(ext),
@@ -5154,7 +5436,21 @@ impl Compile {
                 // F64/I62: `SetHandler` carries precedence; it is stored as a
                 // separate assignment, not as an extension-table entry, so a
                 // later or inherited `AddHandler` can never replace it.
-                scope.mapping_policy.set_handler = Some(SetHandler::parse(&first()));
+                let handler = first();
+                if handler.eq_ignore_ascii_case("cgi-script") {
+                    self.require_capability(Capability::Cgi, loc, "SetHandler cgi-script");
+                }
+                if handler.eq_ignore_ascii_case("server-status") {
+                    self.require_capability(
+                        Capability::ServerStatus,
+                        loc,
+                        "SetHandler server-status",
+                    );
+                }
+                if handler.to_ascii_lowercase().contains("fcgi://") {
+                    self.require_capability(Capability::FastCgi, loc, "SetHandler FastCGI");
+                }
+                scope.mapping_policy.set_handler = Some(SetHandler::parse(&handler));
             }
             "forcetype" => scope.content_policy.force_type = Some(first()),
             "adddefaultcharset" => {
@@ -5357,6 +5653,9 @@ impl Compile {
                     });
                     return;
                 }
+                if args[1].to_ascii_lowercase().contains("fcgi://") {
+                    self.require_capability(Capability::FastCgi, loc, "ProxyPass FastCGI");
+                }
                 if args[0].starts_with('!') {
                     return;
                 }
@@ -5427,6 +5726,9 @@ impl Compile {
                         msg: format!("unsupported ProxyPassMatch backend '{}'", args[1]),
                     });
                     return;
+                }
+                if args[1].to_ascii_lowercase().contains("fcgi://") {
+                    self.require_capability(Capability::FastCgi, loc, "ProxyPassMatch FastCGI");
                 }
                 if !proxy_template_authority_safe(&args[1]) {
                     self.errors.push(ConfigError {
@@ -5722,7 +6024,29 @@ impl Compile {
                 };
             }
             "traceenable" => {
-                self.cfg.trace_enable = !first().eq_ignore_ascii_case("off");
+                if args.len() != 1 {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "TraceEnable requires exactly one of Off, On, or Extended".into(),
+                    });
+                    return;
+                }
+                self.cfg.trace_enable = match first().to_ascii_lowercase().as_str() {
+                    "off" => false,
+                    "on" | "extended" => true,
+                    _ => {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: "TraceEnable requires Off, On, or Extended".into(),
+                        });
+                        return;
+                    }
+                };
+                if self.cfg.trace_enable {
+                    self.require_capability(Capability::Trace, loc, "enabled TraceEnable");
+                }
             }
             "limitrequestline" => {
                 if let Some(n) = parse_u32_arg(args) {
@@ -5786,6 +6110,7 @@ impl Compile {
                 };
             }
             "satisfy" => {
+                self.require_capability(Capability::LegacyAuthz, loc, "Satisfy");
                 let satisfy = match first().to_ascii_lowercase().as_str() {
                     "all" => Satisfy::All,
                     "any" => Satisfy::Any,
@@ -8088,6 +8413,7 @@ fn known_directives() -> HashSet<&'static str> {
         "vapachemaxfastcgioutput",
         "vapachemaxspoolbytes",
         "vapachemaxspoolfiles",
+        "vapachecapability",
         "variantname",
         "virtualhost",
         "xml2encalias",
@@ -8264,7 +8590,12 @@ mod tests {
         assert!(cfg.select_vhost(Some(loopback), 19214, None).is_none());
     }
 
-    fn load_text(text: &str, strict: bool) -> Result<Config, Vec<ConfigError>> {
+    fn load_text_with_prelude(
+        prelude: &str,
+        text: &str,
+        strict: bool,
+        capability_audit: bool,
+    ) -> Result<Config, Vec<ConfigError>> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
@@ -8272,16 +8603,158 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::write(&path, text).unwrap();
-        let result = Config::load(
-            &path,
-            std::env::temp_dir().as_path(),
-            &HashMap::new(),
-            &HashMap::new(),
-            strict,
-        );
+        std::fs::write(&path, format!("{prelude}{text}")).unwrap();
+        let result = if capability_audit {
+            Config::load_capability_audit(
+                &path,
+                std::env::temp_dir().as_path(),
+                &HashMap::new(),
+                &HashMap::new(),
+                strict,
+            )
+        } else {
+            Config::load(
+                &path,
+                std::env::temp_dir().as_path(),
+                &HashMap::new(),
+                &HashMap::new(),
+                strict,
+            )
+        };
         let _ = std::fs::remove_file(path);
         result
+    }
+
+    fn load_text(text: &str, strict: bool) -> Result<Config, Vec<ConfigError>> {
+        load_text_with_prelude(TEST_CAPABILITIES, text, strict, false)
+    }
+
+    fn load_text_default(text: &str) -> Result<Config, Vec<ConfigError>> {
+        load_text_with_prelude("", text, false, false)
+    }
+
+    #[test]
+    fn compatibility_capabilities_are_individual_global_and_default_off() {
+        let defaults = load_text_default("Listen 127.0.0.1:0\n").unwrap();
+        for capability in Capability::ALL {
+            assert!(!defaults.capability_enabled(capability));
+            let cfg = load_text_default(&format!(
+                "VapacheCapability {} On\nListen 127.0.0.1:0\n",
+                capability.name()
+            ))
+            .unwrap();
+            assert!(cfg.capability_enabled(capability));
+            assert_eq!(cfg.capabilities.enabled_names(), vec![capability.name()]);
+        }
+
+        let cases = [
+            (
+                "Trace",
+                "Listen 127.0.0.1:0\nTraceEnable On\n",
+            ),
+            (
+                "AccessFiles",
+                "Listen 127.0.0.1:0\n<Directory /srv>\nAllowOverride All\n</Directory>\n",
+            ),
+            (
+                "AutoIndex",
+                "Listen 127.0.0.1:0\n<Directory /srv>\nOptions Indexes\n</Directory>\n",
+            ),
+            (
+                "Cgi",
+                "Listen 127.0.0.1:0\nScriptAlias /cgi/ /srv/cgi/\n",
+            ),
+            (
+                "FastCgi",
+                "Listen 127.0.0.1:0\nProxyPassMatch ^/(.*\\.php)$ unix:/run/php.sock|fcgi://localhost/srv/\n",
+            ),
+            (
+                "LegacyAuthz",
+                "Listen 127.0.0.1:0\n<Directory /srv>\nOrder deny,allow\nDeny from all\n</Directory>\n",
+            ),
+            (
+                "RewriteProgram",
+                "Listen 127.0.0.1:0\nRewriteMap helper prg:/bin/cat\n",
+            ),
+            (
+                "ServerStatus",
+                "Listen 127.0.0.1:0\n<Location /status>\nSetHandler server-status\n</Location>\n",
+            ),
+            (
+                "Cgi",
+                "Listen 127.0.0.1:0\nRewriteRule ^x$ - [H=cgi-script]\n",
+            ),
+            (
+                "FastCgi",
+                "Listen 127.0.0.1:0\nRewriteRule ^x$ - [H=proxy:fcgi://localhost]\n",
+            ),
+            (
+                "ServerStatus",
+                "Listen 127.0.0.1:0\nRewriteRule ^x$ - [H=server-status]\n",
+            ),
+        ];
+        for (name, text) in cases {
+            let errors = load_text_default(text).unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.msg.contains(&format!("VapacheCapability {name} On"))),
+                "missing {name} rejection: {errors:?}"
+            );
+            assert!(
+                load_text_with_prelude(
+                    &format!("VapacheCapability {name} On\n"),
+                    text,
+                    false,
+                    false,
+                )
+                .is_ok(),
+                "explicit {name} opt-in was rejected"
+            );
+        }
+
+        // Declarations are process-global, order independent, and final: a
+        // later Off cannot leave an earlier feature enabled by accident.
+        assert!(load_text_default(
+            "Listen 127.0.0.1:0\nTraceEnable On\nVapacheCapability Trace On\n"
+        )
+        .is_ok());
+        assert!(load_text_default(
+            "Listen 127.0.0.1:0\nVapacheCapability Trace On\nTraceEnable On\nVapacheCapability Trace Off\n"
+        )
+        .is_err());
+
+        for text in [
+            "Listen 127.0.0.1:0\nVapacheCapability Unknown On\n",
+            "Listen 127.0.0.1:0\nVapacheCapability Trace Maybe\n",
+            "Listen 127.0.0.1:0\n<Directory /srv>\nVapacheCapability Trace On\n</Directory>\n",
+            "Listen 127.0.0.1:0\n<VirtualHost *:80>\nVapacheCapability Trace On\n</VirtualHost>\n",
+            "Listen 127.0.0.1:0\n<If true>\nVapacheCapability Trace On\n</If>\n",
+            "Listen 127.0.0.1:0\nTraceEnable Maybe\n",
+            "Listen 127.0.0.1:0\nTraceEnable\n",
+            "Listen 127.0.0.1:0\nTraceEnable On Off\n",
+        ] {
+            assert!(load_text_default(text).is_err(), "accepted: {text}");
+        }
+        assert!(load_text_default(
+            "VapacheCapability Trace On\nListen 127.0.0.1:0\nTraceEnable Extended\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn capability_audit_reports_but_does_not_auto_enable_missing_gates() {
+        let cfg = load_text_with_prelude(
+            "",
+            "Listen 127.0.0.1:0\nTraceEnable On\n<Directory /srv>\nOptions Indexes\n</Directory>\n",
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(!cfg.capability_enabled(Capability::Trace));
+        assert!(!cfg.capability_enabled(Capability::AutoIndex));
+        assert!(cfg.required_capabilities.contains(&Capability::Trace));
+        assert!(cfg.required_capabilities.contains(&Capability::AutoIndex));
     }
 
     #[test]
@@ -8402,7 +8875,7 @@ mod tests {
 
         let load_with_root = |config: &str| {
             let path = dir.join("rmap-test.conf");
-            std::fs::write(&path, config).unwrap();
+            std::fs::write(&path, format!("{}{config}", TEST_CAPABILITIES)).unwrap();
             let r = Config::load(
                 &path,
                 dir.as_path(),
@@ -12572,6 +13045,9 @@ impl Config {
     /// True when the compiled configuration can dispatch a CGI request.
     /// Used to avoid starting CGI worker processes for static-only servers.
     pub fn has_cgi(&self) -> bool {
+        if !self.capability_enabled(Capability::Cgi) {
+            return false;
+        }
         fn scope_has_cgi(s: &Scope) -> bool {
             s.mapping_policy.aliases.iter().any(|a| a.script)
                 || s.effective_options().contains(Options::EXEC_CGI)
@@ -12701,7 +13177,9 @@ impl Config {
     /// dispatcher can use the one-pass Directory merge and skip the per-
     /// directory walk entirely.
     pub fn htaccess_may_apply(&self, fs_path: &Path) -> bool {
-        self.override_enabled && self.override_applicable(fs_path)
+        self.capability_enabled(Capability::AccessFiles)
+            && self.override_enabled
+            && self.override_applicable(fs_path)
     }
 
     /// Per-directory prefilter for the ancestor walk.  An access file in
@@ -12710,7 +13188,7 @@ impl Config {
     /// compared without filesystem metadata; a wildcard prefix conservatively
     /// admits the walk so the existing effective-policy check decides.
     pub(crate) fn access_file_dir_applicable(&self, dir: &Path) -> bool {
-        if !self.override_enabled {
+        if !self.capability_enabled(Capability::AccessFiles) || !self.override_enabled {
             return false;
         }
         if self.override_anywhere {
@@ -13448,7 +13926,7 @@ mod pass11_kernel_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
-        std::fs::write(&path, text).unwrap();
+        std::fs::write(&path, format!("{}{text}", TEST_CAPABILITIES)).unwrap();
         Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap()
     }
 

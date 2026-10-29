@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-10-29",
   "verus": {
-    "verified_functions": 465,
+    "verified_functions": 467,
     "errors": 0
   },
   "obligations": [
@@ -460,6 +460,13 @@
       "status": "partial",
       "weight": 1.0,
       "evidence": "the direct dispatch and CGI PATH_INFO split bind classification to the lexical request-mapped basename; FastCGI receives that bound name instead of re-deriving it from SCRIPT_FILENAME. Resolved-target evaluation builds canonical authorization and lexical handler scopes from one immutable RequestPlan/access-layer set, then copies only handlers/set_handler from the lexical Files evaluation. handler_identity_lexical_admit guards classification and handler_scope_lexical_admit proves that a differing resolved target cannot contribute a canonical-only Files/FilesMatch force. Canonical Files authorization remains active. F69 plus five P13 replays cover direct AddHandler, PATH_INFO, FastCGI SetHandler, Files-scoped SetHandler, canonical access denial and live Location controls."
+    },
+    {
+      "id": "compatibility_capability_gate",
+      "title": "Default-off compatibility surfaces require a process-global capability",
+      "status": "mechanized",
+      "weight": 1.0,
+      "evidence": "capability_admit is the executable kernel shared by request parsing, access-file admission and final generated-content/execution sinks; disabled_capability_rejects_request proves a requested surface cannot pass a disabled gate. Main-config compilation records gated effectful directives and validates the final process-global set independent of declaration order; declarations are rejected in vhosts, runtime conditional scopes and access files. Runtime backstops cover TRACE, absolute-form targets, request trailers, autoindex, CGI, FastCGI and server-status, while program RewriteMap is main-config-only. Audit-loaded configurations are marked non-runnable and refused by dispatch so suppressed reporting diagnostics cannot enable legacy authz or program maps. Unit matrices cover every capability, declaration context/final-state behavior, audit-only loading, final sinks and access-file escalation attempts."
     }
   ],
   "minimum_weighted_score": 3.5,
@@ -596,6 +603,7 @@
     "Apache-compatible byte-oriented directive-regex mode with default and inline Unicode classes excluded and exact raw-header byte projection",
     "Canonical path text admission: normalized path bytes must be valid UTF-8 and invalid input is rejected without lossy projection",
     "Configuration/filesystem text identity admission: invalid UTF-8 is rejected before policy parsing or request planning",
-    "FastCGI environment provenance admission and tagged merge: main configuration allowed, access-file origin rejected without origin upgrades"
+    "FastCGI environment provenance admission and tagged merge: main configuration allowed, access-file origin rejected without origin upgrades",
+    "Process-global compatibility capability admission and disabled-surface rejection"
   ]
 }

@@ -196,7 +196,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **465 verified functions, 0 errors** (percent-decoding,
+Current result: **467 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -244,6 +244,52 @@ access-file section commands: the backend wire path must stay bound to the
 lexical request mapping while the canonical target remains independently
 contained and authorized, and an allowed child directive cannot admit an
 unlisted section wrapper.
+
+### Default-off compatibility capabilities
+
+Vapache does not inherit Apache's ambient legacy surface. The following
+features are individually disabled unless the global server configuration
+opts in with `VapacheCapability <name> On`:
+
+| Capability | Gated surface |
+| --- | --- |
+| `Trace` | `TraceEnable On`/`Extended` and the TRACE reflection handler |
+| `AccessFiles` | any effective `AllowOverride`/`AllowOverrideList` access-file walk |
+| `LegacyAuthz` | `Order`, `Allow`, `Deny`, and `Satisfy`, including access files |
+| `AutoIndex` | generated directory listings from `Options Indexes` |
+| `Cgi` | `ScriptAlias`, `cgi-script`, and `Options ExecCGI` execution |
+| `FastCgi` | FastCGI `ProxyPassMatch`/`ProxyPass` and handler execution |
+| `RewriteProgram` | external `RewriteMap prg` helpers |
+| `ServerStatus` | the generated `server-status` handler |
+| `AbsoluteRequestTarget` | HTTP/1 absolute-form request targets |
+| `RequestTrailers` | non-empty HTTP/1 chunked request trailers |
+
+Declarations are process-global, order independent, and final-state checked;
+they are rejected in virtual hosts, directory/location sections, and access
+files. Enabling `AccessFiles` therefore cannot let an attacker-controlled
+`.htaccess` enable CGI, autoindex, legacy authorization, FastCGI, status, or
+another global capability. Effectful directives missing their opt-in make
+configuration loading fail, and execution/generation sinks check the same
+gate again.
+
+For example, an application that only needs CGI declares only:
+
+```apache
+VapacheCapability Cgi On
+```
+
+`vapached --audit-capabilities -f /path/to/httpd.conf` parses an existing main
+configuration without auto-enabling anything and prints the declarations it
+would require. Access-file contents are intentionally checked only when read,
+so they remain unable to change the process capability set. A configuration
+loaded in audit mode is also marked non-runnable and the dispatcher refuses
+it, preventing the reporting API from becoming a capability bypass.
+
+HTTP/0.9, unknown/lenient methods, multipart byte ranges, SSI, MultiViews,
+UserDir, DAV, forward proxying, external filters, LDAP/Digest/DBM auth,
+`server-info`, and `balancer-manager` are not implemented and remain
+unconditionally unavailable. They do not receive opt-in switches that imply
+unsupported behavior is safe.
 
 For local FastCGI deployments, the optional global directive below turns the
 remaining pathname-stability deployment rule into a runtime admission check:
@@ -299,12 +345,12 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus   # include the Verus gate
 ```
 
-Current ledger: **53.1% weighted obligations**, **6/6 proof debt**,
+Current ledger: **53.8% weighted obligations**, **6/6 proof debt**,
 **8/8 grant-required sinks**, **8/8 path-target-bound sinks**, **5/8
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **108 adversarial replay cases** covering the findings classes,
-and **465 Verus functions with 0 errors** (including the I3 fast-path
+and **467 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -324,7 +370,7 @@ freshness, disk-accounting and SHA-256 policy-binding proofs for I51/I54).
 
 The ledger lives in `docs/verification-status.json`. It records:
 
-- weighted progress on the sixty-five proof obligations,
+- weighted progress on the sixty-six proof obligations,
 - named unverified security components,
 - sinks that need stronger resource binding,
 - explicit assumptions and unmodeled directive classes,
@@ -454,9 +500,9 @@ failure races and privileged-kernel failures are excluded from that metric.
 
 Latest snapshot: **20,020/20,548 executable server production lines (97.43%)**;
 the new aggregate-resource module is **62/62 (100%)**. The current suite is
-466 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
+471 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
 integration tests, 165 conformance tests and 339 fixed configuration cases.
-The separate Verus gate proves 465 functions with 0 errors; proof-only code is
+The separate Verus gate proves 467 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

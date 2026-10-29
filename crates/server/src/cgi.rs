@@ -1329,7 +1329,14 @@ mod tests {
 
     fn config(root: &Path) -> Config {
         let path = root.join("httpd.conf");
-        fs::write(&path, "Listen 127.0.0.1:0\n").unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{}Listen 127.0.0.1:0\n",
+                crate::config::TEST_CAPABILITIES
+            ),
+        )
+        .unwrap();
         Config::load(&path, root, &HashMap::new(), &HashMap::new(), false).unwrap()
     }
 
@@ -2429,7 +2436,14 @@ mod pass11_kernel_tests {
 
     fn config(root: &Path) -> Config {
         let path = root.join("httpd.conf");
-        std::fs::write(&path, "Listen 127.0.0.1:0\n").unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{}Listen 127.0.0.1:0\n",
+                crate::config::TEST_CAPABILITIES
+            ),
+        )
+        .unwrap();
         Config::load(
             &path,
             root,
@@ -2441,7 +2455,10 @@ mod pass11_kernel_tests {
     }
 
     fn cgi_scope(options: Options, text: &str) -> Scope {
-        let cfg_text = format!("Listen 127.0.0.1:0\n{text}");
+        let cfg_text = format!(
+            "{}Listen 127.0.0.1:0\n{text}",
+            crate::config::TEST_CAPABILITIES
+        );
         let dir = std::env::temp_dir().join(format!("vapache-cgi-matrix-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

@@ -329,7 +329,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
-        fs::write(&path, text).unwrap();
+        fs::write(
+            &path,
+            format!("{}{text}", crate::config::TEST_CAPABILITIES),
+        )
+        .unwrap();
         Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap()
     }
 

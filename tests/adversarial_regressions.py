@@ -42,6 +42,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
 
+VAPACHE_CAPABILITIES = """VapacheCapability AbsoluteRequestTarget On
+VapacheCapability AccessFiles On
+VapacheCapability AutoIndex On
+VapacheCapability Cgi On
+VapacheCapability FastCgi On
+VapacheCapability LegacyAuthz On
+VapacheCapability RequestTrailers On
+VapacheCapability RewriteProgram On
+VapacheCapability ServerStatus On
+VapacheCapability Trace On
+"""
+
 
 def free_port() -> int:
     sock = socket.socket()
@@ -74,7 +86,7 @@ def start_vapached(base: Path, config: str, server_root: Path | None = None):
     logs.mkdir(parents=True, exist_ok=True)
     logs.chmod(0o777)
     config_path = base / "vp.conf"
-    config_path.write_text(config)
+    config_path.write_text(VAPACHE_CAPABILITIES + config)
     command = [str(VAPACHED)]
     if server_root is not None:
         command.extend(["-d", str(server_root)])
@@ -516,7 +528,8 @@ class F23ToF38Tests(unittest.TestCase):
     @classmethod
     def write_config(cls, extra: str = ""):
         cls.config.write_text(
-            f"""ServerRoot "{cls.base}"
+            VAPACHE_CAPABILITIES
+            + f"""ServerRoot "{cls.base}"
 Listen 127.0.0.1:{cls.port}
 ServerName localhost
 PidFile "{cls.logs}/httpd.pid"

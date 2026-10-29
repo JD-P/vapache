@@ -47,12 +47,14 @@ struct Args {
     explain_host: Option<String>,
     explain_port: Option<u16>,
     explain_headers: Vec<(String, String)>,
+    audit_capabilities: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "Usage: vapached [-d serverroot] [-f config] [-D name] [-k start|stop|restart|graceful|status]\n\
          \x20                [-t] [-T] [-M] [-S] [-v] [-V] [-l] [-X] [--strict-config]\n\
+         \x20                [--audit-capabilities]\n\
          \x20                [--explain PATH [--explain-method M] [--explain-host H] [--explain-port P]\n\
          \x20                 [--explain-header 'Name: value']]"
     );
@@ -79,6 +81,7 @@ fn parse_args_from(args: &[String], default_server_root: PathBuf) -> Result<Args
         explain_host: None,
         explain_port: None,
         explain_headers: Vec::new(),
+        audit_capabilities: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -123,6 +126,7 @@ fn parse_args_from(args: &[String], default_server_root: PathBuf) -> Result<Args
             "-V" => a.show_build = true,
             "-l" => a.show_modules_compiled = true,
             "--strict-config" => a.strict = true,
+            "--audit-capabilities" => a.audit_capabilities = true,
             "--no-envvars" => a.no_envvars = true,
             "--explain" => {
                 i += 1;
@@ -624,7 +628,12 @@ fn main() {
     env.entry("SERVER_ROOT".into())
         .or_insert_with(|| server_root.to_string_lossy().into_owned());
 
-    let mut cfg = match Config::load(&config_path, &server_root, &env, &args.defines, args.strict) {
+    let loader = if args.audit_capabilities {
+        Config::load_capability_audit
+    } else {
+        Config::load
+    };
+    let mut cfg = match loader(&config_path, &server_root, &env, &args.defines, args.strict) {
         Ok(c) => c,
         Err(errors) => {
             for e in errors {
@@ -638,6 +647,37 @@ fn main() {
         // Exercised by cli_lifecycle's instrumented subprocess; llvm-cov does
         // not merge that child record into the unit-test binary's main.rs map.
         eprintln!("vapached: {warning}"); // coverage:ignore-line
+    }
+
+    if args.audit_capabilities {
+        let enabled = cfg.capabilities.enabled_names();
+        let missing: Vec<_> = cfg
+            .required_capabilities
+            .iter()
+            .copied()
+            .filter(|capability| !cfg.capability_enabled(*capability))
+            .collect();
+        println!("Capability audit:");
+        println!(
+            "  explicitly enabled: {}",
+            if enabled.is_empty() {
+                "none".to_string()
+            } else {
+                enabled.join(", ")
+            }
+        );
+        if missing.is_empty() {
+            println!("  missing opt-ins: none");
+        } else {
+            println!("  missing opt-ins:");
+            for capability in missing {
+                println!("    VapacheCapability {} On", capability.name());
+            }
+        }
+        println!(
+            "  note: access-file contents are checked when read and can never enable a capability"
+        );
+        return;
     }
 
     if args.show_build {
@@ -979,6 +1019,7 @@ mod tests {
             "-V",
             "-l",
             "--strict-config",
+            "--audit-capabilities",
             "--no-envvars",
             "--explain",
             "/x?q=1",
@@ -1005,6 +1046,7 @@ mod tests {
         let parsed = parse_args_from(&args, PathBuf::from("/default")).unwrap();
         assert_eq!(parsed.server_root, PathBuf::from("relative-root"));
         assert!(parsed.foreground && parsed.test && parsed.strict && parsed.no_envvars);
+        assert!(parsed.audit_capabilities);
         assert!(parsed.dump_modules && parsed.dump_vhosts);
         assert!(parsed.show_version && parsed.show_build && parsed.show_modules_compiled);
         assert_eq!(parsed.explain_port, Some(8080));
@@ -1097,7 +1139,7 @@ mod tests {
         std::fs::write(
             &conf,
             format!(
-                "Listen 127.0.0.1:8080\nServerName example.test\nDocumentRoot {}\nAlias /alias {}\n<Directory {}>\nAllowOverride All\nRequire all granted\n</Directory>\n",
+                "VapacheCapability AccessFiles On\nListen 127.0.0.1:8080\nServerName example.test\nDocumentRoot {}\nAlias /alias {}\n<Directory {}>\nAllowOverride All\nRequire all granted\n</Directory>\n",
                 dir.join("www").display(),
                 alias_root.display(),
                 alias_root.display(),
@@ -1113,7 +1155,7 @@ mod tests {
         std::fs::write(
             &conf,
             format!(
-                "Listen 127.0.0.1:8080\nDocumentRoot {}\n<Directory {}>\nAllowOverride All\n</Directory>\n",
+                "VapacheCapability AccessFiles On\nListen 127.0.0.1:8080\nDocumentRoot {}\n<Directory {}>\nAllowOverride All\n</Directory>\n",
                 dir.join("www").display(),
                 unrelated.display(),
             ),

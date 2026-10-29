@@ -1096,6 +1096,19 @@ def common(port, root, apache, tls_port):
         "</VirtualHost>",
     ]
     if not apache:
+        lines[0:0] = [
+            "VapacheCapability AbsoluteRequestTarget On",
+            "VapacheCapability AccessFiles On",
+            "VapacheCapability AutoIndex On",
+            "VapacheCapability Cgi On",
+            "VapacheCapability FastCgi On",
+            "VapacheCapability LegacyAuthz On",
+            "VapacheCapability RequestTrailers On",
+            "VapacheCapability RewriteProgram On",
+            "VapacheCapability ServerStatus On",
+            "VapacheCapability Trace On",
+        ]
+    if not apache:
         # vapached records LoadModule names for <IfModule>; the paths are not
         # opened and the module code is built in.
         lines = [

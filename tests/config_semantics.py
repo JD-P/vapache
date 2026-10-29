@@ -157,6 +157,18 @@ def base_config(port: int, apache: bool) -> str:
         # vapached only records module names for <IfModule>; paths are unused.
         for mod in APACHE_MODULES:
             lines.append(f"LoadModule {mod} {MODDIR}/mod_{mod.replace('_module','')}.so")
+        lines += [
+            "VapacheCapability AbsoluteRequestTarget On",
+            "VapacheCapability AccessFiles On",
+            "VapacheCapability AutoIndex On",
+            "VapacheCapability Cgi On",
+            "VapacheCapability FastCgi On",
+            "VapacheCapability LegacyAuthz On",
+            "VapacheCapability RequestTrailers On",
+            "VapacheCapability RewriteProgram On",
+            "VapacheCapability ServerStatus On",
+            "VapacheCapability Trace On",
+        ]
     lines += [
         f'ServerRoot "{BASE}"',
         f"Listen {port}",

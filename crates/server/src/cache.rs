@@ -1758,7 +1758,7 @@ mod tests {
         fs::write(
             &conf,
             format!(
-                "Listen 127.0.0.1:0\n\
+                "{}Listen 127.0.0.1:0\n\
 DocumentRoot \"{www}\"\n\
 CacheRoot \"{cache}\"\n\
 CacheEnable disk /\n\
@@ -1768,6 +1768,7 @@ AddHandler cgi-script .cgi\n\
     Options +ExecCGI\n\
     Require all granted\n\
 </Directory>\n",
+                crate::config::TEST_CAPABILITIES,
                 www = dir.join("www").display(),
                 cache = dir.join("cache").display(),
             ),
@@ -2544,7 +2545,7 @@ AddHandler cgi-script .cgi\n\
         fs::write(
             &conf,
             format!(
-                "Listen 127.0.0.1:0\n\
+                "{}Listen 127.0.0.1:0\n\
 DocumentRoot \"{www}\"\n\
 CacheRoot \"{cache}\"\n\
 CacheEnable disk /\n\
@@ -2555,6 +2556,7 @@ AddHandler cgi-script .cgi\n\
     Options +ExecCGI\n\
     Require all granted\n\
 </Directory>\n",
+                crate::config::TEST_CAPABILITIES,
                 www = dir.join("www").display(),
                 cache = dir.join("cache").display(),
             ),
@@ -2719,7 +2721,7 @@ CacheEnable disk /\n\
             fs::write(
                 &conf,
                 format!(
-                    "Listen 127.0.0.1:0\n\
+                    "{}Listen 127.0.0.1:0\n\
 DocumentRoot \"{www}\"\n\
 CacheRoot \"{cache}\"\n\
 CacheEnable disk /\n\
@@ -2730,6 +2732,7 @@ CacheIgnoreQueryString On\n\
 <Directory \"{www}\">\n\
     Require all granted\n\
 </Directory>\n",
+                    crate::config::TEST_CAPABILITIES,
                     www = www.display(),
                     cache = dir.join("cache").display(),
                 ),
@@ -2790,7 +2793,7 @@ CacheIgnoreQueryString On\n\
         fs::write(
             &conf,
             format!(
-                "Listen 127.0.0.1:0\n\
+                "{}Listen 127.0.0.1:0\n\
 DocumentRoot \"{www}\"\n\
 CacheRoot \"{cache}\"\n\
 CacheEnable disk /\n\
@@ -2798,6 +2801,7 @@ ErrorDocument 404 /404.html\n\
 <Directory \"{www}\">\n\
     Require all granted\n\
 </Directory>\n",
+                crate::config::TEST_CAPABILITIES,
                 www = www.display(),
                 cache = dir.join("cache").display(),
             ),
@@ -2853,7 +2857,7 @@ ErrorDocument 404 /404.html\n\
         fs::write(
             &conf,
             format!(
-                "Listen 127.0.0.1:0\n\
+                "{}Listen 127.0.0.1:0\n\
 DocumentRoot \"{www}\"\n\
 CacheRoot \"{cache}\"\n\
 CacheEnable disk /\n\
@@ -2862,6 +2866,7 @@ DirectoryIndex index.html\n\
     AllowOverride All\n\
     Require all granted\n\
 </Directory>\n",
+                crate::config::TEST_CAPABILITIES,
                 www = www.display(),
                 cache = dir.join("cache").display(),
             ),
@@ -2994,12 +2999,13 @@ CacheEnable disk /\n\
             fs::write(
                 &conf,
                 format!(
-                    "Listen 127.0.0.1:0\n\
+                    "{}Listen 127.0.0.1:0\n\
 DocumentRoot \"{www}\"\n\
 CacheRoot \"{cache}\"\n\
 CacheEnable disk /\n\
 CacheIgnoreQueryString On\n\
 <Directory \"{www}\">\nRequire all granted\n</Directory>\n{extra}\n",
+                    crate::config::TEST_CAPABILITIES,
                     www = www.display(),
                     cache = dir.join("cache").display(),
                 ),

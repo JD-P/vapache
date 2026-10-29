@@ -243,6 +243,8 @@ pub struct Limits {
     pub resource_budget: std::sync::Arc<ResourceBudget>,
     pub max_spool_bytes: u64,
     pub max_spool_files: u64,
+    pub allow_absolute_request_target: bool,
+    pub allow_request_trailers: bool,
 }
 
 impl Default for Limits {
@@ -259,6 +261,8 @@ impl Default for Limits {
             resource_budget: std::sync::Arc::new(ResourceBudget::default()),
             max_spool_bytes: 1024 * 1024 * 1024,
             max_spool_files: 128,
+            allow_absolute_request_target: false,
+            allow_request_trailers: false,
         }
     }
 }
@@ -323,6 +327,12 @@ pub fn read_request<R: Read + Write>(
     // Parse directly from the connection buffer; the verified parser returns
     // owned request fields and does not retain a borrow of the head.
     let mut req = parse_head(&buf[..head_end], limits)?;
+    let absolute_target = req.target.starts_with(b"http://") || req.target.starts_with(b"https://");
+    if !vapache_verified::capability_admit(limits.allow_absolute_request_target, absolute_target) {
+        return Err(ReadError::Parse(ParseError::BadRequest(
+            "absolute-form request target is disabled",
+        )));
+    }
     buf.drain(..head_end);
 
     let framing = req.framing;
@@ -414,7 +424,15 @@ pub fn read_request<R: Read + Write>(
                 limits.body,
                 chunk_deadline,
                 Some(&mut lease),
-            )?;
+                limits.allow_request_trailers,
+            )
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::PermissionDenied {
+                    ReadError::Parse(ParseError::BadRequest("request trailers are disabled"))
+                } else {
+                    ReadError::Io(error)
+                }
+            })?;
             req.body_spool = Some(std::sync::Arc::new(SpooledBody {
                 file: std::sync::Mutex::new(file),
                 len,
@@ -516,7 +534,7 @@ fn read_chunked_to_file<R: Read>(
     max: u64,
     deadline: Instant,
 ) -> io::Result<u64> {
-    read_chunked_to_file_budgeted(stream, buf, file, max, deadline, None)
+    read_chunked_to_file_budgeted(stream, buf, file, max, deadline, None, true)
 }
 
 fn read_chunked_to_file_budgeted<R: Read>(
@@ -526,6 +544,7 @@ fn read_chunked_to_file_budgeted<R: Read>(
     max: u64,
     deadline: Instant,
     mut lease: Option<&mut SpoolLease>,
+    allow_trailers: bool,
 ) -> io::Result<u64> {
     let mut total = 0u64;
     loop {
@@ -555,6 +574,12 @@ fn read_chunked_to_file_budgeted<R: Read>(
                 let t = read_line(stream, buf, 8190)?;
                 if t.is_empty() {
                     return Ok(total);
+                }
+                if !vapache_verified::capability_admit(allow_trailers, true) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "request trailers are disabled",
+                    ));
                 }
                 trailer_count += 1;
                 trailer_bytes = trailer_bytes.saturating_add(t.len() + 2);
@@ -1322,6 +1347,55 @@ mod tests {
         let mut cursor = std::io::Cursor::new(wire);
         let mut buf = Vec::new();
         assert!(read_request(&mut cursor, &mut buf, &limits(), |_| {}).is_err());
+    }
+
+    #[test]
+    fn absolute_targets_and_request_trailers_require_capabilities() {
+        let absolute = b"GET http://example.test/a HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec();
+        let mut default_limits = limits();
+        assert!(matches!(
+            read_request(
+                &mut std::io::Cursor::new(absolute.clone()),
+                &mut Vec::new(),
+                &default_limits,
+                |_| {},
+            ),
+            Err(ReadError::Parse(ParseError::BadRequest(
+                "absolute-form request target is disabled"
+            )))
+        ));
+        default_limits.allow_absolute_request_target = true;
+        assert!(read_request(
+            &mut std::io::Cursor::new(absolute),
+            &mut Vec::new(),
+            &default_limits,
+            |_| {},
+        )
+        .unwrap()
+        .is_some());
+
+        let trailers = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\nX-Checksum: yes\r\n\r\n";
+        let mut default_limits = limits();
+        assert!(matches!(
+            read_request(
+                &mut std::io::Cursor::new(trailers.to_vec()),
+                &mut Vec::new(),
+                &default_limits,
+                |_| {},
+            ),
+            Err(ReadError::Parse(ParseError::BadRequest(
+                "request trailers are disabled"
+            )))
+        ));
+        default_limits.allow_request_trailers = true;
+        assert!(read_request(
+            &mut std::io::Cursor::new(trailers.to_vec()),
+            &mut Vec::new(),
+            &default_limits,
+            |_| {},
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]

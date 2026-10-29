@@ -665,7 +665,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
-        std::fs::write(&path, text).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}{text}", crate::config::TEST_CAPABILITIES),
+        )
+        .unwrap();
         Config::load(
             &path,
             &dir,
