@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-10-29",
   "verus": {
-    "verified_functions": 475,
+    "verified_functions": 483,
     "errors": 0
   },
   "obligations": [
@@ -88,7 +88,7 @@
       "title": "Untrusted streams have bounded size and deadlines",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "I33 covers request/proxy trailer count and byte budgets, proxy chunk checked_add before resize, CGI worker path/env/body/output caps, FastCGI record/header/stdout/stderr caps, HTTP/2 budgets and compression. resource_budget_admit mechanizes overflow-free aggregate admission; RAII runtime leases enforce shared spool-byte, spool-file and CGI/FastCGI concurrency ceilings across graceful reloads, with focused exhaustion/release tests. P20 makes both HTTP adapters consume one incremental BodyAccumulator: fixed bodies no larger than 1 MiB remain resident; known-larger, chunked HTTP/1 and HTTP/2 bodies provide at most a 64 KiB actual-byte prefix before spilling. Only bytes actually received are reserved, tiny/empty/token bodies do not consume a spool-file slot, and exhaustion returns 503 with exact RAII release. request_body_memory_admit proves each resident-prefix extension is bounded; body/header parsing now uses hard absolute deadlines and HTTP/2 concurrency is capped at 32 streams. Request-time expression file reads consume expr_file_read_admit, reject non-regular descriptors, use O_NONBLOCK/O_NOFOLLOW and read at most 64 KiB. Broader aggregate socket and upstream resource exhaustion remains outside the model."
+      "evidence": "I33 covers request/proxy trailer count and byte budgets, proxy chunk checked_add before resize, CGI worker path/env/body/output caps, FastCGI record/header/stdout/stderr caps, HTTP/2 budgets and compression. resource_budget_admit mechanizes overflow-free aggregate admission; RAII runtime leases enforce shared spool-byte/file, request/response resident-byte, blocking-read, HTTP/2-stream and CGI/FastCGI concurrency ceilings across reloads. P20 makes both HTTP adapters consume one incremental BodyAccumulator and request_body_memory_admit proves each resident-prefix extension is bounded. Follow-up gates prove successful-only cache invalidation, autoindex scan/render arithmetic, bcrypt cost and PCRE2 input bounds; runtime limits proxy and CGI responses, DNS workers, expensive CPU work and byte-counted policy/auth/access caches. Body/header parsing uses hard deadlines, HTTP/2 is capped at 32 streams per connection and 256 process-wide, and connection spawn/descriptor exhaustion paths are regression-tested. Request-time expression file reads consume expr_file_read_admit, reject non-regular descriptors, use O_NONBLOCK/O_NOFOLLOW and read at most 64 KiB. Kernel/socket scheduling and upstream protocol implementations remain outside the model."
     },
     {
       "id": "response_header_policy",

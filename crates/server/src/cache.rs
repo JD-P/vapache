@@ -16,10 +16,11 @@ use base64::Engine;
 use sha1::{Digest, Sha1};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::IpAddr;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -35,6 +36,7 @@ const MAX_VARIANTS_PER_KEY: usize = 32;
 /// Large representations already have a bounded disk backing file.  Keeping
 /// another full copy resident provides little benefit and magnifies RSS.
 const MAX_MEMORY_BODY: usize = 64 * 1024;
+const MAX_DISK_META_BYTES: u64 = 1024 * 1024;
 /// Full-strength policy/request digest.  The previous 64-bit fingerprint was
 /// collision-prone for an attacker who can vary request headers and force
 /// variants of one cache key.  A SHA-256 digest is still compared exactly.
@@ -68,6 +70,7 @@ struct Entry {
     status: u16,
     headers: Vec<(String, Vec<u8>)>,
     body: Vec<u8>,
+    body_len: u64,
     stored: i64,
     expires: i64,
     policy: PolicyFingerprint,
@@ -146,7 +149,7 @@ fn insert_memory(cfg: &Config, key: &str, entry: Arc<Entry>) {
 }
 
 fn insert_memory_into(cfg: &Config, cache: &mut MemoryCache, key: &str, entry: Arc<Entry>) {
-    if cfg.cache.max_memory_size == 0 || entry.body.len() > MAX_MEMORY_BODY {
+    if cfg.cache.max_memory_size == 0 || entry.body_len > MAX_MEMORY_BODY as u64 {
         return;
     }
     let incoming = memory_entry_size(key, &entry);
@@ -186,6 +189,9 @@ struct DiskUsageState {
     total: u64,
     /// stem -> (accounted bytes, oldest modification time)
     stems: HashMap<PathBuf, (u64, SystemTime)>,
+    /// Exact key decoded once from the metadata file. `None` denotes corrupt
+    /// or legacy metadata and is removed conservatively on invalidation.
+    keys: HashMap<PathBuf, Option<Vec<u8>>>,
 }
 
 fn disk_usage() -> &'static Mutex<HashMap<PathBuf, DiskUsageState>> {
@@ -226,6 +232,38 @@ fn remove_disk_stem_files(stem: &Path) {
     }
 }
 
+fn open_cache_regular(path: &Path, limit: u64) -> Option<(File, fs::Metadata)> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > limit {
+        return None;
+    }
+    Some((file, meta))
+}
+
+fn read_disk_metadata(path: &Path) -> Option<Vec<u8>> {
+    let (mut file, meta) = open_cache_regular(path, MAX_DISK_META_BYTES)?;
+    let mut data = vec![0u8; meta.len() as usize];
+    file.read_exact(&mut data).ok()?;
+    Some(data)
+}
+
+fn write_cache_temp(path: &Path, data: &[u8]) -> io::Result<()> {
+    // A previous crash may leave the predictable temporary name behind.
+    // Unlink it, then use create_new so a racing symlink/FIFO is never opened.
+    let _ = fs::remove_file(path);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(data)
+}
+
 fn scan_disk_usage(root: &Path) -> DiskUsageState {
     let mut state = DiskUsageState::default();
     fn walk(dir: &Path, state: &mut DiskUsageState) {
@@ -246,7 +284,14 @@ fn scan_disk_usage(root: &Path) -> DiskUsageState {
                         continue; // coverage:ignore-line - filesystem race
                     };
                     let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    record_disk_file(state, stem, meta.len(), modified);
+                    record_disk_file(state, stem.clone(), meta.len(), modified);
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "meta")
+                    {
+                        let key = read_disk_metadata(&path).and_then(|data| decode_meta_key(&data));
+                        state.keys.insert(stem, key);
+                    }
                 }
                 _ => {}
             }
@@ -267,6 +312,7 @@ fn remove_disk_stem(cfg: &Config, stem: &Path) {
         if let Some((size, _)) = usage.stems.remove(stem) {
             usage.total = usage.total.saturating_sub(size);
         }
+        usage.keys.remove(stem);
     }
 }
 
@@ -1052,19 +1098,17 @@ pub fn lookup(
         // can use sendfile instead of copying the whole body from user memory.
         const FILE_BODY_THRESHOLD: usize = 64 * 1024;
         let mut served_file = false;
-        if entry.body.len() > FILE_BODY_THRESHOLD {
+        if entry.body_len > FILE_BODY_THRESHOLD as u64 {
             if let Some(stem) = cache_stem(cfg, cache_key) {
                 let path = stem.with_extension("body");
-                if let Ok(file) = fs::File::open(&path) {
-                    if let Ok(meta) = file.metadata() {
-                        if meta.is_file() && meta.len() == entry.body.len() as u64 {
-                            response.body = Body::File {
-                                file,
-                                offset: 0,
-                                len: meta.len(),
-                            };
-                            served_file = true;
-                        }
+                if let Some((file, meta)) = open_cache_regular(&path, cfg.cache.max_file_size) {
+                    if meta.len() == entry.body_len {
+                        response.body = Body::File {
+                            file,
+                            offset: 0,
+                            len: meta.len(),
+                        };
+                        served_file = true;
                     }
                 }
             }
@@ -1141,14 +1185,22 @@ fn freshness(cfg: &CacheConfig, headers: &[(String, Vec<u8>)], now: i64) -> Opti
     None
 }
 
-fn response_body_bytes(body: &mut Body) -> Option<Vec<u8>> {
+fn response_body_bytes(
+    body: &mut Body,
+    resident: &mut crate::resource::ResidentLease,
+) -> Option<Vec<u8>> {
     match body {
         Body::Empty => Some(Vec::new()),
-        Body::Bytes(bytes) => Some(bytes.clone()),
+        Body::Bytes(bytes) => {
+            resident.reserve(bytes.len() as u64).ok()?;
+            Some(bytes.clone())
+        }
         Body::File { file, offset, len } => {
+            let len = usize::try_from(*len).ok()?;
+            resident.reserve(len as u64).ok()?;
             let mut file = file.try_clone().ok()?;
             file.seek(SeekFrom::Start(*offset)).ok()?;
-            let mut bytes = vec![0; *len as usize];
+            let mut bytes = vec![0; len];
             file.read_exact(&mut bytes).ok()?;
             Some(bytes)
         }
@@ -1275,6 +1327,7 @@ fn decode_meta(data: &[u8]) -> Option<Entry> {
         status: status?,
         headers,
         body: Vec::new(),
+        body_len: 0,
         stored: stored?,
         expires: expires?,
         policy: policy?,
@@ -1358,6 +1411,7 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
                 projected = vapache_verified::cache_disk_evict(projected, size);
                 entries = entries.saturating_sub(1);
             }
+            usage.keys.remove(&victim);
         }
         if projected > cfg.cache.max_disk_size || entries > MAX_DISK_ENTRIES {
             return;
@@ -1367,7 +1421,9 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
     let meta_path = stem.with_extension("meta");
     let body_tmp = stem.with_extension("body.tmp");
     let meta_tmp = stem.with_extension("meta.tmp");
-    if fs::write(&body_tmp, &entry.body).is_err() || fs::write(&meta_tmp, &meta).is_err() {
+    if write_cache_temp(&body_tmp, &entry.body).is_err()
+        || write_cache_temp(&meta_tmp, &meta).is_err()
+    {
         let _ = fs::remove_file(&body_tmp);
         let _ = fs::remove_file(&meta_tmp);
         return;
@@ -1388,14 +1444,20 @@ fn disk_store(cfg: &Config, key: &str, entry: &Entry) {
                 .unwrap_or(meta.len() as u64),
         );
     usage.total = vapache_verified::cache_disk_projected(usage.total, old_size, actual);
-    usage.stems.insert(stem, (actual, SystemTime::now()));
+    usage
+        .stems
+        .insert(stem.clone(), (actual, SystemTime::now()));
+    usage.keys.insert(stem, Some(key.as_bytes().to_vec()));
 }
 
 fn disk_load(cfg: &Config, key: &str) -> Option<Entry> {
     let stem = cache_stem(cfg, key)?;
-    let meta = match fs::read(stem.with_extension("meta")) {
-        Ok(meta) => meta,
-        Err(_) => return None,
+    let meta = match read_disk_metadata(&stem.with_extension("meta")) {
+        Some(meta) => meta,
+        None => {
+            remove_disk_stem(cfg, &stem);
+            return None;
+        }
     };
     let metadata_key = decode_meta_key(&meta);
     let exact_key = metadata_key.as_deref() == Some(key.as_bytes());
@@ -1417,9 +1479,18 @@ fn disk_load(cfg: &Config, key: &str) -> Option<Entry> {
         remove_disk_stem(cfg, &stem);
         return None;
     }
-    match fs::read(stem.with_extension("body")) {
-        Ok(body) => entry.body = body,
-        Err(_) => {
+    let (mut body, body_meta) =
+        match open_cache_regular(&stem.with_extension("body"), cfg.cache.max_file_size) {
+            Some(body) => body,
+            None => {
+                remove_disk_stem(cfg, &stem);
+                return None;
+            }
+        };
+    entry.body_len = body_meta.len();
+    if entry.body_len <= MAX_MEMORY_BODY as u64 {
+        entry.body.resize(entry.body_len as usize, 0);
+        if body.read_exact(&mut entry.body).is_err() {
             remove_disk_stem(cfg, &stem);
             return None;
         }
@@ -1498,7 +1569,8 @@ pub fn store(
     let vary_star = combined_header(&response_headers_for_vary, "vary")
         .map(|v| v.split(',').any(|part| part.trim() == "*"))
         .unwrap_or(false);
-    let Some(body) = response_body_bytes(&mut resp.body) else {
+    let mut cache_resident = cfg.resource_budget.try_response_bytes();
+    let Some(body) = response_body_bytes(&mut resp.body, &mut cache_resident) else {
         return;
     };
     let size_ok = body.len() as u64 <= cfg.cache.max_file_size
@@ -1525,10 +1597,12 @@ pub fn store(
     }
     let vary = vary_values(req, &headers);
     let key = cache_key.to_string();
+    let body_len = body.len() as u64;
     let entry = Entry {
         status: resp.status,
         headers,
-        body: body.clone(),
+        body,
+        body_len,
         stored: now,
         expires: vapache_verified::cache_expiry(now, ttl),
         policy: fingerprint,
@@ -1597,52 +1671,32 @@ fn invalidate_disk_prefix(cfg: &Config, prefix: &[u8]) {
     let Some(root) = &cfg.cache.root else {
         return;
     };
-    disk_usage()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(root);
-    fn remove_matches(dir: &Path, prefix: &[u8]) {
-        let Ok(read) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in read.flatten() {
-            let path = entry.path();
-            match entry.file_type() {
-                Ok(ft) if ft.is_dir() => remove_matches(&path, prefix),
-                Ok(ft) if ft.is_file() => {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    if name.ends_with(".body.tmp") || name.ends_with(".meta.tmp") {
-                        let _ = fs::remove_file(&path);
-                    } else if name.ends_with(".meta") {
-                        let key = fs::read(&path).ok().and_then(|data| decode_meta_key(&data));
-                        let prefix_matches = key
-                            .as_deref()
-                            .map(|key| key.starts_with(prefix))
-                            .unwrap_or(false);
-                        if vapache_verified::cache_invalidation_remove_admit(
-                            key.is_some(),
-                            prefix_matches,
-                        ) {
-                            if let Some(stem) = disk_stem(&path) {
-                                remove_disk_stem_files(&stem);
-                            }
-                        }
-                    } else if name.ends_with(".body") {
-                        let Some(stem) = disk_stem(&path) else {
-                            // The `.body` suffix guarantees a nonempty stem.
-                            continue; // coverage:ignore-line - suffix guarantees a stem
-                        };
-                        if !stem.with_extension("meta").is_file() {
-                            remove_disk_stem_files(&stem);
-                        }
-                    }
-                }
-                _ => {}
-            }
+    // Build the index at most once per cache generation. Subsequent unsafe
+    // requests select matching stems in memory instead of recursively walking
+    // and rereading every metadata file.
+    let mut roots = disk_usage().lock().unwrap_or_else(|e| e.into_inner());
+    let usage = roots
+        .entry(root.clone())
+        .or_insert_with(|| scan_disk_usage(root));
+    let victims: Vec<PathBuf> = usage
+        .stems
+        .keys()
+        .filter(|stem| {
+            let key = usage.keys.get(*stem).and_then(|key| key.as_deref());
+            vapache_verified::cache_invalidation_remove_admit(
+                key.is_some(),
+                key.is_some_and(|key| key.starts_with(prefix)),
+            )
+        })
+        .cloned()
+        .collect();
+    for stem in victims {
+        remove_disk_stem_files(&stem);
+        if let Some((size, _)) = usage.stems.remove(&stem) {
+            usage.total = usage.total.saturating_sub(size);
         }
+        usage.keys.remove(&stem);
     }
-    remove_matches(root, prefix);
 }
 
 pub fn invalidate(cfg: &Config, host: &str, path: &str) {
@@ -1721,6 +1775,7 @@ mod tests {
             status: 200,
             headers: vec![("content-type".into(), b"text/plain".to_vec())],
             body: b"hello".to_vec(),
+            body_len: 5,
             stored: unix_now(),
             expires: unix_now() + 60,
             policy: [7u8; 32],
@@ -1843,6 +1898,7 @@ mod tests {
             status: 200,
             headers: vec![("content-type".into(), b"text/plain".to_vec())],
             body: b"stale".to_vec(),
+            body_len: 5,
             stored: unix_now(),
             expires: unix_now() + 60,
             policy: [7u8; 32],
@@ -3288,6 +3344,7 @@ CacheIgnoreQueryString On\n\
             status: 200,
             headers: vec![("content-type".into(), b"text/plain".to_vec())],
             body: body.to_vec(),
+            body_len: body.len() as u64,
             stored: unix_now(),
             expires,
             policy: [7u8; 32],
@@ -3301,6 +3358,13 @@ CacheIgnoreQueryString On\n\
         let (dir, mut cfg) = disk_test_config("targeted-invalidation");
         cfg.cache.max_disk_size = 1_000_000;
         prepare(&cfg);
+        let root = cfg.cache.root.clone().unwrap();
+        // Put crash leftovers in place before the per-generation index is
+        // built. The first disk operation accounts them; later invalidations
+        // must use that index rather than rescan attacker-amplifiable trees.
+        fs::write(root.join("orphan.body.tmp"), b"partial").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("missing-target", root.join("unrelated-link")).unwrap();
         let fingerprint = [7u8; 32];
         let target = Path::new("/srv/index.html");
         let selected_index = base_key(
@@ -3344,11 +3408,6 @@ CacheIgnoreQueryString On\n\
             .unwrap()
             .entries
             .insert(unrelated.clone(), vec![Arc::new(entry.clone())]);
-        let root = cfg.cache.root.clone().unwrap();
-        fs::write(root.join("orphan.body.tmp"), b"partial").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("missing-target", root.join("unrelated-link")).unwrap();
-
         invalidate(&cfg, "example.test", "/dir");
 
         assert!(!selected_stem.with_extension("meta").exists());
@@ -3605,6 +3664,7 @@ CacheIgnoreQueryString On\n\
                     status: 200,
                     headers: Vec::new(),
                     body: b"expired".to_vec(),
+                    body_len: 7,
                     stored: unix_now() - 10,
                     expires: unix_now() - 1,
                     policy,
@@ -3618,6 +3678,7 @@ CacheIgnoreQueryString On\n\
                         ("content-length".into(), b"5".to_vec()),
                     ],
                     body: b"fresh".to_vec(),
+                    body_len: 5,
                     stored: unix_now(),
                     expires: unix_now() + 60,
                     policy,
@@ -3763,10 +3824,18 @@ CacheIgnoreQueryString On\n\
         no_last.ignore_no_last_mod = true;
         assert!(freshness(&no_last, &[], now).is_some());
 
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let mut resident = budget.try_response_bytes();
         let mut empty = Body::Empty;
-        assert_eq!(response_body_bytes(&mut empty), Some(Vec::new()));
+        assert_eq!(
+            response_body_bytes(&mut empty, &mut resident),
+            Some(Vec::new())
+        );
         let mut bytes = Body::Bytes(b"bytes".to_vec());
-        assert_eq!(response_body_bytes(&mut bytes), Some(b"bytes".to_vec()));
+        assert_eq!(
+            response_body_bytes(&mut bytes, &mut resident),
+            Some(b"bytes".to_vec())
+        );
         let file_path = dir.join("body-file");
         fs::write(&file_path, b"012345").unwrap();
         let mut file_body = Body::File {
@@ -3774,12 +3843,15 @@ CacheIgnoreQueryString On\n\
             offset: 2,
             len: 3,
         };
-        assert_eq!(response_body_bytes(&mut file_body), Some(b"234".to_vec()));
+        assert_eq!(
+            response_body_bytes(&mut file_body, &mut resident),
+            Some(b"234".to_vec())
+        );
         let mut stream = Body::Stream {
             reader: Box::new(&b"stream"[..]),
             len: 6,
         };
-        assert!(response_body_bytes(&mut stream).is_none());
+        assert!(response_body_bytes(&mut stream, &mut resident).is_none());
 
         let rnd = crate::config::RewriteMap::Rnd(HashMap::from([
             ("b".into(), vec!["2".into()]),
@@ -3849,6 +3921,18 @@ CacheIgnoreQueryString On\n\
         fs::remove_file(missing_stem.with_extension("body")).unwrap();
         assert!(disk_load(&cfg, "missing-body").is_none());
 
+        let victim = dir.join("cache-temp-victim");
+        fs::write(&victim, b"untouched").unwrap();
+        let safe_stem = cache_stem(&cfg, "safe-temp").unwrap();
+        std::os::unix::fs::symlink(&victim, safe_stem.with_extension("body.tmp")).unwrap();
+        disk_store(&cfg, "safe-temp", &disk_entry(b"cached", unix_now() + 60));
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        assert!(disk_load(&cfg, "safe-temp").is_some());
+        fs::remove_file(safe_stem.with_extension("body")).unwrap();
+        std::os::unix::fs::symlink(&victim, safe_stem.with_extension("body")).unwrap();
+        assert!(disk_load(&cfg, "safe-temp").is_none());
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+
         let root_file = dir.join("cache-is-a-file");
         fs::write(&root_file, b"x").unwrap();
         cfg.cache.root = Some(root_file.clone());
@@ -3867,6 +3951,7 @@ CacheIgnoreQueryString On\n\
             DiskUsageState {
                 total: u64::MAX,
                 stems: HashMap::new(),
+                keys: HashMap::new(),
             },
         );
         cfg.cache.max_disk_size = 1_000;
@@ -4026,6 +4111,7 @@ CacheIgnoreQueryString On\n\
                         status: 200,
                         headers: Vec::new(),
                         body: vec![i as u8],
+                        body_len: 1,
                         stored: unix_now(),
                         expires: unix_now() + 60,
                         policy,
@@ -4039,6 +4125,7 @@ CacheIgnoreQueryString On\n\
             status: 200,
             headers: vec![("Vary".into(), b"X-Variant".to_vec())],
             body: b"v".to_vec(),
+            body_len: 1,
             stored: unix_now(),
             expires: unix_now() + 60,
             policy,

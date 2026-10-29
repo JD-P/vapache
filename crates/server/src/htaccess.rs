@@ -650,9 +650,54 @@ fn mode_key(mode: OverrideMode) -> u32 {
     }
 }
 
-fn cache() -> &'static Mutex<HashMap<CacheKey, Arc<Parsed>>> {
-    static CACHE: OnceLock<Mutex<HashMap<CacheKey, Arc<Parsed>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+const MAX_ACCESS_CACHE_ENTRIES: usize = 512;
+const MAX_ACCESS_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Default)]
+struct AccessFileCache {
+    entries: HashMap<CacheKey, (Arc<Parsed>, usize)>,
+    bytes: usize,
+}
+
+impl AccessFileCache {
+    fn weight(key: &CacheKey) -> usize {
+        (key.size.min(usize::MAX as u64) as usize)
+            .saturating_add(key.path.as_os_str().as_encoded_bytes().len())
+            .saturating_add(key.server_root.as_os_str().as_encoded_bytes().len())
+            .saturating_add(key.allow_list.iter().map(String::len).sum::<usize>())
+            .saturating_add(4096)
+    }
+
+    fn get(&self, key: &CacheKey) -> Option<&Arc<Parsed>> {
+        self.entries.get(key).map(|(parsed, _)| parsed)
+    }
+
+    fn insert(&mut self, key: CacheKey, parsed: Arc<Parsed>) {
+        let weight = Self::weight(&key);
+        if weight > MAX_ACCESS_CACHE_BYTES {
+            return;
+        }
+        if let Some((_, old_weight)) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old_weight);
+        }
+        while self.entries.len() >= MAX_ACCESS_CACHE_ENTRIES
+            || self.bytes.saturating_add(weight) > MAX_ACCESS_CACHE_BYTES
+        {
+            let Some(victim) = self.entries.keys().next().cloned() else {
+                break;
+            };
+            if let Some((_, old_weight)) = self.entries.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(old_weight);
+            }
+        }
+        self.bytes = self.bytes.saturating_add(weight);
+        self.entries.insert(key, (parsed, weight));
+    }
+}
+
+fn cache() -> &'static Mutex<AccessFileCache> {
+    static CACHE: OnceLock<Mutex<AccessFileCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(AccessFileCache::default()))
 }
 
 struct OpenedAccessFile {
@@ -794,6 +839,8 @@ fn parse_cached(
     }
     // Parse outside the lock: a slow filesystem read must not serialize
     // unrelated requests.  Duplicate parses on a race are harmless.
+    let _expensive = crate::resource::try_expensive()
+        .ok_or_else(|| format!("{}: access-file parse capacity exhausted", path.display()))?;
     let (data, stable_meta) = stable_access_snapshot(path, opened)?;
     debug_assert_eq!(stable_meta.dev(), key.dev);
     debug_assert_eq!(stable_meta.ino(), key.ino);
@@ -801,9 +848,6 @@ fn parse_cached(
         cfg, path, &data, mode, allow_list, nonfatal, identity,
     )?);
     let mut guard = cache().lock().unwrap_or_else(|e| e.into_inner());
-    if guard.len() >= 512 {
-        guard.clear();
-    }
     guard.insert(key, Arc::clone(&parsed));
     Ok(parsed)
 }

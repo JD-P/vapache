@@ -559,13 +559,20 @@ async fn send_response(
             send_data_bounded(&mut send, Bytes::from(data), true, send_timeout).await?;
         }
         Body::Stream { mut reader, len } => {
+            let _blocking_read = cfg.resource_budget.try_blocking_read()?;
             let mut left = len;
             let mut buf = vec![0u8; 64 * 1024];
             while left > 0 {
                 let want = left.min(buf.len() as u64) as usize;
-                let n = reader
-                    .read(&mut buf[..want])
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                let (next_reader, next_buf, result) = tokio::task::spawn_blocking(move || {
+                    let result = reader.read(&mut buf[..want]);
+                    (reader, buf, result)
+                })
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+                reader = next_reader;
+                buf = next_buf;
+                let n = result.map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
                 if n == 0 {
                     send_data_bounded(&mut send, Bytes::new(), true, send_timeout).await?;
                     return Ok(sent);
@@ -589,7 +596,9 @@ async fn send_response(
             const OFFLOAD_MIN: u64 = 256 * 1024;
             const OFFLOAD_MAX: u64 = 8 * 1024 * 1024;
             if len >= OFFLOAD_MIN && len <= OFFLOAD_MAX {
+                let blocking_read = cfg.resource_budget.try_blocking_read()?;
                 let data = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
+                    let _blocking_read = blocking_read;
                     // Range responses can start mid-file; only the common
                     // full-file case can be mapped from offset zero.  Mapping
                     // a file the server itself may write is avoided: a
@@ -689,6 +698,29 @@ async fn handle_stream(
         Some(i) => (target[..i].to_vec(), target[i + 1..].to_vec()),
         None => (target.clone(), Vec::new()),
     };
+
+    // The adapter creates a second owned representation of the decoded h2
+    // request. Charge it before cloning and retain the lease through dispatch
+    // and response sending.
+    let mut request_resident = cfg.resource_budget.try_request_bytes();
+    let header_bytes = parts
+        .headers
+        .iter()
+        .fold(target.len() as u64, |total, (name, value)| {
+            total
+                .saturating_add(name.as_str().len() as u64)
+                .saturating_add(value.as_bytes().len() as u64)
+        });
+    if request_resident.reserve(header_bytes).is_err() {
+        return send_response(
+            respond,
+            &cfg,
+            bad(503, "request memory capacity exhausted"),
+            false,
+        )
+        .await
+        .is_err();
+    }
 
     let mut headers = crate::http::Headers::default();
     for (name, value) in parts.headers.iter() {
@@ -801,6 +833,16 @@ async fn handle_stream(
             Some(resp),
         ),
     };
+    if request_resident.reserve(body.bytes.len() as u64).is_err() {
+        return send_response(
+            respond,
+            &cfg,
+            bad(503, "request memory capacity exhausted"),
+            false,
+        )
+        .await
+        .is_err();
+    }
     if let Some(declared) = declared {
         if declared != body.len && early.is_none() {
             // h2 enforces the declared DATA length before clean end-of-stream.
@@ -1042,9 +1084,16 @@ where
                 let Some(result) = accepted else {
                     break;
                 };
-                let (request, respond) =
+                let (request, mut respond) =
                     result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let stream_id = respond.stream_id().as_u32() as u64;
+                let process_stream = match cfg.resource_budget.try_h2_stream() {
+                    Ok(lease) => lease,
+                    Err(_) => {
+                        respond.send_reset(h2::Reason::REFUSED_STREAM);
+                        continue;
+                    }
+                };
                 let Some(next) = vapache_verified::h2_budget_step(
                     budget,
                     vapache_verified::H2BudgetEvent::Begin,
@@ -1056,7 +1105,6 @@ where
                     // stream limit before accept can yield this request.
                     // coverage:ignore-start - upstream h2 admission invariant
                     logger.error("HTTP/2 active-stream budget rejected a stream");
-                    let mut respond = respond;
                     respond.send_reset(h2::Reason::REFUSED_STREAM);
                     continue;
                     // coverage:ignore-stop
@@ -1077,6 +1125,7 @@ where
                 let stream_timeout = cfg.timeout.max(H2_STREAM_FLOOR);
                 let tx = events_tx.clone();
                 tokio::spawn(async move {
+                    let _process_stream = process_stream;
                     let mut done = H2TaskEventGuard {
                         tx,
                         stream_id,

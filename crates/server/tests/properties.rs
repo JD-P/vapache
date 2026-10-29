@@ -55,6 +55,28 @@ proptest! {
     }
 
     #[test]
+    fn autoindex_admission_cannot_overflow(
+        used in any::<u64>(), incoming in any::<u64>(), limit in any::<u64>(),
+    ) {
+        if vapached::verified::autoindex_append_admit(used, incoming, limit) {
+            prop_assert!(used.checked_add(incoming).is_some_and(|sum| sum <= limit));
+        }
+    }
+
+    #[test]
+    fn only_successful_unsafe_requests_invalidate(
+        unsafe_method in any::<bool>(), status in any::<u16>(),
+    ) {
+        let admitted = vapached::verified::cache_invalidation_status_admit(unsafe_method, status);
+        prop_assert_eq!(admitted, unsafe_method && (200..400).contains(&status));
+    }
+
+    #[test]
+    fn bcrypt_cost_is_limited_to_htpasswd_range(cost in any::<u32>()) {
+        prop_assert_eq!(vapached::verified::bcrypt_cost_admit(cost), (4..=17).contains(&cost));
+    }
+
+    #[test]
     fn request_body_memory_admission_cannot_overflow(
         used in any::<u64>(), incoming in any::<u64>(), limit in any::<u64>(),
     ) {

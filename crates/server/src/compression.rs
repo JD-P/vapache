@@ -220,7 +220,12 @@ fn alter_etag(resp: &mut Response, kind: CompressionKind, scope: &Scope) {
 fn read_body(body: Body) -> Result<Vec<u8>, Body> {
     match body {
         Body::Empty => Ok(Vec::new()),
-        Body::Bytes(bytes) => Ok(bytes),
+        Body::Bytes(bytes) => {
+            if !vapache_verified::compression_body_admit(bytes.len() as u64, MAX_COMPRESS_BODY) {
+                return Err(Body::Bytes(bytes));
+            }
+            Ok(bytes)
+        }
         Body::Stream { reader, len } => Err(Body::Stream { reader, len }),
         Body::File {
             mut file,
@@ -334,6 +339,11 @@ pub fn finalize(scope: &Scope, req: &Request, resp: &mut Response, path: &[u8]) 
         return;
     }
 
+    let Some(_expensive) = crate::resource::try_expensive() else {
+        // Compression is optional. Under CPU pressure preserve and send the
+        // identity representation instead of queueing more expensive work.
+        return;
+    };
     let body = std::mem::replace(&mut resp.body, Body::Empty);
     let raw = match read_body(body) {
         Ok(v) => v,
@@ -663,5 +673,11 @@ mod tests {
         };
         finalize(&scope, &request("gzip"), &mut r, b"/x");
         assert!(matches!(r.body, Body::Stream { .. }));
+
+        let oversized = vec![b'x'; MAX_COMPRESS_BODY as usize + 1];
+        let mut r = response(&oversized, "text/plain");
+        finalize(&scope, &request("gzip"), &mut r, b"/x");
+        assert!(header(&r, "content-encoding").is_none());
+        assert_eq!(r.body_len(), oversized.len() as u64);
     }
 }

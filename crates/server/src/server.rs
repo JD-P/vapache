@@ -294,50 +294,47 @@ impl Server {
                             let cfg = self.cfg.clone();
                             let logger = self.logger.clone();
                             let worker_limit = cfg.max_request_workers.max(1);
-                            if !vapache_verified::connection_admit(
-                                ACTIVE_CONNECTIONS.load(Ordering::Relaxed) as u64,
-                                worker_limit as u64,
-                            ) {
+                            let Some(active_guard) = try_reserve_connection(worker_limit) else {
                                 reject_busy_connection(stream, b.tls.is_some(), &self.cfg);
                                 continue;
-                            }
-                            ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+                            };
                             let port = local.map(|l| l.port()).unwrap_or(b.port);
                             let local_ip = local
                                 .map(|l| l.ip().to_string())
                                 .unwrap_or_else(|| "127.0.0.1".into());
                             let tls = b.tls.clone();
-                            std::thread::Builder::new()
-                                .name("conn".into())
-                                .spawn(move || {
-                                    let _guard = ActiveGuard;
-                                    if let Some(tls_cfg) = tls {
-                                        let _ = handle_tls_connection(
-                                            cfg, logger, stream, peer, local_ip, port, tls_cfg,
-                                        );
-                                    } else {
-                                        stream.set_nodelay(true).ok();
-                                        stream.set_read_timeout(Some(Duration::from_secs(20))).ok();
-                                        stream.set_write_timeout(Some(cfg.timeout)).ok();
-                                        let mut stream = stream;
-                                        let _ = handle_connection(
-                                            &cfg,
-                                            &logger,
-                                            &mut stream,
-                                            peer,
-                                            &local_ip,
-                                            port,
-                                            false,
-                                        );
-                                    }
-                                })
-                                .ok();
+                            spawn_connection_thread(move || {
+                                let _guard = active_guard;
+                                if let Some(tls_cfg) = tls {
+                                    let _ = handle_tls_connection(
+                                        cfg, logger, stream, peer, local_ip, port, tls_cfg,
+                                    );
+                                } else {
+                                    stream.set_nodelay(true).ok();
+                                    stream.set_read_timeout(Some(Duration::from_secs(20))).ok();
+                                    stream.set_write_timeout(Some(cfg.timeout)).ok();
+                                    let mut stream = stream;
+                                    let _ = handle_connection(
+                                        &cfg,
+                                        &logger,
+                                        &mut stream,
+                                        peer,
+                                        &local_ip,
+                                        port,
+                                        false,
+                                    );
+                                }
+                            })
+                            .ok();
                         }
-                        Err(e) => {
-                            if accept_error_action(&e) == AcceptAction::Break {
+                        Err(e) => match accept_error_action(&e) {
+                            AcceptAction::Continue => continue,
+                            AcceptAction::Backoff => {
+                                std::thread::sleep(Duration::from_millis(50));
                                 break;
                             }
-                        }
+                            AcceptAction::Break => break,
+                        },
                     }
                 }
             }
@@ -351,6 +348,32 @@ impl Drop for ActiveGuard {
     fn drop(&mut self) {
         ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+fn try_reserve_connection(limit: usize) -> Option<ActiveGuard> {
+    let mut current = ACTIVE_CONNECTIONS.load(Ordering::Acquire);
+    loop {
+        if !vapache_verified::connection_admit(current as u64, limit.max(1) as u64) {
+            return None;
+        }
+        match ACTIVE_CONNECTIONS.compare_exchange_weak(
+            current,
+            current.saturating_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(ActiveGuard),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn spawn_connection_thread<F>(work: F) -> io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    crate::fault::hit("server.connection.spawn")?;
+    std::thread::Builder::new().name("conn".into()).spawn(work)
 }
 
 fn poll_result(rc: libc::c_int, errno: i32) -> io::Result<()> {
@@ -369,9 +392,13 @@ fn poll_result(rc: libc::c_int, errno: i32) -> io::Result<()> {
 enum AcceptAction {
     Break,
     Continue,
+    Backoff,
 }
 
 fn accept_error_action(e: &io::Error) -> AcceptAction {
+    if matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE)) {
+        return AcceptAction::Backoff;
+    }
     match e.kind() {
         io::ErrorKind::WouldBlock => AcceptAction::Break,
         io::ErrorKind::Interrupted => AcceptAction::Continue,
@@ -547,6 +574,37 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 return Ok(());
             }
         };
+        let mut request_resident = cfg.resource_budget.try_request_bytes();
+        let request_resident_bytes = req.headers.iter().fold(
+            req.target.len().saturating_add(req.body.len()) as u64,
+            |total, (name, value)| {
+                total
+                    .saturating_add(name.len() as u64)
+                    .saturating_add(value.len() as u64)
+            },
+        );
+        if request_resident.reserve(request_resident_bytes).is_err() {
+            let mut response = Response::bytes(
+                503,
+                "text/html; charset=iso-8859-1",
+                b"Request memory capacity is temporarily exhausted\n".to_vec(),
+            );
+            response
+                .headers
+                .push(("Connection".into(), b"close".to_vec()));
+            let _ = write_response(
+                stream,
+                &mut response,
+                &ResponseOptions {
+                    server_header: &cfg.server_header(),
+                    keep_alive: false,
+                    head_only: false,
+                    protocol: Version::Http11,
+                    request_keep_alive: false,
+                },
+            );
+            return Ok(());
+        }
         let peer = cfg.client_addr(peer, &req);
         let remote_ip = peer.ip().to_string();
         let bytes_in = req.target.len() as u64 + req.body_len();
@@ -1267,9 +1325,21 @@ pub(crate) fn dispatch_with_scheme(
     local_port: u16,
     tls: bool,
 ) -> Response {
-    crate::expr::with_connection(tls, local_port, || {
+    let mut response = crate::expr::with_connection(tls, local_port, || {
         dispatch_inner_request(cfg, req, peer, local_ip, local_port)
-    })
+    });
+    if response.admit_resident(&cfg.resource_budget).is_err() {
+        response = Response::bytes(
+            503,
+            "text/html; charset=iso-8859-1",
+            b"Response memory capacity is temporarily exhausted\n".to_vec(),
+        );
+        // The small overload response should always fit once the rejected
+        // representation has been dropped. If it does not, sending it
+        // uncharged is preferable to retaining the original large body.
+        let _ = response.admit_resident(&cfg.resource_budget);
+    }
+    response
 }
 
 fn dispatch_inner_request(
@@ -1376,7 +1446,8 @@ fn dispatch_inner_request(
             &cache_ctx.target,
         );
     }
-    if !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE") {
+    let unsafe_method = !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
+    if vapache_verified::cache_invalidation_status_admit(unsafe_method, resp.status) {
         crate::cache::invalidate(cfg, host, invalidation_path.as_deref().unwrap_or(&path));
     }
     resp
@@ -4273,6 +4344,10 @@ mod tests {
             AcceptAction::Break
         );
         assert_eq!(
+            accept_error_action(&io::Error::from_raw_os_error(libc::EMFILE)),
+            AcceptAction::Backoff
+        );
+        assert_eq!(
             timed_io::<u8>(None, "timeout").unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
@@ -4642,6 +4717,21 @@ mod tests {
         assert_eq!(conn.write(b"x").unwrap(), 1);
         assert_eq!(conn.flush().unwrap(), ());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn connection_spawn_failure_releases_reserved_slot() {
+        let before = active_connections();
+        let guard = try_reserve_connection(usize::MAX).unwrap();
+        crate::fault::configure(
+            "server.connection.spawn",
+            0,
+            std::io::ErrorKind::OutOfMemory,
+        );
+        assert!(spawn_connection_thread(move || drop(guard)).is_err());
+        assert_eq!(active_connections(), before);
+        crate::fault::clear();
     }
 
     fn cov_ws_request(path: &str) -> String {

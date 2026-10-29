@@ -16,15 +16,127 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConnection, RootCertStore, StreamOwned};
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Cursor, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
-use std::path::Path;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_PROXY_HEAD: usize = 64 * 1024;
 const MAX_PROXY_BODY: usize = 64 * 1024 * 1024;
+const MAX_PROXY_BODY_IN_MEMORY: usize = 256 * 1024;
+
+struct ProxyBodyCollector {
+    memory: Vec<u8>,
+    file: Option<std::fs::File>,
+    lease: Option<crate::resource::SpoolLease>,
+    len: usize,
+    budget: Arc<crate::resource::ResourceBudget>,
+    max_spool_bytes: u64,
+    max_spool_files: u64,
+}
+
+impl ProxyBodyCollector {
+    fn new(
+        budget: Arc<crate::resource::ResourceBudget>,
+        max_spool_bytes: u64,
+        max_spool_files: u64,
+    ) -> Self {
+        Self {
+            memory: Vec::new(),
+            file: None,
+            lease: None,
+            len: 0,
+            budget,
+            max_spool_bytes,
+            max_spool_files,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let next = self
+            .len
+            .checked_add(bytes.len())
+            .filter(|next| *next <= MAX_PROXY_BODY)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::FileTooLarge, "proxy body too large")
+            })?;
+        if self.file.is_none() && next <= MAX_PROXY_BODY_IN_MEMORY {
+            self.memory.extend_from_slice(bytes);
+            self.len = next;
+            return Ok(());
+        }
+        if self.file.is_none() {
+            let mut lease = self
+                .budget
+                .try_spool(self.max_spool_bytes, self.max_spool_files)?;
+            lease.reserve(next as u64)?;
+            let mut file = crate::http::spool_file()?;
+            file.write_all(&self.memory)?;
+            file.write_all(bytes)?;
+            self.memory.clear();
+            self.file = Some(file);
+            self.lease = Some(lease);
+        } else {
+            self.lease
+                .as_mut()
+                .expect("proxy spool owns a lease")
+                .reserve(bytes.len() as u64)?;
+            self.file
+                .as_mut()
+                .expect("proxy spool owns a file")
+                .write_all(bytes)?;
+        }
+        self.len = next;
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<(Body, Option<crate::resource::SpoolLease>)> {
+        match (self.file.take(), self.lease.take()) {
+            (Some(mut file), Some(lease)) => {
+                file.seek(SeekFrom::Start(0))?;
+                Ok((
+                    Body::File {
+                        file,
+                        offset: 0,
+                        len: self.len as u64,
+                    },
+                    Some(lease),
+                ))
+            }
+            (None, None) if self.memory.is_empty() => Ok((Body::Empty, None)),
+            (None, None) => Ok((Body::Bytes(self.memory), None)),
+            _ => unreachable!("proxy spool file and lease are created together"),
+        }
+    }
+}
+
+trait ProxyBodySink {
+    fn len(&self) -> usize;
+    fn push_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+}
+
+impl ProxyBodySink for Vec<u8> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+impl ProxyBodySink for ProxyBodyCollector {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.push(bytes)
+    }
+}
 
 #[derive(Clone, Debug)]
 struct HttpBackend {
@@ -277,41 +389,97 @@ fn balancer_specs(cfg: &Config, balancer: &Balancer) -> Vec<HealthSpec> {
 /// health-check template or member parameters.  The server calls this before
 /// dropping privileges; the lightweight checker threads only use TCP.
 pub fn start_health_checks(cfg: &Config) {
-    static STARTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let started = STARTED.get_or_init(|| Mutex::new(HashSet::new()));
+    struct HealthGeneration {
+        signature: String,
+        stop: Arc<AtomicBool>,
+    }
+    static GENERATION: OnceLock<Mutex<Option<HealthGeneration>>> = OnceLock::new();
+
+    let mut groups = Vec::new();
+    let mut signature = String::new();
     for balancer in &cfg.balancers {
         let specs = balancer_specs(cfg, balancer);
         if specs.is_empty() {
             continue;
         }
-        let key = format!(
-            "{}:{}",
-            balancer.name,
-            specs
-                .iter()
-                .map(|s| s.url.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        {
-            let mut guard = started.lock().unwrap_or_else(|e| e.into_inner());
-            if !guard.insert(key) {
-                continue;
-            }
+        signature.push_str(&balancer.name);
+        for spec in &specs {
+            use std::fmt::Write as _;
+            let _ = write!(
+                signature,
+                "\0{}\0{}\0{}\0{:?}\0{}\0{}\0{:?}",
+                spec.url,
+                spec.method,
+                spec.uri,
+                spec.interval,
+                spec.passes,
+                spec.fails,
+                spec.ca_file,
+            );
         }
-        std::thread::spawn(move || loop {
-            for spec in &specs {
-                let ok = check_health(spec);
-                update_health(spec, ok);
-            }
-            let wait = specs
-                .iter()
-                .map(|s| s.interval)
-                .min()
-                .unwrap_or(Duration::from_secs(5))
-                .max(Duration::from_millis(250));
-            std::thread::sleep(wait);
+        groups.push(specs);
+    }
+
+    let generation = GENERATION.get_or_init(|| Mutex::new(None));
+    let stop = {
+        let mut current = generation.lock().unwrap_or_else(|error| error.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|running| running.signature == signature)
+        {
+            return;
+        }
+        if let Some(running) = current.take() {
+            running.stop.store(true, Ordering::Release);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        *current = Some(HealthGeneration {
+            signature,
+            stop: Arc::clone(&stop),
         });
+        stop
+    };
+    dead_map()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    health_map()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+
+    for specs in groups {
+        let stop = Arc::clone(&stop);
+        let _ = std::thread::Builder::new()
+            .name("proxy-health".into())
+            .spawn(move || loop {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                for spec in &specs {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let ok = check_health(spec);
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    update_health(spec, ok);
+                }
+                let wait = specs
+                    .iter()
+                    .map(|s| s.interval)
+                    .min()
+                    .unwrap_or(Duration::from_secs(5))
+                    .max(Duration::from_millis(250));
+                let deadline = std::time::Instant::now() + wait;
+                while !stop.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(
+                        Duration::from_millis(100)
+                            .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                    );
+                }
+            });
     }
 }
 
@@ -889,7 +1057,7 @@ fn read_line(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
     Ok(line)
 }
 
-fn read_chunked(reader: &mut impl BufRead, out: &mut Vec<u8>) -> std::io::Result<()> {
+fn read_chunked(reader: &mut impl BufRead, out: &mut impl ProxyBodySink) -> std::io::Result<()> {
     loop {
         let line = read_line(reader)?;
         let line = std::str::from_utf8(&line)
@@ -916,16 +1084,20 @@ fn read_chunked(reader: &mut impl BufRead, out: &mut Vec<u8>) -> std::io::Result
                 }
             }
         }
-        let end = out
-            .len()
+        out.len()
             .checked_add(size)
             .filter(|end| *end <= MAX_PROXY_BODY)
             .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "proxy body too large")
+                std::io::Error::new(std::io::ErrorKind::FileTooLarge, "proxy body too large")
             })?;
-        let start = out.len();
-        out.resize(end, 0);
-        reader.read_exact(&mut out[start..])?;
+        let mut remaining = size;
+        let mut chunk = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let take = remaining.min(chunk.len());
+            reader.read_exact(&mut chunk[..take])?;
+            out.push_bytes(&chunk[..take])?;
+            remaining -= take;
+        }
         let mut crlf = [0u8; 2];
         reader.read_exact(&mut crlf)?;
         if crlf != *b"\r\n" {
@@ -1348,8 +1520,42 @@ impl Drop for PoolBodyReader {
     }
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
 fn proxy_once(
+    stream: Box<dyn ReadWrite>,
+    target: &Target,
+    req: &Request,
+    scope: &Scope,
+    url_path: &str,
+    peer: SocketAddr,
+    https: bool,
+    host: &str,
+) -> std::io::Result<(Response, Option<Box<dyn ReadWrite>>)> {
+    // Parser fuzzing and focused unit tests do not own a full Config. Keep
+    // their accounting bounded and isolated from production configuration.
+    static TEST_BUDGET: OnceLock<Arc<crate::resource::ResourceBudget>> = OnceLock::new();
+    let budget = TEST_BUDGET.get_or_init(|| Arc::new(crate::resource::ResourceBudget::default()));
+    proxy_once_budgeted(
+        stream,
+        budget,
+        crate::resource::MAX_RESPONSE_RESIDENT_BYTES,
+        32,
+        target,
+        req,
+        scope,
+        url_path,
+        peer,
+        https,
+        host,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn proxy_once_budgeted(
     mut stream: Box<dyn ReadWrite>,
+    resource_budget: &Arc<crate::resource::ResourceBudget>,
+    max_spool_bytes: u64,
+    max_spool_files: u64,
     target: &Target,
     req: &Request,
     scope: &Scope,
@@ -1590,6 +1796,12 @@ fn proxy_once(
     }
     let no_body =
         req.method == "HEAD" || status == 204 || status == 304 || (100..200).contains(&status);
+    if !no_body && content_length.is_some_and(|length| length > MAX_PROXY_BODY) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "proxy body too large",
+        ));
+    }
     // Large fixed-length upstream bodies are forwarded without buffering the
     // whole response in memory.  The pool connection is returned only after
     // the body reader reaches EOF, preserving HTTP/1.1 framing.
@@ -1617,22 +1829,39 @@ fn proxy_once(
         }
     }
     let mut body = Vec::new();
+    let mut collected_body = None;
+    let mut spool_lease = None;
     if !no_body {
         if chunked {
-            read_chunked(&mut reader, &mut body)?;
+            let mut collector = ProxyBodyCollector::new(
+                Arc::clone(resource_budget),
+                max_spool_bytes,
+                max_spool_files,
+            );
+            read_chunked(&mut reader, &mut collector)?;
+            let (collected, lease) = collector.finish()?;
+            collected_body = Some(collected);
+            spool_lease = lease;
         } else if let Some(n) = content_length {
             body.resize(n, 0);
             reader.read_exact(&mut body)?;
         } else {
-            Read::by_ref(&mut reader)
-                .take(MAX_PROXY_BODY as u64 + 1)
-                .read_to_end(&mut body)?;
-            if body.len() > MAX_PROXY_BODY {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "proxy body too large",
-                ));
+            let mut collector = ProxyBodyCollector::new(
+                Arc::clone(resource_budget),
+                max_spool_bytes,
+                max_spool_files,
+            );
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                let read = reader.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                collector.push(&chunk[..read])?;
             }
+            let (collected, lease) = collector.finish()?;
+            collected_body = Some(collected);
+            spool_lease = lease;
         }
     }
     let mut response = Response::new(status);
@@ -1640,11 +1869,16 @@ fn proxy_once(
         .into_iter()
         .map(|(n, v)| (std::borrow::Cow::Owned(n), v))
         .collect();
-    response.body = if body.is_empty() {
-        Body::Empty
-    } else {
-        Body::Bytes(body)
-    };
+    response.body = collected_body.unwrap_or_else(|| {
+        if body.is_empty() {
+            Body::Empty
+        } else {
+            Body::Bytes(body)
+        }
+    });
+    if let Some(lease) = spool_lease {
+        response.hold_spool(lease);
+    }
     scope
         .header_policy
         .apply(&mut response.headers, response.status < 400);
@@ -1890,8 +2124,11 @@ pub fn execute(
         );
         tried.insert(backend_key(&current.backend));
         let result = match connect(&current.backend, &active_scope, timeout) {
-            Ok(stream) => proxy_once(
+            Ok(stream) => proxy_once_budgeted(
                 stream,
+                &cfg.resource_budget,
+                cfg.max_spool_bytes,
+                cfg.max_spool_files,
                 &current,
                 req,
                 &active_scope,
@@ -1953,6 +2190,39 @@ pub fn execute(
             }
             Err(e) => {
                 eprintln!("vapache proxy error: {e}");
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::StorageFull
+                        | std::io::ErrorKind::OutOfMemory
+                        | std::io::ErrorKind::WouldBlock
+                ) {
+                    return crate::files::error_response(
+                        cfg,
+                        vhost,
+                        &active_scope,
+                        503,
+                        req,
+                        url_path,
+                        local_port,
+                        host,
+                        peer.ip(),
+                        local_ip,
+                    );
+                }
+                if e.kind() == std::io::ErrorKind::FileTooLarge {
+                    return crate::files::error_response(
+                        cfg,
+                        vhost,
+                        &active_scope,
+                        502,
+                        req,
+                        url_path,
+                        local_port,
+                        host,
+                        peer.ip(),
+                        local_ip,
+                    );
+                }
                 if let Some(name) = &current.balancer {
                     mark_dead(
                         name,
@@ -2012,6 +2282,7 @@ pub fn execute(
 mod tests {
     use super::*;
     use crate::http::{Headers, Version};
+    use std::path::Path;
 
     #[allow(clippy::too_many_arguments)]
     fn execute(
@@ -2159,6 +2430,8 @@ mod tests {
 mod more_tests {
     use super::*;
     use crate::http::{Headers, Version};
+    use std::io::Cursor;
+    use std::path::Path;
 
     #[allow(clippy::too_many_arguments)]
     fn execute(
@@ -3274,9 +3547,13 @@ mod coverage_tests {
     }
 
     fn invalid(response: impl Into<Vec<u8>>, what: &str) {
+        invalid_kind(response, what, std::io::ErrorKind::InvalidData);
+    }
+
+    fn invalid_kind(response: impl Into<Vec<u8>>, what: &str, kind: std::io::ErrorKind) {
         match run(response) {
             Ok(_) => panic!("expected error for {what}"),
-            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{what}: {e}"),
+            Err(e) => assert_eq!(e.kind(), kind, "{what}: {e}"),
         }
     }
 
@@ -3632,9 +3909,18 @@ mod coverage_tests {
             "bad location",
         );
         invalid("HTTP/1.1 200 OK\r\nX-Test: a\u{1}b\r\n\r\n", "bad value");
-        invalid(
+        invalid_kind(
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n",
             "chunk too large",
+            std::io::ErrorKind::FileTooLarge,
+        );
+        invalid_kind(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                MAX_PROXY_BODY + 1
+            ),
+            "fixed body too large",
+            std::io::ErrorKind::FileTooLarge,
         );
 
         let mut many = String::from("HTTP/1.1 200 OK\r\n");
@@ -3680,6 +3966,25 @@ mod coverage_tests {
         match resp.body {
             Body::Bytes(body) => assert_eq!(body, b"Wiki"),
             _ => panic!("expected bytes"),
+        }
+
+        let payload = vec![b'x'; MAX_PROXY_BODY_IN_MEMORY + 1];
+        let mut wire = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            payload.len()
+        )
+        .into_bytes();
+        wire.extend_from_slice(&payload);
+        wire.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (resp, _) = run(wire).unwrap();
+        match resp.body {
+            Body::File { mut file, len, .. } => {
+                assert_eq!(len, payload.len() as u64);
+                let mut got = Vec::new();
+                file.read_to_end(&mut got).unwrap();
+                assert_eq!(got, payload);
+            }
+            _ => panic!("expected a spooled chunked body"),
         }
 
         let mut head = req("/x");
@@ -4400,7 +4705,7 @@ mod coverage_tests {
             Ok(_) => panic!("expected body limit error"),
             Err(e) => e,
         };
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
     }
 
     #[test]

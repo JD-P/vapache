@@ -12,6 +12,8 @@ use crate::verified::{
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct Identity {
@@ -705,6 +707,64 @@ pub fn ip_in_net(ip: IpAddr, net: IpAddr, bits: u8) -> bool {
 }
 
 fn reverse_dns_matches(ip: IpAddr, names: &[String]) -> bool {
+    const MAX_DNS_REQUIRE_NAMES: usize = 256;
+    const MAX_DNS_REQUIRE_BYTES: usize = 64 * 1024;
+
+    struct DnsJob {
+        ip: IpAddr,
+        names: Vec<String>,
+        reply: mpsc::SyncSender<bool>,
+    }
+
+    fn sender() -> &'static mpsc::SyncSender<DnsJob> {
+        static SENDER: OnceLock<mpsc::SyncSender<DnsJob>> = OnceLock::new();
+        SENDER.get_or_init(|| {
+            const DNS_WORKERS: usize = 8;
+            const DNS_QUEUE: usize = 64;
+            let (tx, rx) = mpsc::sync_channel::<DnsJob>(DNS_QUEUE);
+            let rx = Arc::new(Mutex::new(rx));
+            for index in 0..DNS_WORKERS {
+                let rx = Arc::clone(&rx);
+                let _ = std::thread::Builder::new()
+                    .name(format!("dns-{index}"))
+                    .spawn(move || loop {
+                        let job = {
+                            let receiver = rx.lock().unwrap_or_else(|error| error.into_inner());
+                            receiver.recv()
+                        };
+                        let Ok(job) = job else {
+                            break;
+                        };
+                        let result = reverse_dns_matches_blocking(job.ip, &job.names);
+                        let _ = job.reply.try_send(result);
+                    });
+            }
+            tx
+        })
+    }
+
+    let names_bytes = names
+        .iter()
+        .try_fold(0usize, |total, name| total.checked_add(name.len()));
+    if names.len() > MAX_DNS_REQUIRE_NAMES
+        || names_bytes.is_none_or(|bytes| bytes > MAX_DNS_REQUIRE_BYTES)
+    {
+        return false;
+    }
+
+    let (reply, result) = mpsc::sync_channel(1);
+    let job = DnsJob {
+        ip,
+        names: names.to_vec(),
+        reply,
+    };
+    if sender().try_send(job).is_err() {
+        return false;
+    }
+    result.recv_timeout(Duration::from_secs(2)).unwrap_or(false)
+}
+
+fn reverse_dns_matches_blocking(ip: IpAddr, names: &[String]) -> bool {
     let ip = canonical_ip(ip);
     // Forward-confirmed reverse DNS (FCrDNS), matching Apache's behavior:
     // a PTR result is only accepted if it resolves back to the peer address.
@@ -1149,6 +1209,8 @@ mod tests {
             "0.0.0.0".parse::<IpAddr>().unwrap(),
             &["anything".into()]
         ));
+        assert!(!reverse_dns_matches(ip, &vec!["x".into(); 257]));
+        assert!(!reverse_dns_matches(ip, &["x".repeat(64 * 1024 + 1)]));
         assert!(!forward_dns_confirms("\0", ip));
         let ip6: IpAddr = "::1".parse().unwrap();
         let host6 = reverse_dns(ip6).expect("reverse ipv6 localhost");

@@ -14,6 +14,7 @@ use std::path::{Component, Path, PathBuf};
 /// unbounded heap read or a blocking read from a FIFO/device in a writable
 /// document tree.
 const MAX_EXPR_FILE_BYTES: u64 = 64 * 1024;
+const MAX_EXPR_REGEX_BYTES: u64 = 64 * 1024;
 
 /// A PCRE2 expression compiled while the configuration is parsed.  Apache's
 /// `ap_expr` uses PCRE; retaining only Rust `regex` syntax made valid Apache
@@ -49,7 +50,10 @@ impl ExprRegex {
             return Err("bad expression regex: pattern is too large or contains controls".into());
         }
         let mut builder = pcre2::bytes::RegexBuilder::new();
-        builder.caseless(nocase).jit_if_available(true);
+        builder
+            .caseless(nocase)
+            .jit_if_available(true)
+            .max_jit_stack_size(Some(512 * 1024));
         let compiled = builder
             .build(&pattern)
             .map_err(|error| format!("bad expression regex: {error}"))?;
@@ -771,6 +775,15 @@ impl Expr {
             Expr::Compare(l, op, r) => Value::Bool(cmp(&l.eval(ctx)?, op, &r.eval(ctx)?)),
             Expr::Regex(l, regex, negate) => {
                 let text = l.eval(ctx)?.bytes();
+                if !vapache_verified::expr_regex_size_admit(
+                    regex.pattern.len() as u64,
+                    text.len() as u64,
+                    MAX_EXPR_REGEX_BYTES,
+                ) {
+                    return Err("expression regex input is too large".into());
+                }
+                let _expensive = crate::resource::try_expensive()
+                    .ok_or("expression regex capacity exhausted")?;
                 let (caps, eval_error) = match regex.compiled.captures(&text) {
                     Ok(captures) => (captures, None),
                     Err(error) => (None, Some(error.to_string())),

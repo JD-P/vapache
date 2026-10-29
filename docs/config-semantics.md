@@ -949,16 +949,18 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | HTTP/1 request body | `LimitRequestBody`, hard absolute body deadline; fixed bodies no larger than 1 MiB stay resident, while known-larger and chunked bodies provide a 64 KiB actual-byte prefix before an `O_EXCL`, mode-0600 spool file is acquired; the shared quota reserves only bytes actually received |
 | HTTP/1 chunked trailers | trailer count and byte budget within the same hard body deadline |
 | Proxy response head | line, header-count and total-head caps |
-| Proxy response body | fixed-length/chunked/EOF body capped at `MAX_PROXY_BODY`; chunk `checked_add` before resize |
+| Proxy response body | fixed-length/chunked/EOF body capped at 64 MiB; large fixed bodies stream, chunked/EOF bodies spill to the shared unlinked-file tier above 256 KiB, and oversize responses do not trigger balancer failover amplification |
 | Proxy trailers | trailer count and byte budget |
 | CGI worker protocol | path/env/body field caps, env-count cap, body spool above threshold |
-| CGI stdout/stderr | output and stderr caps, watchdog deadline, process-group kill |
+| CGI stdout/stderr | 8 MiB stdout and 64 KiB stderr caps, process-wide resident-byte accounting, watchdog deadline, process-group kill |
 | FastCGI records | fixed record/header sizes; stdout spool cap; stderr cap |
 | FastCGI response head | bounded prefix/header scan before body streaming |
-| Aggregate dynamic I/O | RAII byte/file reservations across request, CGI-worker and FastCGI spools; shared CGI/FastCGI concurrency slots |
+| Aggregate dynamic I/O | RAII byte/file reservations across request, response, CGI-worker and FastCGI/proxy spools; 128 MiB request and response resident ceilings; shared CGI/FastCGI concurrency slots; 32 blocking reads |
 | HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error |
-| HTTP/2 | verified settings, header-state, flow-control and reset budgets; at most 32 concurrent streams, each with a 64 KiB resident body prefix before using the shared request-spool quota |
-| Compression | fixed maximum compressible body; range/HEAD bypass |
+| HTTP/2 | verified settings, header-state, flow-control and reset budgets; at most 32 streams per connection and 256 process-wide, each with a 64 KiB resident body prefix before using the shared request-spool quota |
+| Compression/PCRE/password hashing | fixed input/cost bounds and a shared 32-operation CPU-work admission gate; optional compression falls back to identity under pressure |
+| Autoindex | at most 4096 examined directory records (including filtered names), 4096 rendered entries and 4 MiB of generated HTML |
+| DNS authorization | eight resolver workers, queue length 64, two-second caller deadline and bounded copied host operands |
 | Expression `file()` | confined regular descriptor, `O_NONBLOCK`/`O_NOFOLLOW`, 64 KiB read ceiling |
 
 A malformed or over-limit stream produces an error response or connection
@@ -966,6 +968,14 @@ close; request-spool exhaustion specifically produces `503` and releases its
 exact RAII lease. Empty and small bodies never consume a spool-file slot. No
 attacker-declared length reserves bytes that have not arrived, and no
 attacker-byte-derived extension can move the absolute body deadline.
+Unsafe-method cache invalidation runs only after a successful 2xx/3xx response
+and selects disk victims from a per-generation key index; rejected requests do
+not force recursive cache-tree walks. Disk metadata reads are capped at 1 MiB,
+large cached bodies remain file-backed on warm hits, and request-policy,
+access-file and password-file caches have independent byte and entry ceilings.
+Connection admission uses an atomic reserve/release guard, including thread
+spawn failure, and descriptor-exhaustion accept errors back off instead of
+spinning.
 
 ### I34 — Main-configuration directive disposition closure
 
@@ -1813,6 +1823,15 @@ construction: there is no second production interleaver.
   handles internally without surfacing to the adapter; that external wire
   behavior is now an explicit assumption rather than an unverified adapter
   component.
+- `cache_invalidation_status_admit` proves that only a successful unsafe
+  request can invalidate cache entries; safe methods and every 1xx/4xx/5xx
+  response are inert. `autoindex_append_admit` is consumed before both scan
+  count and rendered-byte growth, so checked subtraction establishes the
+  configured ceiling before allocation.
+- `bcrypt_cost_admit` rejects bcrypt costs outside 4..=17 before invoking the
+  password library. `expr_regex_size_admit` binds PCRE2 pattern and subject
+  sizes to 64 KiB; runtime JIT stack and global expensive-work admission add
+  independent memory and concurrency limits.
 - `rewrite_backref_no_qmark`, `rewrite_filesystem_admit`,
   `rewrite_target_external`, `rewrite_internal_path` and
   `rewrite_authority_equal`.  Rewrite backreference/variable expansion uses

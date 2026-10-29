@@ -13,7 +13,23 @@ pub struct ResourceBudget {
     spool_bytes: AtomicU64,
     spool_files: AtomicU64,
     dynamic_requests: AtomicU64,
+    h2_streams: AtomicU64,
+    request_bytes: AtomicU64,
+    response_bytes: AtomicU64,
+    blocking_reads: AtomicU64,
 }
+
+/// Process-wide ceilings for work whose callers do not carry a `Config`
+/// reference (PCRE expression evaluation, password hashing and compression).
+/// Keeping this separate from request-worker admission prevents HTTP/2 from
+/// multiplying expensive work by its per-connection stream allowance.
+pub const MAX_EXPENSIVE_OPS: u64 = 32;
+pub const MAX_BLOCKING_READS: u64 = 32;
+pub const MAX_H2_STREAMS: u64 = 256;
+pub const MAX_REQUEST_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_RESPONSE_RESIDENT_BYTES: u64 = 128 * 1024 * 1024;
+
+static EXPENSIVE_OPS: AtomicU64 = AtomicU64::new(0);
 
 fn try_add(counter: &AtomicU64, amount: u64, limit: u64) -> bool {
     try_add_counter(counter, amount, limit)
@@ -111,6 +127,48 @@ impl ResourceBudget {
         })
     }
 
+    pub fn try_h2_stream(self: &Arc<Self>) -> io::Result<H2StreamLease> {
+        if !try_add(&self.h2_streams, 1, MAX_H2_STREAMS) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "process-wide HTTP/2 stream limit reached",
+            ));
+        }
+        Ok(H2StreamLease {
+            budget: self.clone(),
+            active: true,
+        })
+    }
+
+    pub fn try_request_bytes(self: &Arc<Self>) -> ResidentLease {
+        ResidentLease::new(
+            self.clone(),
+            ResidentKind::Request,
+            MAX_REQUEST_RESIDENT_BYTES,
+        )
+    }
+
+    pub fn try_response_bytes(self: &Arc<Self>) -> ResidentLease {
+        ResidentLease::new(
+            self.clone(),
+            ResidentKind::Response,
+            MAX_RESPONSE_RESIDENT_BYTES,
+        )
+    }
+
+    pub fn try_blocking_read(self: &Arc<Self>) -> io::Result<BlockingReadLease> {
+        if !try_add(&self.blocking_reads, 1, MAX_BLOCKING_READS) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "process-wide blocking-read limit reached",
+            ));
+        }
+        Ok(BlockingReadLease {
+            budget: self.clone(),
+            active: true,
+        })
+    }
+
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn usage(&self) -> (u64, u64, u64) {
         (
@@ -118,6 +176,121 @@ impl ResourceBudget {
             self.spool_files.load(Ordering::Acquire),
             self.dynamic_requests.load(Ordering::Acquire),
         )
+    }
+
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn extended_usage(&self) -> (u64, u64, u64, u64) {
+        (
+            self.h2_streams.load(Ordering::Acquire),
+            self.request_bytes.load(Ordering::Acquire),
+            self.response_bytes.load(Ordering::Acquire),
+            self.blocking_reads.load(Ordering::Acquire),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResidentKind {
+    Request,
+    Response,
+}
+
+#[derive(Debug)]
+pub struct ResidentLease {
+    budget: Arc<ResourceBudget>,
+    kind: ResidentKind,
+    bytes: u64,
+    limit: u64,
+}
+
+impl ResidentLease {
+    fn new(budget: Arc<ResourceBudget>, kind: ResidentKind, limit: u64) -> Self {
+        Self {
+            budget,
+            kind,
+            bytes: 0,
+            limit,
+        }
+    }
+
+    fn counter(&self) -> &AtomicU64 {
+        match self.kind {
+            ResidentKind::Request => &self.budget.request_bytes,
+            ResidentKind::Response => &self.budget.response_bytes,
+        }
+    }
+
+    pub fn reserve(&mut self, amount: u64) -> io::Result<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+        if !try_add(self.counter(), amount, self.limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "process-wide resident-byte limit reached",
+            ));
+        }
+        self.bytes = self.bytes.saturating_add(amount);
+        Ok(())
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for ResidentLease {
+    fn drop(&mut self) {
+        self.counter().fetch_sub(self.bytes, Ordering::AcqRel);
+        self.bytes = 0;
+    }
+}
+
+#[derive(Debug)]
+pub struct H2StreamLease {
+    budget: Arc<ResourceBudget>,
+    active: bool,
+}
+
+impl Drop for H2StreamLease {
+    fn drop(&mut self) {
+        if self.active {
+            self.budget.h2_streams.fetch_sub(1, Ordering::AcqRel);
+            self.active = false;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct BlockingReadLease {
+    budget: Arc<ResourceBudget>,
+    active: bool,
+}
+
+impl Drop for BlockingReadLease {
+    fn drop(&mut self) {
+        if self.active {
+            self.budget.blocking_reads.fetch_sub(1, Ordering::AcqRel);
+            self.active = false;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ExpensiveLease {
+    active: bool,
+}
+
+pub fn try_expensive() -> Option<ExpensiveLease> {
+    try_add(&EXPENSIVE_OPS, 1, MAX_EXPENSIVE_OPS).then_some(ExpensiveLease { active: true })
+}
+
+impl Drop for ExpensiveLease {
+    fn drop(&mut self) {
+        if self.active {
+            EXPENSIVE_OPS.fetch_sub(1, Ordering::AcqRel);
+            self.active = false;
+        }
     }
 }
 
@@ -194,6 +367,42 @@ mod tests {
         assert_eq!(budget.usage(), (0, 1, 1));
         drop((second, dynamic));
         assert_eq!(budget.usage(), (0, 0, 0));
+    }
+
+    #[test]
+    fn process_wide_stream_memory_and_blocking_leases_release() {
+        let budget = Arc::new(ResourceBudget::default());
+        let stream = budget.try_h2_stream().unwrap();
+        let mut request = budget.try_request_bytes();
+        let mut response = budget.try_response_bytes();
+        let blocking = budget.try_blocking_read().unwrap();
+        request.reserve(7).unwrap();
+        response.reserve(11).unwrap();
+        assert_eq!(budget.extended_usage(), (1, 7, 11, 1));
+        drop((stream, request, response, blocking));
+        assert_eq!(budget.extended_usage(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn process_wide_h2_stream_limit_is_enforced_and_recovers() {
+        let budget = Arc::new(ResourceBudget::default());
+        let leases: Vec<_> = (0..MAX_H2_STREAMS)
+            .map(|_| budget.try_h2_stream().unwrap())
+            .collect();
+        assert!(budget.try_h2_stream().is_err());
+        drop(leases);
+        assert!(budget.try_h2_stream().is_ok());
+    }
+
+    #[test]
+    fn resident_lease_rejects_overflow_and_global_expensive_work_releases() {
+        let budget = Arc::new(ResourceBudget::default());
+        let mut resident = ResidentLease::new(budget, ResidentKind::Request, 8);
+        resident.reserve(8).unwrap();
+        assert!(resident.reserve(1).is_err());
+        let lease = try_expensive().expect("expensive slot");
+        drop(lease);
+        assert!(try_expensive().is_some());
     }
 
     #[test]

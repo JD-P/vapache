@@ -152,11 +152,19 @@ Implemented today:
   request-body spooling for fixed HTTP/1 bodies declared above 1 MB after a
   64 KiB actual-byte prefix (also 64 KiB for chunked HTTP/1 and HTTP/2).
 - Bounded-memory proxy and FastCGI traffic: large fixed-length upstream
-  bodies stream through `Body::Stream`, large FastCGI stdout is spooled to a
-  temporary file, and large request bodies are spooled to an unlinked file
-  before being forwarded to proxy/FastCGI backends. Request and proxy chunk
-  sizes, trailer counts/bytes, proxy head sizes and CGI/FastCGI output are
-  explicitly bounded.
+  bodies stream through `Body::Stream`, chunked/EOF proxy responses spill to
+  an unlinked file above 256 KiB, large FastCGI stdout is spooled, and large
+  request bodies are spooled before forwarding. Proxy responses are capped at
+  64 MiB and local CGI output at 8 MiB. Request and proxy chunk sizes, trailer
+  counts/bytes, proxy head sizes and CGI/FastCGI output are explicitly bounded.
+- Process-wide overload control: at most 256 HTTP/2 streams, 128 MiB each of
+  retained request and response bytes, 32 blocking response reads, and 32
+  concurrent CPU-heavy regex/hash/compression/access-file operations. DNS
+  authorization uses an eight-worker bounded queue and timeout. Autoindex
+  scans at most 4096 directory records and renders at most 4 MiB. Request
+  policy, access-file, password-file and disk-cache metadata indexes are
+  byte/count bounded and evict individual entries rather than clearing or
+  rescanning an attacker-amplifiable working set.
 - Unsupported security-sensitive directives (`SSLRequire*`,
   `SecRuleEngine On`) fail closed even in
   compatibility mode rather than silently weakening access or TLS policy.

@@ -2366,6 +2366,66 @@ struct CachedPolicy {
     conditionals: Arc<Vec<ScopeRule>>,
 }
 
+type PolicyCacheKey = (usize, PathBuf, String);
+const POLICY_CACHE_MAX_ENTRIES: usize = 256;
+const POLICY_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const POLICY_CACHE_VALUE_CHARGE: usize = 128 * 1024;
+
+#[derive(Debug)]
+struct BoundedPolicyCache<V> {
+    entries: HashMap<PolicyCacheKey, (Arc<V>, usize)>,
+    bytes: usize,
+}
+
+impl<V> Default for BoundedPolicyCache<V> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<V> BoundedPolicyCache<V> {
+    fn weight(key: &PolicyCacheKey) -> usize {
+        key.1
+            .as_os_str()
+            .as_bytes()
+            .len()
+            .saturating_add(key.2.len())
+            // Scope merges own several policy vectors. Their exact allocator
+            // footprint is not observable here, so reserve a deliberately
+            // conservative charge and independently cap the entry count.
+            .saturating_add(POLICY_CACHE_VALUE_CHARGE)
+    }
+
+    fn get(&self, key: &PolicyCacheKey) -> Option<Arc<V>> {
+        self.entries.get(key).map(|(value, _)| Arc::clone(value))
+    }
+
+    fn insert(&mut self, key: PolicyCacheKey, value: Arc<V>) {
+        let weight = Self::weight(&key);
+        if weight > POLICY_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some((_, old_weight)) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old_weight);
+        }
+        while self.entries.len() >= POLICY_CACHE_MAX_ENTRIES
+            || self.bytes.saturating_add(weight) > POLICY_CACHE_MAX_BYTES
+        {
+            let Some(victim) = self.entries.keys().next().cloned() else {
+                break;
+            };
+            if let Some((_, old_weight)) = self.entries.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(old_weight);
+            }
+        }
+        self.bytes = self.bytes.saturating_add(weight);
+        self.entries.insert(key, (value, weight));
+    }
+}
+
 /// One `mod_remoteip` trust entry. Apache gives internal proxies permission
 /// to present private addresses; an external trusted proxy may only present a
 /// public address. Keeping the class on each entry is security-significant.
@@ -2581,8 +2641,8 @@ pub struct Config {
     pub server_software: String,
     pub ssl: SslConfig,
     pub cache: CacheConfig,
-    policy_cache: Arc<RwLock<HashMap<(usize, PathBuf, String), Arc<CachedPolicy>>>>,
-    dir_scope_cache: Arc<RwLock<HashMap<(usize, PathBuf, String), Arc<Scope>>>>,
+    policy_cache: Arc<RwLock<BoundedPolicyCache<CachedPolicy>>>,
+    dir_scope_cache: Arc<RwLock<BoundedPolicyCache<Scope>>>,
 }
 
 impl Config {
@@ -3577,8 +3637,8 @@ impl Compile {
             server_software: "Apache".into(),
             ssl: SslConfig::default(),
             cache: CacheConfig::default(),
-            policy_cache: Arc::new(RwLock::new(HashMap::new())),
-            dir_scope_cache: Arc::new(RwLock::new(HashMap::new())),
+            policy_cache: Arc::new(RwLock::new(BoundedPolicyCache::default())),
+            dir_scope_cache: Arc::new(RwLock::new(BoundedPolicyCache::default())),
         };
         let known = known_directives();
         Compile {
@@ -13317,14 +13377,11 @@ impl Config {
         );
         if let Ok(guard) = self.dir_scope_cache.read() {
             if let Some(scope) = guard.get(&key) {
-                return Arc::clone(scope);
+                return scope;
             }
         }
         let scope = Arc::new(self.effective_scope(vhost, dir, url_path));
         if let Ok(mut guard) = self.dir_scope_cache.write() {
-            if guard.len() >= 4096 {
-                guard.clear();
-            }
             guard.insert(key, Arc::clone(&scope));
         }
         scope
@@ -13657,9 +13714,6 @@ impl Config {
         );
         let conditionals = Arc::new(conditionals);
         if let Ok(mut guard) = self.policy_cache.write() {
-            if guard.len() >= 4096 {
-                guard.clear();
-            }
             guard.insert(
                 key,
                 Arc::new(CachedPolicy {
@@ -14237,5 +14291,23 @@ mod pass11_kernel_tests {
             denied.mapping_policy.set_handler,
             Some(SetHandler::Name("none".into()))
         );
+    }
+
+    #[test]
+    fn request_policy_cache_is_byte_bounded_without_wholesale_clear() {
+        let mut cache = BoundedPolicyCache::<Scope>::default();
+        for index in 0..(POLICY_CACHE_MAX_ENTRIES + 32) {
+            cache.insert(
+                (
+                    0,
+                    PathBuf::from(format!("/tmp/{index}")),
+                    format!("/{}-{index}", "x".repeat(8192)),
+                ),
+                Arc::new(Scope::default()),
+            );
+        }
+        assert!(cache.entries.len() <= POLICY_CACHE_MAX_ENTRIES);
+        assert!(cache.bytes <= POLICY_CACHE_MAX_BYTES);
+        assert!(!cache.entries.is_empty());
     }
 }

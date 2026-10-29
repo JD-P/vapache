@@ -6,7 +6,7 @@
 //! allow-list token check for methods and header names.  These are the
 //! parsing rules that httpd's own security advisories keep returning to.
 
-use crate::resource::{ResourceBudget, SpoolLease};
+use crate::resource::{ResidentLease, ResourceBudget, SpoolLease};
 use crate::util::{trim_ascii, with_http_date_now};
 use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
@@ -938,6 +938,7 @@ pub struct Response {
     pub headers: Vec<(Cow<'static, str>, Vec<u8>)>,
     pub body: Body,
     spool_lease: Option<SpoolLease>,
+    resident_lease: Option<ResidentLease>,
 }
 
 impl Response {
@@ -947,6 +948,7 @@ impl Response {
             headers: Vec::new(),
             body: Body::Empty,
             spool_lease: None,
+            resident_lease: None,
         }
     }
 
@@ -977,6 +979,29 @@ impl Response {
 
     pub(crate) fn hold_spool(&mut self, lease: SpoolLease) {
         self.spool_lease = Some(lease);
+    }
+
+    /// Charge retained byte bodies until the response has actually been sent
+    /// or discarded. File and streaming bodies already have bounded backing
+    /// storage and do not consume this resident-byte budget.
+    pub(crate) fn admit_resident(
+        &mut self,
+        budget: &std::sync::Arc<ResourceBudget>,
+    ) -> io::Result<()> {
+        if self.resident_lease.is_some() {
+            return Ok(());
+        }
+        let Body::Bytes(bytes) = &self.body else {
+            return Ok(());
+        };
+        let mut lease = budget.try_response_bytes();
+        lease.reserve(bytes.len() as u64)?;
+        self.resident_lease = Some(lease);
+        Ok(())
+    }
+
+    pub(crate) fn hold_resident(&mut self, lease: ResidentLease) {
+        self.resident_lease = Some(lease);
     }
 }
 
@@ -1669,6 +1694,7 @@ mod tests {
                 len: 7,
             },
             spool_lease: None,
+            resident_lease: None,
         };
         assert_eq!(stream.body_len(), 7);
     }
@@ -1766,6 +1792,7 @@ mod tests {
                 len: 9,
             },
             spool_lease: None,
+            resident_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -1828,6 +1855,7 @@ mod tests {
                 len: 10,
             },
             spool_lease: None,
+            resident_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -1845,6 +1873,7 @@ mod tests {
                 len: 10,
             },
             spool_lease: None,
+            resident_lease: None,
         };
         assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
 
@@ -1862,6 +1891,7 @@ mod tests {
                 len: 32 * 1024,
             },
             spool_lease: None,
+            resident_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -1882,6 +1912,7 @@ mod tests {
                 len: 32 * 1024,
             },
             spool_lease: None,
+            resident_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -1904,6 +1935,7 @@ mod tests {
                 len: 32 * 1024,
             },
             spool_lease: None,
+            resident_lease: None,
         };
         assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
 
@@ -1921,6 +1953,7 @@ mod tests {
                 len: 0,
             },
             spool_lease: None,
+            resident_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -1984,6 +2017,7 @@ mod tests {
                 len: 32 * 1024,
             },
             spool_lease: None,
+            resident_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -2363,6 +2397,7 @@ mod tests {
                 len: 32 * 1024,
             },
             spool_lease: None,
+            resident_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -2383,6 +2418,7 @@ mod tests {
                 len: 32 * 1024,
             },
             spool_lease: None,
+            resident_lease: None,
         };
         assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
         drop(writer);

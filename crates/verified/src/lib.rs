@@ -1655,6 +1655,82 @@ pub proof fn cache_invalidation_preserves_unrelated_keyed_entry(
 {
 }
 
+/// RFC cache invalidation is an effect of a successful unsafe request, not of
+/// an attacker-controlled failing POST/PUT. This also prevents a rejected
+/// request from forcing an O(cache-size) invalidation walk.
+pub open spec fn cache_invalidation_status_spec(unsafe_method: bool, status: u16) -> bool {
+    unsafe_method && status >= 200 && status < 400
+}
+
+pub fn cache_invalidation_status_admit(unsafe_method: bool, status: u16) -> (ok: bool)
+    ensures ok == cache_invalidation_status_spec(unsafe_method, status),
+{
+    unsafe_method && status >= 200 && status < 400
+}
+
+pub proof fn failed_or_safe_request_never_invalidates(unsafe_method: bool, status: u16)
+    requires !unsafe_method || status < 200 || status >= 400,
+    ensures !cache_invalidation_status_spec(unsafe_method, status),
+{
+}
+
+/// Autoindex work is admitted by both entry count and rendered bytes. Each
+/// append is checked before allocation so sorting and HTML construction remain
+/// bounded even for attacker-populated upload directories.
+pub open spec fn autoindex_append_spec(current: u64, incoming: u64, limit: u64) -> bool {
+    current <= limit && incoming <= limit - current
+}
+
+pub fn autoindex_append_admit(current: u64, incoming: u64, limit: u64) -> (ok: bool)
+    ensures ok == autoindex_append_spec(current, incoming, limit),
+{
+    current <= limit && incoming <= limit - current
+}
+
+pub proof fn autoindex_append_stays_bounded(current: u64, incoming: u64, limit: u64)
+    requires autoindex_append_spec(current, incoming, limit),
+    ensures current + incoming <= limit,
+{
+}
+
+/// Password files are operator input, but a remote client selects when their
+/// hashes are evaluated. Reject costs outside Apache htpasswd's supported
+/// range before they can pin a request worker.
+pub open spec fn bcrypt_cost_spec(cost: u32) -> bool {
+    cost >= 4 && cost <= 17
+}
+
+pub fn bcrypt_cost_admit(cost: u32) -> (ok: bool)
+    ensures ok == bcrypt_cost_spec(cost),
+{
+    cost >= 4 && cost <= 17
+}
+
+pub proof fn bcrypt_extreme_cost_rejected(cost: u32)
+    requires cost < 4 || cost > 17,
+    ensures !bcrypt_cost_spec(cost),
+{
+}
+
+/// PCRE compatibility is retained only for bounded patterns and subjects.
+/// This bounds per-match allocation independently of the global CPU-work
+/// admission gate.
+pub open spec fn expr_regex_size_spec(pattern: u64, subject: u64, limit: u64) -> bool {
+    pattern <= limit && subject <= limit
+}
+
+pub fn expr_regex_size_admit(pattern: u64, subject: u64, limit: u64) -> (ok: bool)
+    ensures ok == expr_regex_size_spec(pattern, subject, limit),
+{
+    pattern <= limit && subject <= limit
+}
+
+pub proof fn expr_regex_oversize_rejected(pattern: u64, subject: u64, limit: u64)
+    requires pattern > limit || subject > limit,
+    ensures !expr_regex_size_spec(pattern, subject, limit),
+{
+}
+
 /// Add the single leading slash required for an internal rewrite target.
 /// External targets are classified before this function is called.
 pub fn rewrite_internal_path(joined: &[u8]) -> (out: Vec<u8>)

@@ -416,8 +416,47 @@ fuzzer now varies aggregate byte/file quotas, including zero, and asserts that
 fragmentation produces the same result and every lease returns to zero. Unit,
 adapter and property regressions cover byte-accurate accounting, release on
 failure, HTTP/1 `503`, HTTP/2 spill exhaustion, cache eviction, proxy ACL
-provenance and `<IfFile>` phase order. Verus verifies 475 functions with zero
+provenance and `<IfFile>` phase order. Verus verifies 483 functions with zero
 errors.
+
+## Post-P20 denial-of-service hardening
+
+The follow-up resource review closes cross-connection multipliers that a
+per-request limit cannot contain:
+
+- one `ResourceBudget` now caps process-wide HTTP/2 streams (256), retained
+  request bytes (128 MiB), retained response bytes (128 MiB) and blocking
+  response reads (32). HTTP/2 still enforces 32 streams per connection, while
+  every accepted stream owns the process lease until its task exits;
+- chunked and EOF-delimited proxy responses spill to the shared unlinked spool
+  above 256 KiB, fixed-length bodies above that threshold stream, and every
+  form is capped at 64 MiB. Spool exhaustion returns `503` without poisoning a
+  balancer member; oversize responses return `502` without retrying the full
+  body against every member. Local CGI stdout is capped at 8 MiB and charged
+  while read and again for the parsed response copy;
+- disk cache metadata is capped at 1 MiB, warm large-body hits retain only the
+  file length and serve the body descriptor instead of first reading it into
+  a `Vec`, and cache-store copies consume the response-byte budget. Unsafe
+  invalidation occurs only after a successful 2xx/3xx response and selects
+  victims from a once-per-generation key index rather than walking the cache
+  tree for every rejected POST;
+- autoindex counts every directory record, including filtered dot/backup and
+  unreadable entries, before metadata lookup; it admits at most 4096 records
+  and 4 MiB of HTML. Compression, PCRE2, bcrypt/MD5 and access-file parsing
+  share a 32-operation gate. PCRE2 inputs/JIT stack, bcrypt cost, DNS resolver
+  workers/queue/operands and auth, access-file and request-policy cache bytes
+  are independently bounded;
+- connection admission is a compare/exchange reservation with RAII release.
+  Injected thread-spawn failure returns the slot, and `EMFILE`/`ENFILE` accept
+  failures back off instead of hot-spinning. Proxy health-check reloads cancel
+  the previous generation and old checks cannot publish stale state.
+
+The executable Verus gates are `cache_invalidation_status_admit`,
+`autoindex_append_admit`, `bcrypt_cost_admit` and
+`expr_regex_size_admit`, with proofs for failure and boundary cases. Unit,
+fault-injection and property regressions cover process lease release,
+invalidation, bounded policy caches, hidden autoindex entries, proxy
+spooling/oversize responses, bcrypt extremes and connection spawn failure.
 
 ## Transform-to-sink and filesystem-race closure
 

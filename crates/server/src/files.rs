@@ -677,8 +677,12 @@ enum DirAction {
     Redirect(String),
     Index(File, Metadata, Vec<u8>),
     List(Vec<(Vec<u8>, bool, u64)>),
+    Overloaded,
     Forbidden,
 }
+
+const MAX_AUTOINDEX_ENTRIES: usize = 4096;
+const MAX_AUTOINDEX_BYTES: usize = 4 * 1024 * 1024;
 
 fn directory_action(
     cfg: &Config,
@@ -720,10 +724,29 @@ fn directory_action(
             true,
         )
     {
+        let Some(_expensive) = crate::resource::try_expensive() else {
+            return DirAction::Overloaded;
+        };
         let path = format!("/proc/self/fd/{}", dir.as_raw_fd());
         let mut entries: Vec<(Vec<u8>, bool, u64)> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(path) {
-            for ent in rd.flatten() {
+            let mut scanned = 0u64;
+            for result in rd {
+                // Count every directory record, including unreadable and
+                // filtered dot/backup names. Otherwise an upload directory
+                // full of hidden entries could evade the rendered-entry cap
+                // while still forcing an unbounded readdir walk.
+                if !vapache_verified::autoindex_append_admit(
+                    scanned,
+                    1,
+                    MAX_AUTOINDEX_ENTRIES as u64,
+                ) {
+                    return DirAction::Overloaded;
+                }
+                scanned += 1;
+                let Ok(ent) = result else {
+                    continue;
+                };
                 let name = ent.file_name().as_encoded_bytes().to_vec();
                 if name.starts_with(b".") {
                     continue;
@@ -738,6 +761,13 @@ fn directory_action(
                 }
                 if name.ends_with(b"~") || name.starts_with(b"#") {
                     continue;
+                }
+                if !vapache_verified::autoindex_append_admit(
+                    entries.len() as u64,
+                    1,
+                    MAX_AUTOINDEX_ENTRIES as u64,
+                ) {
+                    return DirAction::Overloaded;
                 }
                 let meta = ent.metadata().ok();
                 let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
@@ -882,6 +912,11 @@ fn serve_directory_inner(
             )
         }
         DirAction::List(entries) => autoindex(cfg, scope, url_path, &entries, host, port),
+        DirAction::Overloaded => Response::bytes(
+            503,
+            "text/html; charset=UTF-8",
+            b"Directory listing capacity is temporarily exhausted\n".to_vec(),
+        ),
         DirAction::Forbidden => error_response(
             cfg, vhost, scope, 403, req, url_path, port, host, peer, local_ip,
         ),
@@ -928,6 +963,13 @@ fn autoindex(
     host: &str,
     port: u16,
 ) -> Response {
+    if entries.len() > MAX_AUTOINDEX_ENTRIES {
+        return Response::bytes(
+            503,
+            "text/html; charset=UTF-8",
+            b"Directory listing capacity is temporarily exhausted\n".to_vec(),
+        );
+    }
     let title = format!("Index of {}", html_escape(url_path.as_bytes()));
     let mut body = String::new();
     body.push_str(
@@ -945,20 +987,33 @@ fn autoindex(
         if *is_dir {
             href.push('/');
         }
-        body.push_str("   <tr><td><a href=\"");
-        body.push_str(&href);
-        body.push_str("\">");
-        body.push_str(&html_escape(name));
+        let mut row = String::new();
+        row.push_str("   <tr><td><a href=\"");
+        row.push_str(&href);
+        row.push_str("\">");
+        row.push_str(&html_escape(name));
         if *is_dir {
-            body.push('/');
+            row.push('/');
         }
-        body.push_str("</a></td><td>");
+        row.push_str("</a></td><td>");
         if *is_dir {
-            body.push_str("-");
+            row.push_str("-");
         } else {
-            body.push_str(&size.to_string());
+            row.push_str(&size.to_string());
         }
-        body.push_str("</td></tr>\n");
+        row.push_str("</td></tr>\n");
+        if !vapache_verified::autoindex_append_admit(
+            body.len() as u64,
+            row.len() as u64,
+            MAX_AUTOINDEX_BYTES as u64,
+        ) {
+            return Response::bytes(
+                503,
+                "text/html; charset=UTF-8",
+                b"Directory listing capacity is temporarily exhausted\n".to_vec(),
+            );
+        }
+        body.push_str(&row);
     }
     body.push_str("  </table>\n");
     add_signature(&mut body, cfg, host, port);
@@ -1690,6 +1745,11 @@ mod tests {
             8080,
         );
         assert_eq!(listed.status, 200);
+        let too_many = vec![(b"entry".to_vec(), false, 1); MAX_AUTOINDEX_ENTRIES + 1];
+        assert_eq!(
+            autoindex(&cfg, &scope, "/dir/", &too_many, "example.test", 8080,).status,
+            503
+        );
 
         let mut text_scope = Scope::default();
         text_scope
@@ -1842,6 +1902,29 @@ mod tests {
             .iter()
             .any(|(n, v)| { n.eq_ignore_ascii_case("cache-control") && v == b"no-cache" }));
         assert!(!error_message(431, "/").is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn autoindex_scan_limit_counts_filtered_hidden_entries() {
+        let (root, cfg) = config("autoindex-hidden-scan-limit");
+        for index in 0..=MAX_AUTOINDEX_ENTRIES {
+            File::create(root.join(format!(".hidden-{index}"))).unwrap();
+        }
+        let mut scope = Scope::default();
+        scope.options.push_add(crate::config::Options::INDEXES);
+        assert!(matches!(
+            directory_action(
+                &cfg,
+                &scope,
+                &request("GET", b"/"),
+                &File::open(&root).unwrap(),
+                "/",
+                b"/",
+                true,
+            ),
+            DirAction::Overloaded
+        ));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

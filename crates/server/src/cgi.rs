@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const MAX_OUTPUT: usize = 64 * 1024 * 1024;
+const MAX_OUTPUT: usize = 8 * 1024 * 1024;
 const MAX_HEADER: usize = 64 * 1024;
 const MAX_STDERR: usize = 64 * 1024;
 const CGI_BODY_IN_MEMORY: u64 = 1024 * 1024;
@@ -345,13 +345,29 @@ pub fn execute(ctx: &CgiContext) -> Response {
         }
     }
 
-    match run_local(&path, &cwd, &env, &body, ctx.cfg.timeout, false, None) {
+    let mut response_lease = ctx.cfg.resource_budget.try_response_bytes();
+    match run_local(
+        &path,
+        &cwd,
+        &env,
+        &body,
+        ctx.cfg.timeout,
+        false,
+        None,
+        Some(&mut response_lease),
+    ) {
         Ok((out, stderr)) => {
             if !stderr.trim().is_empty() {
                 eprintln!("CGI stderr: {}", stderr.trim());
             }
+            if response_lease.reserve(out.len() as u64).is_err() {
+                return cgi_status_error(ctx, 503);
+            }
             match parse_cgi_response(&out, ctx.req.version) {
-                Ok(r) => r,
+                Ok(mut r) => {
+                    r.hold_resident(response_lease);
+                    r
+                }
                 Err(()) => cgi_error(ctx),
             }
         }
@@ -393,6 +409,7 @@ fn execute_via_pool(
         BodySource::Bytes(_) => None,
     };
     let mut worker = pool.take()?;
+    let mut response_lease = ctx.cfg.resource_budget.try_response_bytes();
     match exchange(
         &mut worker.stream,
         path,
@@ -401,14 +418,21 @@ fn execute_via_pool(
         body,
         ctx.cfg.timeout,
         expected,
+        Some(&mut response_lease),
     ) {
         Ok((out, stderr)) => {
             pool.put(worker);
             if !stderr.trim().is_empty() {
                 eprintln!("CGI stderr: {}", stderr.trim());
             }
+            if response_lease.reserve(out.len() as u64).is_err() {
+                return Some(cgi_status_error(ctx, 503));
+            }
             Some(match parse_cgi_response(&out, ctx.req.version) {
-                Ok(r) => r,
+                Ok(mut r) => {
+                    r.hold_resident(response_lease);
+                    r
+                }
                 Err(()) => cgi_error(ctx),
             })
         }
@@ -807,7 +831,7 @@ fn worker_request(stream: &mut UnixStream) -> Result<bool, String> {
     };
     let timeout = Duration::from_secs(read_u64(stream)?.clamp(1, 3600));
 
-    let result = run_local(&script, &cwd, &env, &body, timeout, true, expected);
+    let result = run_local(&script, &cwd, &env, &body, timeout, true, expected, None);
     match result {
         Ok((out, stderr)) => {
             write_u8(stream, 1)?;
@@ -843,6 +867,7 @@ fn exchange(
     body: &BodySource,
     timeout: Duration,
     expected: Option<(u64, u64)>,
+    response_lease: Option<&mut crate::resource::ResidentLease>,
 ) -> Result<(Vec<u8>, String), String> {
     write_bytes(stream, path.as_os_str().as_bytes())?;
     match expected {
@@ -872,7 +897,8 @@ fn exchange(
     send_timeout(stream, timeout)?;
 
     let ok = read_u8(stream)?;
-    let out = read_bytes(stream, MAX_OUTPUT as u32, false)?.unwrap_or_default();
+    let out =
+        read_bytes_budgeted(stream, MAX_OUTPUT as u32, false, response_lease)?.unwrap_or_default();
     let err = read_bytes(stream, MAX_STDERR as u32, false)?.unwrap_or_default();
     let err = String::from_utf8_lossy(&err).into_owned();
     if ok == 0 {
@@ -921,6 +947,15 @@ fn write_bytes(w: &mut impl Write, data: &[u8]) -> Result<(), String> {
 }
 
 fn read_bytes(r: &mut impl Read, limit: u32, eof_ok: bool) -> Result<Option<Vec<u8>>, String> {
+    read_bytes_budgeted(r, limit, eof_ok, None)
+}
+
+fn read_bytes_budgeted(
+    r: &mut impl Read,
+    limit: u32,
+    eof_ok: bool,
+    mut resident: Option<&mut crate::resource::ResidentLease>,
+) -> Result<Option<Vec<u8>>, String> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len) {
         Ok(()) => {}
@@ -930,6 +965,11 @@ fn read_bytes(r: &mut impl Read, limit: u32, eof_ok: bool) -> Result<Option<Vec<
     let len = u32::from_le_bytes(len);
     if !vapache_verified::cgi_field_len_ok(len, limit) {
         return Err("CGI worker message field too large".into());
+    }
+    if let Some(lease) = resident.as_mut() {
+        lease
+            .reserve(len as u64)
+            .map_err(|_| "CGI response memory capacity exhausted".to_string())?;
     }
     let mut data = vec![0u8; len as usize];
     r.read_exact(&mut data).map_err(|e| e.to_string())?;
@@ -979,6 +1019,7 @@ fn run_local(
     timeout: Duration,
     worker_prepared: bool,
     expected: Option<(u64, u64)>,
+    mut response_lease: Option<&mut crate::resource::ResidentLease>,
 ) -> Result<(Vec<u8>, String), String> {
     // In the worker path, set the child's cwd in the worker before spawning
     // instead of asking `Command` for a per-child chdir.  This keeps the spawn
@@ -1059,7 +1100,9 @@ fn run_local(
         .stdout
         .take()
         .ok_or_else(|| "CGI stdout unavailable".to_string())
-        .and_then(|stdout| read_with_deadline(stdout, deadline, &mut out));
+        .and_then(|stdout| {
+            read_with_deadline(stdout, deadline, &mut out, response_lease.as_deref_mut())
+        });
     let waited = if read_result.is_ok() {
         wait_with_deadline(&mut child, pid, deadline)
     } else {
@@ -1114,6 +1157,7 @@ fn read_with_deadline(
     mut reader: impl Read + AsRawFd,
     deadline: Instant,
     out: &mut Vec<u8>,
+    mut resident: Option<&mut crate::resource::ResidentLease>,
 ) -> Result<(), String> {
     let fd = reader.as_raw_fd();
     let mut chunk = [0u8; 64 * 1024];
@@ -1136,6 +1180,11 @@ fn read_with_deadline(
         match reader.read(&mut chunk) {
             Ok(0) => return Ok(()),
             Ok(n) => {
+                if let Some(lease) = resident.as_mut() {
+                    lease
+                        .reserve(n as u64)
+                        .map_err(|_| "CGI response memory capacity exhausted".to_string())?;
+                }
                 out.extend_from_slice(&chunk[..n]);
                 if out.len() > MAX_OUTPUT {
                     return Err("CGI output too large".into());
@@ -1608,6 +1657,7 @@ mod tests {
             Duration::from_millis(50),
             false,
             None,
+            None,
         );
         assert!(result.is_err());
         assert!(start.elapsed() < Duration::from_secs(2));
@@ -1631,6 +1681,7 @@ mod tests {
             &BodySource::Bytes(Vec::new()),
             Duration::from_secs(1),
             false,
+            None,
             None,
         )
         .unwrap_err();
@@ -1669,6 +1720,7 @@ mod tests {
             &BodySource::Bytes(Vec::new()),
             Duration::from_secs(1),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(out, b"out");
@@ -1691,6 +1743,7 @@ mod tests {
             &[],
             &BodySource::Bytes(Vec::new()),
             Duration::from_secs(1),
+            None,
             None,
         )
         .unwrap_err();
@@ -2156,6 +2209,7 @@ mod tests {
             &BodySource::Bytes(Vec::new()),
             Duration::from_secs(1),
             None,
+            None,
         )
         .unwrap_err();
         assert_eq!(err, "CGI worker reported failure");
@@ -2183,6 +2237,7 @@ mod tests {
                 &[],
                 &BodySource::File(file),
                 Duration::from_secs(1),
+                None,
                 None,
             )
             .unwrap_err();
@@ -2251,6 +2306,7 @@ mod tests {
             Duration::from_secs(1),
             false,
             Some((0, 0)),
+            None,
         )
         .is_err());
 
@@ -2262,6 +2318,7 @@ mod tests {
             &BodySource::Bytes(vec![b'x'; 32 * 1024]),
             Duration::from_secs(1),
             false,
+            None,
             None,
         )
         .is_ok());
@@ -2279,14 +2336,18 @@ mod tests {
             Duration::from_millis(50),
             false,
             None,
+            None,
         )
         .is_err());
 
         let mut out = Vec::new();
-        assert!(
-            read_with_deadline(BadFd, Instant::now() + Duration::from_millis(100), &mut out)
-                .is_ok()
-        );
+        assert!(read_with_deadline(
+            BadFd,
+            Instant::now() + Duration::from_millis(100),
+            &mut out,
+            None,
+        )
+        .is_ok());
         assert!(!poll_result(-1, std::io::Error::from(std::io::ErrorKind::Interrupted)).unwrap());
         assert!(poll_result(-1, std::io::Error::from(std::io::ErrorKind::Other)).is_err());
         assert!(!poll_result(0, std::io::Error::from(std::io::ErrorKind::Other)).unwrap());
@@ -2296,16 +2357,25 @@ mod tests {
             file: File::open("/dev/null").unwrap(),
             stage: 0,
         };
-        assert!(
-            read_with_deadline(seq, Instant::now() + Duration::from_millis(100), &mut out).is_err()
-        );
+        assert!(read_with_deadline(
+            seq,
+            Instant::now() + Duration::from_millis(100),
+            &mut out,
+            None,
+        )
+        .is_err());
         drop(null);
         let mut flood = FloodRead {
             file: File::open("/dev/null").unwrap(),
         };
         assert_eq!(
-            read_with_deadline(flood, Instant::now() + Duration::from_secs(10), &mut out)
-                .unwrap_err(),
+            read_with_deadline(
+                flood,
+                Instant::now() + Duration::from_secs(10),
+                &mut out,
+                None,
+            )
+            .unwrap_err(),
             "CGI output too large"
         );
 

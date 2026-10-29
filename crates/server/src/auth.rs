@@ -12,11 +12,17 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
 use md5::Md5;
 use sha1::{Digest, Sha1};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const MAX_PASSWORD_FILE: u64 = 4 * 1024 * 1024;
+const MAX_AUTH_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_AUTH_CACHE_ENTRIES: usize = 128;
 
 const CRYPT_ALPHABET: &[u8; 64] =
     b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -71,13 +77,96 @@ pub fn authenticate(scope: &Scope, req: &Request) -> Option<Identity> {
     })
 }
 
-fn read_small(path: &Path) -> Option<String> {
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct AuthFileKey {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+#[derive(Default)]
+struct AuthFileCache {
+    entries: HashMap<AuthFileKey, (Arc<String>, usize)>,
+    bytes: usize,
+}
+
+fn auth_file_cache() -> &'static Mutex<AuthFileCache> {
+    static CACHE: OnceLock<Mutex<AuthFileCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(AuthFileCache::default()))
+}
+
+fn auth_key(path: &Path, meta: &std::fs::Metadata) -> AuthFileKey {
+    AuthFileKey {
+        path: path.to_path_buf(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+        size: meta.len(),
+        mtime: meta.mtime(),
+        mtime_nsec: meta.mtime_nsec(),
+        ctime: meta.ctime(),
+        ctime_nsec: meta.ctime_nsec(),
+    }
+}
+
+fn read_small(path: &Path) -> Option<Arc<String>> {
     let file = File::open(path).ok()?;
     let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > MAX_PASSWORD_FILE {
         return None;
     }
-    read_bounded(file)
+    let key = auth_key(path, &meta);
+    if let Some(data) = auth_file_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .entries
+        .get(&key)
+        .map(|(data, _)| Arc::clone(data))
+    {
+        return Some(data);
+    }
+    let data = Arc::new(read_bounded(&file)?);
+    let after = file.metadata().ok()?;
+    if auth_key(path, &after) != key {
+        return None;
+    }
+    let weight = data
+        .len()
+        .saturating_add(path.as_os_str().as_encoded_bytes().len())
+        .saturating_add(128);
+    if weight <= MAX_AUTH_CACHE_BYTES {
+        let mut cache = auth_file_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let stale: Vec<AuthFileKey> = cache
+            .entries
+            .keys()
+            .filter(|candidate| candidate.path == path && *candidate != &key)
+            .cloned()
+            .collect();
+        for stale_key in stale {
+            if let Some((_, old_weight)) = cache.entries.remove(&stale_key) {
+                cache.bytes = cache.bytes.saturating_sub(old_weight);
+            }
+        }
+        while cache.entries.len() >= MAX_AUTH_CACHE_ENTRIES
+            || cache.bytes.saturating_add(weight) > MAX_AUTH_CACHE_BYTES
+        {
+            let Some(victim) = cache.entries.keys().next().cloned() else {
+                break;
+            };
+            if let Some((_, old_weight)) = cache.entries.remove(&victim) {
+                cache.bytes = cache.bytes.saturating_sub(old_weight);
+            }
+        }
+        cache.bytes = cache.bytes.saturating_add(weight);
+        cache.entries.insert(key, (Arc::clone(&data), weight));
+    }
+    Some(data)
 }
 
 fn read_bounded(reader: impl Read) -> Option<String> {
@@ -156,9 +245,15 @@ fn verify_password(password: &[u8], stored: &str) -> bool {
         return h.finalize().as_slice() == &decoded[..20];
     }
     if stored.starts_with("$apr1$") {
+        let Some(_expensive) = crate::resource::try_expensive() else {
+            return false;
+        };
         return md5_crypt_matches(password, stored, "$apr1$");
     }
     if stored.starts_with("$1$") {
+        let Some(_expensive) = crate::resource::try_expensive() else {
+            return false;
+        };
         return md5_crypt_matches(password, stored, "$1$");
     }
     if stored.starts_with("$2a$")
@@ -166,6 +261,17 @@ fn verify_password(password: &[u8], stored: &str) -> bool {
         || stored.starts_with("$2x$")
         || stored.starts_with("$2y$")
     {
+        let cost = stored
+            .split('$')
+            .nth(2)
+            .and_then(|cost| cost.parse::<u32>().ok())
+            .unwrap_or(u32::MAX);
+        if !vapache_verified::bcrypt_cost_admit(cost) {
+            return false;
+        }
+        let Some(_expensive) = crate::resource::try_expensive() else {
+            return false;
+        };
         let Ok(password) = std::str::from_utf8(password) else {
             return false;
         };
@@ -416,6 +522,10 @@ mod tests {
         assert!(!verify_password(
             b"wrong",
             "$2y$05$lFdvgVrS6ROEENEOjKS5h.y4SA05OvKSOFRPC1BcjARNhNt.DQ8jC"
+        ));
+        assert!(!verify_password(
+            b"secret",
+            "$2y$31$lFdvgVrS6ROEENEOjKS5h.y4SA05OvKSOFRPC1BcjARNhNt.DQ8jC"
         ));
     }
 
