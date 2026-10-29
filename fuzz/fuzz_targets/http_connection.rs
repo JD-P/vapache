@@ -35,7 +35,7 @@ impl Write for Fragmented<'_> {
     }
 }
 
-fn parse_sequence(data: &[u8], chunk: usize) -> Vec<String> {
+fn parse_sequence(data: &[u8], chunk: usize, spool_bytes: u64, spool_files: u64) -> Vec<String> {
     let mut input = Fragmented {
         input: data,
         offset: 0,
@@ -44,8 +44,8 @@ fn parse_sequence(data: &[u8], chunk: usize) -> Vec<String> {
     let mut buffered = Vec::new();
     let mut limits = Limits::default();
     limits.body = 2 * 1024 * 1024;
-    limits.max_spool_bytes = 4 * 1024 * 1024;
-    limits.max_spool_files = 4;
+    limits.max_spool_bytes = spool_bytes;
+    limits.max_spool_files = spool_files;
     let mut outcomes = Vec::new();
     for _ in 0..16 {
         let before = (input.offset, buffered.len());
@@ -79,12 +79,17 @@ fn parse_sequence(data: &[u8], chunk: usize) -> Vec<String> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    if data.is_empty() {
+    if data.len() < 3 {
         return;
     }
     let chunk = usize::from(data[0]).max(1);
-    let wire = &data[1..];
-    let whole = parse_sequence(wire, wire.len().max(1));
-    let fragmented = parse_sequence(wire, chunk);
+    // Vary the aggregate quotas so the same framing corpus explores normal
+    // spooling, byte exhaustion and file-slot exhaustion.  A zero file quota
+    // is intentional and must still leave the process budget balanced.
+    let spool_bytes = u64::from(data[1]) * 4096;
+    let spool_files = u64::from(data[2] % 5);
+    let wire = &data[3..];
+    let whole = parse_sequence(wire, wire.len().max(1), spool_bytes, spool_files);
+    let fragmented = parse_sequence(wire, chunk, spool_bytes, spool_files);
     assert_eq!(whole, fragmented, "HTTP parsing changed with read fragmentation");
 });

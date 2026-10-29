@@ -22,7 +22,7 @@ use std::net::IpAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 const MAX_ENTRIES: usize = 4096;
@@ -32,6 +32,9 @@ const MAX_DISK_ENTRIES: usize = 4096;
 /// Bound the number of stored variants for one key before evicting the oldest
 /// representation.
 const MAX_VARIANTS_PER_KEY: usize = 32;
+/// Large representations already have a bounded disk backing file.  Keeping
+/// another full copy resident provides little benefit and magnifies RSS.
+const MAX_MEMORY_BODY: usize = 64 * 1024;
 /// Full-strength policy/request digest.  The previous 64-bit fingerprint was
 /// collision-prone for an attacker who can vary request headers and force
 /// variants of one cache key.  A SHA-256 digest is still compared exactly.
@@ -72,9 +75,110 @@ struct Entry {
     vary: Vec<(String, Vec<u8>)>,
 }
 
-fn entries() -> &'static Mutex<HashMap<String, Vec<Entry>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Vec<Entry>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Default)]
+struct MemoryCache {
+    entries: HashMap<String, Vec<Arc<Entry>>>,
+    bytes: u64,
+}
+
+fn entries() -> &'static Mutex<MemoryCache> {
+    static CACHE: OnceLock<Mutex<MemoryCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(MemoryCache::default()))
+}
+
+fn memory_entry_size(key: &str, entry: &Entry) -> u64 {
+    let mut size = key.len() as u64;
+    size = size.saturating_add(entry.body.len() as u64);
+    for (name, value) in &entry.headers {
+        size = size
+            .saturating_add(name.len() as u64)
+            .saturating_add(value.len() as u64);
+    }
+    for (name, value) in &entry.vary {
+        size = size
+            .saturating_add(name.len() as u64)
+            .saturating_add(value.len() as u64);
+    }
+    // Account conservatively for the Entry, Arc, Vec allocations and map
+    // bookkeeping without relying on allocator-specific usable sizes.
+    size.saturating_add(256)
+}
+
+fn evict_oldest_memory(cache: &mut MemoryCache) -> bool {
+    // Empty buckets should never survive production insertion, but removing
+    // one here keeps the entry-count invariant self-healing after tests,
+    // upgrades, or a future interrupted mutation.
+    if let Some(key) = cache
+        .entries
+        .iter()
+        .find_map(|(key, entries)| entries.is_empty().then(|| key.clone()))
+    {
+        cache.entries.remove(&key);
+        return true;
+    }
+    let victim = cache
+        .entries
+        .iter()
+        .flat_map(|(key, entries)| {
+            entries
+                .iter()
+                .enumerate()
+                .map(move |(index, entry)| (key.clone(), index, entry.stored))
+        })
+        .min_by_key(|(_, _, stored)| *stored);
+    let Some((key, index, _)) = victim else {
+        return false;
+    };
+    let mut list = cache.entries.remove(&key).unwrap_or_default();
+    let removed = list.remove(index);
+    cache.bytes = cache
+        .bytes
+        .saturating_sub(memory_entry_size(&key, &removed));
+    if !list.is_empty() {
+        cache.entries.insert(key, list);
+    }
+    true
+}
+
+fn insert_memory(cfg: &Config, key: &str, entry: Arc<Entry>) {
+    let mut cache = entries().lock().unwrap_or_else(|e| e.into_inner());
+    insert_memory_into(cfg, &mut cache, key, entry);
+}
+
+fn insert_memory_into(cfg: &Config, cache: &mut MemoryCache, key: &str, entry: Arc<Entry>) {
+    if cfg.cache.max_memory_size == 0 || entry.body.len() > MAX_MEMORY_BODY {
+        return;
+    }
+    let incoming = memory_entry_size(key, &entry);
+    if incoming > cfg.cache.max_memory_size {
+        return;
+    }
+    let mut list = cache.entries.remove(key).unwrap_or_default();
+    let mut retained = Vec::with_capacity(list.len().saturating_add(1));
+    for old in list.drain(..) {
+        if old.vary == entry.vary {
+            cache.bytes = cache.bytes.saturating_sub(memory_entry_size(key, &old));
+        } else {
+            retained.push(old);
+        }
+    }
+    while retained.len() >= MAX_VARIANTS_PER_KEY {
+        let old = retained.remove(0);
+        cache.bytes = cache.bytes.saturating_sub(memory_entry_size(key, &old));
+    }
+    while (!vapache_verified::cache_memory_admit(cache.bytes, incoming, cfg.cache.max_memory_size)
+        || cache.entries.len() >= MAX_ENTRIES)
+        && evict_oldest_memory(cache)
+    {}
+    if vapache_verified::cache_memory_admit(cache.bytes, incoming, cfg.cache.max_memory_size)
+        && cache.entries.len() < MAX_ENTRIES
+    {
+        cache.bytes = cache.bytes.saturating_add(incoming);
+        retained.push(entry);
+    }
+    if !retained.is_empty() {
+        cache.entries.insert(key.to_string(), retained);
+    }
 }
 
 #[derive(Default)]
@@ -863,34 +967,34 @@ pub fn lookup(
     }
     let key = cache_key.to_string();
     let now = unix_now();
-    let mut found: Option<Entry> = None;
+    let mut found: Option<Arc<Entry>> = None;
     {
-        let mut guard = entries().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(list) = guard.get_mut(&key) {
-            let mut expired = Vec::new();
-            for (idx, entry) in list.iter().enumerate() {
-                if entry.expires <= now {
-                    expired.push(idx);
-                    continue;
-                }
-                if vapache_verified::cache_lookup_admit(
+        let mut cache = entries().lock().unwrap_or_else(|e| e.into_inner());
+        let mut list = cache.entries.remove(&key).unwrap_or_default();
+        let mut retained = Vec::with_capacity(list.len());
+        for entry in list.drain(..) {
+            if entry.expires <= now {
+                cache.bytes = cache.bytes.saturating_sub(memory_entry_size(&key, &entry));
+                continue;
+            }
+            if found.is_none()
+                && vapache_verified::cache_lookup_admit(
                     true,
                     entry.policy == fingerprint,
-                    vary_matches(entry, req),
+                    vary_matches(&entry, req),
                     entry.epoch == current_epoch(),
                     entry.expires,
                     now,
-                ) {
-                    found = Some(entry.clone());
-                    break;
-                }
+                )
+            {
+                // Arc cloning is constant-size and does not copy the cached
+                // representation while the process-wide lock is held.
+                found = Some(Arc::clone(&entry));
             }
-            for idx in expired.into_iter().rev() {
-                list.remove(idx);
-            }
-            if list.is_empty() {
-                guard.remove(&key);
-            }
+            retained.push(entry);
+        }
+        if !retained.is_empty() {
+            cache.entries.insert(key.clone(), retained);
         }
     }
     if found.is_none() {
@@ -905,8 +1009,8 @@ pub fn lookup(
             ) {
                 return None;
             }
-            let mut guard = entries().lock().unwrap_or_else(|e| e.into_inner());
-            guard.entry(key.clone()).or_default().push(loaded.clone());
+            let loaded = Arc::new(loaded);
+            insert_memory(cfg, &key, Arc::clone(&loaded));
             found = Some(loaded);
         }
     }
@@ -966,7 +1070,7 @@ pub fn lookup(
             }
         }
         if !served_file {
-            response.body = Body::Bytes(entry.body);
+            response.body = Body::Bytes(entry.body.clone());
         }
     }
     Some(response)
@@ -1431,22 +1535,8 @@ pub fn store(
         epoch: current_epoch(),
         vary,
     };
-    {
-        let mut guard = entries().lock().unwrap_or_else(|e| e.into_inner());
-        if guard.len() > MAX_ENTRIES && !guard.contains_key(&key) {
-            // Bounded best-effort eviction: drop an arbitrary bucket.
-            if let Some(victim) = guard.keys().next().cloned() {
-                guard.remove(&victim);
-            }
-        }
-        let list = guard.entry(key.clone()).or_default();
-        list.retain(|e| e.vary != entry.vary);
-        list.push(entry.clone());
-        while list.len() > MAX_VARIANTS_PER_KEY {
-            list.remove(0);
-        }
-    }
     disk_store(cfg, &key, &entry);
+    insert_memory(cfg, &key, Arc::new(entry));
     if cfg.cache.header {
         resp.headers
             .retain(|(n, _)| !n.eq_ignore_ascii_case("x-cache"));
@@ -1461,7 +1551,7 @@ pub fn store(
 /// recreate while cleanup is in progress.
 pub fn clear(cfg: &Config) {
     bump_epoch();
-    entries().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *entries().lock().unwrap_or_else(|e| e.into_inner()) = MemoryCache::default();
     invalidate_disk(cfg);
 }
 
@@ -1565,9 +1655,21 @@ pub fn invalidate(cfg: &Config, host: &str, path: &str) {
         key_component(host.as_bytes()),
         key_component(path.as_bytes()),
     );
-    let mut guard = entries().lock().unwrap_or_else(|e| e.into_inner());
-    guard.retain(|key, _| !key.starts_with(&prefix));
-    drop(guard);
+    let mut cache = entries().lock().unwrap_or_else(|e| e.into_inner());
+    let victims: Vec<String> = cache
+        .entries
+        .keys()
+        .filter(|key| key.starts_with(&prefix))
+        .cloned()
+        .collect();
+    for key in victims {
+        if let Some(list) = cache.entries.remove(&key) {
+            for entry in list {
+                cache.bytes = cache.bytes.saturating_sub(memory_entry_size(&key, &entry));
+            }
+        }
+    }
+    drop(cache);
     invalidate_disk_prefix(cfg, prefix.as_bytes());
 }
 
@@ -3235,11 +3337,13 @@ CacheIgnoreQueryString On\n\
         entries()
             .lock()
             .unwrap()
-            .insert(selected_index.clone(), vec![entry.clone()]);
+            .entries
+            .insert(selected_index.clone(), vec![Arc::new(entry.clone())]);
         entries()
             .lock()
             .unwrap()
-            .insert(unrelated.clone(), vec![entry.clone()]);
+            .entries
+            .insert(unrelated.clone(), vec![Arc::new(entry.clone())]);
         let root = cfg.cache.root.clone().unwrap();
         fs::write(root.join("orphan.body.tmp"), b"partial").unwrap();
         #[cfg(unix)]
@@ -3251,8 +3355,12 @@ CacheIgnoreQueryString On\n\
         assert!(!selected_stem.with_extension("body").exists());
         assert!(unrelated_stem.with_extension("meta").exists());
         assert!(unrelated_stem.with_extension("body").exists());
-        assert!(!entries().lock().unwrap().contains_key(&selected_index));
-        assert!(entries().lock().unwrap().contains_key(&unrelated));
+        assert!(!entries()
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&selected_index));
+        assert!(entries().lock().unwrap().entries.contains_key(&unrelated));
         assert!(disk_load(&cfg, &unrelated).is_some());
         assert!(!root.join("orphan.body.tmp").exists());
         #[cfg(unix)]
@@ -3323,6 +3431,37 @@ CacheIgnoreQueryString On\n\
             "break-new",
             &disk_entry(&vec![b'e'; 1_000], unix_now() + 60),
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_cache_has_an_independent_byte_cap_and_skips_large_bodies() {
+        let (dir, mut cfg) = disk_test_config("memory-quota");
+        let mut cache = MemoryCache::default();
+        cfg.cache.max_memory_size = 1_600;
+        let first = Arc::new(disk_entry(&vec![b'a'; 700], unix_now() + 60));
+        let second = Arc::new(disk_entry(&vec![b'b'; 700], unix_now() + 60));
+        insert_memory_into(&cfg, &mut cache, "first", first);
+        insert_memory_into(&cfg, &mut cache, "second", second);
+        assert!(cache.bytes <= cfg.cache.max_memory_size);
+        assert_eq!(cache.entries.len(), 1, "oldest entry should be evicted");
+        assert!(cache.entries.contains_key("second"));
+
+        let large = Arc::new(disk_entry(
+            &vec![b'x'; MAX_MEMORY_BODY + 1],
+            unix_now() + 60,
+        ));
+        insert_memory_into(&cfg, &mut cache, "large", large);
+        assert!(!cache.entries.contains_key("large"));
+
+        cfg.cache.max_memory_size = 0;
+        insert_memory_into(
+            &cfg,
+            &mut cache,
+            "disabled",
+            Arc::new(disk_entry(b"x", unix_now() + 60)),
+        );
+        assert!(!cache.entries.contains_key("disabled"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3459,10 +3598,10 @@ CacheIgnoreQueryString On\n\
             Path::new("/tmp/target"),
         );
         let key = "lookup-edges".to_string();
-        entries().lock().unwrap().insert(
+        entries().lock().unwrap().entries.insert(
             key.clone(),
             vec![
-                Entry {
+                Arc::new(Entry {
                     status: 200,
                     headers: Vec::new(),
                     body: b"expired".to_vec(),
@@ -3471,8 +3610,8 @@ CacheIgnoreQueryString On\n\
                     policy,
                     epoch: current_epoch(),
                     vary: Vec::new(),
-                },
-                Entry {
+                }),
+                Arc::new(Entry {
                     status: 200,
                     headers: vec![
                         ("etag".into(), b"\"tag\"".to_vec()),
@@ -3484,7 +3623,7 @@ CacheIgnoreQueryString On\n\
                     policy,
                     epoch: current_epoch(),
                     vary: Vec::new(),
-                },
+                }),
             ],
         );
         cfg.cache.header = true;
@@ -3493,12 +3632,15 @@ CacheIgnoreQueryString On\n\
         conditional
             .headers
             .insert("if-none-match", b"W/\"tag\", \"other\"".to_vec());
-        entries().lock().unwrap().get_mut(&key).unwrap()[1].policy = cache_policy_fingerprint(
-            &Scope::default(),
-            &conditional,
-            "127.0.0.1".parse().unwrap(),
-            Path::new("/tmp/target"),
-        );
+        let mut memory = entries().lock().unwrap();
+        Arc::make_mut(&mut memory.entries.get_mut(&key).unwrap()[1]).policy =
+            cache_policy_fingerprint(
+                &Scope::default(),
+                &conditional,
+                "127.0.0.1".parse().unwrap(),
+                Path::new("/tmp/target"),
+            );
+        drop(memory);
         let hit = lookup(
             &cfg,
             None,
@@ -3559,13 +3701,13 @@ CacheIgnoreQueryString On\n\
         .is_none());
 
         let expired_key = "only-expired".to_string();
-        entries().lock().unwrap().insert(
+        entries().lock().unwrap().entries.insert(
             expired_key.clone(),
-            vec![Entry {
+            vec![Arc::new(Entry {
                 policy,
                 expires: unix_now() - 1,
                 ..disk_entry(b"old", unix_now() - 1)
-            }],
+            })],
         );
         assert!(lookup(
             &cfg,
@@ -3580,7 +3722,7 @@ CacheIgnoreQueryString On\n\
             Path::new("/tmp/target"),
         )
         .is_none());
-        assert!(!entries().lock().unwrap().contains_key(&expired_key));
+        assert!(!entries().lock().unwrap().entries.contains_key(&expired_key));
 
         let mismatched_key = "disk-policy-mismatch";
         let mismatched = Entry {
@@ -3588,7 +3730,7 @@ CacheIgnoreQueryString On\n\
             ..disk_entry(b"disk", unix_now() + 60)
         };
         disk_store(&cfg, mismatched_key, &mismatched);
-        entries().lock().unwrap().remove(mismatched_key);
+        entries().lock().unwrap().entries.remove(mismatched_key);
         assert!(lookup(
             &cfg,
             None,
@@ -3855,11 +3997,18 @@ CacheIgnoreQueryString On\n\
         ]);
         cfg.cache.header = true;
         {
-            let mut map = entries().lock().unwrap();
-            map.clear();
+            let mut map = MemoryCache::default();
             for i in 0..=MAX_ENTRIES {
-                map.insert(format!("old-{i}"), Vec::new());
+                map.entries.insert(format!("old-{i}"), Vec::new());
             }
+            insert_memory_into(
+                &cfg,
+                &mut map,
+                "new-key",
+                Arc::new(disk_entry(b"ok", unix_now() + 60)),
+            );
+            assert!(map.entries.len() <= MAX_ENTRIES);
+            assert!(map.entries.contains_key("new-key"));
         }
         call(&cfg, &base_req, &mut stored, &good, "new-key");
         assert!(stored
@@ -3868,21 +4017,35 @@ CacheIgnoreQueryString On\n\
             .any(|(n, v)| n.eq_ignore_ascii_case("x-cache") && v == b"MISS"));
 
         let policy = cache_policy_fingerprint(&scope, &base_req, peer, target);
-        entries().lock().unwrap().insert(
+        let mut variants = MemoryCache::default();
+        variants.entries.insert(
             "variants".into(),
             (0..=MAX_VARIANTS_PER_KEY)
-                .map(|i| Entry {
-                    status: 200,
-                    headers: Vec::new(),
-                    body: vec![i as u8],
-                    stored: unix_now(),
-                    expires: unix_now() + 60,
-                    policy,
-                    epoch: current_epoch(),
-                    vary: vec![("x-variant".into(), vec![i as u8])],
+                .map(|i| {
+                    Arc::new(Entry {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: vec![i as u8],
+                        stored: unix_now(),
+                        expires: unix_now() + 60,
+                        policy,
+                        epoch: current_epoch(),
+                        vary: vec![("x-variant".into(), vec![i as u8])],
+                    })
                 })
                 .collect(),
         );
+        let variant_entry = Arc::new(Entry {
+            status: 200,
+            headers: vec![("Vary".into(), b"X-Variant".to_vec())],
+            body: b"v".to_vec(),
+            stored: unix_now(),
+            expires: unix_now() + 60,
+            policy,
+            epoch: current_epoch(),
+            vary: vec![("x-variant".into(), b"new".to_vec())],
+        });
+        insert_memory_into(&cfg, &mut variants, "variants", variant_entry);
         let mut variant_req = base_req.clone();
         variant_req.headers.insert("x-variant", b"new".to_vec());
         let mut variant = Response::bytes(200, "text/plain", b"v".to_vec());
@@ -3890,11 +4053,7 @@ CacheIgnoreQueryString On\n\
             .headers
             .push((Cow::Borrowed("Vary"), b"X-Variant".to_vec()));
         call(&cfg, &variant_req, &mut variant, &good, "variants");
-        assert_eq!(
-            entries().lock().unwrap()["variants"].len(),
-            MAX_VARIANTS_PER_KEY
-        );
-        entries().lock().unwrap().clear();
+        assert_eq!(variants.entries["variants"].len(), MAX_VARIANTS_PER_KEY);
         let _ = fs::remove_dir_all(&dir);
     }
 }

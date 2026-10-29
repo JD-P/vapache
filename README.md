@@ -75,7 +75,8 @@ Implemented today:
   certificate selection, ALPN and `-t` certificate validation on startup.
 - HTTP/2 over TLS (ALPN `h2`) with bounded header/stream limits, Apache
   request/body limits, content-length validation, CGI POST, ranges and HEAD.
-  Cleartext h2c is not implemented.
+  Request bodies retain at most a 64 KiB prefix per stream and then use the
+  same process-wide spool budget as HTTP/1. Cleartext h2c is not implemented.
 - CGI/1.1 executed directly (never through a shell) with a minimal
   environment, `PR_SET_NO_NEW_PRIVS`, rlimits, a new session, a watchdog and
   bounded output. `PATH_INFO` is split against the actual script and policy is
@@ -121,7 +122,9 @@ Implemented today:
 - `mod_cache`/`mod_cache_disk` subset: `CacheEnable`/`CacheDisable` in
   server/vhost/directory scopes, `CacheRoot`, expiration and size limits,
   `CacheMaxDiskSize` (total on-disk quota with oldest-entry eviction and
-  expiry cleanup), `CacheIgnoreCacheControl`, `CacheIgnoreNoLastMod`,
+  expiry cleanup), `CacheMaxMemorySize` (independent resident-byte quota;
+  zero disables the memory tier and large bodies remain disk-only),
+  `CacheIgnoreCacheControl`, `CacheIgnoreNoLastMod`,
   `CacheStorePrivate`, `CacheStoreNoStore`, `CacheIgnoreQueryString` (dynamic
   query-driven CGI/FastCGI/proxy responses bypass the shared cache), `CacheHeader`, `Age`,
   conditional hits, disk warm-start metadata and invalidation on unsafe
@@ -137,14 +140,17 @@ Implemented today:
 - Apache expression evaluation for `Require expr`, `<If>`, `<ElseIf>`,
   `<Else>` and `<IfFile>`: comparisons, boolean logic, string concatenation,
   regex captures, request headers/environment variables, file tests,
-  IP/glob matching and the common string/hash/base64 functions.
+  IP/glob matching and the common string/hash/base64 functions. Request-time
+  `file()` reads require a regular confined descriptor and are capped at 64 KiB.
 - Keep-alive, pipelining, strict HTTP/1.1 parsing, request-smuggling and
   obs-fold rejection, `Content-Length`/`Transfer-Encoding` conflict rejection.
   Request-line and header parsing plus body framing are Verus-verified.
   `RequestReadTimeout` header/body deadlines and header `MinRate`, configurable
   `MaxRequestWorkers`/`ListenBacklog`, graceful `SIGHUP` reload with listener
   reuse, `SIGUSR1` log reopen, `-k graceful`/`graceful-stop` with connection
-  draining, reload cache isolation, and request-body spooling above 1 MB.
+  draining, reload cache isolation, hard absolute body deadlines, and
+  request-body spooling for fixed HTTP/1 bodies declared above 1 MB after a
+  64 KiB actual-byte prefix (also 64 KiB for chunked HTTP/1 and HTTP/2).
 - Bounded-memory proxy and FastCGI traffic: large fixed-length upstream
   bodies stream through `Body::Stream`, large FastCGI stdout is spooled to a
   temporary file, and large request bodies are spooled to an unlinked file

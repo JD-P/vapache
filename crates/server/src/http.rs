@@ -28,6 +28,10 @@ pub const MAX_BODY_BUFFERED: u64 = 32 * 1024 * 1024;
 /// Request bodies above this size are spooled to an unlinked temporary file
 /// instead of occupying heap memory for the whole request.
 pub const MAX_REQUEST_BODY_IN_MEMORY: u64 = 1024 * 1024;
+/// A request already known to require spooling must still provide a
+/// meaningful amount of data before it consumes a global file slot. This
+/// prevents a large declaration plus one byte from exhausting spool files.
+pub(crate) const REQUEST_BODY_SPOOL_PREFIX: u64 = 64 * 1024;
 /// Bound request trailers the same way the proxy reader does.
 const MAX_REQUEST_TRAILERS: usize = 64;
 const MAX_REQUEST_TRAILER_BYTES: usize = 64 * 1024;
@@ -110,6 +114,14 @@ pub struct SpooledBody {
 }
 
 impl SpooledBody {
+    pub(crate) fn from_parts(file: File, len: u64, lease: SpoolLease) -> Self {
+        Self {
+            file: std::sync::Mutex::new(file),
+            len,
+            _lease: Some(lease),
+        }
+    }
+
     pub fn reader(&self) -> io::Result<File> {
         let file = self.file.lock().unwrap_or_else(|e| e.into_inner());
         let mut clone = file.try_clone()?;
@@ -126,6 +138,116 @@ impl SpooledBody {
             file: std::sync::Mutex::new(file),
             len: data.len() as u64,
             _lease: None,
+        }
+    }
+}
+
+/// Incremental request-body sink shared by HTTP/1 chunked framing and HTTP/2.
+/// It retains only a small prefix in memory, obtains a spool-file slot only
+/// when real body bytes cross that threshold, and charges the aggregate spool
+/// budget for bytes actually written rather than for an untrusted declaration.
+pub(crate) struct BodyAccumulator {
+    body: Vec<u8>,
+    file: Option<File>,
+    lease: Option<SpoolLease>,
+    len: u64,
+    memory_limit: u64,
+    resource_budget: std::sync::Arc<ResourceBudget>,
+    max_spool_bytes: u64,
+    max_spool_files: u64,
+}
+
+impl BodyAccumulator {
+    pub(crate) fn new(
+        memory_limit: u64,
+        resource_budget: std::sync::Arc<ResourceBudget>,
+        max_spool_bytes: u64,
+        max_spool_files: u64,
+    ) -> Self {
+        Self {
+            body: Vec::new(),
+            file: None,
+            lease: None,
+            len: 0,
+            memory_limit,
+            resource_budget,
+            max_spool_bytes,
+            max_spool_files,
+        }
+    }
+
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let add = bytes.len() as u64;
+        let next = self
+            .len
+            .checked_add(add)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "request body overflow"))?;
+        if self.file.is_none()
+            && vapache_verified::request_body_memory_admit(self.len, add, self.memory_limit)
+        {
+            self.body.extend_from_slice(bytes);
+            self.len = next;
+            return Ok(());
+        }
+        if self.file.is_none() {
+            let mut lease = self
+                .resource_budget
+                .try_spool(self.max_spool_bytes, self.max_spool_files)?;
+            // Once the in-memory prefix moves to disk it becomes part of the
+            // spool budget too.  Reserve before writing so failure is atomic.
+            lease.reserve(next)?;
+            let mut file = spool_file()?;
+            file.write_all(&self.body)?;
+            file.write_all(bytes)?;
+            self.body.clear();
+            self.file = Some(file);
+            self.lease = Some(lease);
+        } else {
+            self.lease
+                .as_mut()
+                .expect("spooled body owns its resource lease")
+                .reserve(add)?;
+            self.file
+                .as_mut()
+                .expect("spooled body owns its file")
+                .write_all(bytes)?;
+        }
+        self.len = next;
+        Ok(())
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub(crate) fn finish(mut self) -> (Vec<u8>, Option<std::sync::Arc<SpooledBody>>) {
+        match (self.file.take(), self.lease.take()) {
+            (Some(file), Some(lease)) => (
+                Vec::new(),
+                Some(std::sync::Arc::new(SpooledBody::from_parts(
+                    file, self.len, lease,
+                ))),
+            ),
+            (None, None) => (std::mem::take(&mut self.body), None),
+            _ => unreachable!("spool file and lease are created together"),
+        }
+    }
+}
+
+impl Write for BodyAccumulator {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.push(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(file) = &mut self.file {
+            file.flush()
+        } else {
+            Ok(())
         }
     }
 }
@@ -292,13 +414,10 @@ pub fn read_request<R: Read + Write>(
             return Err(ReadError::Parse(ParseError::HeadersTooLarge));
         }
         let elapsed = header_started.elapsed();
-        let allowed = if limits.header_min_rate == 0 {
-            limits.header_timeout
-        } else {
-            limits.header_timeout.max(Duration::from_millis(
-                (buf.len() as u64 * 1000) / limits.header_min_rate,
-            ))
-        };
+        // `header_timeout` is the configured range maximum.  Never derive an
+        // absolute connection lifetime from attacker-controlled byte counts;
+        // MinRate remains a compatibility hint inside that hard ceiling.
+        let allowed = limits.header_timeout;
         if elapsed > allowed {
             return Err(ReadError::Io(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -351,23 +470,22 @@ pub fn read_request<R: Read + Write>(
             if n > limits.body {
                 return Err(ReadError::Parse(ParseError::PayloadTooLarge));
             }
-            let body_deadline = Instant::now()
-                + if limits.body_min_rate == 0 {
-                    limits.body_timeout
-                } else {
-                    limits.body_timeout.max(Duration::from_millis(
-                        n.saturating_mul(1000) / limits.body_min_rate,
-                    ))
-                };
+            // This is an absolute deadline.  Deriving it from an untrusted
+            // Content-Length let a huge declaration extend a worker lease for
+            // hours even when the peer sent no body bytes.
+            let body_deadline = Instant::now() + limits.body_timeout;
             if n > MAX_REQUEST_BODY_IN_MEMORY {
-                let mut lease = limits
-                    .resource_budget
-                    .try_spool(limits.max_spool_bytes, limits.max_spool_files)?;
-                lease.reserve(n)?;
-                let file = spool_file()?;
-                let mut file = file;
+                // A known-large body spills after a small actual-byte prefix.
+                // A declaration plus a token byte therefore holds neither a
+                // spool slot nor a declared-length byte reservation.
+                let mut body = BodyAccumulator::new(
+                    REQUEST_BODY_SPOOL_PREFIX,
+                    limits.resource_budget.clone(),
+                    limits.max_spool_bytes,
+                    limits.max_spool_files,
+                );
                 let take = (n as usize).min(buf.len());
-                file.write_all(&buf[..take])?;
+                body.push(&buf[..take])?;
                 buf.drain(..take);
                 let mut remaining = n - take as u64;
                 let mut chunk = vec![0u8; 64 * 1024];
@@ -387,14 +505,12 @@ pub fn read_request<R: Read + Write>(
                             "EOF in request body",
                         )));
                     }
-                    file.write_all(&chunk[..got])?;
+                    body.push(&chunk[..got])?;
                     remaining -= got as u64;
                 }
-                req.body_spool = Some(std::sync::Arc::new(SpooledBody {
-                    file: std::sync::Mutex::new(file),
-                    len: n,
-                    _lease: Some(lease),
-                }));
+                let (bytes, spool) = body.finish();
+                req.body = bytes;
+                req.body_spool = spool;
             } else {
                 read_exact_into(
                     stream,
@@ -407,25 +523,20 @@ pub fn read_request<R: Read + Write>(
             }
         }
         BodyFraming::Chunked => {
-            let mut lease = limits
-                .resource_budget
-                .try_spool(limits.max_spool_bytes, limits.max_spool_files)?;
-            let mut file = spool_file()?;
-            let chunk_deadline = Instant::now()
-                + if limits.body_min_rate == 0 {
-                    limits.body_timeout
-                } else {
-                    limits.body_timeout.max(Duration::from_millis(
-                        limits.body.saturating_mul(1000) / limits.body_min_rate,
-                    ))
-                };
-            let len = read_chunked_to_file_budgeted(
+            let mut body = BodyAccumulator::new(
+                REQUEST_BODY_SPOOL_PREFIX,
+                limits.resource_budget.clone(),
+                limits.max_spool_bytes,
+                limits.max_spool_files,
+            );
+            let chunk_deadline = Instant::now() + limits.body_timeout;
+            let len = read_chunked_to_writer_budgeted(
                 stream,
                 buf,
-                &mut file,
+                &mut body,
                 limits.body,
                 chunk_deadline,
-                Some(&mut lease),
+                None,
                 limits.allow_request_trailers,
             )
             .map_err(|error| {
@@ -435,11 +546,10 @@ pub fn read_request<R: Read + Write>(
                     ReadError::Io(error)
                 }
             })?;
-            req.body_spool = Some(std::sync::Arc::new(SpooledBody {
-                file: std::sync::Mutex::new(file),
-                len,
-                _lease: Some(lease),
-            }));
+            debug_assert_eq!(len, body.len());
+            let (bytes, spool) = body.finish();
+            req.body = bytes;
+            req.body_spool = spool;
         }
     }
     Ok(Some(req))
@@ -498,7 +608,7 @@ fn read_exact_into<R: Read>(
     out: &mut Vec<u8>,
     n: u64,
     deadline: Instant,
-    min_rate: u64,
+    _min_rate: u64,
 ) -> io::Result<()> {
     let n = n as usize;
     out.reserve(n.min(1 << 20));
@@ -530,6 +640,7 @@ fn read_exact_into<R: Read>(
     Ok(())
 }
 
+#[cfg(test)]
 fn read_chunked_to_file<R: Read>(
     stream: &mut R,
     buf: &mut Vec<u8>,
@@ -540,10 +651,23 @@ fn read_chunked_to_file<R: Read>(
     read_chunked_to_file_budgeted(stream, buf, file, max, deadline, None, true)
 }
 
+#[cfg(test)]
 fn read_chunked_to_file_budgeted<R: Read>(
     stream: &mut R,
     buf: &mut Vec<u8>,
     file: &mut File,
+    max: u64,
+    deadline: Instant,
+    lease: Option<&mut SpoolLease>,
+    allow_trailers: bool,
+) -> io::Result<u64> {
+    read_chunked_to_writer_budgeted(stream, buf, file, max, deadline, lease, allow_trailers)
+}
+
+fn read_chunked_to_writer_budgeted<R: Read, W: Write>(
+    stream: &mut R,
+    buf: &mut Vec<u8>,
+    writer: &mut W,
     max: u64,
     deadline: Instant,
     mut lease: Option<&mut SpoolLease>,
@@ -557,7 +681,7 @@ fn read_chunked_to_file_budgeted<R: Read>(
                 "request body timeout",
             ));
         }
-        let line = read_line(stream, buf, 1024)?;
+        let line = read_line_until(stream, buf, 1024, Some(deadline))?;
         let size_part = line.split(|b| *b == b';').next().unwrap_or(&line);
         let size = crate::util::parse_hex_u64(trim_ascii(size_part))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
@@ -574,7 +698,7 @@ fn read_chunked_to_file_budgeted<R: Read>(
                         "request body timeout",
                     ));
                 }
-                let t = read_line(stream, buf, 8190)?;
+                let t = read_line_until(stream, buf, 8190, Some(deadline))?;
                 if t.is_empty() {
                     return Ok(total);
                 }
@@ -616,7 +740,7 @@ fn read_chunked_to_file_budgeted<R: Read>(
                 if let Some(lease) = lease.as_deref_mut() {
                     lease.reserve(take as u64)?;
                 }
-                file.write_all(&buf[..take])?;
+                writer.write_all(&buf[..take])?;
                 buf.drain(..take);
                 remaining -= take;
                 total += take as u64;
@@ -634,7 +758,7 @@ fn read_chunked_to_file_budgeted<R: Read>(
                 if let Some(lease) = lease.as_deref_mut() {
                     lease.reserve(got as u64)?;
                 }
-                file.write_all(&chunk[..got])?;
+                writer.write_all(&chunk[..got])?;
                 remaining -= got;
                 total += got as u64;
             }
@@ -652,8 +776,24 @@ fn read_chunked_to_file_budgeted<R: Read>(
     }
 }
 
+#[cfg(test)]
 fn read_line<R: Read>(stream: &mut R, buf: &mut Vec<u8>, max: usize) -> io::Result<Vec<u8>> {
+    read_line_until(stream, buf, max, None)
+}
+
+fn read_line_until<R: Read>(
+    stream: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+    deadline: Option<Instant>,
+) -> io::Result<Vec<u8>> {
     loop {
+        if deadline.is_some_and(|deadline| Instant::now() > deadline) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "request body timeout",
+            ));
+        }
         if let Some(p) = buf.windows(2).position(|w| w == b"\r\n") {
             if p > max {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
@@ -1320,14 +1460,16 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(limits.resource_budget.usage(), (0, 1, 0));
+        assert!(first.body_spool.is_none());
+        assert_eq!(limits.resource_budget.usage(), (0, 0, 0));
         assert!(read_request(
             &mut std::io::Cursor::new(chunked.to_vec()),
             &mut Vec::new(),
             &limits,
             |_| {},
         )
-        .is_err());
+        .unwrap()
+        .is_some());
         drop(first);
         assert_eq!(limits.resource_budget.usage(), (0, 0, 0));
         assert!(read_request(
@@ -1338,6 +1480,43 @@ mod tests {
         )
         .unwrap()
         .is_some());
+    }
+
+    #[test]
+    fn body_accumulator_accounts_actual_bytes_and_releases_its_lease() {
+        let budget = std::sync::Arc::new(ResourceBudget::default());
+        let mut body = BodyAccumulator::new(4, budget.clone(), 8, 1);
+        body.push(b"abcd").unwrap();
+        assert_eq!(budget.usage(), (0, 0, 0));
+        body.push(b"e").unwrap();
+        assert_eq!(budget.usage(), (5, 1, 0));
+        assert!(body.push(b"four").is_err());
+        assert_eq!(budget.usage(), (5, 1, 0));
+        let (_, spool) = body.finish();
+        assert_eq!(spool.as_ref().unwrap().len, 5);
+        drop(spool);
+        assert_eq!(budget.usage(), (0, 0, 0));
+
+        let mut declared_large = BodyAccumulator::new(
+            REQUEST_BODY_SPOOL_PREFIX,
+            budget.clone(),
+            2 * REQUEST_BODY_SPOOL_PREFIX,
+            1,
+        );
+        declared_large.push(b"token body bytes").unwrap();
+        assert_eq!(budget.usage(), (0, 0, 0));
+        let mut real_upload = BodyAccumulator::new(
+            REQUEST_BODY_SPOOL_PREFIX,
+            budget.clone(),
+            2 * REQUEST_BODY_SPOOL_PREFIX,
+            1,
+        );
+        real_upload
+            .push(&vec![b'x'; REQUEST_BODY_SPOOL_PREFIX as usize + 1])
+            .unwrap();
+        assert_eq!(budget.usage(), (REQUEST_BODY_SPOOL_PREFIX + 1, 1, 0));
+        drop(real_upload);
+        assert_eq!(budget.usage(), (0, 0, 0));
     }
 
     #[test]
@@ -2092,10 +2271,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(req.body_len(), 4);
-        let mut body = req.body_reader().unwrap().unwrap();
-        let mut read = Vec::new();
-        body.read_to_end(&mut read).unwrap();
-        assert_eq!(read, b"body");
+        assert_eq!(req.body, b"body");
+        assert!(req.body_spool.is_none());
+        assert_eq!(rate_limited.resource_budget.usage(), (0, 0, 0));
     }
 
     struct ShortReads {

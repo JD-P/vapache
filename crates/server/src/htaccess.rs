@@ -227,7 +227,6 @@ pub fn apply_req_deferred_with_root(
                 .file_name()
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let docroot = cfg.documentation_root_for(vhost);
             if req.is_some() {
                 for rule in &delta.rules {
                     if rule.condition.is_some() || rule.branch != ConditionBranch::Normal {
@@ -1102,66 +1101,97 @@ fn parse_block(
                     ));
                 }
                 match section {
-                    AccessSectionKind::If
-                    | AccessSectionKind::IfFile
-                    | AccessSectionKind::ElseIf
-                    | AccessSectionKind::Else => {
+                    AccessSectionKind::IfFile => {
+                        if require_only {
+                            return Err(format!("line {}: <{name}> is not allowed here", *i));
+                        }
+                        let Some(raw_path) = args.first() else {
+                            return Err(format!("line {}: <IfFile> requires an argument", *i));
+                        };
+                        let (negated, raw_path) = raw_path
+                            .strip_prefix('!')
+                            .map_or((false, raw_path.as_str()), |path| (true, path));
+                        let candidate = Path::new(raw_path);
+                        let candidate = if candidate.is_absolute() {
+                            candidate.to_path_buf()
+                        } else {
+                            cfg.server_root.join(candidate)
+                        };
+                        let exists = crate::files::metadata_cached(&candidate).is_ok();
+                        let selected = exists != negated;
+                        debug_assert!(vapache_verified::iffile_exec_on_read_admit(
+                            candidate.is_absolute(),
+                            true,
+                        ));
+                        // Apache's <IfFile> is EXEC_ON_READ.  Parse children
+                        // regardless (configuration errors are not hidden by
+                        // a false condition), then splice the selected branch
+                        // into the enclosing phase.  In particular a nested
+                        // <Files> remains a Files-phase rule instead of being
+                        // collapsed into the final conditional phase.
+                        let mut inner = Scope::default();
+                        let mut inner_rules = Vec::new();
+                        parse_block(
+                            cfg,
+                            lines,
+                            i,
+                            &mut inner,
+                            &mut inner_rules,
+                            mode,
+                            allow_list,
+                            nonfatal,
+                            Some(&name),
+                            false,
+                            next_chain,
+                            None,
+                        )?;
+                        if selected {
+                            scope.merge(&inner);
+                            for mut rule in inner_rules {
+                                rule.order = rules.len();
+                                rules.push(rule);
+                            }
+                        }
+                        current_chain = None;
+                    }
+                    AccessSectionKind::If | AccessSectionKind::ElseIf | AccessSectionKind::Else => {
                         // The wrapper was admitted above; its children still
                         // pass through their own directive/section gates.
                         if require_only {
                             return Err(format!("line {}: <{name}> is not allowed here", *i));
                         }
-                        let (branch, chain, condition) =
-                            if matches!(section, AccessSectionKind::If | AccessSectionKind::IfFile)
-                            {
-                                let expression = if section == AccessSectionKind::If {
-                                    let parsed = crate::expr::parse(&args.join(" "))
-                                        .map_err(|e| format!("line {}: {e}", *i))?;
-                                    // F63/I63: unknown variables fail closed.
-                                    crate::expr::validate_vars(&parsed)
-                                        .map_err(|e| format!("line {}: {e}", *i))?;
-                                    parsed
-                                } else {
-                                    // SectionStart.args excludes the <IfFile> tag
-                                    // itself, so the operator path is the first
-                                    // argument.  A second word is a no-op count
-                                    // operand like in mod_rewrite's <If>/<IfFile>
-                                    // grammar; Apache tests the first word too.
-                                    let path = args.first().cloned().unwrap_or_default();
-                                    crate::expr::Expr::FileTest(
-                                        "-F".into(),
-                                        Box::new(crate::expr::Expr::Str(path)),
-                                    )
-                                };
-                                let chain = *next_chain;
-                                *next_chain += 1;
-                                current_chain = Some(chain);
-                                (ConditionBranch::Normal, Some(chain), Some(expression))
+                        let (branch, chain, condition) = if section == AccessSectionKind::If {
+                            let expression = crate::expr::parse(&args.join(" "))
+                                .map_err(|e| format!("line {}: {e}", *i))?;
+                            // F63/I63: unknown variables fail closed.
+                            crate::expr::validate_vars(&expression)
+                                .map_err(|e| format!("line {}: {e}", *i))?;
+                            let chain = *next_chain;
+                            *next_chain += 1;
+                            current_chain = Some(chain);
+                            (ConditionBranch::Normal, Some(chain), Some(expression))
+                        } else {
+                            let Some(chain) = current_chain else {
+                                return Err(format!("line {}: <{name}> has no preceding <If>", *i));
+                            };
+                            if section == AccessSectionKind::ElseIf {
+                                let expression = crate::expr::parse(&args.join(" "))
+                                    .map_err(|e| format!("line {}: {e}", *i))?;
+                                // F63/I63: unknown variables fail closed.
+                                crate::expr::validate_vars(&expression)
+                                    .map_err(|e| format!("line {}: {e}", *i))?;
+                                (ConditionBranch::ElseIf, Some(chain), Some(expression))
                             } else {
-                                let Some(chain) = current_chain else {
+                                if args.len() > 1 {
                                     return Err(format!(
-                                        "line {}: <{name}> has no preceding <If>",
+                                        "line {}: <Else> does not take arguments",
                                         *i
                                     ));
-                                };
-                                if section == AccessSectionKind::ElseIf {
-                                    let expression = crate::expr::parse(&args.join(" "))
-                                        .map_err(|e| format!("line {}: {e}", *i))?;
-                                    // F63/I63: unknown variables fail closed.
-                                    crate::expr::validate_vars(&expression)
-                                        .map_err(|e| format!("line {}: {e}", *i))?;
-                                    (ConditionBranch::ElseIf, Some(chain), Some(expression))
-                                } else {
-                                    if args.len() > 1 {
-                                        return Err(format!(
-                                            "line {}: <Else> does not take arguments",
-                                            *i
-                                        ));
-                                    }
-                                    current_chain = None;
-                                    (ConditionBranch::Else, Some(chain), None)
                                 }
-                            };
+                                current_chain = None;
+                                (ConditionBranch::Else, Some(chain), None)
+                            }
+                        };
                         let mut inner = Scope::default();
                         let mut inner_rules = Vec::new();
                         parse_block(
@@ -2959,33 +2989,47 @@ mod tests {
     }
 
     #[test]
-    fn iffile_tests_the_operator_path_not_a_second_word() {
-        // SectionStart.args excludes the <IfFile> tag itself: with one word
-        // the named file is what <IfFile> tests, and the old args.get(1)
-        // bug made that argument empty (Always-true via the directory).
+    fn iffile_is_frozen_against_server_root_and_preserves_child_phase() {
         let dir = tempdir("iffile");
         fs::create_dir_all(dir.join("sub")).unwrap();
-        fs::write(dir.join("sub/maintenance.flag"), "x").unwrap();
+        // A relative operand is resolved against ServerRoot, not against the
+        // directory containing the access file or DocumentRoot.
+        fs::write(dir.join("maintenance.flag"), "x").unwrap();
         let cfg = config(&dir, "Listen 127.0.0.1:0\n");
-        let file = dir.join(".htaccess");
-        let shape = |text: &str| {
+        let file = dir.join("sub/.htaccess");
+        let parse = |text: &str| {
             fs::write(&file, text).unwrap();
-            let mut p = parse_file(&cfg, &file, OverrideMode::All, "/sub").unwrap();
-            let expr = p.rules[0].condition.take().expect("condition");
-            match expr {
-                crate::expr::Expr::FileTest(test, inner) => match *inner {
-                    crate::expr::Expr::Str(path) => (test, path),
-                    other => panic!("unexpected operand {other:?}"),
-                },
-                other => panic!("unexpected condition {other:?}"),
-            }
+            parse_file(&cfg, &file, OverrideMode::All, "/sub").unwrap()
         };
+        let parsed = parse(
+            "<IfFile maintenance.flag>\n<Files target.txt>\nRequire all granted\n</Files>\n</IfFile>\n",
+        );
+        assert_eq!(parsed.rules.len(), 1);
+        assert!(matches!(parsed.rules[0].kind, MatchKind::FilesGlob(_)));
+        assert!(parsed.rules[0].condition.is_none());
 
-        let (test, path) = shape("<IfFile maintenance.flag>\nHeader set X-IfFile yes\n</IfFile>\n");
-        assert_eq!((test.as_str(), path.as_str()), ("-F", "maintenance.flag"));
-        // Two words: the first word is tested; the second word is ignored.
-        let (test, path) = shape("<IfFile a.txt ignored>\nHeader set X-IfFile yes\n</IfFile>\n");
-        assert_eq!((test.as_str(), path.as_str()), ("-F", "a.txt"));
+        fs::remove_file(dir.join("maintenance.flag")).unwrap();
+        let parsed = parse("<IfFile maintenance.flag>\nHeader set X-IfFile yes\n</IfFile>\n");
+        assert!(parsed.scope.header_policy.set_headers.is_empty());
+
+        // The first argument remains the operand; the compatibility count
+        // word is ignored.
+        fs::write(dir.join("first.flag"), "x").unwrap();
+        let parsed = parse("<IfFile first.flag ignored>\nHeader set X-IfFile yes\n</IfFile>\n");
+        assert!(parsed
+            .scope
+            .header_policy
+            .set_headers
+            .iter()
+            .any(|(name, _)| name == "X-IfFile"));
+
+        let parsed = parse("<IfFile !missing.flag>\nHeader set X-Negated yes\n</IfFile>\n");
+        assert!(parsed
+            .scope
+            .header_policy
+            .set_headers
+            .iter()
+            .any(|(name, _)| name == "X-Negated"));
         let _ = fs::remove_dir_all(&dir);
     }
 

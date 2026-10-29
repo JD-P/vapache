@@ -2023,6 +2023,24 @@ pub fn cache_disk_size_admit(used: u64, incoming: u64, limit: u64) -> (ok: bool)
     used <= limit && incoming <= limit - used
 }
 
+/// Overflow-free admission for the independently bounded resident cache.
+/// Runtime accounting includes key/header/vary material as well as the body.
+pub open spec fn cache_memory_spec(used: u64, incoming: u64, limit: u64) -> bool {
+    used <= limit && incoming <= limit - used
+}
+
+pub fn cache_memory_admit(used: u64, incoming: u64, limit: u64) -> (ok: bool)
+    ensures ok == cache_memory_spec(used, incoming, limit),
+{
+    used <= limit && incoming <= limit - used
+}
+
+pub proof fn cache_memory_admission_is_bounded(used: u64, incoming: u64, limit: u64)
+    requires cache_memory_spec(used, incoming, limit),
+    ensures used + incoming <= limit,
+{
+}
+
 /// Overflow-free aggregate admission used by spool-byte, spool-file and
 /// dynamic-backend counters.  The caller commits the exact addition with an
 /// atomic compare/exchange, retrying this predicate if the observed value
@@ -2046,6 +2064,66 @@ pub proof fn resource_budget_admission_is_bounded(used: u64, incoming: u64, limi
 pub proof fn resource_budget_rejects_exhausted(used: u64, incoming: u64)
     requires incoming > 0,
     ensures !resource_budget_spec(used, incoming, used),
+{
+}
+
+/// A request-body prefix remains resident in memory only while the exact
+/// incremental addition fits the per-stream allowance.  Both HTTP adapters
+/// consume this predicate before extending their concrete buffer; rejection
+/// therefore means "spill", never "allocate anyway".
+pub open spec fn request_body_memory_spec(used: u64, incoming: u64, limit: u64) -> bool {
+    used <= limit && incoming <= limit - used
+}
+
+pub fn request_body_memory_admit(used: u64, incoming: u64, limit: u64) -> (ok: bool)
+    ensures ok == request_body_memory_spec(used, incoming, limit),
+{
+    used <= limit && incoming <= limit - used
+}
+
+pub proof fn request_body_memory_admission_is_bounded(
+    used: u64,
+    incoming: u64,
+    limit: u64,
+)
+    requires request_body_memory_spec(used, incoming, limit),
+    ensures used + incoming <= limit,
+{
+}
+
+/// `<IfFile>` is safe to splice into its enclosing configuration phase only
+/// after the operator path has been made absolute against ServerRoot and the
+/// parser has retained the children's own phase identities.
+pub fn iffile_exec_on_read_admit(
+    resolved_against_server_root: bool,
+    children_keep_phase: bool,
+) -> (ok: bool)
+    ensures ok == (resolved_against_server_root && children_keep_phase),
+{
+    resolved_against_server_root && children_keep_phase
+}
+
+/// A selected proxy route is admitted only when the configuration-only ACL
+/// authorizes it.  Per-directory policy may impose an additional denial, but
+/// it can never supply the operator grant required by this gate.
+pub fn proxy_operator_acl_admit(proxy_selected: bool, operator_allowed: bool) -> (ok: bool)
+    ensures ok == (!proxy_selected || operator_allowed),
+{
+    !proxy_selected || operator_allowed
+}
+
+/// Request-time `file()` expressions admit only a regular descriptor whose
+/// observed size fits the fixed read ceiling. The runtime additionally uses a
+/// bounded reader so a concurrent growth cannot exceed this allowance.
+pub fn expr_file_read_admit(regular: bool, size: u64, limit: u64) -> (ok: bool)
+    ensures ok == (regular && size <= limit),
+{
+    regular && size <= limit
+}
+
+pub proof fn expr_file_read_admission_is_bounded(regular: bool, size: u64, limit: u64)
+    requires regular, size <= limit,
+    ensures size <= limit,
 {
 }
 
@@ -7819,7 +7897,9 @@ pub fn h2_settings() -> (s: H2Settings)
     ensures h2_settings_sane(s),
 {
     H2Settings {
-        max_concurrent_streams: 100,
+        // Combined with the adapter's 64 KiB in-memory body prefix this caps
+        // one connection's request-body heap at roughly 2 MiB before spooling.
+        max_concurrent_streams: 32,
         max_header_list: 131_072,
         initial_window: 256 * 1024,
         initial_connection_window: 1024 * 1024,

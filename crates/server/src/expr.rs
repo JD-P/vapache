@@ -5,8 +5,15 @@
 //! filesystem root.  Unsupported syntax is a parse error (config fails closed).
 
 use crate::http::Request;
+use std::io::Read;
 use std::net::IpAddr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
+
+/// Request-time expression evaluation must not turn `file()` into an
+/// unbounded heap read or a blocking read from a FIFO/device in a writable
+/// document tree.
+const MAX_EXPR_FILE_BYTES: u64 = 64 * 1024;
 
 /// A PCRE2 expression compiled while the configuration is parsed.  Apache's
 /// `ap_expr` uses PCRE; retaining only Rust `regex` syntax made valid Apache
@@ -701,6 +708,33 @@ fn confined_expr_path(ctx: &Context<'_>, raw: &str, must_exist: bool) -> Option<
     }
 }
 
+fn read_expr_file(path: &Path) -> Result<String, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        // O_NONBLOCK prevents a replaced FIFO from pinning a worker before
+        // descriptor metadata can reject it. O_NOFOLLOW closes the final-name
+        // replacement window after the confinement check.
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(path).map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !vapache_verified::expr_file_read_admit(
+        metadata.is_file(),
+        metadata.len(),
+        MAX_EXPR_FILE_BYTES,
+    ) {
+        return Err("expression file must be a regular file no larger than 64 KiB".into());
+    }
+    let mut data = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_EXPR_FILE_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(|error| error.to_string())?;
+    if data.len() as u64 > MAX_EXPR_FILE_BYTES {
+        return Err("expression file grew beyond 64 KiB while being read".into());
+    }
+    String::from_utf8(data).map_err(|_| "expression file is not valid UTF-8".into())
+}
+
 impl Expr {
     pub fn eval(&self, ctx: &mut Context<'_>) -> Result<Value, String> {
         Ok(match self {
@@ -855,7 +889,7 @@ impl Expr {
                         let p = confined_expr_path(ctx, &arg(0), true).ok_or_else(|| {
                             "expression file path escapes DOCUMENT_ROOT".to_string()
                         })?;
-                        Value::Str(std::fs::read_to_string(p).map_err(|e| e.to_string())?)
+                        Value::Str(read_expr_file(&p)?)
                     }
                     "filesize" => {
                         let p = confined_expr_path(ctx, &arg(0), true).ok_or_else(|| {
@@ -1443,6 +1477,16 @@ mod tests {
         assert!(outside.eval(&mut c).is_err());
         let traversal = parse("-f '../etc/passwd'").unwrap();
         assert!(!traversal.eval(&mut c).unwrap().truthy());
+        std::fs::write(dir.join("oversized.txt"), vec![b'x'; 64 * 1024 + 1]).unwrap();
+        assert!(parse("file('oversized.txt') = ''")
+            .unwrap()
+            .eval(&mut c)
+            .is_err());
+        std::fs::create_dir(dir.join("not-regular")).unwrap();
+        assert!(parse("file('not-regular') = ''")
+            .unwrap()
+            .eval(&mut c)
+            .is_err());
         // FileTest uses the same canonical confinement as file()/filesize().
         for expr in [
             "-f '/etc/passwd'",

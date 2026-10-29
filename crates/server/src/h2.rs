@@ -7,7 +7,9 @@
 //! protocols.
 
 use crate::config::Config;
-use crate::http::{Body, Request, Response, Version};
+use crate::http::{
+    Body, BodyAccumulator, Request, Response, SpooledBody, Version, REQUEST_BODY_SPOOL_PREFIX,
+};
 use crate::log::{AccessEntry, Logger};
 use crate::util::http_date_now;
 use bytes::Bytes;
@@ -113,6 +115,12 @@ enum H2ReadFailure {
     /// observed reset to the connection-level budget.
     Reset,
     Response(Response),
+}
+
+struct H2RequestBody {
+    bytes: Vec<u8>,
+    spool: Option<Arc<SpooledBody>>,
+    len: u64,
 }
 
 fn request_target(method: &str, uri: &http::Uri) -> Option<Vec<u8>> {
@@ -310,8 +318,19 @@ async fn read_body(
     mut recv: h2::RecvStream,
     limit: u64,
     timeout: std::time::Duration,
-) -> Result<Vec<u8>, H2ReadFailure> {
-    let mut body = Vec::new();
+    resource_budget: Arc<crate::resource::ResourceBudget>,
+    max_spool_bytes: u64,
+    max_spool_files: u64,
+) -> Result<H2RequestBody, H2ReadFailure> {
+    // HTTP/2 can run many request bodies concurrently on one connection.  A
+    // small per-stream prefix keeps ordinary forms cheap while the process-
+    // wide spool budget bounds larger concurrent bodies.
+    let mut body = BodyAccumulator::new(
+        REQUEST_BODY_SPOOL_PREFIX,
+        resource_budget,
+        max_spool_bytes,
+        max_spool_files,
+    );
     let mut budget = vapache_verified::h2_body_init(limit);
     let started = Instant::now();
     loop {
@@ -343,15 +362,24 @@ async fn read_body(
             return Err(H2ReadFailure::Response(bad(413, "request body too large")));
         };
         budget = next_budget;
-        body.extend_from_slice(&chunk);
+        if let Err(error) = body.push(&chunk) {
+            let response = if error.kind() == io::ErrorKind::StorageFull {
+                bad(503, "request-body spool capacity exhausted")
+            } else {
+                bad(500, "cannot spool request body")
+            };
+            return Err(H2ReadFailure::Response(response));
+        }
         // Return consumed receive-window capacity to h2.  Without this, any
         // body larger than the initial connection window stalls permanently.
         if recv.flow_control().release_capacity(chunk.len()).is_err() {
             return Err(H2ReadFailure::Reset); // coverage:ignore-line - opaque h2 reset race
         }
-        debug_assert_eq!(body.len() as u64, budget.len);
+        debug_assert_eq!(body.len(), budget.len);
     }
-    Ok(body)
+    let len = body.len();
+    let (bytes, spool) = body.finish();
+    Ok(H2RequestBody { bytes, spool, len })
 }
 
 // The h2 crate owns these capacity terminal states.  The bounded sender is
@@ -739,7 +767,14 @@ async fn handle_stream(
     let body_timeout = cfg
         .request_body_timeout
         .max(std::time::Duration::from_secs(1));
-    let body_future = read_body(recv, max_body, body_timeout);
+    let body_future = read_body(
+        recv,
+        max_body,
+        body_timeout,
+        cfg.resource_budget.clone(),
+        cfg.max_spool_bytes,
+        cfg.max_spool_files,
+    );
     tokio::pin!(body_future);
     let body_result = {
         // `SendResponse::poll_reset` is the h2 API for a client RST_STREAM
@@ -757,10 +792,17 @@ async fn handle_stream(
         Ok(body) => (body, None),
         // The biased `poll_reset` arm above observes this state first.
         Err(H2ReadFailure::Reset) => return true, // coverage:ignore-line - reset-watch invariant
-        Err(H2ReadFailure::Response(resp)) => (Vec::new(), Some(resp)),
+        Err(H2ReadFailure::Response(resp)) => (
+            H2RequestBody {
+                bytes: Vec::new(),
+                spool: None,
+                len: 0,
+            },
+            Some(resp),
+        ),
     };
     if let Some(declared) = declared {
-        if declared != body.len() as u64 && early.is_none() {
+        if declared != body.len && early.is_none() {
             // h2 enforces the declared DATA length before clean end-of-stream.
             // coverage:ignore-start - upstream h2 framing invariant
             return send_response(respond, &cfg, bad(400, "Content-Length mismatch"), false)
@@ -777,8 +819,8 @@ async fn handle_stream(
         query,
         version: Version::Http2,
         headers,
-        body,
-        body_spool: None,
+        body: body.bytes,
+        body_spool: body.spool,
         keep_alive: true,
         expect_continue: false,
         // HTTP/2 framing is handled by the h2 crate before a `Request` exists.
@@ -1361,6 +1403,27 @@ mod tests {
             .await
             .0,
             405
+        );
+
+        let mut spool_limited = (*cfg).clone();
+        spool_limited.limit_request_body = 512 * 1024;
+        spool_limited.max_spool_bytes = 1024;
+        spool_limited.max_spool_files = 1;
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/file.txt")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            round_trip(
+                Arc::new(spool_limited),
+                logger.clone(),
+                request,
+                &vec![b'x'; 80 * 1024],
+            )
+            .await
+            .0,
+            503
         );
 
         let mut limited = (*cfg).clone();

@@ -502,6 +502,30 @@ fn handle_connection<C: Conn + ResponseWrite>(
         }) {
             Ok(Some(r)) => r,
             Ok(None) => return Ok(()),
+            Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::StorageFull => {
+                // Aggregate request-body capacity is a temporary service
+                // condition, not a malformed connection.  Report it
+                // explicitly so clients can retry instead of observing a
+                // silent reset.
+                let mut r = Response::bytes(
+                    503,
+                    "text/html; charset=iso-8859-1",
+                    b"Request body capacity is temporarily exhausted\n".to_vec(),
+                );
+                r.headers.push(("Connection".into(), b"close".to_vec()));
+                let _ = write_response(
+                    stream,
+                    &mut r,
+                    &ResponseOptions {
+                        server_header: &cfg.server_header(),
+                        keep_alive: false,
+                        head_only: false,
+                        protocol: Version::Http11,
+                        request_keep_alive: false,
+                    },
+                );
+                return Ok(());
+            }
             Err(ReadError::Io(e)) => return Err(e),
             Err(ReadError::Parse(e)) => {
                 let status = e.status();
@@ -2618,7 +2642,7 @@ fn dispatch_inner(
     };
     // Only the selected route's proxy identity participates in `<Proxy>`
     // authorization; a losing later route must not deny it.
-    let mut selected_proxy_url: Option<String> = None;
+    let mut selected_proxy_urls: Vec<String> = Vec::new();
     if fastcgi_wins {
         if let Some(logical) = fastcgi_target
             .as_ref()
@@ -2627,7 +2651,9 @@ fn dispatch_inner(
             cfg.apply_proxy_access_urls(vhost, &mut scope, &[logical], req, peer.ip(), &url_path);
         }
         if let Some(target) = &fastcgi_target {
-            selected_proxy_url = target.logical_url.clone();
+            if let Some(logical) = &target.logical_url {
+                selected_proxy_urls.push(logical.clone());
+            }
         }
     } else if let Some(target) = &proxy_target {
         let mut proxy_urls = vec![target.proxy_url.as_str()];
@@ -2635,7 +2661,80 @@ fn dispatch_inner(
             proxy_urls.push(logical);
         }
         cfg.apply_proxy_access_urls(vhost, &mut scope, &proxy_urls, req, peer.ip(), &url_path);
-        selected_proxy_url = Some(target.proxy_url.clone());
+        selected_proxy_urls.push(target.proxy_url.clone());
+        if let Some(logical) = &target.logical_url {
+            selected_proxy_urls.push(logical.clone());
+        }
+    }
+
+    let selected_proxy_route = fastcgi_wins || proxy_target.is_some();
+    if selected_proxy_route {
+        // Apache does not perform a per-directory access-file walk for a
+        // ProxyPass/ProxyPassMatch request.  Keep the ordinary combined scope
+        // for compatibility (an access file may still narrow access), but
+        // independently require the configuration-only Directory/Files/
+        // Location/If/Proxy scope to authorize the route.  Thus an access-file
+        // grant can never erase an operator Location deny (P18-B2).
+        let (mut operator_scope, operator_conditionals) =
+            crate::policy_ref::effective_scope_req(cfg, vhost, &fs_path, &url_path, req, peer.ip());
+        apply_rewrite_effects(&mut operator_scope, &rewrite_effects);
+        crate::policy_ref::apply_conditionals(
+            cfg,
+            vhost,
+            &mut operator_scope,
+            &operator_conditionals,
+            &fs_path,
+            &url_path,
+            req,
+            peer.ip(),
+        );
+        let proxy_identities: Vec<&str> = selected_proxy_urls.iter().map(String::as_str).collect();
+        cfg.apply_proxy_access_urls(
+            vhost,
+            &mut operator_scope,
+            &proxy_identities,
+            req,
+            peer.ip(),
+            &url_path,
+        );
+        if let Some(r) = helper_method_not_allowed(
+            cfg,
+            vhost,
+            &operator_scope,
+            req,
+            &url_path,
+            local_port,
+            &server_name,
+            peer.ip(),
+            local_ip,
+        ) {
+            return r;
+        }
+        let mut operator_resource = access::ResourceKey::request(
+            vhost,
+            req,
+            &url_path,
+            Some(&fs_path),
+            selected_proxy_urls.first().map(String::as_str),
+        );
+        let operator_access = helper_access_response(
+            cfg,
+            vhost,
+            &operator_scope,
+            req,
+            &url_path,
+            &fs_path,
+            local_port,
+            &server_name,
+            peer.ip(),
+            local_ip,
+            &mut operator_resource,
+        );
+        if !vapache_verified::proxy_operator_acl_admit(true, operator_access.is_ok()) {
+            return operator_access
+                .err()
+                .expect("verified proxy ACL rejection has an error response");
+        }
     }
 
     if let Some(r) = helper_method_not_allowed(
@@ -2656,7 +2755,7 @@ fn dispatch_inner(
         req,
         &url_path,
         Some(&fs_path),
-        selected_proxy_url.as_deref(),
+        selected_proxy_urls.first().map(String::as_str),
     );
     let mut grant = match helper_access_response(
         cfg,
@@ -4708,6 +4807,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn exhausted_request_spool_returns_503_instead_of_dropping_connection() {
+        let dir = cov_dir("spool-503");
+        let mut cfg = cov_config(&dir, "");
+        cfg.max_spool_bytes = 1024;
+        cfg.max_spool_files = 1;
+        let body_len = crate::http::MAX_REQUEST_BODY_IN_MEMORY + 1;
+        let mut wire = format!(
+            "POST /file.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: {body_len}\r\n\r\n"
+        )
+        .into_bytes();
+        wire.extend(std::iter::repeat_n(b'x', body_len as usize));
+        let mut conn = ScriptConn::new(&wire);
+        handle_connection(
+            &cfg,
+            &cov_logger(&cfg),
+            &mut conn,
+            cov_peer(),
+            "127.0.0.1",
+            80,
+            false,
+        )
+        .unwrap();
+        assert_eq!(cov_status(&String::from_utf8_lossy(&conn.output)), 503);
+        assert_eq!(cfg.resource_budget.usage(), (0, 0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn cov_dispatch(cfg: &Config, method: &str, path: &str) -> Response {
         let req = cov_req(method, path);
         dispatch(cfg, &req, cov_peer(), "127.0.0.1", 80)
@@ -5604,6 +5731,60 @@ mod tests {
         );
         assert_eq!(resp.status, 401);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxied_route_requires_configuration_only_location_acl() {
+        let dir = cov_dir("proxy-operator-acl");
+        std::fs::write(dir.join("www/script.php"), "<?php\n").unwrap();
+        std::fs::write(
+            dir.join("www/.htaccess"),
+            "<If \"true\">\nRequire all granted\n</If>\n",
+        )
+        .unwrap();
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "<Directory \"{}/www\">\nAllowOverride AuthConfig\n</Directory>\n\
+                 <Location \"/script.php\">\nRequire all denied\n</Location>\n\
+                 ProxyPassMatch ^/(.*\\.php)$ \"unix:/tmp/vapache-missing.sock|fcgi://localhost{}/www/\"\n",
+                dir.display(),
+                dir.display(),
+            ),
+        );
+        // Reaching the deliberately missing backend would produce 5xx.  A
+        // 403 proves the access-file grant cannot erase the operator ACL.
+        assert_eq!(cov_dispatch(&cfg, "GET", "/script.php").status, 403);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn htaccess_iffile_is_frozen_at_parse_time_without_skipping_files_acl() {
+        let dir = cov_dir("iffile-phase-acl");
+        std::fs::write(dir.join("flag"), "server-root marker\n").unwrap();
+        std::fs::write(dir.join("www/flag"), "document-root marker\n").unwrap();
+        std::fs::write(dir.join("www/secret.txt"), "secret\n").unwrap();
+        std::fs::write(
+            dir.join("www/.htaccess"),
+            "<IfFile \"flag\">\nRequire all granted\n</IfFile>\n",
+        )
+        .unwrap();
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "<Directory \"{}/www\">\n\
+                 AllowOverride AuthConfig\n\
+                 <Files \"secret.txt\">\nRequire all denied\n</Files>\n\
+                 </Directory>\n",
+                dir.display(),
+            ),
+        );
+
+        // The access-file grant is a directory-phase rule.  Apache freezes
+        // IfFile while reading the file, relative to ServerRoot, and still
+        // applies the later Files phase; it must not become a final override.
+        assert_eq!(cov_dispatch(&cfg, "GET", "/secret.txt").status, 403);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

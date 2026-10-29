@@ -55,6 +55,41 @@ proptest! {
     }
 
     #[test]
+    fn request_body_memory_admission_cannot_overflow(
+        used in any::<u64>(), incoming in any::<u64>(), limit in any::<u64>(),
+    ) {
+        if vapached::verified::request_body_memory_admit(used, incoming, limit) {
+            prop_assert!(used.checked_add(incoming).is_some_and(|sum| sum <= limit));
+        }
+    }
+
+    #[test]
+    fn cache_memory_admission_cannot_overflow(
+        used in any::<u64>(), incoming in any::<u64>(), limit in any::<u64>(),
+    ) {
+        if vapached::verified::cache_memory_admit(used, incoming, limit) {
+            prop_assert!(used.checked_add(incoming).is_some_and(|sum| sum <= limit));
+        }
+    }
+
+    #[test]
+    fn proxy_operator_gate_never_accepts_an_operator_denial(
+        proxy_selected in any::<bool>(), operator_allowed in any::<bool>(),
+    ) {
+        let admitted =
+            vapached::verified::proxy_operator_acl_admit(proxy_selected, operator_allowed);
+        prop_assert!(!admitted || !proxy_selected || operator_allowed);
+    }
+
+    #[test]
+    fn expression_file_read_gate_requires_regular_bounded_input(
+        regular in any::<bool>(), size in any::<u64>(), limit in any::<u64>(),
+    ) {
+        let admitted = vapached::verified::expr_file_read_admit(regular, size, limit);
+        prop_assert_eq!(admitted, regular && size <= limit);
+    }
+
+    #[test]
     fn capability_disable_is_monotone(requested in any::<bool>()) {
         let disabled = vapached::verified::capability_admit(false, requested);
         let enabled = vapached::verified::capability_admit(true, requested);

@@ -946,8 +946,8 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | Stream | Explicit bound |
 |---|---|
 | HTTP/1 request line/head | `LimitRequestLine`, `LimitRequestFields`, `LimitRequestFieldSize`, total head cap |
-| HTTP/1 request body | `LimitRequestBody`, in-memory threshold then an `O_EXCL`, mode-0600 spool file that is unlinked immediately |
-| HTTP/1 chunked trailers | trailer count and byte budget, request deadline |
+| HTTP/1 request body | `LimitRequestBody`, hard absolute body deadline; fixed bodies no larger than 1 MiB stay resident, while known-larger and chunked bodies provide a 64 KiB actual-byte prefix before an `O_EXCL`, mode-0600 spool file is acquired; the shared quota reserves only bytes actually received |
+| HTTP/1 chunked trailers | trailer count and byte budget within the same hard body deadline |
 | Proxy response head | line, header-count and total-head caps |
 | Proxy response body | fixed-length/chunked/EOF body capped at `MAX_PROXY_BODY`; chunk `checked_add` before resize |
 | Proxy trailers | trailer count and byte budget |
@@ -957,12 +957,15 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | FastCGI response head | bounded prefix/header scan before body streaming |
 | Aggregate dynamic I/O | RAII byte/file reservations across request, CGI-worker and FastCGI spools; shared CGI/FastCGI concurrency slots |
 | HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error |
-| HTTP/2 | verified settings, header-state, flow-control, body and reset budgets |
+| HTTP/2 | verified settings, header-state, flow-control and reset budgets; at most 32 concurrent streams, each with a 64 KiB resident body prefix before using the shared request-spool quota |
 | Compression | fixed maximum compressible body; range/HEAD bypass |
+| Expression `file()` | confined regular descriptor, `O_NONBLOCK`/`O_NOFOLLOW`, 64 KiB read ceiling |
 
 A malformed or over-limit stream produces an error response or connection
-close; it never causes an unbounded allocation or an indefinitely pinned
-worker.
+close; request-spool exhaustion specifically produces `503` and releases its
+exact RAII lease. Empty and small bodies never consume a spool-file slot. No
+attacker-declared length reserves bytes that have not arrived, and no
+attacker-byte-derived extension can move the absolute body deadline.
 
 ### I34 — Main-configuration directive disposition closure
 
@@ -1525,6 +1528,15 @@ an entry only when that metadata key exactly matches the requested key, while
 the SHA-1 filename is treated only as an index. Unsafe-method invalidation uses
 the same canonical request/selected-representation identity and removes only
 entries admitted by the verified key-prefix predicate.
+
+The disk and resident tiers have independent quotas. `CacheMaxMemorySize`
+defaults to 64 MiB and counts the base key, body, response headers, Vary
+material and fixed entry overhead. Insertions consume the overflow-free
+`cache_memory_admit` kernel and evict the oldest entries until the new total
+fits; zero disables the tier. Bodies above 64 KiB stay disk-only, and a hit
+clones an `Arc<Entry>` under the mutex rather than copying the body while the
+process-wide cache lock is held. `CacheMaxDiskSize` remains the independent
+persisted-byte ceiling.
 
 ## 9. Formalization boundary
 

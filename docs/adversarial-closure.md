@@ -369,6 +369,56 @@ with bounded and exhausted proofs. Focused runtime tests cover exact endpoint
 registration, socket replacement metadata, ACL rejection, reservation
 exhaustion/release and reload-shared accounting.
 
+## Pass 18-B through 20 closure
+
+The remaining Pass 18 configuration differentials and both resource-exhaustion
+passes are closed at their shared phase and accounting boundaries:
+
+- P18-B1 access-file `<IfFile>` is now an execute-on-read construct. Relative
+  operands resolve against `ServerRoot`, the result is frozen while the access
+  file is parsed, and admitted children are spliced with their own phase
+  identities. A wrapped directory grant therefore cannot jump past a later
+  `<Files>` or `<Location>` denial. `iffile_exec_on_read_admit` pins both the
+  absolute path binding and child-phase retention.
+- P18-B2 selected proxy and FastCGI routes must first pass a scope rebuilt from
+  operator configuration only. The access-file scope is still evaluated and
+  may narrow the result, but it cannot supply the grant that authorizes a
+  `ProxyPass`/`ProxyPassMatch` sink. `proxy_operator_acl_admit` is consumed at
+  that boundary.
+- P19 gives the resident cache its own `CacheMaxMemorySize` byte ceiling
+  (64 MiB by default). Accounting includes key, body, response headers, Vary
+  material and fixed entry overhead; replacement and oldest-entry eviction
+  happen under the cache mutex. Bodies above 64 KiB are disk-only, zero
+  disables the memory tier, and hits clone an `Arc<Entry>` under the lock
+  instead of copying the retained body. `cache_memory_admit` proves each
+  insertion fits without overflow.
+- P20 makes HTTP/1 and HTTP/2 consume the same incremental body accumulator.
+  Fixed HTTP/1 bodies no larger than 1 MiB remain resident; known-larger,
+  chunked HTTP/1 and HTTP/2 bodies provide at most a 64 KiB prefix before
+  spilling to the shared unlinked-file tier. The lease reserves
+  only bytes actually received, is acquired only when a body crosses the
+  threshold, and is released exactly on completion or error. Exhaustion emits
+  `503` instead of dropping the connection. HTTP/2 concurrency is reduced to
+  32 streams and `request_body_memory_admit` proves each resident-prefix
+  extension remains within its allowance.
+
+The adjacent DoS review also removed three amplification seams: empty and tiny
+chunked requests no longer consume spool-file slots, a large fixed-length
+declaration plus token data must cross the 64 KiB actual-byte threshold before
+it consumes a file slot, and request headers,
+body chunks and trailers are all governed by hard absolute deadlines rather
+than deadlines extended by attacker-supplied byte counts. Request-time
+expression `file()` reads now reject non-regular descriptors, open
+nonblocking/no-follow and stop at 64 KiB, so a FIFO or large attacker-selected
+file below DocumentRoot cannot pin a worker or multiply heap by the worker
+count. The HTTP framing
+fuzzer now varies aggregate byte/file quotas, including zero, and asserts that
+fragmentation produces the same result and every lease returns to zero. Unit,
+adapter and property regressions cover byte-accurate accounting, release on
+failure, HTTP/1 `503`, HTTP/2 spill exhaustion, cache eviction, proxy ACL
+provenance and `<IfFile>` phase order. Verus verifies 475 functions with zero
+errors.
+
 ## Transform-to-sink and filesystem-race closure
 
 The two pre-review hardening items after Pass 14 are now runtime-enforced

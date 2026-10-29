@@ -2,7 +2,7 @@
   "schema": 1,
   "updated": "2026-10-29",
   "verus": {
-    "verified_functions": 467,
+    "verified_functions": 475,
     "errors": 0
   },
   "obligations": [
@@ -18,7 +18,7 @@
       "title": "Directory < Files < Location < Condition",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "config_rule_phase, config_deferred_slot and config_rule_precedes are executable specifications consumed through an exhaustive MatchKind projection by phase collection and the recursive nested-rule sorter; config_rule_order_is_asymmetric proves the comparator cannot order a pair both ways. access_plan_interleaves proves the exact source/depth plan consumed by the runtime: DirectoryConfig then optional DirectoryAccess at each root-to-leaf depth, Directory own-path and DirectoryMatch, BaseFiles, FilesConfig then optional FilesAccess at each depth, DirectoryMatch Files, Location, config conditions and access conditions. condition_source_plan_exec is consumed by request_plan when it applies config conditions before access-file conditions, and its proof ties that order to the access-plan tail. Standard-library sort correctness and parser directive/pattern payload semantics remain outside Verus."
+      "evidence": "config_rule_phase, config_deferred_slot and config_rule_precedes are executable specifications consumed through an exhaustive MatchKind projection by phase collection and the recursive nested-rule sorter; config_rule_order_is_asymmetric proves the comparator cannot order a pair both ways. access_plan_interleaves proves the exact source/depth plan consumed by the runtime: DirectoryConfig then optional DirectoryAccess at each root-to-leaf depth, Directory own-path and DirectoryMatch, BaseFiles, FilesConfig then optional FilesAccess at each depth, DirectoryMatch Files, Location, config conditions and access conditions. condition_source_plan_exec is consumed by request_plan when it applies config conditions before access-file conditions, and its proof ties that order to the access-plan tail. Access-file IfFile is evaluated while parsing against an absolute ServerRoot path and its children retain their native Directory/Files phases; iffile_exec_on_read_admit is consumed at that splice. Standard-library sort correctness and parser directive/pattern payload semantics remain outside Verus."
     },
     {
       "id": "htaccess_interleave",
@@ -60,7 +60,7 @@
       "title": "ACL reachability and resource binding",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "I1a exact ResourceKey grants and I1b inode/backend/policy binding feed the executable TransformCapability state. Every protected file, directory, CGI, FastCGI, proxy, WebSocket and cache sink calls AccessGrant::require_sink, which combines exact resource equality with the verified sink-specific admission predicate. I31 opens and reauthorizes CGI and FastCGI scripts before binding the selected inode; P15 FastCGI binds transport, lexical SCRIPT_FILENAME, authorized canonical path and PATH_INFO, with fastcgi_script_identity_admit proving that neither script identity can be omitted. P17 adds fastcgi_resolved_target_admit at the SetHandler constructor so its lexical classification/wire path cannot be replaced by the canonical authorization path. Authorization providers and request-plan refinement remain outside this obligation."
+      "evidence": "I1a exact ResourceKey grants and I1b inode/backend/policy binding feed the executable TransformCapability state. Every protected file, directory, CGI, FastCGI, proxy, WebSocket and cache sink calls AccessGrant::require_sink, which combines exact resource equality with the verified sink-specific admission predicate. I31 opens and reauthorizes CGI and FastCGI scripts before binding the selected inode; P15 FastCGI binds transport, lexical SCRIPT_FILENAME, authorized canonical path and PATH_INFO, with fastcgi_script_identity_admit proving that neither script identity can be omitted. P17 adds fastcgi_resolved_target_admit at the SetHandler constructor so its lexical classification/wire path cannot be replaced by the canonical authorization path. P18-B2 rebuilds a configuration-only scope for every selected ProxyPass/ProxyPassMatch or FastCGI route and consumes proxy_operator_acl_admit before the access-file-restricted scope, so access files may narrow but never supply the operator grant. Authorization providers and request-plan refinement remain outside this obligation."
     },
     {
       "id": "mapping_order",
@@ -88,7 +88,7 @@
       "title": "Untrusted streams have bounded size and deadlines",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "I33 covers request/proxy trailer count and byte budgets, proxy chunk checked_add before resize, CGI worker path/env/body/output caps, FastCGI record/header/stdout/stderr caps, HTTP/2 budgets and compression. resource_budget_admit mechanizes overflow-free aggregate admission; RAII runtime leases enforce shared spool-byte, spool-file and CGI/FastCGI concurrency ceilings across graceful reloads, with focused exhaustion/release tests. Broader aggregate heap, socket and upstream resource exhaustion remains outside the model."
+      "evidence": "I33 covers request/proxy trailer count and byte budgets, proxy chunk checked_add before resize, CGI worker path/env/body/output caps, FastCGI record/header/stdout/stderr caps, HTTP/2 budgets and compression. resource_budget_admit mechanizes overflow-free aggregate admission; RAII runtime leases enforce shared spool-byte, spool-file and CGI/FastCGI concurrency ceilings across graceful reloads, with focused exhaustion/release tests. P20 makes both HTTP adapters consume one incremental BodyAccumulator: fixed bodies no larger than 1 MiB remain resident; known-larger, chunked HTTP/1 and HTTP/2 bodies provide at most a 64 KiB actual-byte prefix before spilling. Only bytes actually received are reserved, tiny/empty/token bodies do not consume a spool-file slot, and exhaustion returns 503 with exact RAII release. request_body_memory_admit proves each resident-prefix extension is bounded; body/header parsing now uses hard absolute deadlines and HTTP/2 concurrency is capped at 32 streams. Request-time expression file reads consume expr_file_read_admit, reject non-regular descriptors, use O_NONBLOCK/O_NOFOLLOW and read at most 64 KiB. Broader aggregate socket and upstream resource exhaustion remains outside the model."
     },
     {
       "id": "response_header_policy",
@@ -225,10 +225,10 @@
     },
     {
       "id": "cache_disk_bounds",
-      "title": "Disk cache has a total quota, entry cap and expiry cleanup",
+      "title": "Disk and resident cache tiers have independent byte quotas",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "cache_disk_projected and cache_disk_evict mechanize replacement projection and monotone eviction; persisted bytes are tracked per cache root, CacheMaxDiskSize and MAX_DISK_ENTRIES are enforced by evicting the oldest stems, oversized entries are refused, expired/old-generation files are deleted on load, per-key variants are capped, and CacheIgnoreQueryString bypasses dynamic CGI/FastCGI/proxy targets"
+      "evidence": "cache_disk_projected and cache_disk_evict mechanize replacement projection and monotone eviction; persisted bytes are tracked per cache root, CacheMaxDiskSize and MAX_DISK_ENTRIES are enforced by evicting the oldest stems, oversized entries are refused, expired/old-generation files are deleted on load, per-key variants are capped, and CacheIgnoreQueryString bypasses dynamic CGI/FastCGI/proxy targets. The independent CacheMaxMemorySize counter includes key, body, response headers and Vary material; cache_memory_admit bounds overflow-free insertion and replacement, oldest entries are evicted under the lock, bodies above 64 KiB remain disk-only, and lookup clones an Arc rather than copying a retained body under the process-wide mutex"
     },
     {
       "id": "expr_file_test_confined",
@@ -528,6 +528,11 @@
     "HTTP/2 settings, decoded-header budget and flow-control model",
     "HTTP/DoS connection and compression resource admission",
     "Overflow-free aggregate spool and dynamic-backend resource admission",
+    "Incremental request-body resident-prefix admission shared by HTTP/1 and HTTP/2",
+    "Independent resident-cache byte admission including key/header/Vary material",
+    "Access-file IfFile execute-on-read admission with ServerRoot binding and child-phase retention",
+    "Configuration-only operator ACL admission for selected proxy and FastCGI routes",
+    "Bounded regular-descriptor admission for request-time expression file reads",
     "Access-log escaping",
     "Cache lookup key/policy/freshness/Vary admission",
     "Proxy target identity key",

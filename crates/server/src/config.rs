@@ -2324,6 +2324,9 @@ pub struct CacheConfig {
     /// independently bounded from the in-memory entry map so unique query
     /// strings cannot fill the filesystem (F44).
     pub max_disk_size: u64,
+    /// Total estimated resident bytes retained by the process-wide cache.
+    /// Zero disables the memory tier while leaving the bounded disk cache on.
+    pub max_memory_size: u64,
     pub ignore_no_last_mod: bool,
     pub ignore_cache_control: bool,
     pub store_no_store: bool,
@@ -2344,6 +2347,7 @@ impl Default for CacheConfig {
             max_file_size: 1024 * 1024,
             min_file_size: 0,
             max_disk_size: 64 * 1024 * 1024,
+            max_memory_size: 64 * 1024 * 1024,
             ignore_no_last_mod: false,
             ignore_cache_control: false,
             store_no_store: false,
@@ -5621,6 +5625,11 @@ impl Compile {
                     self.cfg.cache.max_disk_size = n;
                 }
             }
+            "cachemaxmemorysize" => {
+                if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
+                    self.cfg.cache.max_memory_size = n;
+                }
+            }
             "cacheminsize" => {
                 if let Some(n) = crate::util::parse_u64(first().as_bytes()) {
                     self.cfg.cache.min_file_size = n;
@@ -6545,7 +6554,11 @@ fn parse_request_read_timeout(
         let time = values
             .next()?
             .split('-')
-            .next()?
+            // Preserve Apache's range maximum as the hard lifetime ceiling.
+            // Using only the initial value and then extending it from an
+            // attacker-controlled count made the timeout effectively
+            // unbounded.
+            .next_back()?
             .parse::<u64>()
             .ok()
             .map(Duration::from_secs)?;
@@ -9553,12 +9566,14 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
             "Listen 127.0.0.1:0\n\
              CacheMaxFileSize 1234\n\
              CacheMaxDiskSize 5678\n\
+             CacheMaxMemorySize 3456\n\
              CacheDefaultExpire 9\n",
             false,
         )
         .unwrap();
         assert_eq!(c.cache.max_file_size, 1234);
         assert_eq!(c.cache.max_disk_size, 5678);
+        assert_eq!(c.cache.max_memory_size, 3456);
         assert_eq!(c.cache.default_expire, 9);
     }
 
@@ -11384,8 +11399,8 @@ ServerName localhost\n\
         assert_eq!(
             parse_request_read_timeout("header=10-20, body=30-40 MinRate=99"),
             Some((
-                Some(Duration::from_secs(10)),
-                Some(Duration::from_secs(30)),
+                Some(Duration::from_secs(20)),
+                Some(Duration::from_secs(40)),
                 Some(99),
                 Some(99)
             ))
@@ -11757,6 +11772,7 @@ CacheMinExpire 1\n\
 CacheMaxFileSize 100\n\
 CacheMinSize 2\n\
 CacheMaxDiskSize 1024\n\
+CacheMaxMemorySize 512\n\
 CacheIgnoreNoLastMod On\n\
 CacheIgnoreCacheControl On\n\
 CacheStoreNoStore On\n\
@@ -11827,6 +11843,7 @@ RewriteOptions Inherit\n"
         assert_eq!(c.cache.max_file_size, 100);
         assert_eq!(c.cache.min_file_size, 2);
         assert_eq!(c.cache.max_disk_size, 1024);
+        assert_eq!(c.cache.max_memory_size, 512);
         assert!(c.cache.ignore_no_last_mod);
         assert!(c.cache.ignore_cache_control);
         assert!(c.cache.store_no_store);
