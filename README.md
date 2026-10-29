@@ -419,11 +419,18 @@ the pre-adversarial gate. Longer campaigns use cargo-fuzz:
 ```sh
 cargo install cargo-fuzz
 rustup toolchain install nightly --profile minimal
-cargo +nightly fuzz run http_request fuzz/corpus/http_request
-cargo +nightly fuzz run config_sections fuzz/corpus/config_sections
-cargo +nightly fuzz run cgi_response fuzz/corpus/cgi_response
-cargo +nightly fuzz run fastcgi_records fuzz/corpus/fastcgi_records
+tests/fuzz_smoke.sh                         # bounded run of every target
+FUZZ_SECONDS_PER_TARGET=900 tests/fuzz_campaign.sh
 ```
+
+The 13 targets cover individual HTTP requests, fragmented/pipelined
+connections, configuration tokenization and full compilation, `.htaccess`
+walks, rewrite expressions, CGI/FastCGI/proxy responses, HTTP/2 frames, cache
+metadata, TLS policy and OCSP DER. Dictionaries and seed corpora live beside
+the targets. Property tests, Loom interleaving exploration, deterministic
+failure injection, Miri, sanitizers, mutation testing, protocol suites,
+supply-chain checks and scheduled soak/performance jobs are described in
+[`docs/quality.md`](docs/quality.md).
 
 `config_grammar.py` enumerates the supported directive/context grammar and
 checks that Apache and vapached agree on acceptance and rejection.  It is the

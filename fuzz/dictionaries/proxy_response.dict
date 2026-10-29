@@ -1,0 +1,8 @@
+"HTTP/1.1 200 OK\x0d\x0a"
+"HTTP/1.1 101 Switching Protocols\x0d\x0a"
+"Content-Length: 0\x0d\x0a"
+"Transfer-Encoding: chunked\x0d\x0a"
+"Connection: close\x0d\x0a"
+"Location: http://backend/\x0d\x0a"
+"\x0d\x0a"
+"0\x0d\x0a\x0d\x0a"

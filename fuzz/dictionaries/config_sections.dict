@@ -1,0 +1,8 @@
+"<Directory />"
+"</Directory>"
+"<Files \"*.txt\">"
+"</Files>"
+"<If \"true\">"
+"</If>"
+"Require all denied"
+"AllowOverride None"

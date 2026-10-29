@@ -16,20 +16,74 @@ pub struct ResourceBudget {
 }
 
 fn try_add(counter: &AtomicU64, amount: u64, limit: u64) -> bool {
-    counter
-        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            vapache_verified::resource_budget_admit(current, amount, limit)
-                .then_some(current + amount)
-        })
-        .is_ok()
+    try_add_counter(counter, amount, limit)
+}
+
+/// Small abstraction over the atomic operation used by the production
+/// budget.  Keeping the admission loop generic lets the exact production
+/// algorithm run under Loom's deterministic scheduler in tests.
+trait BudgetCounter {
+    fn load_value(&self, order: Ordering) -> u64;
+    fn compare_exchange_value(
+        &self,
+        current: u64,
+        next: u64,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u64, u64>;
+}
+
+impl BudgetCounter for AtomicU64 {
+    fn load_value(&self, order: Ordering) -> u64 {
+        self.load(order)
+    }
+
+    fn compare_exchange_value(
+        &self,
+        current: u64,
+        next: u64,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u64, u64> {
+        self.compare_exchange_weak(current, next, success, failure)
+    }
+}
+
+#[cfg(test)]
+impl BudgetCounter for loom::sync::atomic::AtomicU64 {
+    fn load_value(&self, order: Ordering) -> u64 {
+        self.load(order)
+    }
+
+    fn compare_exchange_value(
+        &self,
+        current: u64,
+        next: u64,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u64, u64> {
+        self.compare_exchange_weak(current, next, success, failure)
+    }
+}
+
+fn try_add_counter<C: BudgetCounter>(counter: &C, amount: u64, limit: u64) -> bool {
+    let mut current = counter.load_value(Ordering::Acquire);
+    loop {
+        if !vapache_verified::resource_budget_admit(current, amount, limit) {
+            return false;
+        }
+        let Some(next) = current.checked_add(amount) else {
+            return false;
+        };
+        match counter.compare_exchange_value(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 impl ResourceBudget {
-    pub fn try_spool(
-        self: &Arc<Self>,
-        max_bytes: u64,
-        max_files: u64,
-    ) -> io::Result<SpoolLease> {
+    pub fn try_spool(self: &Arc<Self>, max_bytes: u64, max_files: u64) -> io::Result<SpoolLease> {
         if !try_add(&self.spool_files, 1, max_files) {
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
@@ -57,8 +111,8 @@ impl ResourceBudget {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn usage(&self) -> (u64, u64, u64) {
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn usage(&self) -> (u64, u64, u64) {
         (
             self.spool_bytes.load(Ordering::Acquire),
             self.spool_files.load(Ordering::Acquire),
@@ -112,9 +166,7 @@ pub struct DynamicLease {
 impl Drop for DynamicLease {
     fn drop(&mut self) {
         if self.active {
-            self.budget
-                .dynamic_requests
-                .fetch_sub(1, Ordering::AcqRel);
+            self.budget.dynamic_requests.fetch_sub(1, Ordering::AcqRel);
             self.active = false;
         }
     }
@@ -173,5 +225,30 @@ mod tests {
             .count();
         assert_eq!(admitted, LIMIT);
         assert_eq!(budget.usage(), (0, 0, 0));
+    }
+
+    #[test]
+    fn loom_explores_atomic_admission_and_release_interleavings() {
+        loom::model(|| {
+            use loom::sync::atomic::AtomicU64 as LoomAtomicU64;
+            use loom::sync::Arc as LoomArc;
+
+            let counter = LoomArc::new(LoomAtomicU64::new(0));
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let counter = counter.clone();
+                workers.push(loom::thread::spawn(move || {
+                    if try_add_counter(&*counter, 1, 1) {
+                        assert!(counter.load(Ordering::Acquire) <= 1);
+                        loom::thread::yield_now();
+                        counter.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert_eq!(counter.load(Ordering::Acquire), 0);
+        });
     }
 }

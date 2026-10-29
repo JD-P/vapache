@@ -22,9 +22,9 @@ step() {
 
 command -v cargo >/dev/null 2>&1 || fail "cargo is required"
 command -v cargo-verus >/dev/null 2>&1 || fail "cargo-verus is required"
-command -v cargo-fuzz >/dev/null 2>&1 || fail "cargo-fuzz is required"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"
 cargo +nightly --version >/dev/null 2>&1 || fail "a nightly Rust toolchain is required for cargo-fuzz"
+cargo +nightly fuzz --version >/dev/null 2>&1 || fail "cargo-fuzz is required"
 
 if [ -n "${APACHE:-}" ]; then
     [ -x "$APACHE" ] || fail "APACHE is not executable: $APACHE"
@@ -87,15 +87,7 @@ step "Rust workspace tests"
 cargo test --workspace -- --test-threads=1
 
 step "coverage-guided parser fuzz targets"
-cargo check --manifest-path fuzz/Cargo.toml
-FUZZ_SMOKE_RUNS=${FUZZ_SMOKE_RUNS:-64}
-FUZZ_CORPUS_ROOT=$(mktemp -d /tmp/vapache-fuzz-smoke.XXXXXX)
-for target in http_request config_sections cgi_response fastcgi_records; do
-    mkdir "$FUZZ_CORPUS_ROOT/$target"
-    cp "fuzz/corpus/$target"/* "$FUZZ_CORPUS_ROOT/$target/"
-    cargo +nightly fuzz run "$target" "$FUZZ_CORPUS_ROOT/$target" -- \
-        -runs="$FUZZ_SMOKE_RUNS"
-done
+tests/fuzz_smoke.sh
 
 step "Verus proof and verification-ledger gate"
 python3 tests/verification_status.py --run-verus

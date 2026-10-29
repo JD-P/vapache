@@ -1,0 +1,8 @@
+"Require all denied"
+"Require all granted"
+"<RequireAll>"
+"</RequireAll>"
+"<Files \"*.txt\">"
+"</Files>"
+"Options -Indexes"
+"RewriteEngine On"

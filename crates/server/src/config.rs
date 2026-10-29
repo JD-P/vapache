@@ -4540,10 +4540,7 @@ impl Compile {
                         self.errors.push(ConfigError {
                             file: loc.file.clone(),
                             line: loc.line,
-                            msg: format!(
-                                "invalid Unix FastCGI endpoint-owner uid '{}'",
-                                args[3]
-                            ),
+                            msg: format!("invalid Unix FastCGI endpoint-owner uid '{}'", args[3]),
                         });
                         return;
                     }
@@ -14003,22 +14000,13 @@ mod pass11_kernel_tests {
             "VapacheMaxDynamicRequests 1 2\n",
             "<VirtualHost *:80>\nVapacheMaxFastCGIOutput 1\n</VirtualHost>\n",
         ] {
-            let dir = std::env::temp_dir().join(format!(
-                "vapache-resource-config-{}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("vapache-resource-config-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("invalid.conf");
             std::fs::write(&path, format!("Listen 127.0.0.1:0\n{text}")).unwrap();
-            assert!(Config::load(
-                &path,
-                &dir,
-                &HashMap::new(),
-                &HashMap::new(),
-                false
-            )
-            .is_err());
+            assert!(Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).is_err());
         }
     }
 

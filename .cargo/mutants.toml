@@ -1,0 +1,6 @@
+# Loading zero is an equivalent stale-read mutation: compare_exchange_weak
+# observes the real value and retries before it can admit over budget. The
+# `with 1` mutation remains enabled and is caught by the resource tests.
+exclude_re = [
+    "<impl BudgetCounter for AtomicU64>::load_value -> u64 with 0$",
+]

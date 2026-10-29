@@ -616,7 +616,6 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         if new_path.is_empty() {
             return Outcome::Error("empty rewrite substitution".into());
         }
-        let mut new_path = new_path;
         let mut external = is_external_url(&new_path);
         if external && rule.flags.redirect.is_none() && !rule.flags.proxy {
             if let Some(internal) = same_host_internal(ctx, req, &new_path) {
@@ -1654,11 +1653,9 @@ mod tests {
         let mut scope = Scope::default();
         scope.rewrite_policy.rewrite_engine = Some(true);
         let mut rule =
-            parse_rewrite_rule(&["^/old$".into(), "-".into(), "[F]".into()], "/", false)
-                .unwrap();
-        rule.conditions.push(
-            parse_rewrite_cond(&["%{HTTP:X-Test}".into(), "^(.)sqlmap$".into()]).unwrap(),
-        );
+            parse_rewrite_rule(&["^/old$".into(), "-".into(), "[F]".into()], "/", false).unwrap();
+        rule.conditions
+            .push(parse_rewrite_cond(&["%{HTTP:X-Test}".into(), "^(.)sqlmap$".into()]).unwrap());
         // This second condition only matches if %1 is the exact 0xff byte;
         // replacement-character or empty-string projections both fail it.
         rule.conditions
@@ -1666,9 +1663,7 @@ mod tests {
         scope.rewrite_policy.rewrite_rules.push(rule);
 
         let mut request = req();
-        request
-            .headers
-            .insert("x-test", b"\xffsqlmap".to_vec());
+        request.headers.insert("x-test", b"\xffsqlmap".to_vec());
         let root = Path::new("/tmp");
         assert!(matches!(
             process(&scope, &request, &ctx("/old", &root.join("old"), root)),

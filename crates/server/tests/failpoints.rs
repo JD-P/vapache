@@ -1,0 +1,112 @@
+#![cfg(feature = "fault-injection")]
+
+use std::io;
+use vapached::files::Target;
+use vapached::http::{read_request, Limits, ReadError};
+
+struct Fragmented<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl io::Read for Fragmented<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() || self.offset == self.input.len() {
+            return Ok(0);
+        }
+        output[0] = self.input[self.offset];
+        self.offset += 1;
+        Ok(1)
+    }
+}
+
+impl io::Write for Fragmented<'_> {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn fragmented(input: &[u8]) -> Fragmented<'_> {
+    Fragmented { input, offset: 0 }
+}
+
+#[test]
+fn injected_header_failures_retry_eintr_and_reject_other_errors() {
+    let wire = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    vapached::fault::configure("http.head.read", 0, io::ErrorKind::Interrupted);
+    let request = read_request(
+        &mut io::Cursor::new(wire.to_vec()),
+        &mut Vec::new(),
+        &Limits::default(),
+        |_| {},
+    )
+    .expect("EINTR is retryable")
+    .expect("request after EINTR");
+    assert_eq!(request.target, b"/");
+
+    vapached::fault::configure("http.head.read", 0, io::ErrorKind::ConnectionReset);
+    let result = read_request(
+        &mut io::Cursor::new(wire.to_vec()),
+        &mut Vec::new(),
+        &Limits::default(),
+        |_| {},
+    );
+    assert!(
+        matches!(result, Err(ReadError::Io(error)) if error.kind() == io::ErrorKind::ConnectionReset)
+    );
+    vapached::fault::clear();
+}
+
+#[test]
+fn injected_secure_open_failure_never_returns_a_file() {
+    let root = std::env::temp_dir().join(format!("vapache-failpoint-open-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("visible.txt"), b"secret").unwrap();
+
+    vapached::fault::configure("fs.open_beneath", 0, io::ErrorKind::PermissionDenied);
+    assert!(matches!(
+        vapached::files::resolve_target(&root, std::path::Path::new("visible.txt"), true),
+        Target::Forbidden | Target::NotFound
+    ));
+    vapached::fault::clear();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn injected_fixed_body_read_failure_is_propagated() {
+    let wire = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody";
+    vapached::fault::configure("http.body.read", 0, io::ErrorKind::ConnectionReset);
+    let result = read_request(
+        &mut fragmented(wire),
+        &mut Vec::new(),
+        &Limits::default(),
+        |_| {},
+    );
+    assert!(
+        matches!(result, Err(ReadError::Io(error)) if error.kind() == io::ErrorKind::ConnectionReset)
+    );
+}
+
+#[test]
+fn injected_chunk_line_and_data_failures_are_propagated() {
+    let wire = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\n";
+    for boundary in ["http.chunk.line", "http.chunk.read"] {
+        vapached::fault::configure(boundary, 0, io::ErrorKind::ConnectionReset);
+        let result = read_request(
+            &mut fragmented(wire),
+            &mut Vec::new(),
+            &Limits::default(),
+            |_| {},
+        );
+        assert!(
+            matches!(result, Err(ReadError::Io(error)) if error.kind() == io::ErrorKind::ConnectionReset),
+            "{boundary} did not fail closed"
+        );
+    }
+}

@@ -3550,10 +3550,7 @@ mod tests {
             ("SetHandler proxy:fcgi://localhost\n", "FastCgi"),
             ("RewriteRule ^x$ - [H=cgi-script]\n", "Cgi"),
             ("RewriteRule ^x$ - [H=server-status]\n", "ServerStatus"),
-            (
-                "RewriteRule ^x$ - [H=proxy:fcgi://localhost]\n",
-                "FastCgi",
-            ),
+            ("RewriteRule ^x$ - [H=proxy:fcgi://localhost]\n", "FastCgi"),
             ("Order deny,allow\n", "LegacyAuthz"),
             ("Deny from all\n", "LegacyAuthz"),
             ("Satisfy any\n", "LegacyAuthz"),

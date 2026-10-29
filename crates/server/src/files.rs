@@ -298,6 +298,7 @@ fn root_file(root: &Path) -> io::Result<Arc<File>> {
 }
 
 fn open_beneath(root: &Path, rel: &Path, flags: u64, follow: bool) -> OpenResult {
+    crate::fault::hit("fs.open_beneath")?;
     let root_file = root_file(root)?;
     let rel_c = CString::new(rel.as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;

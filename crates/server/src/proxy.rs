@@ -402,10 +402,16 @@ fn sticky_route(
 }
 
 fn trim_ascii_bytes(mut value: &[u8]) -> &[u8] {
-    while value.first().is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
         value = &value[1..];
     }
-    while value.last().is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
         value = &value[..value.len() - 1];
     }
     value
@@ -726,8 +732,7 @@ fn validate_proxy_head(head: &[u8]) -> std::io::Result<()> {
     let method = parts.next().ok_or_else(invalid)?;
     let target = parts.next().ok_or_else(invalid)?;
     let version = parts.next().ok_or_else(invalid)?;
-    if parts.next().is_some()
-        || !crate::verified::proxy_request_line_admit(method, target, version)
+    if parts.next().is_some() || !crate::verified::proxy_request_line_admit(method, target, version)
     {
         return Err(invalid());
     }
@@ -754,7 +759,10 @@ fn validate_proxy_head(head: &[u8]) -> std::io::Result<()> {
         if terminated {
             return Err(invalid());
         }
-        let colon = line.iter().position(|byte| *byte == b':').ok_or_else(invalid)?;
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or_else(invalid)?;
         let (name, rest) = line.split_at(colon);
         let value = &rest[1..];
         if !crate::verified::proxy_header_admit(name, value) {
@@ -970,9 +978,10 @@ pub fn is_websocket(req: &Request) -> bool {
     }
     let upgrade = req
         .header("upgrade")
-        .map(|v| v.split(|b| *b == b',').any(|token| {
-            trim_ascii_bytes(token).eq_ignore_ascii_case(b"websocket")
-        }))
+        .map(|v| {
+            v.split(|b| *b == b',')
+                .any(|token| trim_ascii_bytes(token).eq_ignore_ascii_case(b"websocket"))
+        })
         .unwrap_or(false);
     let connection = req
         .header("connection")
@@ -1251,6 +1260,7 @@ fn client_config(scope: &Scope) -> std::io::Result<Arc<rustls::ClientConfig>> {
 }
 
 fn connect_tcp(backend: &HttpBackend, timeout: Duration) -> std::io::Result<TcpStream> {
+    crate::fault::hit("proxy.connect")?;
     let mut tcp = None;
     let mut last = None;
     for addr in (backend.host.as_str(), backend.port).to_socket_addrs()? {
@@ -1640,6 +1650,76 @@ fn proxy_once(
         .apply(&mut response.headers, response.status < 400);
     crate::compression::finalize(scope, req, &mut response, url_path.as_bytes());
     Ok((response, None))
+}
+
+/// Drive the complete upstream response parser without opening a socket.
+/// Writes made by `proxy_once` are discarded while reads come from the fuzz
+/// input, so framing, header filtering, chunk decoding and streaming-body
+/// setup all use the production path.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_parse_proxy_response(data: &[u8]) {
+    struct FuzzIo {
+        input: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl Read for FuzzIo {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.input, output)
+        }
+    }
+
+    impl Write for FuzzIo {
+        fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let target = Target {
+        backend: HttpBackend {
+            host: "127.0.0.1".into(),
+            port: 80,
+            base: "/".into(),
+            tls: false,
+        },
+        path: "/".into(),
+        suffix: String::new(),
+        reverse: Vec::new(),
+        balancer: None,
+        fail_on_status: Vec::new(),
+        proxy_url: "http://127.0.0.1/".into(),
+        logical_url: None,
+        route_order: 0,
+    };
+    let request = Request {
+        method: "GET".into(),
+        target: b"/".to_vec(),
+        raw_path: b"/".to_vec(),
+        query: Vec::new(),
+        version: crate::http::Version::Http11,
+        headers: crate::http::Headers::default(),
+        body: Vec::new(),
+        body_spool: None,
+        keep_alive: true,
+        expect_continue: false,
+        framing: crate::verified::BodyFraming::None,
+    };
+    let io = FuzzIo {
+        input: std::io::Cursor::new(data.to_vec()),
+    };
+    let _ = proxy_once(
+        Box::new(io),
+        &target,
+        &request,
+        &Scope::default(),
+        "/",
+        "127.0.0.1:1".parse().expect("static socket address"),
+        false,
+        "localhost",
+    );
 }
 
 fn alternate_target(
@@ -2248,6 +2328,20 @@ mod more_tests {
         scope.proxy_policy.proxy_passes[0].prefix = "/".into();
         assert!(match_target(&cfg, &scope, "/anything").is_some());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn injected_proxy_connect_failure_is_propagated() {
+        let backend = HttpBackend {
+            host: "127.0.0.1".into(),
+            port: 80,
+            base: "/".into(),
+            tls: false,
+        };
+        crate::fault::configure("proxy.connect", 0, std::io::ErrorKind::PermissionDenied);
+        let error = connect_tcp(&backend, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]
@@ -3288,7 +3382,10 @@ mod coverage_tests {
         assert!(websocket_accept("dGhlIHNhbXBsZSBub25jZQ==").is_some());
 
         let head = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
-        assert_eq!(response_header(head, b"upgrade"), Some(b"websocket".as_slice()));
+        assert_eq!(
+            response_header(head, b"upgrade"),
+            Some(b"websocket".as_slice())
+        );
         assert_eq!(response_header(head, b"missing"), None);
         assert_eq!(response_header(b"HTTP/1.1 101 \xff\r\n", b"x"), None);
         assert_eq!(

@@ -355,10 +355,11 @@ Four additional attack surfaces are closed before the next adversarial pass:
   FastCGI requests across graceful reloads. Request bodies, FastCGI responses
   and the CGI worker's duplicate body copy reserve and release from the same
   counters; FastCGI output also has a per-request ceiling.
-- LibFuzzer entry points cover HTTP request framing, configuration sections,
-  CGI response heads and FastCGI records. The fail-closed pre-pass compiles
-  and smoke-runs all four targets, while the documented cargo-fuzz commands
-  support longer sanitizer campaigns.
+- LibFuzzer entry points cover HTTP request framing and fragmentation, full
+  configuration compilation, access-file walks, rewrite expressions, CGI,
+  FastCGI and proxy responses, HTTP/2 frames, cache metadata, TLS policy and
+  OCSP DER. The fail-closed pre-pass compiles and smoke-runs all 13 targets;
+  scheduled campaigns retain corpora and crash artifacts.
 
 `resource_budget_admit` adds an overflow-safe executable Verus admission gate
 with bounded and exhausted proofs. Focused runtime tests cover exact endpoint

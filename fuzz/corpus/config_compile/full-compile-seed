@@ -1,0 +1,7 @@
+VapacheCapability AccessFiles On
+Listen 127.0.0.1:0
+DocumentRoot /tmp
+<Directory /tmp>
+    AllowOverride All
+    Require all granted
+</Directory>

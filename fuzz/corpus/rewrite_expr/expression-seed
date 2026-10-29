@@ -1,0 +1,1 @@
+%{REQUEST_METHOD} == 'GET' && req('X-Test') =~ m#^[a-z]+$#

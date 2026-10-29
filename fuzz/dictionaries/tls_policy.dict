@@ -1,0 +1,6 @@
+"all"
+"TLSv1.2"
+"TLSv1.3"
+"-TLSv1.1"
+"*.example.test"
+"[::1]:443"

@@ -1026,11 +1026,16 @@ fn run_local(
             cmd.pre_exec(move || child_process_setup(timeout));
         }
     }
-    let spawn_result = cmd.spawn();
+    let spawn_result = crate::fault::hit("cgi.spawn")
+        .map_err(|e| format!("cannot execute {}: {e}", path.display()))
+        .and_then(|()| {
+            cmd.spawn()
+                .map_err(|e| format!("cannot execute {}: {e}", path.display()))
+        });
     if let Some(previous) = previous_cwd {
         let _ = std::env::set_current_dir(previous);
     }
-    let mut child = spawn_result.map_err(|e| format!("cannot execute {}: {e}", path.display()))?;
+    let mut child = spawn_result?;
     let pid = child.id() as i32;
     let deadline = Instant::now() + timeout;
 
@@ -1331,10 +1336,7 @@ mod tests {
         let path = root.join("httpd.conf");
         fs::write(
             &path,
-            format!(
-                "{}Listen 127.0.0.1:0\n",
-                crate::config::TEST_CAPABILITIES
-            ),
+            format!("{}Listen 127.0.0.1:0\n", crate::config::TEST_CAPABILITIES),
         )
         .unwrap();
         Config::load(&path, root, &HashMap::new(), &HashMap::new(), false).unwrap()
@@ -1610,6 +1612,30 @@ mod tests {
         assert!(result.is_err());
         assert!(start.elapsed() < Duration::from_secs(2));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn injected_cgi_spawn_failure_is_propagated() {
+        let dir = tempdir("spawn-failpoint");
+        let path = script(
+            &dir,
+            "unreached.sh",
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\n'\n",
+        );
+        crate::fault::configure("cgi.spawn", 0, std::io::ErrorKind::PermissionDenied);
+        let error = run_local(
+            &path,
+            &dir,
+            &[],
+            &BodySource::Bytes(Vec::new()),
+            Duration::from_secs(1),
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("injected failure at cgi.spawn"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2438,10 +2464,7 @@ mod pass11_kernel_tests {
         let path = root.join("httpd.conf");
         std::fs::write(
             &path,
-            format!(
-                "{}Listen 127.0.0.1:0\n",
-                crate::config::TEST_CAPABILITIES
-            ),
+            format!("{}Listen 127.0.0.1:0\n", crate::config::TEST_CAPABILITIES),
         )
         .unwrap();
         Config::load(

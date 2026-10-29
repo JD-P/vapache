@@ -1,0 +1,148 @@
+use proptest::prelude::*;
+use std::io::{self, Read, Write};
+use vapached::config::{Options, Scope};
+use vapached::http::{read_request, Limits, ReadError};
+use vapached::scope_policy::OptionsPolicy;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    #[test]
+    fn normalized_paths_are_idempotent(tail in prop::collection::vec(any::<u8>(), 0..512)) {
+        let mut input = vec![b'/'];
+        input.extend(tail);
+        if let Some(normalized) = vapached::verified::normalize_uri_path(&input) {
+            prop_assert_eq!(vapached::verified::normalize_uri_path(&normalized), Some(normalized));
+        }
+    }
+
+    #[test]
+    fn cache_key_hex_is_injective_and_alphabet_safe(
+        left in prop::collection::vec(any::<u8>(), 0..256),
+        right in prop::collection::vec(any::<u8>(), 0..256),
+    ) {
+        let encoded_left = vapached::verified::cache_key_hex(&left);
+        let encoded_right = vapached::verified::cache_key_hex(&right);
+        prop_assert_eq!(encoded_left.len(), left.len() * 2);
+        prop_assert!(encoded_left.iter().all(u8::is_ascii_hexdigit));
+        if left != right {
+            prop_assert_ne!(encoded_left, encoded_right);
+        }
+    }
+
+    #[test]
+    fn conjoining_options_never_grants(url in any::<u32>(), target in any::<u32>()) {
+        let result = vapached::verified::options_conjoin(url, target);
+        prop_assert_eq!(result & url, result);
+        prop_assert_eq!(result & target, result);
+        prop_assert_eq!(result, vapached::verified::options_conjoin(target, url));
+    }
+
+    #[test]
+    fn removing_options_is_monotone(bits in any::<u32>(), mask in any::<u32>()) {
+        let result = vapached::verified::options_apply(bits, 2, mask);
+        prop_assert_eq!(result & bits, result);
+        prop_assert_eq!(result & mask, 0);
+    }
+
+    #[test]
+    fn aggregate_budget_admission_cannot_overflow(
+        used in any::<u64>(), incoming in any::<u64>(), limit in any::<u64>(),
+    ) {
+        if vapached::verified::resource_budget_admit(used, incoming, limit) {
+            prop_assert!(used.checked_add(incoming).is_some_and(|sum| sum <= limit));
+        }
+    }
+
+    #[test]
+    fn capability_disable_is_monotone(requested in any::<bool>()) {
+        let disabled = vapached::verified::capability_admit(false, requested);
+        let enabled = vapached::verified::capability_admit(true, requested);
+        prop_assert!(!requested || !disabled);
+        prop_assert!(!disabled || enabled);
+        prop_assert!(enabled);
+    }
+
+    #[test]
+    fn runtime_scope_restriction_refines_verified_options_meet(
+        url in any::<u32>(), target in any::<u32>(),
+    ) {
+        let mut lexical = Scope::default();
+        lexical.options = OptionsPolicy::default();
+        lexical.options.push_set(url);
+        let mut resolved = Scope::default();
+        resolved.options = OptionsPolicy::default();
+        resolved.options.push_set(target);
+        resolved.restrict_policy_with(&lexical);
+        prop_assert_eq!(
+            resolved.effective_options().0,
+            vapached::verified::options_conjoin(url, target)
+        );
+    }
+
+    #[test]
+    fn http_parser_is_independent_of_read_fragmentation(
+        wire in prop::collection::vec(any::<u8>(), 0..8192),
+        chunk in 1usize..128,
+    ) {
+        prop_assert_eq!(parse_once(&wire, wire.len().max(1)), parse_once(&wire, chunk));
+    }
+}
+
+#[derive(Debug)]
+struct Fragmented<'a> {
+    input: &'a [u8],
+    offset: usize,
+    chunk: usize,
+}
+
+impl Read for Fragmented<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let take = output
+            .len()
+            .min(self.chunk)
+            .min(self.input.len().saturating_sub(self.offset));
+        output[..take].copy_from_slice(&self.input[self.offset..self.offset + take]);
+        self.offset += take;
+        Ok(take)
+    }
+}
+
+impl Write for Fragmented<'_> {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn parse_once(wire: &[u8], chunk: usize) -> String {
+    let mut stream = Fragmented {
+        input: wire,
+        offset: 0,
+        chunk,
+    };
+    let mut buffered = Vec::new();
+    match read_request(&mut stream, &mut buffered, &Limits::default(), |_| {}) {
+        Ok(Some(request)) => format!(
+            "ok:{}:{:?}:{}:{}:{:?}",
+            request.method,
+            request.target,
+            request.body_len(),
+            request.keep_alive,
+            buffered
+        ),
+        Ok(None) => "eof".into(),
+        Err(ReadError::Parse(error)) => format!("parse:{}:{}", error.status(), error.message()),
+        Err(ReadError::Io(error)) => format!("io:{:?}", error.kind()),
+    }
+}
+
+#[test]
+fn options_default_remains_follow_symlinks_after_property_setup() {
+    assert!(Scope::default()
+        .effective_options()
+        .contains(Options::FOLLOW_SYMLINKS));
+}

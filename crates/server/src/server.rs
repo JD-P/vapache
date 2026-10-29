@@ -1952,10 +1952,8 @@ fn dispatch_inner(
     }
 
     if req.method == "TRACE" {
-        if !vapache_verified::capability_admit(
-            cfg.capability_enabled(Capability::Trace),
-            true,
-        ) || !cfg.trace_enable
+        if !vapache_verified::capability_admit(cfg.capability_enabled(Capability::Trace), true)
+            || !cfg.trace_enable
         {
             let mut r = error_response(
                 cfg,

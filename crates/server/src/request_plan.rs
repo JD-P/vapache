@@ -285,9 +285,8 @@ impl RequestPlan {
         // subjects and CGI identity.  Reject a filesystem identity that
         // cannot be represented exactly instead of projecting it through
         // U+FFFD at any of those policy boundaries.
-        let textual_identity = root.to_str().is_some()
-            && rel.to_str().is_some()
-            && fs_path.to_str().is_some();
+        let textual_identity =
+            root.to_str().is_some() && rel.to_str().is_some() && fs_path.to_str().is_some();
         if !vapache_verified::text_identity_admit(textual_identity) {
             return Err(PlanError::AccessFiles(format!(
                 "{}: non-UTF-8 filesystem policy identity",
@@ -665,11 +664,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("httpd.conf");
-        std::fs::write(
-            &path,
-            format!("{}{text}", crate::config::TEST_CAPABILITIES),
-        )
-        .unwrap();
+        std::fs::write(&path, format!("{}{text}", crate::config::TEST_CAPABILITIES)).unwrap();
         Config::load(
             &path,
             &dir,

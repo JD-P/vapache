@@ -14,9 +14,9 @@
 
 use crate::cgi::{self, CgiContext};
 use crate::config::{Config, FastCgiEndpoint, FastCgiStablePathPolicy, Scope};
-use crate::http::{Body, Response};
 #[cfg(test)]
 use crate::http::Request;
+use crate::http::{Body, Response};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
@@ -1001,14 +1001,7 @@ fn path_has_posix_acl(path: &Path) -> io::Result<bool> {
     })?;
     for name in ["system.posix_acl_access", "system.posix_acl_default"] {
         let name = std::ffi::CString::new(name).expect("static xattr name");
-        let len = unsafe {
-            libc::lgetxattr(
-                path.as_ptr(),
-                name.as_ptr(),
-                std::ptr::null_mut(),
-                0,
-            )
-        };
+        let len = unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
         if len > 0 {
             return Ok(true);
         }
@@ -1282,13 +1275,9 @@ mod tests {
             endpoint_owner_uid: None,
             trusted_owner_uids: vec![0],
         };
-        let err = connect(
-            &tcp_backend,
-            Duration::from_millis(1),
-            Some(&tcp_policy),
-        )
-        .err()
-        .unwrap();
+        let err = connect(&tcp_backend, Duration::from_millis(1), Some(&tcp_policy))
+            .err()
+            .unwrap();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -1313,11 +1302,8 @@ mod tests {
         };
         let mut cfg = config(&dir);
         cfg.fastcgi_stable_paths = Some(vec![policy.clone()]);
-        let backend = parse_backend(&format!(
-            "unix:{}|fcgi://localhost",
-            socket.display()
-        ))
-        .unwrap();
+        let backend =
+            parse_backend(&format!("unix:{}|fcgi://localhost", socket.display())).unwrap();
         assert!(stable_policy_for(&cfg, &backend).unwrap().is_some());
         let unregistered = parse_backend("fcgi://127.0.0.1:9000").unwrap();
         assert!(stable_policy_for(&cfg, &unregistered).is_err());

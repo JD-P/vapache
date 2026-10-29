@@ -1,0 +1,122 @@
+name: nightly-adversarial
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds per fuzz target
+        default: "900"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  sustained-fuzzing:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - http_request
+          - http_connection
+          - config_sections
+          - config_compile
+          - htaccess_walk
+          - rewrite_expr
+          - cgi_response
+          - fastcgi_records
+          - proxy_response
+          - h2_frames
+          - cache_metadata
+          - tls_policy
+          - ocsp_der
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+      - name: Fuzz ${{ matrix.target }}
+        env:
+          FUZZ_TARGETS: ${{ matrix.target }}
+          FUZZ_SECONDS_PER_TARGET: ${{ inputs.fuzz_seconds || '900' }}
+        run: tests/fuzz_campaign.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}
+            fuzz/corpus/${{ matrix.target }}
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, leak, thread]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal --component rust-src
+      - name: ${{ matrix.sanitizer }} sanitizer
+        run: tests/sanitizers.sh ${{ matrix.sanitizer }}
+
+  full-adversarial-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install external reference implementations
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apache2 php-fpm curl libcurl4-openssl-dev
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+          tests/ci/install_verus.sh .tools/verus
+      - name: Fail-closed pre-adversarial gate
+        run: tests/pre_adversarial.sh
+
+  protocol-and-soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --locked --release -p vapached
+      - name: Install h2spec
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz \
+            -o /tmp/h2spec.tar.gz
+          mkdir -p .tools/h2spec
+          tar -xzf /tmp/h2spec.tar.gz -C .tools/h2spec
+      - name: TLS policy suite
+        run: python3 tests/protocol_conformance.py --tls
+      - name: HTTP/2 specification suite
+        run: python3 tests/protocol_conformance.py --h2spec .tools/h2spec/h2spec
+      - name: Concurrent malformed-connection soak
+        env:
+          SOAK_SECONDS: 60
+          SOAK_WORKERS: 32
+        run: python3 tests/soak.py
+
+  branch-coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install cargo-llvm-cov --locked
+      - name: LLVM branch coverage
+        run: >-
+          cargo llvm-cov --workspace --all-features --branch --lcov
+          --output-path branch-coverage.lcov
+      - uses: actions/upload-artifact@v4
+        with:
+          name: branch-coverage
+          path: branch-coverage.lcov

@@ -39,6 +39,69 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "http_connection"
+path = "fuzz_targets/http_connection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_compile"
+path = "fuzz_targets/config_compile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "htaccess_walk"
+path = "fuzz_targets/htaccess_walk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_response"
+path = "fuzz_targets/proxy_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rewrite_expr"
+path = "fuzz_targets/rewrite_expr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_frames"
+path = "fuzz_targets/h2_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cache_metadata"
+path = "fuzz_targets/cache_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_policy"
+path = "fuzz_targets/tls_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ocsp_der"
+path = "fuzz_targets/ocsp_der.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
 

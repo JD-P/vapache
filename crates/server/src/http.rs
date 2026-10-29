@@ -6,8 +6,8 @@
 //! allow-list token check for methods and header names.  These are the
 //! parsing rules that httpd's own security advisories keep returning to.
 
-use crate::util::{trim_ascii, with_http_date_now};
 use crate::resource::{ResourceBudget, SpoolLease};
+use crate::util::{trim_ascii, with_http_date_now};
 use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -306,7 +306,8 @@ pub fn read_request<R: Read + Write>(
             )));
         }
         let mut chunk = [0u8; 8192];
-        match stream.read(&mut chunk) {
+        let read = crate::fault::hit("http.head.read").and_then(|()| stream.read(&mut chunk));
+        match read {
             Ok(0) => {
                 if buf.is_empty() {
                     return Ok(None);
@@ -378,6 +379,7 @@ pub fn read_request<R: Read + Write>(
                         )));
                     }
                     let want = remaining.min(chunk.len() as u64) as usize;
+                    crate::fault::hit("http.body.read")?;
                     let got = stream.read(&mut chunk[..want])?;
                     if got == 0 {
                         return Err(ReadError::Io(io::Error::new(
@@ -514,6 +516,7 @@ fn read_exact_into<R: Read>(
             ));
         }
         let want = remaining.min(chunk.len());
+        crate::fault::hit("http.body.read")?;
         let got = stream.read(&mut chunk[..want])?;
         if got == 0 {
             return Err(io::Error::new(
@@ -620,6 +623,7 @@ fn read_chunked_to_file_budgeted<R: Read>(
             } else {
                 let mut chunk = [0u8; 8192];
                 let want = remaining.min(chunk.len());
+                crate::fault::hit("http.chunk.read")?;
                 let got = stream.read(&mut chunk[..want])?;
                 if got == 0 {
                     return Err(io::Error::new(
@@ -662,6 +666,7 @@ fn read_line<R: Read>(stream: &mut R, buf: &mut Vec<u8>, max: usize) -> io::Resu
             return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
         }
         let mut chunk = [0u8; 8192];
+        crate::fault::hit("http.chunk.line")?;
         let n = stream.read(&mut chunk)?;
         if n == 0 {
             return Err(io::Error::new(
@@ -1306,8 +1311,7 @@ mod tests {
         assert_eq!(limits.resource_budget.usage(), (0, 0, 0));
 
         limits.max_spool_bytes = 1024 * 1024;
-        let chunked =
-            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let chunked = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
         let first = read_request(
             &mut std::io::Cursor::new(chunked.to_vec()),
             &mut Vec::new(),

@@ -1,0 +1,88 @@
+name: quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Security-focused Clippy gate
+        run: >-
+          cargo clippy -p vapached --lib --bins --no-deps --
+          -D clippy::correctness -D clippy::suspicious
+          -D unused_must_use -A unsafe_code
+      - name: Rust and property tests
+        run: cargo test --workspace --all-targets --all-features -- --test-threads=1
+      - name: Unsafe boundary budget
+        run: python3 tests/unsafe_inventory.py
+      - name: Verification ledger and CVE matrix
+        run: |
+          python3 tests/verification_status.py
+          python3 tests/cve_matrix.py --check
+
+  verus:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Install matching Verus release
+        run: tests/ci/install_verus.sh .tools/verus
+      - name: Machine-check security kernels
+        run: python3 tests/verification_status.py --run-verus
+
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchains and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+      - name: Compile and smoke every fuzz target
+        env:
+          FUZZ_SMOKE_RUNS: 128
+        run: tests/fuzz_smoke.sh
+
+  supply-chain:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install policy tools
+        run: |
+          cargo install cargo-deny --locked
+          cargo install cargo-audit --locked
+          cargo install cargo-vet --locked
+      - name: License, source, duplicate and advisory policy
+        run: cargo deny check
+      - name: RustSec audit
+        run: cargo audit --deny warnings
+      - name: Dependency review ledger
+        run: cargo vet --locked

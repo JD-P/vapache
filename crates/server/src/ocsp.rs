@@ -378,6 +378,17 @@ fn successful_response(data: &[u8]) -> bool {
         && data[status.content_start] == 0
 }
 
+/// Bound the handwritten DER and HTTP-URL parsers with arbitrary certificate
+/// and responder material.  No network access occurs in this entry point.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_ocsp_parsers(data: &[u8]) {
+    let _ = parse_cert(data);
+    let _ = successful_response(data);
+    if let Ok(text) = std::str::from_utf8(data) {
+        let _ = parse_http_url(text);
+    }
+}
+
 fn cache() -> &'static Mutex<HashMap<Vec<u8>, Vec<u8>>> {
     static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Vec<u8>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))

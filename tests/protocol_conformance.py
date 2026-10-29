@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""External HTTP/2 and TLS protocol checks against a real vapached process."""
+
+import argparse
+import os
+import socket
+import ssl
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target/release/vapached"))
+
+
+def free_port():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def wait_for_port(port, process):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"vapached exited with {process.returncode}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.05)
+    raise RuntimeError("timed out waiting for vapached")
+
+
+def start_tls_server(base):
+    base = Path(base)
+    (base / "logs").mkdir()
+    (base / "www").mkdir()
+    (base / "www/index.html").write_text("vapache protocol test\n")
+    cert = base / "cert.pem"
+    key = base / "key.pem"
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-days", "1", "-subj", "/CN=localhost", "-keyout", str(key),
+        "-out", str(cert),
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    port = free_port()
+    config = base / "httpd.conf"
+    config.write_text(f'''ServerRoot "{base}"
+Listen 127.0.0.1:{port}
+PidFile "{base}/logs/vapached.pid"
+ErrorLog "{base}/logs/error.log"
+ServerName localhost
+TraceEnable Off
+Protocols h2 http/1.1
+DocumentRoot "{base}/www"
+<Directory "{base}/www">
+    AllowOverride None
+    Require all granted
+</Directory>
+<VirtualHost *:{port}>
+    ServerName localhost
+    SSLEngine On
+    SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
+    SSLCertificateFile "{cert}"
+    SSLCertificateKeyFile "{key}"
+    DocumentRoot "{base}/www"
+</VirtualHost>
+''')
+    output = (base / "logs/process.log").open("wb")
+    process = subprocess.Popen(
+        [str(VAPACHED), "-f", str(config), "-DFOREGROUND"],
+        cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
+    )
+    try:
+        wait_for_port(port, process)
+    except Exception:
+        process.terminate()
+        process.wait(timeout=5)
+        output.close()
+        raise
+    return process, output, port
+
+
+def tls_connection(port, minimum, maximum, alpn=None):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.minimum_version = minimum
+    context.maximum_version = maximum
+    if alpn:
+        context.set_alpn_protocols(alpn)
+    raw = socket.create_connection(("127.0.0.1", port), timeout=3)
+    return context.wrap_socket(raw, server_hostname="localhost")
+
+
+def check_tls(port):
+    for version in (ssl.TLSVersion.TLSv1, ssl.TLSVersion.TLSv1_1):
+        try:
+            connection = tls_connection(port, version, version)
+        except (ssl.SSLError, OSError):
+            continue
+        connection.close()
+        raise AssertionError(f"legacy protocol {version.name} was accepted")
+
+    for version in (ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3):
+        with tls_connection(port, version, version) as connection:
+            assert connection.version() in {"TLSv1.2", "TLSv1.3"}
+
+    with tls_connection(
+        port, ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.MAXIMUM_SUPPORTED,
+        ["h2", "http/1.1"],
+    ) as connection:
+        assert connection.selected_alpn_protocol() == "h2"
+    print("protocol-conformance: TLS versions and ALPN pass")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--h2spec", help="path to the h2spec executable")
+    parser.add_argument("--tls", action="store_true", help="run TLS policy checks")
+    args = parser.parse_args()
+    if not args.h2spec and not args.tls:
+        parser.error("select --h2spec or --tls")
+    if not VAPACHED.is_file():
+        raise SystemExit(f"missing vapached binary: {VAPACHED}")
+
+    with tempfile.TemporaryDirectory(prefix="vapache-protocol-") as temporary:
+        process, output, port = start_tls_server(temporary)
+        try:
+            if args.tls:
+                check_tls(port)
+            if args.h2spec:
+                subprocess.run([
+                    args.h2spec, "--tls", "--insecure", "--strict",
+                    "--host", "127.0.0.1", "--port", str(port),
+                    "--timeout", "3",
+                ], check=True, timeout=300)
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            output.close()
+
+
+if __name__ == "__main__":
+    main()

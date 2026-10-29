@@ -53,6 +53,11 @@ fn normalize_name(name: &str) -> String {
     name.trim_end_matches('.').to_ascii_lowercase()
 }
 
+fn wildcard_name_matches(name: &str, suffix: &str) -> bool {
+    name.strip_suffix(&format!(".{suffix}"))
+        .is_some_and(|prefix| !prefix.is_empty() && !prefix.contains('.'))
+}
+
 impl SniResolver {
     fn select_key(&self, name: Option<&str>) -> Arc<CertifiedKey> {
         let Some(name) = name else {
@@ -63,10 +68,8 @@ impl SniResolver {
             return current_key(key);
         }
         for (suffix, key) in &self.wildcards {
-            if let Some(prefix) = name.strip_suffix(&format!(".{suffix}")) {
-                if !prefix.is_empty() && !prefix.contains('.') {
-                    return current_key(key);
-                }
+            if wildcard_name_matches(&name, suffix) {
+                return current_key(key);
             }
         }
         current_key(&self.default)
@@ -80,6 +83,8 @@ impl ResolvesServerCert for SniResolver {
 }
 
 fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
+    crate::fault::hit("tls.cert.read")
+        .map_err(|e| format!("cannot open certificate {}: {e}", path.display()))?;
     let data = std::fs::read(path)
         .map_err(|e| format!("cannot open certificate {}: {e}", path.display()))?;
     let certs = CertificateDer::pem_slice_iter(&data)
@@ -92,6 +97,8 @@ fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
 }
 
 fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
+    crate::fault::hit("tls.key.read")
+        .map_err(|e| format!("cannot open private key {}: {e}", path.display()))?;
     let data = std::fs::read(path)
         .map_err(|e| format!("cannot open private key {}: {e}", path.display()))?;
     PrivateKeyDer::from_pem_slice(&data).map_err(|e| match e {
@@ -249,6 +256,22 @@ fn protocol_versions(spec: Option<&str>) -> Result<Vec<&'static SupportedProtoco
         out.push(&rustls::version::TLS13);
     }
     Ok(out)
+}
+
+/// Exercise the vapache-owned SNI normalization/wildcard and TLS protocol
+/// policy parsers.  rustls itself has separate cryptographic fuzzing; this
+/// target covers the configuration-to-resolver boundary specific to vapache.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_tls_policy(data: &[u8]) {
+    let Ok(text) = std::str::from_utf8(data) else {
+        return;
+    };
+    let normalized = normalize_name(text);
+    let _ = protocol_versions(Some(text));
+    for raw_suffix in text.split(|ch: char| ch.is_ascii_whitespace() || ch == ',') {
+        let suffix = normalize_name(raw_suffix.trim_start_matches("*."));
+        let _ = wildcard_name_matches(&normalized, &suffix);
+    }
 }
 
 fn vhost_applies(v: &VHost, port: u16, local_ip: Option<IpAddr>) -> bool {
@@ -463,6 +486,27 @@ mod tests {
             ..SslConfig::default()
         };
         assert!(load_key(&ssl, &provider, None).is_err());
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn injected_certificate_and_key_reads_fail_closed() {
+        let dir = tempdir("read-failpoints");
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, b"not reached").unwrap();
+        std::fs::write(&key, b"not reached").unwrap();
+
+        crate::fault::configure("tls.cert.read", 0, std::io::ErrorKind::PermissionDenied);
+        assert!(read_certs(&cert)
+            .unwrap_err()
+            .contains("injected failure at tls.cert.read"));
+
+        crate::fault::configure("tls.key.read", 0, std::io::ErrorKind::PermissionDenied);
+        assert!(read_key(&key)
+            .unwrap_err()
+            .contains("injected failure at tls.key.read"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

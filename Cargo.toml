@@ -4,7 +4,7 @@ members = [
     "crates/verified",
     "crates/server",
 ]
-exclude = ["fuzz"]
+exclude = ["fuzz", "vendor/h2-0.4.20"]
 
 [workspace.package]
 version = "0.1.0"

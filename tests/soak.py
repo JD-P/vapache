@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Concurrent valid/malformed connection soak with an RSS-growth ceiling."""
+
+import os
+import random
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target/release/vapached"))
+DURATION = int(os.environ.get("SOAK_SECONDS", "30"))
+WORKERS = int(os.environ.get("SOAK_WORKERS", "24"))
+
+
+def free_port():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def rss_kib(pid):
+    for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1])
+    return 0
+
+
+def health(port):
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as stream:
+        stream.sendall(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        response = stream.recv(4096)
+    return b" 200 " in response
+
+
+def worker(port, stop, failures, seed):
+    randomizer = random.Random(seed)
+    requests = [
+        b"GET /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        b"GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        b"GET /one HTTP/1.1\r\nHost: localhost\r\n\r\nGET /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        b"GET / HTTP/1.1\nHost: localhost\n\n",
+    ]
+    while not stop.is_set():
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1) as stream:
+                request = randomizer.choice(requests)
+                split = randomizer.randrange(1, len(request) + 1)
+                stream.sendall(request[:split])
+                if split < len(request) and randomizer.random() > 0.2:
+                    stream.sendall(request[split:])
+                stream.settimeout(0.2)
+                try:
+                    while stream.recv(4096):
+                        pass
+                except (socket.timeout, ConnectionError, OSError):
+                    pass
+        except OSError:
+            if not stop.is_set():
+                failures.append("connection failure")
+
+
+def main():
+    if not VAPACHED.is_file():
+        raise SystemExit(f"missing vapached binary: {VAPACHED}")
+    with tempfile.TemporaryDirectory(prefix="vapache-soak-") as temporary:
+        base = Path(temporary)
+        (base / "logs").mkdir()
+        (base / "www").mkdir()
+        (base / "www/index.html").write_text("healthy\n")
+        port = free_port()
+        config = base / "httpd.conf"
+        config.write_text(f'''ServerRoot "{base}"
+Listen 127.0.0.1:{port}
+PidFile "{base}/logs/vapached.pid"
+ErrorLog "{base}/logs/error.log"
+ServerName localhost
+TraceEnable Off
+KeepAlive On
+VapacheMaxSpoolBytes 16777216
+VapacheMaxSpoolFiles 16
+VapacheMaxDynamicRequests 8
+DocumentRoot "{base}/www"
+<Directory "{base}/www">
+    AllowOverride None
+    Require all granted
+</Directory>
+''')
+        with (base / "logs/process.log").open("wb") as output:
+            process = subprocess.Popen(
+                [str(VAPACHED), "-f", str(config), "-DFOREGROUND"],
+                cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    try:
+                        if health(port):
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(0.05)
+                else:
+                    raise AssertionError("vapached did not become healthy")
+                baseline = rss_kib(process.pid)
+                stop = threading.Event()
+                failures = []
+                workers = [
+                    threading.Thread(target=worker, args=(port, stop, failures, index), daemon=True)
+                    for index in range(WORKERS)
+                ]
+                for thread in workers:
+                    thread.start()
+                time.sleep(DURATION)
+                stop.set()
+                for thread in workers:
+                    thread.join(timeout=2)
+                assert process.poll() is None, "vapached died during soak"
+                assert health(port), "vapached failed post-soak health check"
+                growth = max(0, rss_kib(process.pid) - baseline)
+                assert growth < 256 * 1024, f"RSS grew by {growth} KiB"
+                assert len(failures) < WORKERS * 4, f"excess connection failures: {len(failures)}"
+                print(f"soak: pass ({DURATION}s, {WORKERS} workers, RSS +{growth} KiB)")
+            finally:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
+
+if __name__ == "__main__":
+    main()

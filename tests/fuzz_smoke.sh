@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+
+if ! cargo +nightly fuzz --version >/dev/null 2>&1; then
+    echo "fuzz-smoke: cargo-fuzz is required" >&2
+    exit 2
+fi
+cargo +nightly --version >/dev/null
+cargo check --manifest-path fuzz/Cargo.toml
+
+runs=${FUZZ_SMOKE_RUNS:-64}
+corpus_root=$(mktemp -d /tmp/vapache-fuzz-smoke.XXXXXX)
+trap 'rm -rf "$corpus_root"' EXIT INT TERM
+targets=${FUZZ_TARGETS:-"http_request http_connection config_sections config_compile htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response h2_frames cache_metadata tls_policy ocsp_der"}
+
+for target in $targets; do
+    mkdir "$corpus_root/$target"
+    cp "fuzz/corpus/$target"/* "$corpus_root/$target/"
+    dictionary=
+    [ ! -f "fuzz/dictionaries/$target.dict" ] \
+        || dictionary="-dict=fuzz/dictionaries/$target.dict"
+    cargo +nightly fuzz run "$target" "$corpus_root/$target" -- \
+        -runs="$runs" -timeout=5 -max_len=262144 $dictionary
+done

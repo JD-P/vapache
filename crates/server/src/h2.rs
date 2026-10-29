@@ -850,6 +850,44 @@ fn h2_task_end(
     }
 }
 
+/// Feed arbitrary wire bytes through the patched h2 state machine.  This is
+/// deliberately bounded: malformed inputs must terminate promptly rather
+/// than parking a fuzz worker on an incomplete connection.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_h2_frames(data: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::{timeout, Duration};
+
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+    else {
+        return;
+    };
+    let input = data[..data.len().min(256 * 1024)].to_vec();
+    runtime.block_on(async move {
+        let capacity = input.len().clamp(1024, 256 * 1024);
+        let (mut raw_client, server_io) = tokio::io::duplex(capacity);
+        let writer = tokio::spawn(async move {
+            let _ = raw_client.write_all(&input).await;
+            let _ = raw_client.shutdown().await;
+        });
+        if let Ok(Ok(mut connection)) =
+            timeout(Duration::from_millis(20), h2::server::handshake(server_io)).await
+        {
+            for _ in 0..16 {
+                match timeout(Duration::from_millis(2), connection.accept()).await {
+                    Ok(Some(Ok((_request, mut respond)))) => {
+                        respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    }
+                    Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+                }
+            }
+        }
+        let _ = writer.await;
+    });
+}
+
 pub async fn serve(
     cfg: Arc<Config>,
     logger: Arc<Logger>,
