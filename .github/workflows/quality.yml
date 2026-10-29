@@ -21,7 +21,7 @@ jobs:
   rust:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
       - uses: actions/cache@v4
@@ -50,7 +50,7 @@ jobs:
   verus:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
       - name: Install matching Verus release
@@ -61,7 +61,7 @@ jobs:
   fuzz-smoke:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchains and cargo-fuzz
         run: |
           rustup toolchain install nightly --profile minimal
@@ -74,7 +74,7 @@ jobs:
   supply-chain:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install policy tools
         run: |
           cargo install cargo-deny --locked
