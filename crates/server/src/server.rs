@@ -474,6 +474,9 @@ fn handle_connection<C: Conn + ResponseWrite>(
         body_timeout: cfg.request_body_timeout.max(Duration::from_secs(1)),
         header_min_rate: cfg.request_header_min_rate,
         body_min_rate: cfg.request_body_min_rate,
+        resource_budget: cfg.resource_budget.clone(),
+        max_spool_bytes: cfg.max_spool_bytes,
+        max_spool_files: cfg.max_spool_files,
     };
     // `Time out` applies to the first request; idle keep-alive connections use
     // `KeepAliveTimeout`.  Set the socket option once per connection instead of
@@ -2823,6 +2826,7 @@ fn dispatch_inner(
                 scope,
                 &root,
                 &url_path,
+                &fs_path,
                 actual_path.as_ref(),
                 name,
             ) {
@@ -3413,7 +3417,7 @@ fn run_fastcgi(
         .unwrap_or(lexical_script_url);
     let proxy_identity = format!(
         "lexical={}|authorized={}",
-        target.script_filename.display(),
+        target.script_filename().display(),
         authorized_path.display()
     );
     let (target_grant, target_resource, target_scope) = match authorize_resolved_target(
@@ -5412,7 +5416,7 @@ mod tests {
         assert!(matches!(resp.status, 500 | 502 | 503), "{}", resp.status);
 
         let mut missing_target = target.clone();
-        missing_target.script_filename = dir.join("www/missing.php");
+        missing_target.replace_script_filename_for_test(dir.join("www/missing.php"));
         let resp = run_fastcgi(
             &cfg,
             None,

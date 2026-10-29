@@ -152,8 +152,10 @@ pub(crate) fn tokenize_config(s: &str) -> Result<Vec<String>, String> {
             } else if b[i] == b'"' || b[i] == b'\'' {
                 quote = b[i];
             } else if b[i] == b'>' {
+                // Apache permits an unquoted comparison operator in
+                // `<IfVersion >= 2.4>`. The closing delimiter is therefore
+                // the last unquoted `>`, not necessarily the first one.
                 end = Some(i);
-                break;
             }
         }
         let end = end.ok_or("unterminated section tag")?;
@@ -245,6 +247,10 @@ mod tests {
         assert_eq!(tokenize("\"^\\.ht\"").unwrap(), vec!["^\\.ht"]);
         assert_eq!(tokenize("\"a \\\"b\\\"\"").unwrap(), vec!["a \"b\""]);
         assert!(tokenize("\"unterminated").is_err());
+        assert_eq!(
+            tokenize_config("<IfVersion >= 2.4>").unwrap(),
+            vec!["<IfVersion", ">=", "2.4"]
+        );
     }
 
     #[test]

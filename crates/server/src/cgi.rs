@@ -283,6 +283,17 @@ pub(crate) fn build_env(ctx: &CgiContext) -> Vec<(OsString, OsString)> {
 }
 
 pub fn execute(ctx: &CgiContext) -> Response {
+    let _dynamic_lease = match ctx
+        .cfg
+        .resource_budget
+        .try_dynamic(ctx.cfg.max_dynamic_requests)
+    {
+        Ok(lease) => lease,
+        Err(e) => {
+            eprintln!("vapached: CGI admission failed: {e}");
+            return cgi_status_error(ctx, 503);
+        }
+    };
     let original_path = ctx.root.join(ctx.script_rel);
     let cwd = original_path
         .parent()
@@ -360,6 +371,27 @@ fn execute_via_pool(
     body: &BodySource,
     expected: Option<(u64, u64)>,
 ) -> Option<Response> {
+    let _worker_spool_lease = match body {
+        BodySource::File(_) => {
+            let mut lease = match ctx
+                .cfg
+                .resource_budget
+                .try_spool(ctx.cfg.max_spool_bytes, ctx.cfg.max_spool_files)
+            {
+                Ok(lease) => lease,
+                Err(e) => {
+                    eprintln!("vapached: CGI worker spool admission failed: {e}");
+                    return Some(cgi_status_error(ctx, 503));
+                }
+            };
+            if let Err(e) = lease.reserve(body.len()) {
+                eprintln!("vapached: CGI worker spool admission failed: {e}");
+                return Some(cgi_status_error(ctx, 503));
+            }
+            Some(lease)
+        }
+        BodySource::Bytes(_) => None,
+    };
     let mut worker = pool.take()?;
     match exchange(
         &mut worker.stream,
@@ -389,11 +421,15 @@ fn execute_via_pool(
 }
 
 fn cgi_error(ctx: &CgiContext) -> Response {
+    cgi_status_error(ctx, 500)
+}
+
+fn cgi_status_error(ctx: &CgiContext, status: u16) -> Response {
     crate::files::error_response(
         ctx.cfg,
         ctx.vhost,
         &crate::config::Scope::default(),
-        500,
+        status,
         ctx.req,
         ctx.script_name,
         ctx.local_port,
@@ -1226,6 +1262,11 @@ fn canonical_header_name(lname: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("-")
+}
+
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_parse_cgi_response(data: &[u8]) {
+    let _ = parse_cgi_response(data, Version::Http11);
 }
 
 fn split_cgi_head(data: &[u8]) -> Option<(&[u8], &[u8])> {

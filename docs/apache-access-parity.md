@@ -25,8 +25,9 @@ authorization scope.
 `tests/config_semantics.py` is the live oracle.  It starts Apache and VApache
 with paired configurations, sends the same requests, and compares outcomes.
 `tests/coverage.sh` runs its fixed corpus plus 128 deterministic generated ACL
-cases.  P15 adds PCRE expression and `mod_remoteip` chain cases.  The
-end-to-end P15 cases in `tests/adversarial_regressions.py` independently pin
+cases. P15 adds PCRE expression and `mod_remoteip` chain cases; P18 adds the
+independent section-command gates for `AllowOverrideList`. The end-to-end
+P15/P17 cases in `tests/adversarial_regressions.py` independently pin
 FastCGI lexical/canonical identity, canonical-target authorization, trusted
 proxy address handling, and fail-closed expression behavior.
 
@@ -40,6 +41,11 @@ The corresponding production decisions are small Verus kernels:
 - `fastcgi_script_identity_admit` requires the backend identity to bind both
   the lexical path sent as `SCRIPT_FILENAME` and the canonical path used for
   containment and authorization.
+- `fastcgi_resolved_target_admit` requires the `SetHandler` resolved-file
+  constructor to bind its lexical basename and wire path independently from
+  the canonical authorized target.
+- `htaccess_section_admit` makes a section command's category or exact
+  `AllowOverrideList "<Section"` entry independent from any listed child.
 
 The RemoteIP model was derived from Apache 2.4.69
 [`mod_remoteip.c`](https://github.com/apache/httpd/blob/2.4.69/modules/metadata/mod_remoteip.c).
@@ -89,9 +95,12 @@ That audit closed these additional refinement failures:
   `Require all`, negative providers in OR contexts and authorization sections
   containing only negative providers are rejected like Apache.
 
-`tests/config_semantics.py` contains 237 fixed paired cases after this audit,
-including 25 source-derived additions. The two newest cases exercise content
-type and environment policy across lexical and canonical symlink identities.
+`tests/config_semantics.py` contains 339 fixed paired cases after this audit,
+including 127 source-derived additions. The newest 96-case matrix exercises
+every supported access-file wrapper under child-only and exact command lists,
+`Nonfatal=Override`, and the AuthConfig/FileInfo/Limit masks. It also pins
+execute-on-read nonfatal behavior, nested authorization-container admission,
+and `<IfVersion >= ...>` tokenization to the Apache binary oracle.
 `tests/config_validity.py` pins the corresponding load-time rejection rules.
 Unsupported expression forms or directive ownership that cannot be
 represented exactly fail configuration loading; they are not converted into

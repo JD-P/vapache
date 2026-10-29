@@ -720,10 +720,15 @@ fn stable_access_snapshot(
         .file
         .metadata()
         .map_err(|e| format!("{}: {e}", path.display()))?;
+    let current_after = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !vapache_verified::descriptor_snapshot_admit(
-        before.is_file() && after.is_file(),
-        before.dev() == after.dev() && before.ino() == after.ino(),
-        same_access_file_version(&before, &after),
+        before.is_file() && after.is_file() && current_after.is_file(),
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.dev() == current_after.dev()
+            && before.ino() == current_after.ino(),
+        same_access_file_version(&before, &after)
+            && same_access_file_version(&before, &current_after),
         data.len() as u64 <= MAX_HTACCESS,
     ) {
         return Err(format!(
@@ -873,6 +878,133 @@ fn parse_access_bytes(
     })
 }
 
+/// Closed set of access-file sections understood by the effectful parser.
+/// Parsing and dispatch both consume this enum, so a new supported wrapper
+/// cannot bypass the section-command override gate by being added to a second
+/// string match (P18).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccessSectionKind {
+    Files = 0,
+    FilesMatch = 1,
+    If = 2,
+    IfFile = 3,
+    ElseIf = 4,
+    Else = 5,
+    IfModule = 6,
+    IfDefine = 7,
+    IfDirective = 8,
+    IfSection = 9,
+    IfVersion = 10,
+    RequireAll = 11,
+    RequireAny = 12,
+    RequireNone = 13,
+    Limit = 14,
+    LimitExcept = 15,
+}
+
+impl AccessSectionKind {
+    #[cfg(test)]
+    const ALL: [Self; 16] = [
+        Self::Files,
+        Self::FilesMatch,
+        Self::If,
+        Self::IfFile,
+        Self::ElseIf,
+        Self::Else,
+        Self::IfModule,
+        Self::IfDefine,
+        Self::IfDirective,
+        Self::IfSection,
+        Self::IfVersion,
+        Self::RequireAll,
+        Self::RequireAny,
+        Self::RequireNone,
+        Self::Limit,
+        Self::LimitExcept,
+    ];
+
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "files" => Self::Files,
+            "filesmatch" => Self::FilesMatch,
+            "if" => Self::If,
+            "iffile" => Self::IfFile,
+            "elseif" => Self::ElseIf,
+            "else" => Self::Else,
+            "ifmodule" => Self::IfModule,
+            "ifdefine" => Self::IfDefine,
+            "ifdirective" => Self::IfDirective,
+            "ifsection" => Self::IfSection,
+            "ifversion" => Self::IfVersion,
+            "requireall" => Self::RequireAll,
+            "requireany" => Self::RequireAny,
+            "requirenone" => Self::RequireNone,
+            "limit" => Self::Limit,
+            "limitexcept" => Self::LimitExcept,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Files => "files",
+            Self::FilesMatch => "filesmatch",
+            Self::If => "if",
+            Self::IfFile => "iffile",
+            Self::ElseIf => "elseif",
+            Self::Else => "else",
+            Self::IfModule => "ifmodule",
+            Self::IfDefine => "ifdefine",
+            Self::IfDirective => "ifdirective",
+            Self::IfSection => "ifsection",
+            Self::IfVersion => "ifversion",
+            Self::RequireAll => "requireall",
+            Self::RequireAny => "requireany",
+            Self::RequireNone => "requirenone",
+            Self::Limit => "limit",
+            Self::LimitExcept => "limitexcept",
+        }
+    }
+
+    fn allowed_in_limit(self) -> bool {
+        matches!(
+            self,
+            Self::Limit
+                | Self::LimitExcept
+                | Self::RequireAll
+                | Self::RequireAny
+                | Self::RequireNone
+                | Self::IfModule
+                | Self::IfDefine
+                | Self::IfDirective
+                | Self::IfSection
+                | Self::IfVersion
+        )
+    }
+}
+
+/// Admission for access-file section commands. Apache applies the section's
+/// own override mask (or an exact `AllowOverrideList "<Section"` entry)
+/// before examining the directives nested inside it.
+fn section_allowed_list(
+    mode: OverrideMode,
+    allow_list: &[String],
+    section: AccessSectionKind,
+) -> bool {
+    let category_allowed = vapache_verified::htaccess_section_category_admit(
+        section as u8,
+        mode.is_enabled(),
+        mode.allows(OverrideCategory::AuthConfig),
+        mode.allows(OverrideCategory::Limit),
+    );
+    let command_name = format!("<{}", section.name());
+    let section_listed = allow_list
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&command_name));
+    vapache_verified::htaccess_section_admit(category_allowed, section_listed)
+}
+
 fn parse_block(
     cfg: &Config,
     lines: &[String],
@@ -907,79 +1039,129 @@ fn parse_block(
                 };
             }
             crate::config_frontend::ConfigLine::SectionStart { name, args } => {
-                if limit.is_some()
-                    && !matches!(
-                        name.as_str(),
-                        "limit"
-                            | "limitexcept"
-                            | "requireall"
-                            | "requireany"
-                            | "requirenone"
-                            | "ifmodule"
-                            | "ifdefine"
-                            | "ifdirective"
-                            | "ifsection"
-                            | "ifversion"
-                    )
-                {
+                // Apache gates the section command itself before it parses
+                // any child directives. AllowOverrideList names are not a
+                // union over arbitrary wrappers: listing `Require` does not
+                // implicitly admit `<Files>`, `<If>` or `<RequireAll>` (P18).
+                let section = AccessSectionKind::parse(&name);
+                let policy_allowed = section
+                    .map(|kind| {
+                        // Apache's authz-core parser owns nested authorization
+                        // containers once the outer Require section command
+                        // has been admitted. Directives inside still pass the
+                        // ordinary AllowOverride/List gate below.
+                        (require_only
+                            && matches!(
+                                kind,
+                                AccessSectionKind::RequireAll
+                                    | AccessSectionKind::RequireAny
+                                    | AccessSectionKind::RequireNone
+                            ))
+                            || section_allowed_list(mode, allow_list, kind)
+                    })
+                    // Unknown commands have no override category; pass the
+                    // policy stage so the independent Unknown/Nonfatal gate
+                    // decides whether to skip or reject them.
+                    .unwrap_or(true);
+                match vapache_verified::htaccess_gate_admit(
+                    policy_allowed,
+                    section.is_some(),
+                    section
+                        .map(|kind| {
+                            vapache_verified::htaccess_section_nonfatal_override_admit(
+                                kind as u8,
+                                nonfatal.allows_override(),
+                            )
+                        })
+                        .unwrap_or(nonfatal.allows_override()),
+                    nonfatal.allows_unknown(),
+                ) {
+                    1 => {
+                        skip_section(lines, i, &name)?;
+                        continue;
+                    }
+                    2 => {
+                        if section.is_some() {
+                            return Err(format!(
+                                "line {}: <{name}> is not allowed by AllowOverride",
+                                *i
+                            ));
+                        }
+                        return Err(format!(
+                            "line {}: unsupported .htaccess section <{name}>",
+                            *i
+                        ));
+                    }
+                    _ => {}
+                }
+                let section = section.expect("known section passed the admission gate");
+                if limit.is_some() && !section.allowed_in_limit() {
                     return Err(format!(
                         "line {}: <{name}> is not allowed inside a method-limited section",
                         *i
                     ));
                 }
-                match name.as_str() {
-                    "if" | "iffile" | "elseif" | "else" => {
-                        // Apache applies the override category to the directives
-                        // inside an <If> section, not to the section itself.
+                match section {
+                    AccessSectionKind::If
+                    | AccessSectionKind::IfFile
+                    | AccessSectionKind::ElseIf
+                    | AccessSectionKind::Else => {
+                        // The wrapper was admitted above; its children still
+                        // pass through their own directive/section gates.
                         if require_only {
                             return Err(format!("line {}: <{name}> is not allowed here", *i));
                         }
-                        let (branch, chain, condition) = if name == "if" || name == "iffile" {
-                            let expression = if name == "if" {
-                                let parsed = crate::expr::parse(&args.join(" "))
-                                    .map_err(|e| format!("line {}: {e}", *i))?;
-                                // F63/I63: unknown variables fail closed.
-                                crate::expr::validate_vars(&parsed)
-                                    .map_err(|e| format!("line {}: {e}", *i))?;
-                                parsed
+                        let (branch, chain, condition) =
+                            if matches!(section, AccessSectionKind::If | AccessSectionKind::IfFile)
+                            {
+                                let expression = if section == AccessSectionKind::If {
+                                    let parsed = crate::expr::parse(&args.join(" "))
+                                        .map_err(|e| format!("line {}: {e}", *i))?;
+                                    // F63/I63: unknown variables fail closed.
+                                    crate::expr::validate_vars(&parsed)
+                                        .map_err(|e| format!("line {}: {e}", *i))?;
+                                    parsed
+                                } else {
+                                    // SectionStart.args excludes the <IfFile> tag
+                                    // itself, so the operator path is the first
+                                    // argument.  A second word is a no-op count
+                                    // operand like in mod_rewrite's <If>/<IfFile>
+                                    // grammar; Apache tests the first word too.
+                                    let path = args.first().cloned().unwrap_or_default();
+                                    crate::expr::Expr::FileTest(
+                                        "-F".into(),
+                                        Box::new(crate::expr::Expr::Str(path)),
+                                    )
+                                };
+                                let chain = *next_chain;
+                                *next_chain += 1;
+                                current_chain = Some(chain);
+                                (ConditionBranch::Normal, Some(chain), Some(expression))
                             } else {
-                                // SectionStart.args excludes the <IfFile> tag
-                                // itself, so the operator path is the first
-                                // argument.  A second word is a no-op count
-                                // operand like in mod_rewrite's <If>/<IfFile>
-                                // grammar; Apache tests the first word too.
-                                let path = args.first().cloned().unwrap_or_default();
-                                crate::expr::Expr::FileTest(
-                                    "-F".into(),
-                                    Box::new(crate::expr::Expr::Str(path)),
-                                )
-                            };
-                            let chain = *next_chain;
-                            *next_chain += 1;
-                            current_chain = Some(chain);
-                            (ConditionBranch::Normal, Some(chain), Some(expression))
-                        } else {
-                            let Some(chain) = current_chain else {
-                                return Err(format!("line {}: <{name}> has no preceding <If>", *i));
-                            };
-                            if name == "elseif" {
-                                let expression = crate::expr::parse(&args.join(" "))
-                                    .map_err(|e| format!("line {}: {e}", *i))?;
-                                // F63/I63: unknown variables fail closed.
-                                crate::expr::validate_vars(&expression)
-                                    .map_err(|e| format!("line {}: {e}", *i))?;
-                                (ConditionBranch::ElseIf, Some(chain), Some(expression))
-                            } else {
-                                if args.len() > 1 {
+                                let Some(chain) = current_chain else {
                                     return Err(format!(
-                                        "line {}: <Else> does not take arguments",
+                                        "line {}: <{name}> has no preceding <If>",
                                         *i
                                     ));
+                                };
+                                if section == AccessSectionKind::ElseIf {
+                                    let expression = crate::expr::parse(&args.join(" "))
+                                        .map_err(|e| format!("line {}: {e}", *i))?;
+                                    // F63/I63: unknown variables fail closed.
+                                    crate::expr::validate_vars(&expression)
+                                        .map_err(|e| format!("line {}: {e}", *i))?;
+                                    (ConditionBranch::ElseIf, Some(chain), Some(expression))
+                                } else {
+                                    if args.len() > 1 {
+                                        return Err(format!(
+                                            "line {}: <Else> does not take arguments",
+                                            *i
+                                        ));
+                                    }
+                                    current_chain = None;
+                                    (ConditionBranch::Else, Some(chain), None)
                                 }
-                                current_chain = None;
-                                (ConditionBranch::Else, Some(chain), None)
-                            }
-                        };
+                            };
                         let mut inner = Scope::default();
                         let mut inner_rules = Vec::new();
                         parse_block(
@@ -1007,27 +1189,9 @@ fn parse_block(
                             nested: inner_rules,
                         });
                     }
-                    "requireall" | "requireany" | "requirenone" => {
-                        let policy_allowed =
-                            mode.allows(OverrideCategory::AuthConfig) || !allow_list.is_empty();
-                        match vapache_verified::htaccess_gate_admit(
-                            policy_allowed,
-                            true,
-                            nonfatal.allows_override(),
-                            nonfatal.allows_unknown(),
-                        ) {
-                            1 => {
-                                skip_section(lines, i, &name)?;
-                                continue;
-                            }
-                            2 => {
-                                return Err(format!(
-                                    "line {}: <{name}> is not allowed by AllowOverride",
-                                    *i
-                                ));
-                            }
-                            _ => {}
-                        }
+                    AccessSectionKind::RequireAll
+                    | AccessSectionKind::RequireAny
+                    | AccessSectionKind::RequireNone => {
                         let mut inner = Scope::default();
                         let mut inner_rules = Vec::new();
                         parse_block(
@@ -1060,14 +1224,14 @@ fn parse_block(
                             nodes.push(entry.node);
                         }
                         if !nodes.is_empty() {
-                            let invalid_negative = match name.as_str() {
-                                "requireall" => {
+                            let invalid_negative = match section {
+                                AccessSectionKind::RequireAll => {
                                     !nodes.iter().any(|node| !require_node_is_negative(node))
                                 }
-                                "requireany" | "requirenone" => {
+                                AccessSectionKind::RequireAny | AccessSectionKind::RequireNone => {
                                     nodes.iter().any(require_node_is_negative)
                                 }
-                                _ => false,
+                                _ => unreachable!(),
                             };
                             if invalid_negative {
                                 return Err(format!(
@@ -1075,10 +1239,11 @@ fn parse_block(
                                     *i
                                 ));
                             }
-                            let node = match name.as_str() {
-                                "requireall" => RequireNode::All(nodes),
-                                "requireany" => RequireNode::Any(nodes),
-                                _ => RequireNode::None(nodes),
+                            let node = match section {
+                                AccessSectionKind::RequireAll => RequireNode::All(nodes),
+                                AccessSectionKind::RequireAny => RequireNode::Any(nodes),
+                                AccessSectionKind::RequireNone => RequireNode::None(nodes),
+                                _ => unreachable!(),
                             };
                             if !require_only && require_node_is_negative(&node) {
                                 return Err(format!(
@@ -1089,30 +1254,9 @@ fn parse_block(
                             scope.add_require(node, limit);
                         }
                     }
-                    "limit" | "limitexcept" => {
+                    AccessSectionKind::Limit | AccessSectionKind::LimitExcept => {
                         if require_only {
                             return Err(format!("line {}: <{name}> is not allowed here", *i));
-                        }
-                        let policy_allowed = mode.allows(OverrideCategory::AuthConfig)
-                            || mode.allows(OverrideCategory::Limit)
-                            || !allow_list.is_empty();
-                        match vapache_verified::htaccess_gate_admit(
-                            policy_allowed,
-                            true,
-                            nonfatal.allows_override(),
-                            nonfatal.allows_unknown(),
-                        ) {
-                            1 => {
-                                skip_section(lines, i, &name)?;
-                                continue;
-                            }
-                            2 => {
-                                return Err(format!(
-                                    "line {}: <{name}> is not allowed by AllowOverride",
-                                    *i
-                                ));
-                            }
-                            _ => {}
                         }
                         let methods = crate::config::parse_method_set_args(&name, &args, true)
                             .map_err(|e| format!("line {}: {e}", *i))?;
@@ -1147,15 +1291,13 @@ fn parse_block(
                             Some(&combined),
                         )?;
                     }
-                    "files" | "filesmatch" => {
-                        // The override category applies to the directives inside
-                        // the section, not to the section itself.
+                    AccessSectionKind::Files | AccessSectionKind::FilesMatch => {
                         if require_only {
                             return Err(format!("line {}: <{name}> is not allowed here", *i));
                         }
                         let pat = args.join(" ");
                         let kind =
-                            if name == "files" {
+                            if section == AccessSectionKind::Files {
                                 crate::config::compile_files_pattern(&args)
                                     .map_err(|e| format!("line {}: {e}", *i))?
                             } else {
@@ -1189,7 +1331,7 @@ fn parse_block(
                             nested: inner_rules,
                         });
                     }
-                    "ifmodule" => {
+                    AccessSectionKind::IfModule => {
                         let active = ifmodule_active(cfg, &args)?;
                         if active {
                             parse_block(
@@ -1210,7 +1352,7 @@ fn parse_block(
                             skip_section(lines, i, &name)?;
                         }
                     }
-                    "ifdefine" => {
+                    AccessSectionKind::IfDefine => {
                         let active =
                             named_condition_active(&args, |name| cfg.config_defines.contains(name))
                                 .map_err(|e| format!("line {}: {e}", *i))?;
@@ -1233,16 +1375,16 @@ fn parse_block(
                             skip_section(lines, i, &name)?;
                         }
                     }
-                    "ifdirective" | "ifsection" => {
+                    AccessSectionKind::IfDirective | AccessSectionKind::IfSection => {
                         let active = named_condition_active(&args, |candidate| {
-                            if name == "ifdirective" {
+                            if section == AccessSectionKind::IfDirective {
                                 cfg.directive_exists(candidate).unwrap_or(false)
                             } else {
                                 cfg.section_exists(candidate)
                             }
                         })
                         .map_err(|e| format!("line {}: {e}", *i))?;
-                        if name == "ifdirective" {
+                        if section == AccessSectionKind::IfDirective {
                             let candidate = args
                                 .first()
                                 .map(|arg| arg.trim_start_matches('!'))
@@ -1269,7 +1411,7 @@ fn parse_block(
                             skip_section(lines, i, &name)?;
                         }
                     }
-                    "ifversion" => {
+                    AccessSectionKind::IfVersion => {
                         let active = crate::config::ifversion_matches(&args)
                             .map_err(|e| format!("line {}: {e}", *i))?;
                         if active {
@@ -1289,25 +1431,6 @@ fn parse_block(
                             )?;
                         } else {
                             skip_section(lines, i, &name)?;
-                        }
-                    }
-                    _ => {
-                        match vapache_verified::htaccess_gate_admit(
-                            true,
-                            false,
-                            nonfatal.allows_override(),
-                            nonfatal.allows_unknown(),
-                        ) {
-                            1 => {
-                                skip_section(lines, i, &name)?;
-                                continue;
-                            }
-                            _ => {
-                                return Err(format!(
-                                    "line {}: unsupported .htaccess section <{name}>",
-                                    *i
-                                ));
-                            }
                         }
                     }
                 }
@@ -2202,22 +2325,16 @@ fn apply_directive(
                     args[1..].join(" "),
                 )));
         }
-        "unsetenv" => scope
-            .environment_policy
-            .unset_env
-            .extend(
-                args.iter()
-                    .cloned()
-                    .map(crate::scope_policy::Originated::access),
-            ),
-        "passenv" => scope
-            .environment_policy
-            .pass_env
-            .extend(
-                args.iter()
-                    .cloned()
-                    .map(crate::scope_policy::Originated::access),
-            ),
+        "unsetenv" => scope.environment_policy.unset_env.extend(
+            args.iter()
+                .cloned()
+                .map(crate::scope_policy::Originated::access),
+        ),
+        "passenv" => scope.environment_policy.pass_env.extend(
+            args.iter()
+                .cloned()
+                .map(crate::scope_policy::Originated::access),
+        ),
         "setenvif" | "setenvifnocase" | "browsermatch" | "browsermatchnocase" => {
             scope
                 .environment_policy
@@ -2605,8 +2722,10 @@ mod tests {
         )
         .unwrap();
         let p = parse_file(&cfg, &file, OverrideMode::All, "/").unwrap();
-        assert_eq!(p.scope.environment_policy.set_env[0].value,
-            ("STATIC".to_string(), "yes".to_string()));
+        assert_eq!(
+            p.scope.environment_policy.set_env[0].value,
+            ("STATIC".to_string(), "yes".to_string())
+        );
         assert_eq!(
             p.scope.environment_policy.set_env[0].origin,
             vapache_verified::EnvironmentOrigin::AccessFile
@@ -4217,6 +4336,64 @@ mod tests {
         )
         .is_ok());
 
+        // P18: an inner directive in AllowOverrideList never admits its
+        // section wrapper. This covers all supported section-mask families,
+        // not only the reported <Files>/<FilesMatch> spelling.
+        let require_only_list = &["require".to_string()];
+        for text in [
+            "<Files \"x\">\nRequire all granted\n</Files>\n",
+            "<FilesMatch \"^x$\">\nRequire all granted\n</FilesMatch>\n",
+            "<If \"true\">\nRequire all granted\n</If>\n",
+            "<IfFile /tmp>\nRequire all granted\n</IfFile>\n",
+            "<IfModule core_module>\nRequire all granted\n</IfModule>\n",
+            "<RequireAll>\nRequire all granted\n</RequireAll>\n",
+            "<Limit GET>\nRequire all granted\n</Limit>\n",
+        ] {
+            assert!(
+                parse(
+                    text,
+                    OverrideMode::None,
+                    NonfatalMode::None,
+                    require_only_list,
+                )
+                .is_err(),
+                "section wrapper escaped AllowOverrideList: {text:?}"
+            );
+        }
+        assert!(parse(
+            "<Files \"x\">\nRequire all granted\n</Files>\n",
+            OverrideMode::None,
+            NonfatalMode::Override,
+            require_only_list,
+        )
+        .is_ok());
+        for text in [
+            "<IfFile missing>\nRequire all granted\n</IfFile>\n",
+            "<IfModule core_module>\nRequire all granted\n</IfModule>\n",
+            "<IfDefine MISSING>\nRequire all granted\n</IfDefine>\n",
+            "<IfDirective Require>\nRequire all granted\n</IfDirective>\n",
+            "<IfSection Files>\nRequire all granted\n</IfSection>\n",
+            "<IfVersion >= 2.4>\nRequire all granted\n</IfVersion>\n",
+        ] {
+            assert!(
+                parse(
+                    text,
+                    OverrideMode::None,
+                    NonfatalMode::Override,
+                    require_only_list,
+                )
+                .is_err(),
+                "execute-on-read wrapper was incorrectly skipped: {text:?}"
+            );
+        }
+        assert!(parse(
+            "<RequireAll>\nRequire all granted\n<RequireNone>\nRequire ip 192.0.2.1\n</RequireNone>\n</RequireAll>\n",
+            OverrideMode::None,
+            NonfatalMode::None,
+            &["<requireall".to_string(), "require".to_string()],
+        )
+        .is_ok());
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4228,6 +4405,29 @@ mod tests {
             &["require".to_string()],
             "require",
             &args(&["all", "granted"])
+        ));
+        for section in AccessSectionKind::ALL {
+            assert_eq!(AccessSectionKind::parse(section.name()), Some(section));
+            assert!(
+                !section_allowed_list(OverrideMode::None, &["require".to_string()], section),
+                "{}",
+                section.name()
+            );
+        }
+        assert!(section_allowed_list(
+            OverrideMode::None,
+            &["<files".to_string()],
+            AccessSectionKind::Files,
+        ));
+        assert!(!section_allowed_list(
+            OverrideMode::None,
+            &["files".to_string()],
+            AccessSectionKind::Files,
+        ));
+        assert!(section_allowed_list(
+            OverrideMode::Categories(OverrideCategories(OverrideCategories::AUTH_CONFIG,)),
+            &[],
+            AccessSectionKind::Files,
         ));
         assert!(!directive_allowed_list(
             OverrideMode::Categories(OverrideCategories(OverrideCategories::OPT_INDEXES)),
@@ -4375,6 +4575,60 @@ mod tests {
         .expect("a changed cached descriptor must fail closed");
         assert!(error.contains("changed while it was being evaluated"));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn access_file_snapshot_survives_concurrent_atomic_path_swaps() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempdir("descriptor-race");
+        let path = dir.join(".htaccess");
+        let other = dir.join("other.htaccess");
+        let first = b"SetEnv SNAPSHOT first\n";
+        let second = b"SetEnv SNAPSHOT second\n";
+        fs::write(&path, first).unwrap();
+        fs::write(&other, second).unwrap();
+        let first_meta = fs::metadata(&path).unwrap();
+        let second_meta = fs::metadata(&other).unwrap();
+        let admitted_inodes = [
+            (first_meta.dev(), first_meta.ino()),
+            (second_meta.dev(), second_meta.ino()),
+        ];
+        let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let other_c = std::ffi::CString::new(other.as_os_str().as_encoded_bytes()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let attacker_stop = Arc::clone(&stop);
+        let attacker = std::thread::spawn(move || {
+            while !attacker_stop.load(Ordering::Relaxed) {
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_renameat2,
+                        libc::AT_FDCWD,
+                        path_c.as_ptr(),
+                        libc::AT_FDCWD,
+                        other_c.as_ptr(),
+                        libc::RENAME_EXCHANGE,
+                    )
+                };
+                assert_eq!(rc, 0);
+                std::thread::yield_now();
+            }
+        });
+
+        for _ in 0..2_000 {
+            let Some(opened) = open_access_file(&path).unwrap() else {
+                panic!("atomic exchange must keep both names present");
+            };
+            if let Ok((data, meta)) = stable_access_snapshot(&path, opened) {
+                assert!(data == first || data == second);
+                assert!(admitted_inodes.contains(&(meta.dev(), meta.ino())));
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        attacker.join().unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 

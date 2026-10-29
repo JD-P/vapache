@@ -1131,6 +1131,70 @@ pub proof fn fastcgi_identity_admission_requires_backend_parity(
 {
 }
 
+/// P17: the resolved-file `SetHandler` constructor must bind classification
+/// to the lexical basename, derive the backend wire path from that lexical
+/// mapping, and keep the separately authorized descriptor target contained.
+/// A canonical path is never sufficient as a substitute for the lexical wire
+/// identity because backends such as PHP-FPM apply policy to that spelling.
+pub open spec fn fastcgi_resolved_target_spec(
+    lexical_name_bound: bool,
+    wire_matches_lexical_mapping: bool,
+    lexical_wire_contained: bool,
+    canonical_authorized_contained: bool,
+) -> bool {
+    lexical_name_bound
+        && wire_matches_lexical_mapping
+        && lexical_wire_contained
+        && canonical_authorized_contained
+}
+
+pub fn fastcgi_resolved_target_admit(
+    lexical_name_bound: bool,
+    wire_matches_lexical_mapping: bool,
+    lexical_wire_contained: bool,
+    canonical_authorized_contained: bool,
+) -> (admit: bool)
+    ensures admit == fastcgi_resolved_target_spec(
+        lexical_name_bound,
+        wire_matches_lexical_mapping,
+        lexical_wire_contained,
+        canonical_authorized_contained,
+    ),
+{
+    lexical_name_bound
+        && wire_matches_lexical_mapping
+        && lexical_wire_contained
+        && canonical_authorized_contained
+}
+
+pub proof fn fastcgi_resolved_target_rejects_unbound_lexical_identity(
+    wire_matches_lexical_mapping: bool,
+    lexical_wire_contained: bool,
+    canonical_authorized_contained: bool,
+)
+    ensures !fastcgi_resolved_target_spec(
+        false,
+        wire_matches_lexical_mapping,
+        lexical_wire_contained,
+        canonical_authorized_contained,
+    ),
+{
+}
+
+pub proof fn fastcgi_resolved_target_rejects_canonical_wire_substitution(
+    lexical_name_bound: bool,
+    lexical_wire_contained: bool,
+    canonical_authorized_contained: bool,
+)
+    ensures !fastcgi_resolved_target_spec(
+        lexical_name_bound,
+        false,
+        lexical_wire_contained,
+        canonical_authorized_contained,
+    ),
+{
+}
+
 pub open spec fn transform_retarget_spec() -> TransformCapability {
     TransformCapability {
         target_bound: false,
@@ -1959,6 +2023,32 @@ pub fn cache_disk_size_admit(used: u64, incoming: u64, limit: u64) -> (ok: bool)
     used <= limit && incoming <= limit - used
 }
 
+/// Overflow-free aggregate admission used by spool-byte, spool-file and
+/// dynamic-backend counters.  The caller commits the exact addition with an
+/// atomic compare/exchange, retrying this predicate if the observed value
+/// changed concurrently.
+pub open spec fn resource_budget_spec(used: u64, incoming: u64, limit: u64) -> bool {
+    used <= limit && incoming <= limit - used
+}
+
+pub fn resource_budget_admit(used: u64, incoming: u64, limit: u64) -> (ok: bool)
+    ensures ok == resource_budget_spec(used, incoming, limit),
+{
+    used <= limit && incoming <= limit - used
+}
+
+pub proof fn resource_budget_admission_is_bounded(used: u64, incoming: u64, limit: u64)
+    requires resource_budget_spec(used, incoming, limit),
+    ensures used + incoming <= limit,
+{
+}
+
+pub proof fn resource_budget_rejects_exhausted(used: u64, incoming: u64)
+    requires incoming > 0,
+    ensures !resource_budget_spec(used, incoming, used),
+{
+}
+
 /// F45/I42: an expression file test must be relative, free of parent
 /// components, and (after canonicalization) beneath the document root.
 pub fn expr_file_test_admit(
@@ -2771,6 +2861,113 @@ pub fn override_mode_allows(mode: u8, categories: u32, required: u32) -> (ok: bo
 
 pub proof fn override_none_never_allows(categories: u32, required: u32)
     ensures !override_mode_allows_spec(0, categories, required),
+{
+}
+
+/// Total P18 section-family projection consumed by the runtime's closed
+/// AccessSectionKind enum. Codes 0..10 use Apache's OR_ALL mask, 11..13 are
+/// authorization containers, and 14..15 are method containers. Unknown codes
+/// are rejected rather than inheriting a permissive default.
+pub open spec fn htaccess_section_category_spec(
+    section_code: u8,
+    any_override_enabled: bool,
+    auth_config_allowed: bool,
+    limit_allowed: bool,
+) -> bool {
+    (section_code < 11 && any_override_enabled)
+        || (11 <= section_code && section_code < 14 && auth_config_allowed)
+        || (14 <= section_code
+            && section_code < 16
+            && (auth_config_allowed || limit_allowed))
+}
+
+pub fn htaccess_section_category_admit(
+    section_code: u8,
+    any_override_enabled: bool,
+    auth_config_allowed: bool,
+    limit_allowed: bool,
+) -> (admit: bool)
+    ensures admit == htaccess_section_category_spec(
+        section_code,
+        any_override_enabled,
+        auth_config_allowed,
+        limit_allowed,
+    ),
+{
+    (section_code < 11 && any_override_enabled)
+        || (11 <= section_code && section_code < 14 && auth_config_allowed)
+        || (14 <= section_code
+            && section_code < 16
+            && (auth_config_allowed || limit_allowed))
+}
+
+pub proof fn htaccess_unknown_section_code_is_never_category_admitted(
+    section_code: u8,
+    any_override_enabled: bool,
+    auth_config_allowed: bool,
+    limit_allowed: bool,
+)
+    requires 16 <= section_code,
+    ensures !htaccess_section_category_spec(
+        section_code,
+        any_override_enabled,
+        auth_config_allowed,
+        limit_allowed,
+    ),
+{
+}
+
+/// Apache evaluates IfFile and module/configuration introspection sections
+/// while it reads the access file. Their command failures are not suppressible
+/// by `Nonfatal=Override`; runtime and ordinary nested sections are. Unknown
+/// codes fail closed rather than acquiring the skippable property.
+pub open spec fn htaccess_section_override_skippable_spec(section_code: u8) -> bool {
+    section_code < 16
+        && section_code != 3
+        && !(6 <= section_code && section_code <= 10)
+}
+
+pub fn htaccess_section_nonfatal_override_admit(
+    section_code: u8,
+    nonfatal_override: bool,
+) -> (skip_allowed: bool)
+    ensures skip_allowed
+        == (nonfatal_override && htaccess_section_override_skippable_spec(section_code)),
+{
+    nonfatal_override
+        && section_code < 16
+        && section_code != 3
+        && !(6 <= section_code && section_code <= 10)
+}
+
+pub proof fn htaccess_execute_on_read_section_is_not_override_skippable(section_code: u8)
+    requires section_code == 3 || (6 <= section_code && section_code <= 10),
+    ensures !htaccess_section_override_skippable_spec(section_code),
+{
+}
+
+/// P18: access-file section wrappers have an admission decision independent
+/// of their children. A permitted inner directive cannot admit an unlisted
+/// section when no category in the section's own override mask is active.
+pub open spec fn htaccess_section_spec(
+    category_allowed: bool,
+    section_explicitly_listed: bool,
+) -> bool {
+    category_allowed || section_explicitly_listed
+}
+
+pub fn htaccess_section_admit(
+    category_allowed: bool,
+    section_explicitly_listed: bool,
+) -> (admit: bool)
+    ensures admit == htaccess_section_spec(category_allowed, section_explicitly_listed),
+{
+    category_allowed || section_explicitly_listed
+}
+
+pub proof fn htaccess_inner_directive_cannot_admit_wrapper(inner_directive_allowed: bool)
+    ensures
+        inner_directive_allowed ==> !htaccess_section_spec(false, false),
 {
 }
 
@@ -9057,6 +9254,113 @@ pub proof fn handler_scope_lexical_when_resolved_differs(
         handler_scope_lexical_spec(resolved_differs, files_scope_uses_lexical_basename)
             && resolved_differs
             ==> files_scope_uses_lexical_basename,
+{
+}
+
+/// P17 hardening: a pathname component is stable against a configured local
+/// FastCGI backend only when the backend is not root, the component has a
+/// trusted owner, and no untrusted write class can replace or modify it.
+/// Symlink mode bits are not meaningful on Unix; their containing directory
+/// is checked separately, while the symlink's owner must still be trusted.
+pub open spec fn fastcgi_stable_component_spec(
+    backend_is_root: bool,
+    owner_trusted: bool,
+    owner_is_backend: bool,
+    group_or_other_writable: bool,
+    symlink: bool,
+    has_posix_acl: bool,
+) -> bool {
+    !backend_is_root
+        && owner_trusted
+        && !has_posix_acl
+        && (symlink || (!owner_is_backend && !group_or_other_writable))
+}
+
+pub fn fastcgi_stable_component_admit(
+    backend_is_root: bool,
+    owner_trusted: bool,
+    owner_is_backend: bool,
+    group_or_other_writable: bool,
+    symlink: bool,
+    has_posix_acl: bool,
+) -> (ok: bool)
+    ensures ok == fastcgi_stable_component_spec(
+        backend_is_root,
+        owner_trusted,
+        owner_is_backend,
+        group_or_other_writable,
+        symlink,
+        has_posix_acl,
+    ),
+{
+    !backend_is_root
+        && owner_trusted
+        && !has_posix_acl
+        && (symlink || (!owner_is_backend && !group_or_other_writable))
+}
+
+pub proof fn fastcgi_stable_component_rejects_root_backend(
+    owner_trusted: bool,
+    owner_is_backend: bool,
+    group_or_other_writable: bool,
+    symlink: bool,
+)
+    ensures !fastcgi_stable_component_spec(
+        true,
+        owner_trusted,
+        owner_is_backend,
+        group_or_other_writable,
+        symlink,
+        false,
+    ),
+{
+}
+
+pub proof fn fastcgi_stable_component_rejects_backend_owned_file(
+    owner_trusted: bool,
+    group_or_other_writable: bool,
+)
+    ensures !fastcgi_stable_component_spec(
+        false,
+        owner_trusted,
+        true,
+        group_or_other_writable,
+        false,
+        false,
+    ),
+{
+}
+
+pub proof fn fastcgi_stable_component_rejects_untrusted_owner(
+    owner_is_backend: bool,
+    group_or_other_writable: bool,
+    symlink: bool,
+)
+    ensures !fastcgi_stable_component_spec(
+        false,
+        false,
+        owner_is_backend,
+        group_or_other_writable,
+        symlink,
+        false,
+    ),
+{
+}
+
+pub proof fn fastcgi_stable_component_rejects_posix_acl(
+    owner_trusted: bool,
+    owner_is_backend: bool,
+    group_or_other_writable: bool,
+    symlink: bool,
+)
+    ensures !fastcgi_stable_component_spec(
+        false,
+        owner_trusted,
+        owner_is_backend,
+        group_or_other_writable,
+        symlink,
+        true,
+    ),
 {
 }
 

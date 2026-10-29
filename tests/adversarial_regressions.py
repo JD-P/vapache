@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end regressions for the pass-2 through pass-15 findings (F23-P15).
+"""End-to-end regressions for the pass-2 through pass-18 findings (F23-P18).
 
 The suite starts fresh vapached instances in temporary trees and exercises
 the exploit shapes from adversarial/findings.md: terminal rewrite/proxy authorization,
@@ -237,6 +237,30 @@ class FastCgiMock:
             self.path.unlink()
         except FileNotFoundError:
             pass
+
+
+class TcpFastCgiMock(FastCgiMock):
+    """TCP variant of the parameter-reflecting FastCGI oracle."""
+
+    def __init__(self, port: int):
+        super().__init__(Path("/nonexistent-vapache-tcp-fastcgi-socket"))
+        self.port = port
+
+    def start(self) -> None:
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(("127.0.0.1", self.port))
+        self.listener.listen(16)
+        self.listener.settimeout(0.2)
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.listener is not None:
+            try:
+                self.listener.close()
+            except OSError:
+                pass
 
 
 def raw_request(address: str, port: int, target: bytes):
@@ -3196,6 +3220,13 @@ class P15ApacheParityHardeningTests(unittest.TestCase):
             "pub",
             "open",
             "secret",
+            "handler",
+            "handler-target",
+            "handler-access",
+            "handler-alias",
+            "handler-regex",
+            "handler-tcp",
+            "handler-prefix",
             "remote",
             "expr-q",
             "expr-z",
@@ -3217,6 +3248,21 @@ class P15ApacheParityHardeningTests(unittest.TestCase):
         (cls.www / "secret" / "app.php").write_text("<?php echo 'SECRET';\n")
         (cls.www / "pub" / "open.txt").symlink_to("../open/app.php")
         (cls.www / "pub" / "link.txt").symlink_to("../secret/app.php")
+        (cls.www / "handler-target" / "app.php").write_text("<?php echo 'HANDLER';\n")
+        (cls.www / "handler" / "link.txt").symlink_to("../handler-target/app.php")
+        (cls.www / "handler" / "hop.txt").symlink_to("link.txt")
+        for rel in [
+            "handler-access",
+            "handler-alias",
+            "handler-regex",
+            "handler-tcp",
+            "handler-prefix",
+        ]:
+            if rel in {"handler-alias", "handler-regex"}:
+                (cls.www / rel / "app.php").write_text("<?php echo 'HANDLER';\n")
+                (cls.www / rel / "link.txt").symlink_to("app.php")
+            else:
+                (cls.www / rel / "link.txt").symlink_to("../handler-target/app.php")
         for rel, name in [
             ("expr-q", "secret.txt"),
             ("expr-z", "secret.txt"),
@@ -3238,6 +3284,12 @@ class P15ApacheParityHardeningTests(unittest.TestCase):
 
         cls.mock = FastCgiMock(cls.base / "fcgi.sock")
         cls.mock.start()
+        cls.tcp_fastcgi_port = free_port()
+        cls.tcp_mock = TcpFastCgiMock(cls.tcp_fastcgi_port)
+        cls.tcp_mock.start()
+        (cls.www / "handler-access" / ".htaccess").write_text(
+            f'SetHandler "proxy:unix:{cls.base}/fcgi.sock|fcgi://localhost"\n'
+        )
         cls.port = free_port()
         cls.config_text = f'''ServerRoot "{cls.base}"
 Listen 127.0.0.1:{cls.port}
@@ -3253,6 +3305,26 @@ ProxyPassMatch "^/(.*\\.php(/.*)?)$" "unix:{cls.base}/fcgi.sock|fcgi://localhost
 <Directory "{cls.www}">
     Options +ExecCGI +FollowSymLinks
     Require all granted
+</Directory>
+<Directory "{cls.www}/handler">
+    SetHandler "proxy:unix:{cls.base}/fcgi.sock|fcgi://localhost"
+</Directory>
+Alias /p17-alias/ "{cls.www}/handler-alias/"
+AliasMatch "^/p17-regex/(.*)$" "{cls.www}/handler-regex/$1"
+<Directory "{cls.www}/handler-alias">
+    SetHandler "proxy:unix:{cls.base}/fcgi.sock|fcgi://localhost"
+</Directory>
+<Directory "{cls.www}/handler-regex">
+    SetHandler "proxy:unix:{cls.base}/fcgi.sock|fcgi://localhost"
+</Directory>
+<Directory "{cls.www}/handler-access">
+    AllowOverride FileInfo
+</Directory>
+<Directory "{cls.www}/handler-tcp">
+    SetHandler "proxy:fcgi://127.0.0.1:{cls.tcp_fastcgi_port}"
+</Directory>
+<Directory "{cls.www}/handler-prefix">
+    SetHandler "proxy:unix:{cls.base}/fcgi.sock|fcgi://localhost{cls.www}/"
 </Directory>
 <Location "/secret/">
     Require all denied
@@ -3307,6 +3379,8 @@ RewriteRule "^/expr-rewrite/secret\\.txt$" "-" [F,L]
         stop_vapached(getattr(cls, "proc", None))
         if getattr(cls, "mock", None):
             cls.mock.stop()
+        if getattr(cls, "tcp_mock", None):
+            cls.tcp_mock.stop()
         if getattr(cls, "base", None):
             shutil.rmtree(getattr(cls, "base"), ignore_errors=True)
 
@@ -3319,6 +3393,56 @@ RewriteRule "^/expr-rewrite/secret\\.txt$" "-" [F,L]
         self.assertIn(b"SCRIPT_NAME=/pub/open.txt", body)
         self.assertIn(b"PATH_INFO=/x.php", body)
         self.assertNotIn(f"SCRIPT_FILENAME={self.www}/open/app.php".encode(), body)
+
+    def test_p17_sethandler_forwards_lexical_script_identity(self):
+        status, _, body = request(self.port, "/handler/link.txt")
+        self.assertEqual(status, 200, body[:300])
+        self.assertIn(
+            f"SCRIPT_FILENAME={self.www}/handler/link.txt".encode(), body
+        )
+        self.assertNotIn(
+            f"SCRIPT_FILENAME={self.www}/handler-target/app.php".encode(), body
+        )
+
+    def test_p17_sethandler_routing_matrix_keeps_lexical_script_identity(self):
+        cases = [
+            (
+                "/handler/hop.txt",
+                self.www / "handler" / "hop.txt",
+                self.www / "handler-target" / "app.php",
+            ),
+            (
+                "/handler-access/link.txt",
+                self.www / "handler-access" / "link.txt",
+                self.www / "handler-target" / "app.php",
+            ),
+            (
+                "/p17-alias/link.txt",
+                self.www / "handler-alias" / "link.txt",
+                self.www / "handler-alias" / "app.php",
+            ),
+            (
+                "/p17-regex/link.txt",
+                self.www / "handler-regex" / "link.txt",
+                self.www / "handler-regex" / "app.php",
+            ),
+            (
+                "/handler-tcp/link.txt",
+                self.www / "handler-tcp" / "link.txt",
+                self.www / "handler-target" / "app.php",
+            ),
+            (
+                "/handler-prefix/link.txt",
+                self.www / "handler-prefix" / "link.txt",
+                self.www / "handler-target" / "app.php",
+            ),
+        ]
+        for request_path, lexical_path, canonical_path in cases:
+            with self.subTest(request_path=request_path):
+                status, _, body = request(self.port, request_path)
+                self.assertEqual(status, 200, body[:300])
+                self.assertIn(f"SCRIPT_FILENAME={lexical_path}".encode(), body)
+                self.assertNotIn(f"SCRIPT_FILENAME={canonical_path}".encode(), body)
 
     def test_p15_a_canonical_location_is_reauthorized(self):
         status, _, body = request(self.port, "/pub/link.txt/x.php")

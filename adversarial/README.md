@@ -1,8 +1,8 @@
 # Adversarial findings and exploit harness
 
 This folder is the retained adversarial record for vapache: the numbered
-finding write-ups from every adversarial pass, plus the pass-11 exploit
-harness and its per-case dossiers.  Keeping the exact exploit shapes here
+finding write-ups from every adversarial pass, plus the retained exploit and
+remediation harnesses. Keeping the exact exploit shapes here
 prevents re-deriving them from scratch.
 
 ## Layout
@@ -27,8 +27,23 @@ prevents re-deriving them from scratch.
 | `p13/exploit_p13.py` | Pass-13 differential battery (P13-A FastCGI symlink classification, P13-B CGI `PATH_INFO` symlink classification) |
 | `p14/exploit_p14.py` | Pass-14 differential battery (P14-A `<Files>` phase order, P14-B `[P]` SSRF, P14-C expr file-test root, P14-D duplicate headers, P14-E `[C]` chain) |
 | `p16/exploit_p16.py` | Pass-16 remediation battery: requires Apache/vapache parity for access-file FastCGI environment provenance, ASCII-default directive regexes, raw-byte header guards, and `SetEnvIf` value/chaining/backreference semantics (36 verdicts with A6/B1/B2/C1-C3/D1-D3 controls; A uses a portable built-in FastCGI parameter mock, not PHP-FPM) |
-| `p17/exploit_p17.py` | Pass-17 differential battery (P17-A, 15 verdicts): FastCGI `SetHandler` plus a `.txt` symlink to a `.php` target; cases A (global handler), B (child `SetHandler none` upload tree), C (`<FilesMatch>` plus access-file handlers) and D (`<Location>`/`<Directory>` negative controls). Requires Apache `mod_proxy_fcgi` and a real PHP-FPM; keeps the FPM access log as `SCRIPT_FILENAME` evidence |
-| `p18/exploit_p18.py` | Pass-18 differential battery (P18-A, 14 verdicts): uploaded PHP-FPM (per-directory and parent `FilesMatch` handlers) and CGI scripts under `AllowOverrideList Require`; `<Files>`/`<FilesMatch>` grants bypass the outer file-scoped deny only on vapache, with no-`.htaccess`, top-level-`Require`, scoped-`ok` and `AllowOverride AuthConfig` parity controls. Requires `mod_proxy_fcgi`/PHP-FPM for group A; group B runs CGI-only |
+| `p17/exploit_p17.py` | Pass-17 remediation battery (P17-A, 15 verdicts): FastCGI `SetHandler` plus a `.txt` symlink to a `.php` target; cases A (global handler), B (child `SetHandler none` upload tree), C (`<FilesMatch>` plus access-file handlers) and D (`<Location>`/`<Directory>` negative controls). Requires Apache `mod_proxy_fcgi` and a real PHP-FPM; keeps the FPM access log as lexical `SCRIPT_FILENAME` evidence |
+| `p18/exploit_p18.py` | Pass-18 remediation battery (P18-A, 14 verdicts): uploaded PHP-FPM (per-directory and parent `FilesMatch` handlers) and CGI scripts under `AllowOverrideList Require`; both servers must reject unlisted `<Files>`/`<FilesMatch>` wrappers, with no-`.htaccess`, top-level-`Require`, scoped-`ok` and `AllowOverride AuthConfig` controls. Requires `mod_proxy_fcgi`/PHP-FPM for group A; group B runs CGI-only |
+
+## Pre-adversarial gate
+
+Run the complete fail-closed pre-pass from the repository root:
+
+```sh
+tests/pre_adversarial.sh
+```
+
+The gate requires Apache, its proxy/FCGI modules, cargo-verus and a real
+PHP-FPM executable. Missing dependencies are failures. It runs the Rust suite,
+compiles and smoke-runs all coverage-guided parser fuzz targets, runs the proof
+ledger with Verus, grammar/validity checks, fixed plus randomized and stateful
+configuration differentials, Apache differential conformance, portable
+adversarial regressions, and the real-backend P17/P18 batteries.
 
 ## Running the pass-11 battery
 
@@ -247,28 +262,28 @@ python3 adversarial/p17/exploit_p17.py --show-fpm-log     # print paired SCRIPT_
 python3 adversarial/p17/exploit_p17.py --keep             # accepted; fixture/logs are always kept
 ```
 
-Pass-17 case **P17-A** — the resolved-file FastCGI `SetHandler` identity.  A
+Pass-17 case **P17-A** — the resolved-file FastCGI `SetHandler` identity. A
 global handler (a supported vhost recipe:
 `SetHandler "proxy:unix:…|fcgi://localhost"`) serves
 `pub/link.txt -> ../secret/app.php` and
 `pub/upload-link.txt -> ../uploads/shell.php`.  Apache's `mod_proxy_fcgi`
 forwards the lexical request-mapped `.txt` name to PHP-FPM, whose stock
-`security.limit_extensions` gate refuses it (`403 Access denied.`); vapache's
-`handler_target_for_file` forwards the canonical `.php` target, so PHP-FPM
-executes it (`200 PHPEXEC … uid=33`).  The same differential holds with the
-`fcgi://localhost/` spelling.
+`security.limit_extensions` gate refuses it (`403 Access denied.`). Remediated
+vapache must forward the same lexical `.txt` path while retaining the canonical
+`.php` target for authorization and inode binding. The same parity requirement
+holds with the `fcgi://localhost/` spelling.
 
 **A** is the unguarded global handler and isolates the `SCRIPT_FILENAME` differential; because there is no upload execution hardening in A, the direct `.php` upload is executable on both servers. **B** adds
 `<Directory "…/uploads"> SetHandler none</Directory>`, so the direct upload URL
-is static source on both servers while the symlink route still executes only
-on vapache — this is the security-relevant RCE chain; **C** is the Debian-style `<FilesMatch "\.php$">` main handler plus a
+is static source on both servers while the symlink route is refused by both
+backends; **C** is the Debian-style `<FilesMatch "\.php$">` main handler plus a
 `pub/.htaccess` proxy handler and an `uploads/.htaccess` `default-handler`
-override (`AllowOverride All`), which gives the same hardened direct-upload
-result through an access-file handler; **D** is the negative control —
+override (`AllowOverride All`), which pins the same result through an
+access-file handler; **D** is the negative control —
 `<Location "/uploads/">` and `<Directory "…/uploads"> Require all denied` both
 return `403` on both servers, because vapache still reauthorizes the canonical
-target.  P17 is therefore a backend-policy/extension-gate bypass, not an
-access-control bypass of those guards.  The benchmark `ProxyPassMatch` spelling
+target. The retained P17 exploit shape is closed at the backend
+policy/extension gate without weakening those guards. The benchmark `ProxyPassMatch` spelling
 is fixed by P15 and is not affected by this branch; a bare
 `<FilesMatch "\.php$">` handler alone does not match the `.txt` URL and is not
 affected either.
@@ -277,8 +292,8 @@ The harness starts a private PHP-FPM pool under `/tmp/opencode/p17-harness`
 with `php_admin_value[security.limit_extensions] = .php .phar`; the Apache
 oracle runs `-X` on sibling loopback ports with separate pid files.  The FPM
 access log with `access.format = "%f|%r"` is retained after every run and is
-the evidence that Apache and vapache send different `SCRIPT_FILENAME` values
-for the same request.
+the evidence that Apache and vapache send the same lexical `SCRIPT_FILENAME`
+for the request.
 
 ## Running the pass-18 battery
 
@@ -304,21 +319,17 @@ adds a file-scoped grant:
 
 Apache 2.4.69 rejects the access file with `500`
 (`.htaccess: <Files not allowed here`) because the container section is not
-permitted by the directive-only `AllowOverrideList`.  Vapache parses the
-section anyway, admits the inner `Require` from the list, and the `<Files>`
-grant overrides the outer `<FilesMatch>` deny; the uploaded PHP executes as the
-FPM worker (`200 PHPEXEC … uid=33`) and writes a `pwned.txt` marker.  The
-`<FilesMatch>` section form behaves the same (Apache `<FilesMatch not allowed
-here`), as does a parent `FilesMatch` handler.  The CGI group reproduces the
-same differential with `AddHandler cgi-script` + `Options +ExecCGI`; Apache
-returns `500`, vapache returns `200 EXEC uid=33`.
+permitted by the directive-only `AllowOverrideList`. Remediated vapache must
+reject it with the same `500` before parsing the nested `Require`; no PHP/CGI
+execution marker may be created. The `<FilesMatch>` section form and a parent
+`FilesMatch` handler exercise the same gate, and the CGI group pins it without
+requiring PHP-FPM.
 
 The battery's controls show the outer deny is otherwise live (no `.htaccess`,
 both `403`), that a plain top-level `.htaccess Require all granted` cannot
-override it (both `403`), that the grant is scoped to the attacker's filename
-(`ok.php`/`ok.cgi` remain `403` on vapache while Apache reports `500` for the
-invalid access file), and that `AllowOverride AuthConfig` with the same
-section is a parity control (both servers execute).  The harness starts a
+override it (both `403`), that the invalid wrapper makes every request at that
+level fail closed, and that `AllowOverride AuthConfig` with the same section is
+a parity control (both servers execute). The harness starts a
 private PHP-FPM pool under `/tmp/opencode/p18-harness/fpm`
 with `security.limit_extensions = .php .phar`, runs Apache `-X` and vapached on
 sibling loopback ports with separate pid files, and retains per-case Apache

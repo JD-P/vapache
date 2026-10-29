@@ -18,39 +18,42 @@ rm -rf target/cov "$PROFILE_DIR"
 mkdir -p "$PROFILE_DIR"
 chmod 777 "$PROFILE_DIR"
 
-CARGO_TARGET_DIR=target/cov RUSTFLAGS="-C instrument-coverage" \
+COVERAGE_RUSTFLAGS="-C instrument-coverage -C llvm-args=-runtime-counter-relocation"
+
+CARGO_TARGET_DIR=target/cov RUSTFLAGS="$COVERAGE_RUSTFLAGS" \
     cargo build --release -p vapached
 
-CARGO_TARGET_DIR=target/cov RUSTFLAGS="-C instrument-coverage" \
-LLVM_PROFILE_FILE="$PROFILE_DIR/unit-%p-%m.profraw" \
-    cargo test --workspace -- --test-threads=1
+CARGO_TARGET_DIR=target/cov RUSTFLAGS="$COVERAGE_RUSTFLAGS" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/unit-%p-%m%c.profraw" \
+    cargo test -p vapached -- --test-threads=1
 
 if command -v apache2 >/dev/null 2>&1; then
     VAPACHED="$PWD/target/cov/release/vapached" \
-    LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+    LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
     PYTHONDONTWRITEBYTECODE=1 \
         python3 tests/config_grammar.py
 
     VAPACHED="$PWD/target/cov/release/vapached" \
-    LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+    LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
     PYTHONDONTWRITEBYTECODE=1 \
         python3 tests/config_validity.py
 
     VAPACHED="$PWD/target/cov/release/vapached" \
-    LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+    LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
     PYTHONDONTWRITEBYTECODE=1 \
-        python3 tests/config_semantics.py --random 128 --seed 2469
+        python3 tests/config_semantics.py --random 128 --seed 2469 \
+            --stateful 128 --stateful-seed 1818
 else
     echo "coverage: Apache not found; skipping differential config suites"
 fi
 
 VAPACHED="$PWD/target/cov/release/vapached" \
-LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/conformance.py
 
 VAPACHED="$PWD/target/cov/release/vapached" \
-LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m.profraw" \
+LLVM_PROFILE_FILE="$PROFILE_DIR/vapache-%p-%m%c.profraw" \
 PYTHONDONTWRITEBYTECODE=1 \
     python3 tests/adversarial_regressions.py
 

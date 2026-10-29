@@ -167,18 +167,23 @@ by the phases above.
 
 - `All` permits every implemented directive;
 - each category permits its directive group;
-- `AllowOverrideList` permits individual directive names even when
-  `AllowOverride None` would otherwise disable access files; the effective
-  permission set is the union of both;
+- `AllowOverrideList` permits individually named commands even when
+  `AllowOverride None` would otherwise disable access files; section commands
+  use their Apache spelling (for example `"<Files"`) and are gated separately
+  from their children;
 - `Nonfatal=Override|Unknown|All` suppresses category/unknown errors while a
   genuine syntax error in a valid directive still fails with 500;
 - `Options=...` permits an `Options` token only if the corresponding option
   is listed, except that `Options None` is always permitted once any
   `Options` override is enabled;
-- the section containers `<If>`, `<IfFile>`, `<Files>`, `<FilesMatch>` do not
-  themselves require a category; the directives **inside** them do;
-- `<Limit>`/`<LimitExcept>` are permitted by `AuthConfig` or `Limit`, and
-  their inner authorization directives still obey their own categories.
+- the section containers `<If>`, `<IfFile>`, `<Files>`, `<FilesMatch>` and the
+  conditional wrappers require some active `AllowOverride` category (Apache's
+  `OR_ALL`) or an exact section entry in `AllowOverrideList`; a listed inner
+  directive never admits an unlisted wrapper;
+- `<RequireAll>`/`<RequireAny>`/`<RequireNone>` require `AuthConfig` or their
+  own exact list entry; `<Limit>`/`<LimitExcept>` require `AuthConfig`, `Limit`
+  or their own exact list entry. Their inner directives are admitted
+  independently.
 
 A disallowed directive is an error (500), not a silent skip.  This is the
 fail-closed rule and must be preserved by the model.
@@ -830,9 +835,38 @@ cannot override calculated names.  Request bodies stay on their spool file
 above the threshold; stdout/stderr, descriptors and deadlines are bounded.
 
 The FastCGI protocol has no descriptor-passing primitive: PHP-FPM opens
-`SCRIPT_FILENAME` after this final comparison. Pathname stability beyond that
-external protocol boundary is therefore a backend contract. Local CGI has no
-equivalent residual because it executes from the retained descriptor.
+`SCRIPT_FILENAME` after this final comparison. A deployment can make the
+pathname requirement machine-enforced with repeatable global entries:
+
+```text
+VapacheFastCGIStablePath On <unix-endpoint> <backend-uid> <endpoint-owner-uid> <trusted-owner-uid>...
+```
+
+`endpoint` is an exact `unix:/path` transport identity. Once enabled, an
+unregistered backend is rejected. Unix socket type, owner and inode are
+validated before and after connect separately from the PHP worker UID. TCP
+entries are rejected because a loopback address cannot authenticate the
+process that owns it. The lexical and canonical script paths are walked
+immediately before parameters are sent.
+Every component owner must be listed, group/other write bits and POSIX ACLs
+are rejected, and a non-symlink component cannot be owned by the backend (an
+owner could otherwise use `chmod` to regain write permission). Root backends
+and relative paths fail closed. `Off` is the default.
+
+`VapacheMaxSpoolBytes`, `VapacheMaxSpoolFiles`,
+`VapacheMaxDynamicRequests` and `VapacheMaxFastCGIOutput` provide process-wide
+aggregate spool/concurrency budgets plus a per-request FastCGI output bound.
+RAII reservations cover request bodies, FastCGI responses and the worker-side
+CGI body copy and are shared across graceful reloads.
+
+Without that opt-in policy, a compliant deployment MUST
+make every FastCGI script and each ancestor directory non-writable by the
+backend and by any less-trusted process for the whole request lifetime. Use a
+read-only bind mount or immutable release tree, and keep uploads and other
+writable content outside every FastCGI handler mapping. If that invariant
+cannot be provided, FastCGI execution is outside the verified security
+boundary. Local CGI has no equivalent residual because it executes from the
+retained descriptor.
 
 ### I32 — Proxy route and balancer identity
 
@@ -883,6 +917,7 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | CGI stdout/stderr | output and stderr caps, watchdog deadline, process-group kill |
 | FastCGI records | fixed record/header sizes; stdout spool cap; stderr cap |
 | FastCGI response head | bounded prefix/header scan before body streaming |
+| Aggregate dynamic I/O | RAII byte/file reservations across request, CGI-worker and FastCGI spools; shared CGI/FastCGI concurrency slots |
 | HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error |
 | HTTP/2 | verified settings, header-state, flow-control, body and reset budgets |
 | Compression | fixed maximum compressible body; range/HEAD bypass |
@@ -1528,7 +1563,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **433 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **465 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -1813,12 +1848,17 @@ rewrite that changes the filesystem target re-evaluates
 Static file/directory/local-CGI grants carry the opened inode and symlink
 targets are reauthorized. FastCGI opens its script first, reauthorizes the
 descriptor path, binds both inode and backend, and performs a final pathname
-inode comparison before emitting parameters. Proxy and WebSocket grants are
+inode comparison before emitting parameters. The opt-in stable-path policy
+additionally projects `fastcgi_stable_component_admit` over every lexical and
+canonical component using the configured backend and trusted-owner UIDs.
+Proxy and WebSocket grants are
 backend-bound; cache grants are policy-key-bound. Parser payload semantics,
 the regex engine, expression leaf evaluators and the standard library's
-concrete sorting implementation remain outside Verus. The only script-path
-stability assumption is beyond the FastCGI protocol boundary, where the
-external backend must open `SCRIPT_FILENAME` itself.
+concrete sorting implementation remain outside Verus. The external backend
+must still open `SCRIPT_FILENAME` itself. With `VapacheFastCGIStablePath On`,
+the verified component predicate is enforced immediately before that handoff;
+with the default `Off`, the equivalent read-only-tree rule remains an explicit
+deployment assumption. Writable trees must not inherit a FastCGI handler.
 
 Security-sensitive unimplemented directives fail closed in compatibility mode.
 The classifier covers the auth/TLS/proxy/filter/DAV/LDAP/cache families by
@@ -1900,8 +1940,9 @@ comparison and glob semantics, and rewrite condition-chain folding are
 verified kernels. Parser payload translation, standard-library sorting and
 regex semantics are explicit assumptions, not hidden axioms. Filesystem
 objects used by protected sinks and access-file parsing are descriptor/inode
-bound; the remaining path-stability contract is the external FastCGI
-backend's later open of `SCRIPT_FILENAME`.
+bound. The external FastCGI backend's later open of `SCRIPT_FILENAME` is
+covered when the opt-in stable-path check admits both identities, or when the
+deployment provides the equivalent read-only requirement stated in I31.
 
 ## 10b. Verification progress ledger
 
@@ -1924,8 +1965,8 @@ The current ledger (2026-10-28) is:
 - sinks: **8/8** grant-required, **8/8** path/target-bound, **5/8**
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
-  not yet systematic; the separate finding-replay suite covers F23–P15);
-- Verus: **433 functions, 0 errors**, with no `assume` or `external_body`
+  not yet systematic; the separate finding-replay suite covers F23–P18);
+- Verus: **465 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops
@@ -1979,7 +2020,9 @@ python3 tests/security_coverage.py --check
 ```
 
 The tracker measures **production lines before each file's test module** and
-currently enforces 100% for:
+sets a fail-closed 100% target for every listed server module. The current
+full-tree snapshot is 20,020/20,548 lines (97.43%); the new aggregate resource
+accounting module is 62/62. Security-critical targets include:
 
 - `fastcgi.rs` — record parsing, spooling, script/PATH_INFO containment,
   environment derivation, error paths and process boundary;
@@ -1988,10 +2031,10 @@ currently enforces 100% for:
 - `tls.rs` — certificate/key parsing, SNI selection, OCSP refresh, client-auth
   policy and listener construction.
 
-The remaining high-risk surfaces (`cgi`, `h2`, `proxy`, `server`,
-`htaccess`, `config`, `expr`, `rewrite`) are reported with their current
-production coverage and promoted to enforced 100% one at a time.  A module is
-not considered closed merely because its test module is covered; the tracker
+The remaining debt in high-risk surfaces (`cgi`, `h2`, `proxy`, `server`,
+`htaccess`, `config`, `expr`, `rewrite`) remains visible as a gate failure
+rather than being silently removed from enforcement. A module is not
+considered closed merely because its test module is covered; the tracker
 excludes test-only code from the denominator.
 
 ## 12. Known gaps before formal proof
@@ -2022,7 +2065,10 @@ excludes test-only code from the denominator.
   `AccessGrant` at runtime.
 - FastCGI cannot pass its retained script descriptor through the protocol;
   the external backend's open of `SCRIPT_FILENAME` occurs after vapache's
-  final pathname-to-inode comparison and remains a backend contract.
+  final pathname-to-inode comparison. Enable `VapacheFastCGIStablePath` to
+  enforce trusted owners and backend write exclusion, or provide the
+  equivalent read-only release-tree invariant; never map writable content to
+  FastCGI.
 
 ## 13. Apache CVE triage
 

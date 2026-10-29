@@ -13,15 +13,19 @@
 //! splitting, status handling and compression consistent across both paths.
 
 use crate::cgi::{self, CgiContext};
-use crate::config::{Config, Scope, VHost};
-use crate::http::{Body, Request, Response};
+use crate::config::{Config, FastCgiEndpoint, FastCgiStablePathPolicy, Scope};
+use crate::http::{Body, Response};
+#[cfg(test)]
+use crate::http::Request;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+#[cfg(test)]
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -33,7 +37,7 @@ const FCGI_STDIN: u8 = 5;
 const FCGI_STDOUT: u8 = 6;
 const FCGI_STDERR: u8 = 7;
 const FCGI_RESPONDER: u16 = 1;
-const MAX_FASTCGI_OUTPUT: u64 = 1024 * 1024 * 1024;
+const DEFAULT_MAX_FASTCGI_OUTPUT: u64 = 64 * 1024 * 1024;
 const FASTCGI_SPOOL_THRESHOLD: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -48,10 +52,71 @@ pub struct Backend {
     prefix: String,
 }
 
+impl Backend {
+    fn endpoint(&self) -> FastCgiEndpoint {
+        match &self.transport {
+            Transport::Unix(path) => FastCgiEndpoint::Unix(path.clone()),
+            Transport::Tcp(host, port) => FastCgiEndpoint::Tcp {
+                host: host.to_ascii_lowercase(),
+                port: *port,
+            },
+        }
+    }
+}
+
+mod lexical_script_path {
+    use super::{script_from_prefix, split_path_info, Backend};
+    use std::path::{Path, PathBuf};
+
+    /// Path identity presented to the FastCGI backend. The tuple field is
+    /// private to this child module, so production code cannot wrap an
+    /// authorization/canonical path and call it lexical. Every value comes
+    /// from the request mapping constructor below (P15/P17).
+    #[derive(Clone, Debug)]
+    pub(super) struct LexicalScriptPath(PathBuf);
+
+    impl LexicalScriptPath {
+        pub(super) fn from_mapping(
+            backend: &Backend,
+            root: &Path,
+            rel: &Path,
+        ) -> Option<(Self, PathBuf)> {
+            let (path, base) = script_from_prefix(backend, root, rel)?;
+            Some((Self(path), base))
+        }
+
+        pub(super) fn split_path_info(
+            self,
+            url_path: &str,
+            base: &Path,
+        ) -> Option<(Self, String, String)> {
+            let (path, script_name, path_info) = split_path_info(self.0, url_path, base)?;
+            Some((Self(path), script_name, path_info))
+        }
+
+        pub(super) fn matches_mapping(&self, backend: &Backend, root: &Path, rel: &Path) -> bool {
+            script_from_prefix(backend, root, rel)
+                .map(|(expected, _)| expected == self.0)
+                .unwrap_or(false)
+        }
+
+        pub(super) fn as_path(&self) -> &Path {
+            &self.0
+        }
+
+        #[cfg(test)]
+        pub(super) fn for_test(path: PathBuf) -> Self {
+            Self(path)
+        }
+    }
+}
+
+use lexical_script_path::LexicalScriptPath;
+
 #[derive(Clone, Debug)]
 pub struct Target {
     backend: Backend,
-    pub script_filename: PathBuf,
+    script_filename: LexicalScriptPath,
     pub script_name: String,
     pub path_info: String,
     pub route_order: usize,
@@ -59,6 +124,15 @@ pub struct Target {
 }
 
 impl Target {
+    pub(crate) fn script_filename(&self) -> &Path {
+        self.script_filename.as_path()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_script_filename_for_test(&mut self, path: PathBuf) {
+        self.script_filename = LexicalScriptPath::for_test(path);
+    }
+
     /// Exact FastCGI transport plus both script identities used for resource
     /// binding. `script_filename` is the lexical Apache-compatible value sent
     /// to the backend; `authorized_path` is the canonical opened object whose
@@ -70,7 +144,7 @@ impl Target {
         };
         format!(
             "{transport}|lexical={}|authorized={}|{}|{}",
-            self.script_filename.display(),
+            self.script_filename().display(),
             authorized_path.display(),
             self.script_name,
             self.path_info
@@ -96,7 +170,7 @@ pub(crate) fn open_script(
     owner_match_only: bool,
 ) -> Option<ScriptBinding> {
     let base = fastcgi_script_base(&target.backend, root);
-    let rel = target.script_filename.strip_prefix(&base).ok()?;
+    let rel = target.script_filename().strip_prefix(&base).ok()?;
     let crate::files::Target::File { file, meta } =
         crate::files::resolve_target_checked(&base, rel, follow_symlinks, owner_match_only)
     else {
@@ -150,9 +224,24 @@ fn split_host_path(rest: &str) -> Option<(String, u16, String)> {
         Some((h, p)) => (h, format!("/{p}")),
         None => (rest, String::new()),
     };
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().ok()?),
-        None => (hostport.to_string(), 9000),
+    let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let host = rest[..close].to_string();
+        let suffix = &rest[close + 1..];
+        let port = if suffix.is_empty() {
+            9000
+        } else {
+            suffix.strip_prefix(':')?.parse().ok()?
+        };
+        (host, port)
+    } else {
+        if hostport.matches(':').count() > 1 {
+            return None;
+        }
+        match hostport.rsplit_once(':') {
+            Some((host, port)) => (host.to_string(), port.parse().ok()?),
+            None => (hostport.to_string(), 9000),
+        }
     };
     if host.is_empty() {
         return None;
@@ -315,11 +404,12 @@ pub fn match_proxy(scope: &Scope, url_path: &str, root: &Path) -> Option<Target>
             continue;
         };
         let rel = PathBuf::from(suffix);
-        let Some((script_filename, base)) = script_from_prefix(&backend, root, &rel) else {
+        let Some((script_filename, base)) = LexicalScriptPath::from_mapping(&backend, root, &rel)
+        else {
             continue;
         };
         let Some((script_filename, script_name, path_info)) =
-            split_path_info(script_filename, url_path, &base)
+            script_filename.split_path_info(url_path, &base)
         else {
             continue;
         };
@@ -359,11 +449,13 @@ pub fn match_proxy(scope: &Scope, url_path: &str, root: &Path) -> Option<Target>
             .unwrap_or_else(|| url_path.to_string());
         let rel_text = rel_text.trim_start_matches('/');
         let rel_capture = PathBuf::from(rel_text);
-        let Some((script_filename, base)) = script_from_prefix(&backend, root, &rel_capture) else {
+        let Some((script_filename, base)) =
+            LexicalScriptPath::from_mapping(&backend, root, &rel_capture)
+        else {
             continue;
         };
         let Some((script_filename, script_name, path_info)) =
-            split_path_info(script_filename, url_path, &base)
+            script_filename.split_path_info(url_path, &base)
         else {
             continue;
         };
@@ -400,8 +492,10 @@ pub fn handler_target(scope: &Scope, root: &Path, rel: &Path, url_path: &str) ->
         return None;
     }
     let backend = parse_backend(handler)?;
-    let (script_filename, base) = script_from_prefix(&backend, root, rel)?;
-    if script_filename.is_file() && !contained_after_resolving_symlinks(&script_filename, &base) {
+    let (script_filename, base) = LexicalScriptPath::from_mapping(&backend, root, rel)?;
+    if script_filename.as_path().is_file()
+        && !contained_after_resolving_symlinks(script_filename.as_path(), &base)
+    {
         return None;
     }
     Some(Target {
@@ -414,13 +508,15 @@ pub fn handler_target(scope: &Scope, root: &Path, rel: &Path, url_path: &str) ->
     })
 }
 
-/// Handler selection for a resolved file.  `name` is the lexical
-/// request-mapped basename used for classification; the actual opened target
-/// supplies only `SCRIPT_FILENAME`, containment and authorization (P13/I70).
+/// Handler selection for a resolved file. `lexical_path` and `name` are the
+/// request-mapped identities used for the FastCGI wire path and handler
+/// classification. `actual_path` is the canonical opened object and is used
+/// only for containment and authorization (P13/P15/P17).
 pub(crate) fn handler_target_for_file(
     scope: &Scope,
     root: &Path,
     url_path: &str,
+    lexical_path: &Path,
     actual_path: &Path,
     name: &[u8],
 ) -> Option<Target> {
@@ -429,12 +525,25 @@ pub(crate) fn handler_target_for_file(
         return None;
     }
     let backend = parse_backend(handler)?;
-    let base = fastcgi_script_base(&backend, root);
-    let script_filename = clean_script_path(actual_path);
-    if !script_under_base(&script_filename, &base) {
+    let rel = lexical_path.strip_prefix(root).ok()?;
+    let (script_filename, base) = LexicalScriptPath::from_mapping(&backend, root, rel)?;
+    let authorized_path = clean_script_path(actual_path);
+    let name_is_lexical = lexical_path
+        .file_name()
+        .map(|value| value.as_encoded_bytes())
+        .unwrap_or(b"")
+        == name;
+    if !vapache_verified::fastcgi_resolved_target_admit(
+        name_is_lexical,
+        script_filename.matches_mapping(&backend, root, rel),
+        script_under_base(script_filename.as_path(), &base),
+        script_under_base(&authorized_path, &base),
+    ) {
         return None;
     }
-    if script_filename.is_file() && !contained_after_resolving_symlinks(&script_filename, &base) {
+    if script_filename.as_path().is_file()
+        && !contained_after_resolving_symlinks(script_filename.as_path(), &base)
+    {
         return None;
     }
     Some(Target {
@@ -447,17 +556,90 @@ pub(crate) fn handler_target_for_file(
     })
 }
 
-fn connect(backend: &Backend, timeout: Duration) -> io::Result<Box<dyn ReadWrite>> {
+fn stable_policy_for<'a>(
+    cfg: &'a Config,
+    backend: &Backend,
+) -> io::Result<Option<&'a FastCgiStablePathPolicy>> {
+    let Some(policies) = &cfg.fastcgi_stable_paths else {
+        return Ok(None);
+    };
+    policies
+        .iter()
+        .find(|policy| policy.endpoint == backend.endpoint())
+        .map(Some)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "FastCGI backend has no exact stable-path policy",
+            )
+        })
+}
+
+fn validate_unix_endpoint(
+    policy: &FastCgiStablePathPolicy,
+    path: &Path,
+) -> io::Result<std::fs::Metadata> {
+    let Some(parent) = path.parent() else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "FastCGI Unix endpoint has no parent directory",
+        ));
+    };
+    enforce_stable_fastcgi_path(policy, parent)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_socket() || Some(meta.uid()) != policy.endpoint_owner_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "FastCGI Unix endpoint type or owner changed",
+        ));
+    }
+    if path_has_posix_acl(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "FastCGI Unix endpoint has a POSIX ACL",
+        ));
+    }
+    Ok(meta)
+}
+
+fn connect(
+    backend: &Backend,
+    timeout: Duration,
+    policy: Option<&FastCgiStablePathPolicy>,
+) -> io::Result<Box<dyn ReadWrite>> {
     match &backend.transport {
         Transport::Unix(path) => {
+            let before = policy
+                .map(|policy| validate_unix_endpoint(policy, path))
+                .transpose()?;
             let s = UnixStream::connect(path)?;
+            if let (Some(policy), Some(before)) = (policy, before) {
+                let after = validate_unix_endpoint(policy, path)?;
+                if before.dev() != after.dev()
+                    || before.ino() != after.ino()
+                    || before.uid() != after.uid()
+                    || before.mode() != after.mode()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "FastCGI Unix endpoint changed during connect",
+                    ));
+                }
+            }
             s.set_read_timeout(Some(timeout))?;
             s.set_write_timeout(Some(timeout))?;
             Ok(Box::new(s))
         }
         Transport::Tcp(host, port) => {
+            if policy.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "strict FastCGI policy requires an authenticated Unix socket backend",
+                ));
+            }
             let mut last = None;
-            for addr in (host.as_str(), *port).to_socket_addrs()? {
+            let addrs: Vec<_> = (host.as_str(), *port).to_socket_addrs()?.collect();
+            for addr in addrs {
                 match TcpStream::connect_timeout(&addr, timeout) {
                     Ok(s) => {
                         s.set_read_timeout(Some(timeout))?;
@@ -545,7 +727,11 @@ fn send_request(stream: &mut dyn ReadWrite, params: &[u8], body: &mut dyn Read) 
 
 enum Spool {
     Memory(Vec<u8>),
-    File { file: File, len: u64 },
+    File {
+        file: File,
+        len: u64,
+        lease: Option<crate::resource::SpoolLease>,
+    },
 }
 
 impl Spool {
@@ -557,19 +743,41 @@ impl Spool {
     }
 
     fn push(&mut self, data: &[u8]) -> io::Result<()> {
+        self.push_budgeted(data, None)
+    }
+
+    fn push_budgeted(
+        &mut self,
+        data: &[u8],
+        budget: Option<(&std::sync::Arc<crate::resource::ResourceBudget>, u64, u64)>,
+    ) -> io::Result<()> {
         match self {
             Spool::Memory(v) => {
                 if v.len().saturating_add(data.len()) > FASTCGI_SPOOL_THRESHOLD {
+                    let mut lease = if let Some((budget, max_bytes, max_files)) = budget {
+                        let mut lease = budget.try_spool(max_bytes, max_files)?;
+                        lease.reserve(v.len() as u64 + data.len() as u64)?;
+                        Some(lease)
+                    } else {
+                        None
+                    };
                     let mut file = temp_file()?;
                     file.write_all(v)?;
                     file.write_all(data)?;
                     let len = v.len() as u64 + data.len() as u64;
-                    *self = Spool::File { file, len };
+                    *self = Spool::File {
+                        file,
+                        len,
+                        lease: lease.take(),
+                    };
                 } else {
                     v.extend_from_slice(data);
                 }
             }
-            Spool::File { file, len } => {
+            Spool::File { file, len, lease } => {
+                if let Some(lease) = lease {
+                    lease.reserve(data.len() as u64)?;
+                }
                 file.write_all(data)?;
                 *len = len.saturating_add(data.len() as u64);
             }
@@ -631,7 +839,11 @@ fn response_from_spool(spool: Spool, version: crate::http::Version) -> io::Resul
     match spool {
         Spool::Memory(data) => cgi::parse_cgi_response(&data, version)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid FastCGI response")),
-        Spool::File { mut file, len } => {
+        Spool::File {
+            mut file,
+            len,
+            lease,
+        } => {
             file.seek(SeekFrom::Start(0))?;
             let prefix_len = len.min(128 * 1024) as usize;
             let mut prefix = vec![0u8; prefix_len];
@@ -661,6 +873,9 @@ fn response_from_spool(spool: Spool, version: crate::http::Version) -> io::Resul
                     len: body_len,
                 };
             }
+            if let Some(lease) = lease {
+                response.hold_spool(lease);
+            }
             Ok(response)
         }
     }
@@ -669,6 +884,14 @@ fn response_from_spool(spool: Spool, version: crate::http::Version) -> io::Resul
 fn read_response_with_limit(
     stream: &mut dyn ReadWrite,
     max_output: u64,
+) -> io::Result<(Spool, Vec<u8>)> {
+    read_response_with_budget(stream, max_output, None)
+}
+
+fn read_response_with_budget(
+    stream: &mut dyn ReadWrite,
+    max_output: u64,
+    budget: Option<(&std::sync::Arc<crate::resource::ResourceBudget>, u64, u64)>,
 ) -> io::Result<(Spool, Vec<u8>)> {
     let mut spool = Spool::Memory(Vec::new());
     let mut stderr = Vec::new();
@@ -689,13 +912,15 @@ fn read_response_with_limit(
         content.truncate(len);
         match ty {
             FCGI_STDOUT => {
-                spool.push(&content)?;
-                if spool.len() > max_output {
+                if spool.len() > max_output
+                    || content.len() as u64 > max_output.saturating_sub(spool.len())
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "FastCGI output too large",
                     ));
                 }
+                spool.push_budgeted(&content, budget)?;
             }
             FCGI_STDERR => {
                 if stderr.len() + content.len() <= 64 * 1024 {
@@ -709,7 +934,13 @@ fn read_response_with_limit(
 }
 
 fn read_response(stream: &mut dyn ReadWrite) -> io::Result<(Spool, Vec<u8>)> {
-    read_response_with_limit(stream, MAX_FASTCGI_OUTPUT)
+    read_response_with_limit(stream, DEFAULT_MAX_FASTCGI_OUTPUT)
+}
+
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_parse_fastcgi_records(data: &[u8]) {
+    let mut cursor = Cursor::new(data.to_vec());
+    let _ = read_response_with_limit(&mut cursor, 1024 * 1024);
 }
 
 /// Execute a FastCGI request.  `base` supplies the request and connection
@@ -734,7 +965,7 @@ fn retain_script_path_binding(target: &Target, binding: &ScriptBinding) -> io::R
     let current = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(&target.script_filename)?;
+        .open(target.script_filename())?;
     let current_meta = current.metadata()?;
     let same_selected =
         selected.dev() == binding.meta.dev() && selected.ino() == binding.meta.ino();
@@ -760,12 +991,152 @@ fn retain_script_path_binding(target: &Target, binding: &ScriptBinding) -> io::R
     Ok(current)
 }
 
+#[cfg(target_os = "linux")]
+fn path_has_posix_acl(path: &Path) -> io::Result<bool> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "NUL byte in FastCGI stable path",
+        )
+    })?;
+    for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+        let name = std::ffi::CString::new(name).expect("static xattr name");
+        let len = unsafe {
+            libc::lgetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if len > 0 {
+            return Ok(true);
+        }
+        if len == 0 {
+            continue;
+        }
+        let err = io::Error::last_os_error();
+        let code = err.raw_os_error();
+        if code == Some(libc::ENODATA)
+            || code == Some(libc::ENOTSUP)
+            || code == Some(libc::EOPNOTSUPP)
+        {
+            continue;
+        }
+        return Err(err);
+    }
+    Ok(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn path_has_posix_acl(_path: &Path) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "FastCGI POSIX ACL validation is unavailable on this platform",
+    ))
+}
+
+fn stable_fastcgi_component(
+    policy: &FastCgiStablePathPolicy,
+    path: &Path,
+    meta: &std::fs::Metadata,
+) -> io::Result<()> {
+    let uid = meta.uid();
+    let mode = meta.mode();
+    let symlink = meta.file_type().is_symlink();
+    let has_acl = !symlink && path_has_posix_acl(path)?;
+    let admitted = vapache_verified::fastcgi_stable_component_admit(
+        policy.backend_uid == 0,
+        policy.trusted_owner_uids.contains(&uid),
+        uid == policy.backend_uid,
+        mode & 0o022 != 0,
+        symlink,
+        has_acl,
+    );
+    if admitted {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "FastCGI stable-path policy rejected {} (uid={uid}, mode={:04o}, acl={has_acl})",
+                path.display(),
+                mode & 0o7777
+            ),
+        ))
+    }
+}
+
+/// Check every lexical/canonical pathname component. A symlink's own mode is
+/// ignored (Unix reports meaningless 0777 bits), but its owner and containing
+/// directory are checked, and the canonical target is checked separately.
+fn enforce_stable_fastcgi_path(policy: &FastCgiStablePathPolicy, path: &Path) -> io::Result<()> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "FastCGI stable-path policy requires an absolute script path",
+        ));
+    }
+    let mut current = PathBuf::from("/");
+    stable_fastcgi_component(policy, &current, &std::fs::symlink_metadata(&current)?)?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => current.push(name),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "FastCGI stable-path policy rejects non-normal path components",
+                ));
+            }
+        }
+        let meta = std::fs::symlink_metadata(&current)?;
+        stable_fastcgi_component(policy, &current, &meta)?;
+    }
+    Ok(())
+}
+
+fn fastcgi_error_response(
+    base: &CgiContext,
+    scope: &Scope,
+    target: &Target,
+    status: u16,
+) -> Response {
+    crate::files::error_response(
+        base.cfg,
+        base.vhost,
+        scope,
+        status,
+        base.req,
+        &target.script_name,
+        base.local_port,
+        base.host,
+        base.remote_ip
+            .parse()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        base.local_ip,
+    )
+}
+
 fn execute_inner(
     base: &CgiContext,
     scope: &Scope,
     target: &Target,
     binding: Option<&ScriptBinding>,
 ) -> Response {
+    let _dynamic_lease = match base
+        .cfg
+        .resource_budget
+        .try_dynamic(base.cfg.max_dynamic_requests)
+    {
+        Ok(lease) => lease,
+        Err(e) => {
+            eprintln!("vapache FastCGI admission error: {e}");
+            return fastcgi_error_response(base, scope, target, 503);
+        }
+    };
     let mut env = env_from_base(base);
     // The FastCGI target, not the base request mapping, is authoritative for
     // the script and PATH_INFO.  Remove all four derived values before adding
@@ -779,7 +1150,7 @@ fn execute_inner(
     });
     env.push((
         OsString::from("SCRIPT_FILENAME"),
-        OsString::from(target.script_filename.to_string_lossy().into_owned()),
+        OsString::from(target.script_filename().as_os_str()),
     ));
     env.push((
         OsString::from("SCRIPT_NAME"),
@@ -802,8 +1173,15 @@ fn execute_inner(
     }
     let result = (|| -> io::Result<Response> {
         let timeout = base.cfg.timeout.max(Duration::from_secs(5));
-        let mut stream = connect(&target.backend, timeout)?;
+        let policy = stable_policy_for(base.cfg, &target.backend)?;
+        let mut stream = connect(&target.backend, timeout, policy)?;
         let params = build_params(&env);
+        if let Some(policy) = policy {
+            enforce_stable_fastcgi_path(policy, target.script_filename())?;
+            if let Some(binding) = binding {
+                enforce_stable_fastcgi_path(policy, &binding.actual_path)?;
+            }
+        }
         // Connect first, then keep both the originally selected descriptor and
         // a last-moment open of SCRIPT_FILENAME alive through the exchange.
         // A slow backend connection therefore cannot widen the check-to-send
@@ -822,7 +1200,15 @@ fn execute_inner(
             let mut reader = Cursor::new(base.req.body.as_slice());
             send_request(&mut stream, &params, &mut reader)?;
         }
-        let (spool, stderr) = read_response(&mut stream)?;
+        let (spool, stderr) = read_response_with_budget(
+            &mut stream,
+            base.cfg.max_fastcgi_output,
+            Some((
+                &base.cfg.resource_budget,
+                base.cfg.max_spool_bytes,
+                base.cfg.max_spool_files,
+            )),
+        )?;
         if !stderr.is_empty() {
             eprintln!(
                 "vapache FastCGI stderr: {}",
@@ -839,20 +1225,7 @@ fn execute_inner(
         }
         Err(e) => {
             eprintln!("vapache FastCGI error: {e}");
-            crate::files::error_response(
-                base.cfg,
-                base.vhost,
-                scope,
-                502,
-                base.req,
-                &target.script_name,
-                base.local_port,
-                base.host,
-                base.remote_ip
-                    .parse()
-                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-                base.local_ip,
-            )
+            fastcgi_error_response(base, scope, target, 502)
         }
     }
 }
@@ -871,8 +1244,188 @@ mod tests {
     }
 
     #[test]
+    fn strict_fastcgi_path_policy_checks_backend_write_reachability() {
+        let policy = FastCgiStablePathPolicy {
+            endpoint: FastCgiEndpoint::Unix(PathBuf::from("/run/php/test.sock")),
+            backend_uid: 33,
+            endpoint_owner_uid: Some(0),
+            trusted_owner_uids: vec![0],
+        };
+        enforce_stable_fastcgi_path(&policy, Path::new("/etc/passwd"))
+            .expect("root-owned system path should be stable for uid 33");
+        assert!(enforce_stable_fastcgi_path(&policy, Path::new("/tmp")).is_err());
+        assert!(enforce_stable_fastcgi_path(&policy, Path::new("relative.php")).is_err());
+
+        assert!(!vapache_verified::fastcgi_stable_component_admit(
+            false, true, true, false, false, false
+        ));
+        assert!(!vapache_verified::fastcgi_stable_component_admit(
+            false, true, false, true, false, false
+        ));
+        assert!(vapache_verified::fastcgi_stable_component_admit(
+            false, true, false, false, false, false
+        ));
+        assert!(vapache_verified::fastcgi_stable_component_admit(
+            false, true, true, true, true, false
+        ));
+        assert!(!vapache_verified::fastcgi_stable_component_admit(
+            false, true, false, false, false, true
+        ));
+
+        let tcp_backend = parse_backend("fcgi://127.0.0.1:9000").unwrap();
+        let tcp_policy = FastCgiStablePathPolicy {
+            endpoint: FastCgiEndpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 9000,
+            },
+            backend_uid: 33,
+            endpoint_owner_uid: None,
+            trusted_owner_uids: vec![0],
+        };
+        let err = connect(
+            &tcp_backend,
+            Duration::from_millis(1),
+            Some(&tcp_policy),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_policy_binds_exact_endpoint_owner_and_rejects_posix_acls() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("vapache-fcgi-policy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        let socket = dir.join("php.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let euid = unsafe { libc::geteuid() } as u32;
+        let backend_uid = if euid == 33 { 34 } else { 33 };
+        let policy = FastCgiStablePathPolicy {
+            endpoint: FastCgiEndpoint::Unix(socket.clone()),
+            backend_uid,
+            endpoint_owner_uid: Some(euid),
+            trusted_owner_uids: vec![0, euid],
+        };
+        let mut cfg = config(&dir);
+        cfg.fastcgi_stable_paths = Some(vec![policy.clone()]);
+        let backend = parse_backend(&format!(
+            "unix:{}|fcgi://localhost",
+            socket.display()
+        ))
+        .unwrap();
+        assert!(stable_policy_for(&cfg, &backend).unwrap().is_some());
+        let unregistered = parse_backend("fcgi://127.0.0.1:9000").unwrap();
+        assert!(stable_policy_for(&cfg, &unregistered).is_err());
+
+        let accept = std::thread::spawn(move || listener.accept().unwrap());
+        connect(&backend, Duration::from_secs(2), Some(&policy)).unwrap();
+        drop(accept.join().unwrap());
+
+        let file = dir.join("script.php");
+        fs::write(&file, "<?php\n").unwrap();
+        let mut acl = Vec::new();
+        acl.extend_from_slice(&2u32.to_le_bytes());
+        for (tag, perm, id) in [
+            (0x01u16, 0x06u16, u32::MAX),
+            (0x02u16, 0x04u16, 65_534u32),
+            (0x04u16, 0x04u16, u32::MAX),
+            (0x10u16, 0x04u16, u32::MAX),
+            (0x20u16, 0x04u16, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&perm.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        let file_c = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        let name = std::ffi::CString::new("system.posix_acl_access").unwrap();
+        assert_eq!(
+            unsafe {
+                libc::setxattr(
+                    file_c.as_ptr(),
+                    name.as_ptr(),
+                    acl.as_ptr().cast(),
+                    acl.len(),
+                    0,
+                )
+            },
+            0
+        );
+        assert!(path_has_posix_acl(&file).unwrap());
+        assert!(enforce_stable_fastcgi_path(&policy, &file).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn final_script_binding_survives_concurrent_atomic_swaps() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("vapache-fcgi-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        let script = dir.join("index.php");
+        let other = dir.join("attacker.php");
+        fs::write(&script, "SAFE\n").unwrap();
+        fs::write(&other, "ATTACKER\n").unwrap();
+        let selected = File::open(&script).unwrap();
+        let selected_meta = selected.metadata().unwrap();
+        let binding = ScriptBinding {
+            file: selected,
+            meta: selected_meta,
+            actual_path: fs::canonicalize(&script).unwrap(),
+        };
+        let target = Target {
+            backend: parse_backend("fcgi://127.0.0.1:9000").unwrap(),
+            script_filename: LexicalScriptPath::for_test(script.clone()),
+            script_name: "/index.php".into(),
+            path_info: String::new(),
+            route_order: 0,
+            logical_url: None,
+        };
+        let script_c = std::ffi::CString::new(script.as_os_str().as_bytes()).unwrap();
+        let other_c = std::ffi::CString::new(other.as_os_str().as_bytes()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let attacker_stop = Arc::clone(&stop);
+        let attacker = std::thread::spawn(move || {
+            while !attacker_stop.load(Ordering::Relaxed) {
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_renameat2,
+                        libc::AT_FDCWD,
+                        script_c.as_ptr(),
+                        libc::AT_FDCWD,
+                        other_c.as_ptr(),
+                        libc::RENAME_EXCHANGE,
+                    )
+                };
+                assert_eq!(rc, 0);
+                std::thread::yield_now();
+            }
+        });
+        for _ in 0..2_000 {
+            if let Ok(retained) = retain_script_path_binding(&target, &binding) {
+                let meta = retained.metadata().unwrap();
+                assert_eq!(
+                    (meta.dev(), meta.ino()),
+                    (binding.meta.dev(), binding.meta.ino())
+                );
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        attacker.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn spool_temp_file_never_follows_a_preexisting_symlink() {
-        use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!("vapache-fcgi-spool-safe-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1017,7 +1570,7 @@ mod tests {
         .unwrap();
         let target = Target {
             backend,
-            script_filename: PathBuf::from("/var/www/html/index.php"),
+            script_filename: LexicalScriptPath::for_test(PathBuf::from("/var/www/html/index.php")),
             script_name: "/index.php".into(),
             path_info: String::new(),
             route_order: 0,
@@ -1099,7 +1652,7 @@ mod tests {
         .unwrap();
         let target = Target {
             backend,
-            script_filename: PathBuf::from("/var/www/html/index.php"),
+            script_filename: LexicalScriptPath::for_test(PathBuf::from("/var/www/html/index.php")),
             script_name: "/index.php".into(),
             path_info: "/info".into(),
             route_order: 0,
@@ -1164,7 +1717,7 @@ mod tests {
         .unwrap();
         let target = Target {
             backend,
-            script_filename: PathBuf::from("/var/www/html/index.php"),
+            script_filename: LexicalScriptPath::for_test(PathBuf::from("/var/www/html/index.php")),
             script_name: "/index.php".into(),
             path_info: String::new(),
             route_order: 0,
@@ -1232,7 +1785,7 @@ mod tests {
 
         let unix_target = Target {
             backend: unix,
-            script_filename: PathBuf::from("/srv/index.php"),
+            script_filename: LexicalScriptPath::for_test(PathBuf::from("/srv/index.php")),
             script_name: "/index.php".into(),
             path_info: String::new(),
             route_order: 0,
@@ -1243,7 +1796,7 @@ mod tests {
         assert!(key.contains("lexical=/srv/index.php|authorized=/srv/real/index.php"));
         let tcp_target = Target {
             backend: tcp_path,
-            script_filename: PathBuf::from("/srv/index.php"),
+            script_filename: LexicalScriptPath::for_test(PathBuf::from("/srv/index.php")),
             script_name: "/index.php".into(),
             path_info: "/info".into(),
             route_order: 0,
@@ -1382,7 +1935,7 @@ mod tests {
         pass("/ok", &valid, 0);
         let target = match_proxy(&scope, "/ok/index.php", &root).unwrap();
         assert_eq!(target.route_order, 0);
-        assert_eq!(target.script_filename, root.join("index.php"));
+        assert_eq!(target.script_filename(), root.join("index.php"));
         assert!(target.logical_url.as_deref().unwrap().starts_with("unix:"));
         assert!(match_proxy(&scope, "/escape/../outside/secret.php", &root).is_none());
         assert!(match_proxy(&scope, "/link/link.php", &root).is_none());
@@ -1407,7 +1960,7 @@ mod tests {
         rule("^/ok/(.*)$", &format!("{valid}$1"), 0);
         let regex_target = match_proxy(&regex_scope, "/ok/index.php", &root).unwrap();
         assert_eq!(regex_target.route_order, 0);
-        assert_eq!(regex_target.script_filename, root.join("index.php"));
+        assert_eq!(regex_target.script_filename(), root.join("index.php"));
         assert!(match_proxy(&regex_scope, "/badregex", &root).is_none());
         assert!(match_proxy(&regex_scope, "/escape/../outside/secret.php", &root).is_none());
         assert!(match_proxy(&regex_scope, "/nogroup", &root).is_some());
@@ -1464,7 +2017,7 @@ mod tests {
             "/index.php",
         )
         .unwrap();
-        assert_eq!(handler.script_filename, root.join("index.php"));
+        assert_eq!(handler.script_filename(), root.join("index.php"));
         assert_eq!(handler.logical_url.as_deref(), Some(proxy_handler.as_str()));
         // The resolved-target variant rejects a target outside the configured
         // FastCGI base and a symlink whose real target escapes it.
@@ -1472,6 +2025,7 @@ mod tests {
             &handler_scope(&proxy_handler),
             &root,
             "/secret.php",
+            &root.join("secret.php"),
             &outside.join("secret.php"),
             b"secret.php",
         )
@@ -1481,6 +2035,7 @@ mod tests {
             &root,
             "/link.php",
             &root.join("link.php"),
+            &root.join("link.php"),
             b"link.php",
         )
         .is_none());
@@ -1488,6 +2043,7 @@ mod tests {
             &handler_scope(&proxy_handler),
             &root,
             "/index.php",
+            &root.join("index.php"),
             &root.join("index.php"),
             b"index.php",
         )
@@ -1504,6 +2060,7 @@ mod tests {
             &extension_scope,
             &root,
             "/link.txt",
+            &root.join("link.txt"),
             &root.join("index.php"),
             b"link.txt",
         )
@@ -1513,9 +2070,48 @@ mod tests {
             &root,
             "/index.php",
             &root.join("index.php"),
+            &root.join("index.php"),
             b"index.php",
         )
         .is_some());
+
+        // P17: SetHandler classification may cover a non-PHP lexical name,
+        // but the backend must still receive that lexical path. The canonical
+        // descriptor target remains a separate authorization identity.
+        std::os::unix::fs::symlink("index.php", root.join("link.txt")).unwrap();
+        let mut forced_scope = Scope::default();
+        forced_scope.mapping_policy.set_handler =
+            Some(crate::config::SetHandler::Name(proxy_handler.clone()));
+        let resolved = handler_target_for_file(
+            &forced_scope,
+            &root,
+            "/link.txt",
+            &root.join("link.txt"),
+            &root.join("index.php"),
+            b"link.txt",
+        )
+        .unwrap();
+        assert_eq!(resolved.script_filename(), root.join("link.txt"));
+        assert!(resolved.script_filename.matches_mapping(
+            &parse_backend(&proxy_handler).unwrap(),
+            &root,
+            Path::new("link.txt"),
+        ));
+        let forged_canonical = LexicalScriptPath::for_test(root.join("index.php"));
+        assert!(!forged_canonical.matches_mapping(
+            &parse_backend(&proxy_handler).unwrap(),
+            &root,
+            Path::new("link.txt"),
+        ));
+        assert!(handler_target_for_file(
+            &forced_scope,
+            &root,
+            "/link.txt",
+            &root.join("link.txt"),
+            &root.join("index.php"),
+            b"index.php",
+        )
+        .is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1548,14 +2144,14 @@ mod tests {
             transport: Transport::Tcp("127.0.0.1".into(), port),
             prefix: String::new(),
         };
-        assert!(connect(&backend, Duration::from_secs(2)).is_ok());
+        assert!(connect(&backend, Duration::from_secs(2), None).is_ok());
         handle.join().unwrap();
 
         let dead = Backend {
             transport: Transport::Tcp("127.0.0.1".into(), 1),
             prefix: String::new(),
         };
-        assert!(connect(&dead, Duration::from_millis(100)).is_err());
+        assert!(connect(&dead, Duration::from_millis(100), None).is_err());
     }
 
     #[test]
@@ -1594,6 +2190,7 @@ mod tests {
         Spool::File {
             file,
             len: data.len() as u64,
+            lease: None,
         }
     }
 
@@ -1681,6 +2278,30 @@ mod tests {
         assert!(stderr.len() <= 64 * 1024);
     }
 
+    #[test]
+    fn fastcgi_response_spool_holds_aggregate_budget_until_response_drop() {
+        let mut payload = b"Content-Type: text/plain\r\n\r\n".to_vec();
+        payload.extend(std::iter::repeat(b'x').take(FASTCGI_SPOOL_THRESHOLD + 32));
+        let mut input = Vec::new();
+        for chunk in payload.chunks(60_000) {
+            record(&mut input, FCGI_STDOUT, 1, chunk);
+        }
+        record(&mut input, FCGI_END_REQUEST, 1, &[0u8; 8]);
+        let budget = Arc::new(crate::resource::ResourceBudget::default());
+        let mut cursor = Cursor::new(input);
+        let (spool, _) = read_response_with_budget(
+            &mut cursor,
+            2 * 1024 * 1024,
+            Some((&budget, 2 * 1024 * 1024, 1)),
+        )
+        .unwrap();
+        assert_eq!(budget.usage().1, 1);
+        let response = response_from_spool(spool, crate::http::Version::Http11).unwrap();
+        assert_eq!(budget.usage().1, 1);
+        drop(response);
+        assert_eq!(budget.usage(), (0, 0, 0));
+    }
+
     fn mock_fastcgi_with_stderr(listener: UnixListener) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -1722,7 +2343,7 @@ mod tests {
 
         let missing = Target {
             backend: parse_backend("unix:/definitely/missing.sock|fcgi://localhost").unwrap(),
-            script_filename: dir.join("index.php"),
+            script_filename: LexicalScriptPath::for_test(dir.join("index.php")),
             script_name: "/index.php".into(),
             path_info: String::new(),
             route_order: 0,
@@ -1757,7 +2378,7 @@ mod tests {
         let handle = mock_fastcgi_with_stderr(listener);
         let target = Target {
             backend: parse_backend(&format!("unix:{}|fcgi://localhost", sock.display())).unwrap(),
-            script_filename: dir.join("index.php"),
+            script_filename: LexicalScriptPath::for_test(dir.join("index.php")),
             script_name: "/index.php".into(),
             path_info: String::new(),
             route_order: 0,
@@ -1853,14 +2474,14 @@ mod tests {
         fs::write(&script, "<?php echo 'selected';\n").unwrap();
         let target = Target {
             backend: parse_backend("fcgi://127.0.0.1:9000/").unwrap(),
-            script_filename: script.clone(),
+            script_filename: LexicalScriptPath::for_test(script.clone()),
             script_name: "/index.php".into(),
             path_info: String::new(),
             route_order: 0,
             logical_url: None,
         };
         let non_file_target = Target {
-            script_filename: dir.clone(),
+            script_filename: LexicalScriptPath::for_test(dir.clone()),
             ..target.clone()
         };
         assert!(open_script(&non_file_target, &dir, true, false).is_none());

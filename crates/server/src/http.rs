@@ -7,6 +7,7 @@
 //! parsing rules that httpd's own security advisories keep returning to.
 
 use crate::util::{trim_ascii, with_http_date_now};
+use crate::resource::{ResourceBudget, SpoolLease};
 use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -105,6 +106,7 @@ impl Headers {
 pub struct SpooledBody {
     file: std::sync::Mutex<File>,
     pub len: u64,
+    _lease: Option<SpoolLease>,
 }
 
 impl SpooledBody {
@@ -123,6 +125,7 @@ impl SpooledBody {
         Self {
             file: std::sync::Mutex::new(file),
             len: data.len() as u64,
+            _lease: None,
         }
     }
 }
@@ -237,6 +240,9 @@ pub struct Limits {
     pub body_timeout: Duration,
     pub header_min_rate: u64,
     pub body_min_rate: u64,
+    pub resource_budget: std::sync::Arc<ResourceBudget>,
+    pub max_spool_bytes: u64,
+    pub max_spool_files: u64,
 }
 
 impl Default for Limits {
@@ -250,6 +256,9 @@ impl Default for Limits {
             body_timeout: Duration::from_secs(30),
             header_min_rate: 0,
             body_min_rate: 0,
+            resource_budget: std::sync::Arc::new(ResourceBudget::default()),
+            max_spool_bytes: 1024 * 1024 * 1024,
+            max_spool_files: 128,
         }
     }
 }
@@ -340,6 +349,10 @@ pub fn read_request<R: Read + Write>(
                     ))
                 };
             if n > MAX_REQUEST_BODY_IN_MEMORY {
+                let mut lease = limits
+                    .resource_budget
+                    .try_spool(limits.max_spool_bytes, limits.max_spool_files)?;
+                lease.reserve(n)?;
                 let file = spool_file()?;
                 let mut file = file;
                 let take = (n as usize).min(buf.len());
@@ -368,6 +381,7 @@ pub fn read_request<R: Read + Write>(
                 req.body_spool = Some(std::sync::Arc::new(SpooledBody {
                     file: std::sync::Mutex::new(file),
                     len: n,
+                    _lease: Some(lease),
                 }));
             } else {
                 read_exact_into(
@@ -381,6 +395,9 @@ pub fn read_request<R: Read + Write>(
             }
         }
         BodyFraming::Chunked => {
+            let mut lease = limits
+                .resource_budget
+                .try_spool(limits.max_spool_bytes, limits.max_spool_files)?;
             let mut file = spool_file()?;
             let chunk_deadline = Instant::now()
                 + if limits.body_min_rate == 0 {
@@ -390,10 +407,18 @@ pub fn read_request<R: Read + Write>(
                         limits.body.saturating_mul(1000) / limits.body_min_rate,
                     ))
                 };
-            let len = read_chunked_to_file(stream, buf, &mut file, limits.body, chunk_deadline)?;
+            let len = read_chunked_to_file_budgeted(
+                stream,
+                buf,
+                &mut file,
+                limits.body,
+                chunk_deadline,
+                Some(&mut lease),
+            )?;
             req.body_spool = Some(std::sync::Arc::new(SpooledBody {
                 file: std::sync::Mutex::new(file),
                 len,
+                _lease: Some(lease),
             }));
         }
     }
@@ -491,6 +516,17 @@ fn read_chunked_to_file<R: Read>(
     max: u64,
     deadline: Instant,
 ) -> io::Result<u64> {
+    read_chunked_to_file_budgeted(stream, buf, file, max, deadline, None)
+}
+
+fn read_chunked_to_file_budgeted<R: Read>(
+    stream: &mut R,
+    buf: &mut Vec<u8>,
+    file: &mut File,
+    max: u64,
+    deadline: Instant,
+    mut lease: Option<&mut SpoolLease>,
+) -> io::Result<u64> {
     let mut total = 0u64;
     loop {
         if Instant::now() > deadline {
@@ -549,6 +585,9 @@ fn read_chunked_to_file<R: Read>(
             }
             if !buf.is_empty() {
                 let take = remaining.min(buf.len());
+                if let Some(lease) = lease.as_deref_mut() {
+                    lease.reserve(take as u64)?;
+                }
                 file.write_all(&buf[..take])?;
                 buf.drain(..take);
                 remaining -= take;
@@ -562,6 +601,9 @@ fn read_chunked_to_file<R: Read>(
                         io::ErrorKind::UnexpectedEof,
                         "EOF in chunked body",
                     ));
+                }
+                if let Some(lease) = lease.as_deref_mut() {
+                    lease.reserve(got as u64)?;
                 }
                 file.write_all(&chunk[..got])?;
                 remaining -= got;
@@ -725,6 +767,7 @@ pub struct Response {
     pub status: u16,
     pub headers: Vec<(Cow<'static, str>, Vec<u8>)>,
     pub body: Body,
+    spool_lease: Option<SpoolLease>,
 }
 
 impl Response {
@@ -733,6 +776,7 @@ impl Response {
             status,
             headers: Vec::new(),
             body: Body::Empty,
+            spool_lease: None,
         }
     }
 
@@ -759,6 +803,10 @@ impl Response {
             Body::File { len, .. } => *len,
             Body::Stream { len, .. } => *len,
         }
+    }
+
+    pub(crate) fn hold_spool(&mut self, lease: SpoolLease) {
+        self.spool_lease = Some(lease);
     }
 }
 
@@ -1222,6 +1270,48 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_request_spool_limits_fail_closed_and_release() {
+        let mut limits = limits();
+        limits.max_spool_bytes = 1024;
+        limits.max_spool_files = 1;
+        let mut cursor = std::io::Cursor::new(
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\n\r\n".to_vec(),
+        );
+        assert!(read_request(&mut cursor, &mut Vec::new(), &limits, |_| {}).is_err());
+        assert_eq!(limits.resource_budget.usage(), (0, 0, 0));
+
+        limits.max_spool_bytes = 1024 * 1024;
+        let chunked =
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let first = read_request(
+            &mut std::io::Cursor::new(chunked.to_vec()),
+            &mut Vec::new(),
+            &limits,
+            |_| {},
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(limits.resource_budget.usage(), (0, 1, 0));
+        assert!(read_request(
+            &mut std::io::Cursor::new(chunked.to_vec()),
+            &mut Vec::new(),
+            &limits,
+            |_| {},
+        )
+        .is_err());
+        drop(first);
+        assert_eq!(limits.resource_budget.usage(), (0, 0, 0));
+        assert!(read_request(
+            &mut std::io::Cursor::new(chunked.to_vec()),
+            &mut Vec::new(),
+            &limits,
+            |_| {},
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
     fn request_trailers_are_bounded() {
         let mut wire =
             b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
@@ -1321,6 +1411,7 @@ mod tests {
                 reader: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
                 len: 7,
             },
+            spool_lease: None,
         };
         assert_eq!(stream.body_len(), 7);
     }
@@ -1417,6 +1508,7 @@ mod tests {
                 offset: 0,
                 len: 9,
             },
+            spool_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -1478,6 +1570,7 @@ mod tests {
                 reader: Box::new(std::io::Cursor::new(vec![b's'; 10])),
                 len: 10,
             },
+            spool_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -1494,6 +1587,7 @@ mod tests {
                 reader: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
                 len: 10,
             },
+            spool_lease: None,
         };
         assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
 
@@ -1510,6 +1604,7 @@ mod tests {
                 offset: 0,
                 len: 32 * 1024,
             },
+            spool_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -1529,6 +1624,7 @@ mod tests {
                 offset: 0,
                 len: 32 * 1024,
             },
+            spool_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -1550,6 +1646,7 @@ mod tests {
                 offset: 0,
                 len: 32 * 1024,
             },
+            spool_lease: None,
         };
         assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
 
@@ -1566,6 +1663,7 @@ mod tests {
                 offset: 0,
                 len: 0,
             },
+            spool_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -1628,6 +1726,7 @@ mod tests {
                 offset: 0,
                 len: 32 * 1024,
             },
+            spool_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -2007,6 +2106,7 @@ mod tests {
                 offset: 0,
                 len: 32 * 1024,
             },
+            spool_lease: None,
         };
         assert_eq!(
             write_response(&mut writer, &mut response, &response_options()).unwrap(),
@@ -2026,6 +2126,7 @@ mod tests {
                 offset: 0,
                 len: 32 * 1024,
             },
+            spool_lease: None,
         };
         assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
         drop(writer);

@@ -1,5 +1,8 @@
 # Cargo build output
 /target/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
 
 # LLVM raw coverage profiles from tests/coverage.sh
 *.profraw

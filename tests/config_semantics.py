@@ -19,6 +19,7 @@ request below is sent to both and the observable status/headers are compared.
 Usage:
     python3 tests/config_semantics.py
     python3 tests/config_semantics.py -v
+    python3 tests/config_semantics.py --stateful 128 --stateful-seed 1818
     KEEP_TREE=1 python3 tests/config_semantics.py
 """
 
@@ -1944,6 +1945,102 @@ CASES = [
         "requests": [("GET", "/aol_require/file.txt", None, {})],
     },
     {
+        "name": "allowoverridelist-does-not-admit-files-wrapper",
+        "dir": "aol_no_files_wrapper",
+        "files": {
+            ".htaccess": '<Files "secret.txt">\n    Require all granted\n</Files>\n',
+            "secret.txt": "secret\n",
+        },
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    AllowOverride None",
+            "    AllowOverrideList Require",
+            '    <FilesMatch "^secret\\.txt$">',
+            "        Require all denied",
+            "    </FilesMatch>",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/aol_no_files_wrapper/secret.txt", None, {})],
+    },
+    {
+        "name": "allowoverridelist-does-not-admit-filesmatch-wrapper",
+        "dir": "aol_no_filesmatch_wrapper",
+        "files": {
+            ".htaccess": '<FilesMatch "^secret\\.txt$">\n    Require all granted\n</FilesMatch>\n',
+            "secret.txt": "secret\n",
+        },
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    AllowOverride None",
+            "    AllowOverrideList Require",
+            '    <FilesMatch "^secret\\.txt$">',
+            "        Require all denied",
+            "    </FilesMatch>",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/aol_no_filesmatch_wrapper/secret.txt", None, {})],
+    },
+    {
+        "name": "allowoverridelist-does-not-admit-if-wrapper",
+        "dir": "aol_no_if_wrapper",
+        "files": {
+            ".htaccess": '<If "true">\n    Require all denied\n</If>\n',
+        },
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    AllowOverride None",
+            "    AllowOverrideList Require",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/aol_no_if_wrapper/file.txt", None, {})],
+    },
+    {
+        "name": "allowoverridelist-does-not-admit-require-wrapper",
+        "dir": "aol_no_require_wrapper",
+        "files": {
+            ".htaccess": "<RequireAll>\n    Require all granted\n</RequireAll>\n",
+        },
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    AllowOverride None",
+            "    AllowOverrideList Require",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/aol_no_require_wrapper/file.txt", None, {})],
+    },
+    {
+        "name": "allowoverridelist-does-not-admit-limit-wrapper",
+        "dir": "aol_no_limit_wrapper",
+        "files": {
+            ".htaccess": "<Limit GET>\n    Require all denied\n</Limit>\n",
+        },
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    AllowOverride None",
+            "    AllowOverrideList Require",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/aol_no_limit_wrapper/file.txt", None, {})],
+    },
+    {
+        "name": "allowoverridelist-explicit-files-wrapper",
+        "dir": "aol_explicit_files_wrapper",
+        "files": {
+            ".htaccess": '<Files "secret.txt">\n    Require all granted\n</Files>\n',
+            "secret.txt": "secret\n",
+        },
+        "config": [
+            f'<Directory "{{dir}}">',
+            "    AllowOverride None",
+            '    AllowOverrideList "<Files" Require',
+            '    <FilesMatch "^secret\\.txt$">',
+            "        Require all denied",
+            "    </FilesMatch>",
+            "</Directory>",
+        ],
+        "requests": [("GET", "/aol_explicit_files_wrapper/secret.txt", None, {})],
+    },
+    {
         "name": "allowoverridelist-header-only",
         "dir": "aol_header",
         "files": {".htaccess": "Header set X-AOL yes\n"},
@@ -2319,6 +2416,94 @@ def generated_cases():
 
 
 CASES.extend(generated_cases())
+
+
+def section_override_cases():
+    """Apache-oracle matrix for every supported access-file section.
+
+    Each wrapper is exercised with a child-only list entry, its exact command
+    entry, Nonfatal=Override, AuthConfig, FileInfo and Limit. Prerequisite
+    wrappers for Else/ElseIf/RequireNone are listed independently so the case
+    reaches the target command rather than failing at its enclosing syntax.
+    """
+    specs = [
+        ("files", '<Files "file.txt">\n    Require all granted\n</Files>\n', "<Files", []),
+        ("filesmatch", '<FilesMatch "^file\\.txt$">\n    Require all granted\n</FilesMatch>\n', "<FilesMatch", []),
+        ("if", '<If "true">\n    Require all granted\n</If>\n', "<If", []),
+        ("iffile", '<IfFile "missing-section-matrix-flag">\n    Require all granted\n</IfFile>\n', "<IfFile", []),
+        (
+            "elseif",
+            '<If "false">\n    Require all denied\n</If>\n'
+            '<ElseIf "true">\n    Require all granted\n</ElseIf>\n',
+            "<ElseIf",
+            ["<If"],
+        ),
+        (
+            "else",
+            '<If "false">\n    Require all denied\n</If>\n'
+            '<Else>\n    Require all granted\n</Else>\n',
+            "<Else",
+            ["<If"],
+        ),
+        ("ifmodule", '<IfModule core_module>\n    Require all granted\n</IfModule>\n', "<IfModule", []),
+        ("ifdefine", '<IfDefine !SECTION_MATRIX_MISSING>\n    Require all granted\n</IfDefine>\n', "<IfDefine", []),
+        ("ifdirective", '<IfDirective Require>\n    Require all granted\n</IfDirective>\n', "<IfDirective", []),
+        ("ifsection", '<IfSection Files>\n    Require all granted\n</IfSection>\n', "<IfSection", []),
+        ("ifversion", '<IfVersion >= 2.4>\n    Require all granted\n</IfVersion>\n', "<IfVersion", []),
+        ("requireall", '<RequireAll>\n    Require all granted\n</RequireAll>\n', "<RequireAll", []),
+        ("requireany", '<RequireAny>\n    Require all granted\n</RequireAny>\n', "<RequireAny", []),
+        (
+            "requirenone",
+            '<RequireAll>\n    Require all granted\n    <RequireNone>\n'
+            '        Require ip 192.0.2.1\n    </RequireNone>\n</RequireAll>\n',
+            "<RequireNone",
+            ["<RequireAll"],
+        ),
+        ("limit", '<Limit GET>\n    Require all granted\n</Limit>\n', "<Limit", []),
+        ("limitexcept", '<LimitExcept POST>\n    Require all granted\n</LimitExcept>\n', "<LimitExcept", []),
+    ]
+
+    def list_line(commands):
+        values = [f'"{command}"' for command in commands] + ["Require"]
+        return "    AllowOverrideList " + " ".join(values)
+
+    out = []
+    for tag, access_file, command, prerequisites in specs:
+        variants = [
+            ("child-only", ["    AllowOverride None", list_line(prerequisites)]),
+            (
+                "exact",
+                ["    AllowOverride None", list_line([*prerequisites, command])],
+            ),
+            (
+                "nonfatal",
+                [
+                    "    AllowOverride None Nonfatal=Override",
+                    list_line(prerequisites),
+                ],
+            ),
+            ("authconfig", ["    AllowOverride AuthConfig"]),
+            (
+                "fileinfo",
+                ["    AllowOverride FileInfo", list_line(prerequisites)],
+            ),
+            ("limit-category", ["    AllowOverride Limit", list_line(prerequisites)]),
+        ]
+        for variant, override_lines in variants:
+            name = f"section-gate-{tag}-{variant}"
+            out.append(
+                {
+                    "name": name,
+                    "dir": name.replace("-", "_"),
+                    "files": {".htaccess": access_file},
+                    "config": [f'<Directory "{{dir}}">', *override_lines, "</Directory>"],
+                    "requests": [("GET", f"/{name.replace('-', '_')}/file.txt", None, {})],
+                }
+            )
+    return out
+
+
+CASES.extend(section_override_cases())
 
 
 # Cases derived directly from Apache 2.4.69's execute-on-read containers,
@@ -2744,15 +2929,40 @@ def random_cases(count: int, seed: int):
                 "    " + loc_req,
                 "</Location>",
             ]
-        # Sometimes .htaccess gating; use AuthConfig or All.
+        # Sometimes .htaccess gating, including exact and child-only
+        # AllowOverrideList section entries. This keeps randomized coverage on
+        # the P18 seam instead of limiting it to broad category modes.
         if rng.random() < 0.35:
-            mode = rng.choice(["None", "AuthConfig", "All"])
-            config += [
-                f'<Directory "{{dir}}">',
-                f"    AllowOverride {mode}",
-                "</Directory>",
-            ]
-            if mode != "None":
+            mode = rng.choice(
+                ["None", "AuthConfig", "All", "ListRequire", "ListFiles"]
+            )
+            config.append(f'<Directory "{{dir}}">')
+            if mode == "ListRequire":
+                config += [
+                    "    AllowOverride None",
+                    "    AllowOverrideList Require",
+                ]
+                files[".htaccess"] = rng.choice(
+                    [
+                        "Require all denied\n",
+                        '<Files "file.txt">\n    Require all granted\n</Files>\n',
+                    ]
+                )
+            elif mode == "ListFiles":
+                config += [
+                    "    AllowOverride None",
+                    '    AllowOverrideList "<Files" Require',
+                ]
+                files[".htaccess"] = rng.choice(
+                    [
+                        '<Files "file.txt">\n    Require all denied\n</Files>\n',
+                        '<FilesMatch "^file\\.txt$">\n    Require all denied\n</FilesMatch>\n',
+                    ]
+                )
+            else:
+                config.append(f"    AllowOverride {mode}")
+            config.append("</Directory>")
+            if mode not in ("None", "ListRequire", "ListFiles"):
                 if rng.random() < 0.3:
                     files[".htaccess"] = (
                         '<If "%{HTTP:X-Random} == \'yes\'">\n'
@@ -2777,6 +2987,140 @@ def random_cases(count: int, seed: int):
                 "files": files,
                 "config": config,
                 "requests": requests,
+            }
+        )
+    return out
+
+
+def stateful_access_cases(count: int, seed: int):
+    """Generate access-file parser histories, including invalid transitions.
+
+    Unlike ``random_cases``, these cases deliberately model an open-section
+    stack and mutate it: balanced nesting, a close of the wrong stack entry,
+    and EOF with live entries.  The remaining states cover duplicate
+    AllowOverride ordering and every Nonfatal behavior (the default None plus
+    Override, Unknown and All).  Apache remains the result oracle.
+    """
+    rng = random.Random(seed)
+    out = []
+    for i in range(count):
+        name = f"stateful-{seed}-{i}"
+        directory = f"stateful_{seed}_{i}"
+        state = i % 9
+        wrapper = rng.choice(
+            [
+                ('<Files "file.txt">', "</Files>"),
+                ('<FilesMatch "^file\\.txt$">', "</FilesMatch>"),
+            ]
+        )
+        condition = rng.choice(['<If "true">', '<If "%{HTTP:X-State} == \'yes\'">'])
+        headers = {"X-State": "yes"}
+
+        if state == 0:
+            # Push If -> Files -> RequireAll -> RequireNone, then pop in the
+            # exact reverse order. This exercises both parser stack state and
+            # nested authz state in one access file.
+            access = (
+                f"{condition}\n"
+                f"    {wrapper[0]}\n"
+                "        <RequireAll>\n"
+                "            Require all granted\n"
+                "            <RequireNone>\n"
+                "                Require ip 192.0.2.1\n"
+                "            </RequireNone>\n"
+                "        </RequireAll>\n"
+                f"    {wrapper[1]}\n"
+                "</If>\n"
+            )
+            config = [
+                '<Directory "{dir}">',
+                "    AllowOverride AuthConfig",
+                "</Directory>",
+            ]
+        elif state == 1:
+            # Pop If while Files is still the live top-of-stack entry.
+            access = (
+                f"{condition}\n    {wrapper[0]}\n"
+                "        Require all denied\n"
+                "</If>\n"
+                f"{wrapper[1]}\n"
+            )
+            config = [
+                '<Directory "{dir}">',
+                "    AllowOverride AuthConfig",
+                "</Directory>",
+            ]
+        elif state == 2:
+            # End-of-file with both wrapper entries still live.
+            access = (
+                f"{condition}\n    {wrapper[0]}\n"
+                "        Require all denied\n"
+            )
+            config = [
+                '<Directory "{dir}">',
+                "    AllowOverride AuthConfig",
+                "</Directory>",
+            ]
+        elif state == 3:
+            access = "Require all denied\n"
+            config = [
+                '<Directory "{dir}">',
+                "    AllowOverride None",
+                "    AllowOverride AuthConfig",
+                "</Directory>",
+            ]
+        elif state == 4:
+            access = "Require all denied\n"
+            config = [
+                '<Directory "{dir}">',
+                "    AllowOverride AuthConfig",
+                "    AllowOverride None",
+                "</Directory>",
+            ]
+        elif state == 5:
+            # Nonfatal=None is represented by omitting the option.
+            access = "Options +Indexes\nRequire all denied\n"
+            config = [
+                '<Directory "{dir}">',
+                "    AllowOverride AuthConfig",
+                "</Directory>",
+            ]
+        elif state == 6:
+            access = "Options +Indexes\nRequire all denied\n"
+            config = [
+                '<Directory "{dir}">',
+                "    AllowOverride AuthConfig Nonfatal=Override",
+                "</Directory>",
+            ]
+        elif state == 7:
+            access = "DefinitelyNotAStatefulDirective on\nRequire all denied\n"
+            config = [
+                '<Directory "{dir}">',
+                "    AllowOverride AuthConfig Nonfatal=Unknown",
+                "</Directory>",
+            ]
+        else:
+            access = (
+                "Options +Indexes\n"
+                "DefinitelyNotAStatefulDirective on\n"
+                "Require all denied\n"
+            )
+            config = [
+                '<Directory "{dir}">',
+                "    AllowOverride AuthConfig Nonfatal=All",
+                "</Directory>",
+            ]
+
+        out.append(
+            {
+                "name": name,
+                "dir": directory,
+                "files": {".htaccess": access},
+                "config": config,
+                "requests": [
+                    ("GET", f"/{directory}/file.txt", headers, {}),
+                    ("HEAD", f"/{directory}/file.txt", headers, {}),
+                ],
             }
         )
     return out
@@ -2831,9 +3175,13 @@ def main():
     ap.add_argument("--only", default="")
     ap.add_argument("--random", type=int, default=0)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--stateful", type=int, default=0)
+    ap.add_argument("--stateful-seed", type=int, default=1818)
     args = ap.parse_args()
     if args.random:
         CASES.extend(random_cases(args.random, args.seed))
+    if args.stateful:
+        CASES.extend(stateful_access_cases(args.stateful, args.stateful_seed))
     if args.only:
         CASES[:] = [c for c in CASES if re.search(args.only, c["name"], re.I)]
 

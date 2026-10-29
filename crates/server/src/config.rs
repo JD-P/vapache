@@ -1584,9 +1584,7 @@ impl Scope {
         env: &mut RequestEnvironment,
     ) {
         for entry in rules {
-            if fastcgi
-                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
-            {
+            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let rule = &entry.value;
@@ -1666,9 +1664,7 @@ impl Scope {
             &mut env,
         );
         for entry in &self.environment_policy.rewrite_env {
-            if fastcgi
-                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
-            {
+            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let (name, value) = &entry.value;
@@ -1676,9 +1672,7 @@ impl Scope {
             env.push((name.clone(), value.clone()));
         }
         for entry in &self.environment_policy.rewrite_unset_env {
-            if fastcgi
-                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
-            {
+            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let name = &entry.value;
@@ -1705,9 +1699,7 @@ impl Scope {
     ) -> RequestEnvironment {
         let mut env = self.authorization_environment(req, url_path, peer, fastcgi);
         for entry in &self.environment_policy.rewrite_late_env {
-            if fastcgi
-                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
-            {
+            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let (name, value) = &entry.value;
@@ -1715,18 +1707,14 @@ impl Scope {
             env.push((name.clone(), value.clone()));
         }
         for entry in &self.environment_policy.rewrite_late_unset_env {
-            if fastcgi
-                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
-            {
+            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let name = &entry.value;
             env.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
         }
         for entry in &self.environment_policy.set_env {
-            if fastcgi
-                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
-            {
+            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let (name, value) = &entry.value;
@@ -1734,9 +1722,7 @@ impl Scope {
             env.push((name.clone(), value.as_bytes().to_vec()));
         }
         for entry in &self.environment_policy.pass_env {
-            if fastcgi
-                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
-            {
+            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let name = &entry.value;
@@ -1747,9 +1733,7 @@ impl Scope {
             env.push((name.clone(), value.as_os_str().as_bytes().to_vec()));
         }
         for entry in &self.environment_policy.unset_env {
-            if fastcgi
-                && !vapache_verified::fastcgi_environment_origin_admit(entry.origin)
-            {
+            if fastcgi && !vapache_verified::fastcgi_environment_origin_admit(entry.origin) {
                 continue;
             }
             let name = &entry.value;
@@ -2388,6 +2372,27 @@ pub struct RemoteIpProxy {
     pub internal: bool,
 }
 
+/// Exact transport identity covered by a FastCGI stability policy.  A policy
+/// cannot silently migrate from one PHP-FPM pool to another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FastCgiEndpoint {
+    Unix(PathBuf),
+    Tcp { host: String, port: u16 },
+}
+
+/// Opt-in local filesystem stability contract for one exact FastCGI backend.
+/// `backend_uid` is the worker identity that must be unable to mutate the
+/// script path. `endpoint_owner_uid` independently authenticates a Unix socket
+/// pathname. Strict policies reject TCP because it cannot authenticate the
+/// backend process; the TCP enum variant remains the routing endpoint identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastCgiStablePathPolicy {
+    pub endpoint: FastCgiEndpoint,
+    pub backend_uid: u32,
+    pub endpoint_owner_uid: Option<u32>,
+    pub trusted_owner_uids: Vec<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub server_root: PathBuf,
@@ -2435,6 +2440,14 @@ pub struct Config {
     pub health_templates: HashMap<String, HealthTemplate>,
     pub remoteip_header: Option<String>,
     pub remoteip_proxies: Vec<RemoteIpProxy>,
+    /// `None` is explicitly off. `Some` is strict: every FastCGI target must
+    /// match exactly one registered endpoint policy.
+    pub fastcgi_stable_paths: Option<Vec<FastCgiStablePathPolicy>>,
+    pub max_spool_bytes: u64,
+    pub max_spool_files: u64,
+    pub max_dynamic_requests: u64,
+    pub max_fastcgi_output: u64,
+    pub resource_budget: Arc<crate::resource::ResourceBudget>,
     pub access_file_names: Vec<String>,
     pub directory_index: Vec<String>,
     /// True when any compiled scope enables `AllowOverride All`.  This lets
@@ -2661,6 +2674,11 @@ fn core_directive_exists(name: &str) -> bool {
             | "undefine"
             | "usecanonicalname"
             | "usecanonicalphysicalport"
+            | "vapachefastcgistablepath"
+            | "vapachemaxdynamicrequests"
+            | "vapachemaxfastcgioutput"
+            | "vapachemaxspoolbytes"
+            | "vapachemaxspoolfiles"
     )
 }
 
@@ -3262,6 +3280,69 @@ fn authz_section_allowed(section: SectionKind) -> bool {
     )
 }
 
+fn parse_fastcgi_policy_endpoint(raw: &str) -> Result<FastCgiEndpoint, String> {
+    if let Some(path) = raw.strip_prefix("unix:") {
+        let path = PathBuf::from(path);
+        if path.as_os_str().is_empty() || !path.is_absolute() || raw.contains('|') {
+            return Err("Unix FastCGI policy endpoints must be absolute socket paths".into());
+        }
+        if path.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        }) {
+            return Err("Unix FastCGI policy endpoints must use normal path components".into());
+        }
+        return Ok(FastCgiEndpoint::Unix(path));
+    }
+
+    let authority = raw
+        .strip_prefix("fcgi://")
+        .ok_or_else(|| "FastCGI policy endpoint must start with unix: or fcgi://".to_string())?;
+    if authority.is_empty()
+        || authority.contains('/')
+        || authority.contains('@')
+        || authority.contains('?')
+        || authority.contains('#')
+    {
+        return Err("TCP FastCGI policy endpoint must contain only host[:port]".into());
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let close = rest
+            .find(']')
+            .ok_or_else(|| "unterminated IPv6 FastCGI policy endpoint".to_string())?;
+        let host = &rest[..close];
+        let suffix = &rest[close + 1..];
+        let port = if suffix.is_empty() {
+            9000
+        } else {
+            suffix
+                .strip_prefix(':')
+                .ok_or_else(|| "invalid IPv6 FastCGI policy endpoint".to_string())?
+                .parse::<u16>()
+                .map_err(|_| "invalid FastCGI policy port".to_string())?
+        };
+        (host.to_ascii_lowercase(), port)
+    } else {
+        if authority.matches(':').count() > 1 {
+            return Err("IPv6 FastCGI policy endpoints must use brackets".into());
+        }
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (
+                host.to_ascii_lowercase(),
+                port.parse::<u16>()
+                    .map_err(|_| "invalid FastCGI policy port".to_string())?,
+            ),
+            None => (authority.to_ascii_lowercase(), 9000),
+        }
+    };
+    if host.is_empty() || port == 0 {
+        return Err("invalid TCP FastCGI policy endpoint".into());
+    }
+    Ok(FastCgiEndpoint::Tcp { host, port })
+}
+
 struct Compile {
     events: Vec<Event>,
     pos: usize,
@@ -3331,6 +3412,12 @@ impl Compile {
             health_templates: HashMap::new(),
             remoteip_header: None,
             remoteip_proxies: Vec::new(),
+            fastcgi_stable_paths: None,
+            max_spool_bytes: 1024 * 1024 * 1024,
+            max_spool_files: 128,
+            max_dynamic_requests: 64,
+            max_fastcgi_output: 64 * 1024 * 1024,
+            resource_budget: Arc::new(crate::resource::ResourceBudget::default()),
             access_file_names: vec![".htaccess".into()],
             directory_index: vec!["index.html".into()],
             override_enabled: false,
@@ -4179,6 +4266,151 @@ impl Compile {
             "serverroot" => {
                 if let Some(a) = args.first() {
                     self.cfg.server_root = PathBuf::from(a);
+                }
+            }
+            "vapachefastcgistablepath" => {
+                if section != SectionKind::Server || inside_vhost {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "VapacheFastCGIStablePath is only allowed in global server context"
+                            .into(),
+                    });
+                    return;
+                }
+                if args.len() == 1 && args[0].eq_ignore_ascii_case("off") {
+                    self.cfg.fastcgi_stable_paths = None;
+                    return;
+                }
+                if args.len() < 5 || !args[0].eq_ignore_ascii_case("on") {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "VapacheFastCGIStablePath requires 'Off' or 'On <unix-endpoint> <backend-uid> <endpoint-owner-uid> <trusted-owner-uid>...'".into(),
+                    });
+                    return;
+                }
+                let endpoint = match parse_fastcgi_policy_endpoint(&args[1]) {
+                    Ok(endpoint) => endpoint,
+                    Err(msg) => {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg,
+                        });
+                        return;
+                    }
+                };
+                if matches!(endpoint, FastCgiEndpoint::Tcp { .. }) {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "VapacheFastCGIStablePath requires a Unix socket; TCP cannot authenticate the backend process".into(),
+                    });
+                    return;
+                }
+                let Ok(backend_uid) = args[2].parse::<u32>() else {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("invalid FastCGI backend uid '{}'", args[2]),
+                    });
+                    return;
+                };
+                if backend_uid == 0 {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "VapacheFastCGIStablePath rejects uid 0 backends".into(),
+                    });
+                    return;
+                }
+                let endpoint_owner_uid = match args[3].parse::<u32>() {
+                    Ok(uid) => Some(uid),
+                    Err(_) => {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!(
+                                "invalid Unix FastCGI endpoint-owner uid '{}'",
+                                args[3]
+                            ),
+                        });
+                        return;
+                    }
+                };
+                let mut trusted_owner_uids = Vec::new();
+                for raw in &args[4..] {
+                    let Ok(uid) = raw.parse::<u32>() else {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg: format!("invalid trusted path-owner uid '{raw}'"),
+                        });
+                        return;
+                    };
+                    if !trusted_owner_uids.contains(&uid) {
+                        trusted_owner_uids.push(uid);
+                    }
+                }
+                let policies = self.cfg.fastcgi_stable_paths.get_or_insert_with(Vec::new);
+                if policies.iter().any(|policy| policy.endpoint == endpoint) {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("duplicate FastCGI stable-path endpoint '{}'", args[1]),
+                    });
+                    return;
+                }
+                policies.push(FastCgiStablePathPolicy {
+                    endpoint,
+                    backend_uid,
+                    endpoint_owner_uid,
+                    trusted_owner_uids,
+                });
+            }
+            "vapachemaxspoolbytes"
+            | "vapachemaxspoolfiles"
+            | "vapachemaxdynamicrequests"
+            | "vapachemaxfastcgioutput" => {
+                if section != SectionKind::Server || inside_vhost {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("{name} is only allowed in global server context"),
+                    });
+                    return;
+                }
+                if args.len() != 1 {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("{name} requires exactly one positive integer"),
+                    });
+                    return;
+                }
+                let Some(value) = crate::util::parse_u64(args[0].as_bytes()) else {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("invalid resource limit '{}'", args[0]),
+                    });
+                    return;
+                };
+                if value == 0 {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: format!("{name} must be greater than zero"),
+                    });
+                    return;
+                }
+                match name {
+                    "vapachemaxspoolbytes" => self.cfg.max_spool_bytes = value,
+                    "vapachemaxspoolfiles" => self.cfg.max_spool_files = value,
+                    "vapachemaxdynamicrequests" => self.cfg.max_dynamic_requests = value,
+                    "vapachemaxfastcgioutput" => self.cfg.max_fastcgi_output = value,
+                    _ => unreachable!(),
                 }
             }
             "servername" => {
@@ -6574,13 +6806,10 @@ pub(crate) fn parse_allow_methods(args: &[String]) -> Result<AllowMethods, Strin
 /// silently changing meaning.
 pub(crate) fn guard_regex(pattern: &str) -> Result<(), String> {
     let inline_unicode_classes = directive_regex_enables_unicode(pattern);
-    if !vapache_verified::directive_regex_pattern_admit(
-        true,
-        false,
-        inline_unicode_classes,
-    ) {
-        return Err("unsupported regex mode: inline Unicode classes are not Apache-compatible"
-            .into());
+    if !vapache_verified::directive_regex_pattern_admit(true, false, inline_unicode_classes) {
+        return Err(
+            "unsupported regex mode: inline Unicode classes are not Apache-compatible".into(),
+        );
     }
     if vapache_verified::regex_dialect_admit(pattern.as_bytes()) {
         Ok(())
@@ -7854,6 +8083,11 @@ fn known_directives() -> HashSet<&'static str> {
         "user",
         "userdir",
         "userdirnegotiation",
+        "vapachefastcgistablepath",
+        "vapachemaxdynamicrequests",
+        "vapachemaxfastcgioutput",
+        "vapachemaxspoolbytes",
+        "vapachemaxspoolfiles",
         "variantname",
         "virtualhost",
         "xml2encalias",
@@ -8060,14 +8294,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("httpd.conf");
         std::fs::write(&config, b"Listen 127.0.0.1:0\nServerName bad\xffname\n").unwrap();
-        let errors = Config::load(
-            &config,
-            &dir,
-            &HashMap::new(),
-            &HashMap::new(),
-            false,
-        )
-        .unwrap_err();
+        let errors =
+            Config::load(&config, &dir, &HashMap::new(), &HashMap::new(), false).unwrap_err();
         assert!(errors
             .iter()
             .any(|error| error.msg.contains("not valid UTF-8")));
@@ -9839,13 +10067,10 @@ ServerName localhost\n\
             .environment_policy
             .set_env
             .push(Originated::main(("BASE".into(), "1".into())));
-        scope
-            .environment_policy
-            .rewrite_env
-            .push(Originated::main((
-                "SERVER_REWRITE".into(),
-                b"early".to_vec(),
-            )));
+        scope.environment_policy.rewrite_env.push(Originated::main((
+            "SERVER_REWRITE".into(),
+            b"early".to_vec(),
+        )));
         scope
             .environment_policy
             .rewrite_late_env
@@ -9932,17 +10157,14 @@ ServerName localhost\n\
         assert!(compile_regex(r"(?iu:^\w+$)").is_err());
 
         let mut scope = Scope::default();
-        scope
-            .environment_policy
-            .set_env
-            .push(Originated::main(("PHP_VALUE".into(), "main=allowed".into())));
-        scope
-            .environment_policy
-            .set_env
-            .push(Originated::access((
-                "PHP_VALUE".into(),
-                "auto_prepend_file=/tmp/pwn".into(),
-            )));
+        scope.environment_policy.set_env.push(Originated::main((
+            "PHP_VALUE".into(),
+            "main=allowed".into(),
+        )));
+        scope.environment_policy.set_env.push(Originated::access((
+            "PHP_VALUE".into(),
+            "auto_prepend_file=/tmp/pwn".into(),
+        )));
         scope.environment_policy.set_env.push(Originated::access((
             "PHP_ADMIN_VALUE".into(),
             "auto_prepend_file=/tmp/pwn".into(),
@@ -10023,10 +10245,7 @@ ServerName localhost\n\
         assert!(auth.contains(&("ID".into(), b"scanner".to_vec())));
 
         let local = scope.request_env(&req, "/index.php", peer);
-        assert!(local.contains(&(
-            "PHP_VALUE".into(),
-            b"auto_prepend_file=/tmp/pwn".to_vec()
-        )));
+        assert!(local.contains(&("PHP_VALUE".into(), b"auto_prepend_file=/tmp/pwn".to_vec())));
         assert!(local.contains(&(
             "PHP_ADMIN_VALUE".into(),
             b"auto_prepend_file=/tmp/pwn".to_vec()
@@ -11990,11 +12209,7 @@ Require all granted\n\
         target.environment_policy.set_env_if.push(Originated::main(
             parse_env_rule(
                 "setenvif",
-                &[
-                    "X-Gate".into(),
-                    "^yes$".into(),
-                    "SHARED=target".into(),
-                ],
+                &["X-Gate".into(), "^yes$".into(), "SHARED=target".into()],
             )
             .unwrap(),
         ));
@@ -12011,7 +12226,10 @@ Require all granted\n\
         let options = target.effective_options();
         assert!(options.contains(Options::EXEC_CGI));
         assert!(!options.contains(Options::INDEXES));
-        assert_eq!(target.content_policy.force_type.as_deref(), Some("text/plain"));
+        assert_eq!(
+            target.content_policy.force_type.as_deref(),
+            Some("text/plain")
+        );
         assert!(target
             .content_policy
             .remove_types
@@ -13232,6 +13450,98 @@ mod pass11_kernel_tests {
         let path = dir.join("httpd.conf");
         std::fs::write(&path, text).unwrap();
         Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).unwrap()
+    }
+
+    #[test]
+    fn fastcgi_stable_path_policy_is_explicit_global_and_fail_closed() {
+        let cfg = load_text_direct(
+            "Listen 127.0.0.1:0\nVapacheFastCGIStablePath On unix:/run/php/a.sock 33 0 0 1001 0\nVapacheFastCGIStablePath On unix:/run/php/b.sock 34 0 0\n",
+        );
+        assert_eq!(
+            cfg.fastcgi_stable_paths,
+            Some(vec![
+                FastCgiStablePathPolicy {
+                    endpoint: FastCgiEndpoint::Unix(PathBuf::from("/run/php/a.sock")),
+                    backend_uid: 33,
+                    endpoint_owner_uid: Some(0),
+                    trusted_owner_uids: vec![0, 1001],
+                },
+                FastCgiStablePathPolicy {
+                    endpoint: FastCgiEndpoint::Unix(PathBuf::from("/run/php/b.sock")),
+                    backend_uid: 34,
+                    endpoint_owner_uid: Some(0),
+                    trusted_owner_uids: vec![0],
+                },
+            ])
+        );
+        let cfg = load_text_direct(
+            "Listen 127.0.0.1:0\nVapacheFastCGIStablePath On unix:/run/php/a.sock 33 0 0\nVapacheFastCGIStablePath Off\n",
+        );
+        assert_eq!(cfg.fastcgi_stable_paths, None);
+
+        let dir = std::env::temp_dir().join(format!(
+            "vapache-fastcgi-stable-config-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, text) in [
+            "VapacheFastCGIStablePath On unix:/run/php/a.sock 0 0 0\n",
+            "VapacheFastCGIStablePath On unix:/run/php/a.sock nope 0 0\n",
+            "VapacheFastCGIStablePath On unix:relative.sock 33 0 0\n",
+            "VapacheFastCGIStablePath On unix:/run/php/a.sock 33 - 0\n",
+            "VapacheFastCGIStablePath On fcgi://127.0.0.1:9000 33 - 0\n",
+            "VapacheFastCGIStablePath On fcgi://127.0.0.1:9000 33 0 0\n",
+            "VapacheFastCGIStablePath On unix:/run/php/a.sock 33 0 0\nVapacheFastCGIStablePath On unix:/run/php/a.sock 34 0 0\n",
+            "VapacheFastCGIStablePath Off 33\n",
+            "<Directory /srv>\nVapacheFastCGIStablePath On unix:/run/php/a.sock 33 0 0\n</Directory>\n",
+            "<VirtualHost *:80>\nVapacheFastCGIStablePath On unix:/run/php/a.sock 33 0 0\n</VirtualHost>\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = dir.join(format!("invalid-{i}.conf"));
+            std::fs::write(&path, format!("Listen 127.0.0.1:0\n{text}")).unwrap();
+            assert!(
+                Config::load(&path, &dir, &HashMap::new(), &HashMap::new(), false).is_err(),
+                "configuration unexpectedly accepted: {text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn aggregate_resource_limits_are_positive_and_global() {
+        let cfg = load_text_direct(
+            "Listen 127.0.0.1:0\nVapacheMaxSpoolBytes 4096\nVapacheMaxSpoolFiles 3\nVapacheMaxDynamicRequests 2\nVapacheMaxFastCGIOutput 1024\n",
+        );
+        assert_eq!(cfg.max_spool_bytes, 4096);
+        assert_eq!(cfg.max_spool_files, 3);
+        assert_eq!(cfg.max_dynamic_requests, 2);
+        assert_eq!(cfg.max_fastcgi_output, 1024);
+        for text in [
+            "VapacheMaxSpoolBytes 0\n",
+            "VapacheMaxSpoolFiles nope\n",
+            "VapacheMaxDynamicRequests 1 2\n",
+            "<VirtualHost *:80>\nVapacheMaxFastCGIOutput 1\n</VirtualHost>\n",
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "vapache-resource-config-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("invalid.conf");
+            std::fs::write(&path, format!("Listen 127.0.0.1:0\n{text}")).unwrap();
+            assert!(Config::load(
+                &path,
+                &dir,
+                &HashMap::new(),
+                &HashMap::new(),
+                false
+            )
+            .is_err());
+        }
     }
 
     #[test]

@@ -196,7 +196,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **448 verified functions, 0 errors** (percent-decoding,
+Current result: **465 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -239,6 +239,57 @@ merges. The post-P16 hardening adds a verified textual-identity gate for
 configuration and filesystem policy paths; request plans, config files,
 access files, includes and MIME maps reject invalid UTF-8 instead of applying
 replacement-character policy.
+P17 and P18 add executable gates for resolved-file FastCGI targets and
+access-file section commands: the backend wire path must stay bound to the
+lexical request mapping while the canonical target remains independently
+contained and authorized, and an allowed child directive cannot admit an
+unlisted section wrapper.
+
+For local FastCGI deployments, the optional global directive below turns the
+remaining pathname-stability deployment rule into a runtime admission check:
+
+```apache
+# endpoint, PHP worker uid, Unix-socket owner uid, then trusted tree owners
+VapacheFastCGIStablePath On unix:/run/php/php8.4-fpm.sock 33 0 0 1001
+```
+
+The directive is repeatable, once per backend. Turning it on is strict: a
+FastCGI request whose exact Unix socket is not registered is denied. The
+socket is checked before and after `connect()` for type, owner and inode
+stability independently of the configured PHP worker UID. TCP is rejected in
+strict mode because a loopback address does not authenticate the process that
+owns it; use a protected Unix socket for the verified backend-identity
+boundary.
+
+Both the lexical `SCRIPT_FILENAME` and the canonical authorized script path
+are walked immediately before parameters are sent. Every component must have
+a listed owner and no group/other write bit; a non-symlink component cannot be
+owned by the backend, because its owner could restore write permission with
+`chmod`. POSIX ACLs are rejected rather than assuming the mode bits describe
+all writers. Symlink ownership and both sides of the mapping are checked. Root
+backends, relative paths and malformed identities are rejected.
+`VapacheFastCGIStablePath Off` disables the policy (the default).
+
+Aggregate dynamic-I/O limits are global directives and remain shared across a
+graceful reload:
+
+```apache
+VapacheMaxSpoolBytes 1073741824
+VapacheMaxSpoolFiles 128
+VapacheMaxDynamicRequests 64
+VapacheMaxFastCGIOutput 67108864
+```
+
+The RAII budget covers request-body spool files, FastCGI response spools and
+the CGI worker's duplicate body spool. CGI and FastCGI share the dynamic
+request ceiling; exhaustion returns `503` and every error path releases its
+reservation. FastCGI output is now bounded to 64 MiB per request by default.
+
+Because FastCGI transports a pathname rather than an open descriptor, the
+verified deployment boundary requires FastCGI scripts and every ancestor
+directory to be non-writable by the backend and all less-trusted principals
+for the complete request lifetime. A read-only release tree satisfies this;
+writable uploads must live outside all FastCGI handler mappings.
 
 Function count is not the progress metric. The verification ledger tracks
 security obligations and proof debt:
@@ -252,8 +303,8 @@ Current ledger: **53.1% weighted obligations**, **6/6 proof debt**,
 **8/8 grant-required sinks**, **8/8 path-target-bound sinks**, **5/8
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
-failures**, **106 adversarial replay cases** covering the findings classes,
-and **448 Verus functions with 0 errors** (including the I3 fast-path
+failures**, **108 adversarial replay cases** covering the findings classes,
+and **465 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -290,7 +341,7 @@ requiring a grant. Raising a budget is a deliberate, reviewable change.
 cargo test --workspace          # Rust unit tests
 python3 tests/conformance.py    # 165 local vapached conformance tests
 python3 tests/conformance.py --differential  # also compare with Apache
-python3 tests/adversarial_regressions.py  # F23-P15 end-to-end replay suite
+python3 tests/adversarial_regressions.py  # F23-P18 end-to-end replay suite
 ```
 
 The conformance suite starts a real `vapached` and covers HTTP/1.1, HTTPS,
@@ -298,20 +349,34 @@ HTTP/2, CGI, conditional requests, ranges, access control and Basic auth. Use
 `--differential` when Apache is installed to start both servers and write
 `tests/differential_report.md`, comparing status codes, selected headers and
 bodies.  The `adversarial/`
-folder holds the numbered findings write-ups (passes 3–14) and the pass-11,
-pass-13 through pass-15 exploit harnesses (`adversarial/p11/exploit_p11.py`,
+folder holds the numbered findings write-ups (passes 3–18) and the pass-11,
+pass-13 through pass-18 exploit harnesses (`adversarial/p11/exploit_p11.py`,
 `adversarial/p13/exploit_p13.py`, `adversarial/p14/exploit_p14.py` and
-`adversarial/p15/exploit_p15.py`) with
+`adversarial/p15/exploit_p15.py` through `adversarial/p18/exploit_p18.py`) with
 their Apache-versus-vapached case dossiers, so the exact exploit shapes are
 documented rather than re-derived.
 
 Security-sensitive configuration semantics are checked separately:
 
 ```sh
-python3 tests/config_semantics.py  # 237 fixed differential cases
+python3 tests/config_semantics.py  # 339 fixed differential cases
 python3 tests/config_semantics.py --random 300 --seed 7  # deterministic randomized matrix
+python3 tests/config_semantics.py --stateful 256 --stateful-seed 1818
 python3 tests/config_validity.py  # context acceptance matrix (Apache -t vs vapached -t)
 python3 tests/config_grammar.py   # finite valid/invalid grammar matrix
+tests/pre_adversarial.sh         # fail-closed full gate, including real PHP-FPM
+```
+
+Coverage-guided parser targets are in `fuzz/` and are compiled and smoke-run by
+the pre-adversarial gate. Longer campaigns use cargo-fuzz:
+
+```sh
+cargo install cargo-fuzz
+rustup toolchain install nightly --profile minimal
+cargo +nightly fuzz run http_request fuzz/corpus/http_request
+cargo +nightly fuzz run config_sections fuzz/corpus/config_sections
+cargo +nightly fuzz run cgi_response fuzz/corpus/cgi_response
+cargo +nightly fuzz run fastcgi_records fuzz/corpus/fastcgi_records
 ```
 
 `config_grammar.py` enumerates the supported directive/context grammar and
@@ -322,7 +387,9 @@ obligations.
 `config_semantics.py` generates isolated combinations of `AllowOverride`
 categories, `<Limit>`/`<LimitExcept>`, `Require` trees, `AuthMerging`,
 `Satisfy`/legacy access, `<If>` chains, `Files`/`Directory` wildcards and
-Directory/Files/Location ordering, then compares both servers. It caught
+Directory/Files/Location ordering, then compares both servers. Its stateful
+mode also drives balanced nested wrappers, mismatched closes, live-stack EOF,
+duplicate `AllowOverride` ordering and all four `Nonfatal` behaviors. It caught
 several fail-open ordering bugs during development, including conditional
 sections being applied before a later grant, `<Location "/x/">` matching the
 file `/x`, and access-file merges being ordered after `<Files>`.
@@ -378,15 +445,18 @@ python3 tests/security_coverage.py --check
 ```
 
 `security_coverage.py` reports executable production-line coverage before each
-file's test module. Every server module is enforced at 100%, including the CLI,
-cache, file serving, HTTP/2, logging, OCSP, proxying and rewrite execution.
+file's test module. Every listed server module has a 100% target, so `--check`
+fails while any module has uncovered production code. The list includes the
+CLI, cache, file serving, HTTP/2, logging, OCSP, proxying, rewrite execution
+and aggregate resource accounting.
 Delimiter-only lines and narrowly documented unreachable invariants, external
 failure races and privileged-kernel failures are excluded from that metric.
 
-Latest snapshot: **18,913/18,913 executable server production lines (100%)**.
-The current suite is 454 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
-integration tests, 165 conformance tests and 237 fixed configuration cases.
-The separate Verus gate proves 448 functions with 0 errors; proof-only code is
+Latest snapshot: **20,020/20,548 executable server production lines (97.43%)**;
+the new aggregate-resource module is **62/62 (100%)**. The current suite is
+466 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
+integration tests, 165 conformance tests and 339 fixed configuration cases.
+The separate Verus gate proves 465 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

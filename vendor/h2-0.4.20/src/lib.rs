@@ -133,6 +133,7 @@ mod share;
 
 #[cfg(fuzzing)]
 #[cfg_attr(feature = "unstable", allow(missing_docs))]
+/// Fuzzing-only entry points for exercising internal HTTP/2 codecs.
 pub mod fuzz_bridge;
 
 pub use crate::error::{Error, Reason};

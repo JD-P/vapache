@@ -530,8 +530,18 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 4096];
-            let _ = stream.read(&mut request);
+            // Drain the complete request before replying. Closing a socket
+            // with unread request bytes can emit a TCP RST and make the
+            // response-body assertion timing-dependent under a full suite.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !request.ends_with(b"\r\n\r\nrequest") {
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
             let _ = stream.write_all(&response);
         });
         let result = fetch_response(

@@ -46,6 +46,7 @@ MODULES = [
     ("policy_ref", "crates/server/src/policy_ref.rs", 100.0),
     ("proxy", "crates/server/src/proxy.rs", 100.0),
     ("request_plan", "crates/server/src/request_plan.rs", 100.0),
+    ("resource", "crates/server/src/resource.rs", 100.0),
     ("rewrite", "crates/server/src/rewrite.rs", 100.0),
     ("scope_policy", "crates/server/src/scope_policy.rs", 100.0),
     ("server", "crates/server/src/server.rs", 100.0),
@@ -144,10 +145,15 @@ def main() -> int:
     for line in export_lcov().splitlines():
         if line.startswith("SF:"):
             current = line[3:]
-            data[current] = {}
+            # llvm-cov may emit the same source once per instrumented object
+            # (library tests, daemon tests, and release daemon). Preserve and
+            # add every object's counters instead of letting the last object
+            # silently replace the higher-coverage unit-test record.
+            data.setdefault(current, {})
         elif line.startswith("DA:") and current:
             number, count = line[3:].split(",", 2)[:2]
-            data[current][int(number)] = int(count)
+            line_number = int(number)
+            data[current][line_number] = data[current].get(line_number, 0) + int(count)
 
     print("production-line coverage for server modules")
     print(f"{'module':12} {'lines':>7} {'missed':>7} {'cover':>8}   status")

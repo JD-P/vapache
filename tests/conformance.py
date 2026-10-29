@@ -38,7 +38,14 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parent.parent
 VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
 APACHE = shutil.which("apache2") or "/usr/sbin/apache2"
-MODDIR = Path("/usr/lib/apache2/modules")
+MODDIR = Path(
+    os.environ.get(
+        "APACHE_MODDIR",
+        "/usr/lib/apache2/modules"
+        if Path("/usr/lib/apache2/modules").is_dir()
+        else "/workspace/.vapache-setup/sysroot/usr/lib/apache2/modules",
+    )
+)
 BASE = Path(tempfile.mkdtemp(prefix="vapache-tests-"))
 AP_PORT = int(os.environ.get("VAPACHE_AP_PORT", "18080"))
 VP_PORT = int(os.environ.get("VAPACHE_VP_PORT", "18081"))

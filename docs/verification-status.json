@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "updated": "2026-10-28",
+  "updated": "2026-10-29",
   "verus": {
-    "verified_functions": 448,
+    "verified_functions": 465,
     "errors": 0
   },
   "obligations": [
@@ -46,7 +46,7 @@
       "title": "AllowOverride/AllowOverrideList/Nonfatal gate",
       "status": "mechanized",
       "weight": 1.0,
-      "evidence": "override_mode_allows is the executable category-bit admission kernel used by OverrideMode::allows/allows_flag; htaccess_gate_admit is the single final disposition for ordinary directives, Require groups, Limit sections and unknown sections. htaccess_apply_requires_known_and_allowed proves that only a known, policy-admitted construct can reach the effectful parser; Nonfatal=Override/Unknown/All can skip rejected material but can never apply it. The exhaustive directive/category/AllowOverrideList/Nonfatal parser matrix exercises the runtime wiring."
+      "evidence": "override_mode_allows is the executable category-bit admission kernel used by OverrideMode::allows/allows_flag; htaccess_section_category_admit and htaccess_section_admit totalize every supported section command and independently gate it by its Apache category mask or exact AllowOverrideList '<Section' entry, so a listed child cannot admit an unlisted top-level wrapper. htaccess_section_nonfatal_override_admit pins Apache's fail-closed execute-on-read section subset; nested authz containers are admitted only after their outer authz command has passed while child directives remain gated. htaccess_gate_admit is the single final apply/skip/reject disposition before the effectful parser. The exhaustive parser matrix and 96 paired Apache wrapper cases cover child-only/exact lists, category masks and Nonfatal behavior."
     },
     {
       "id": "prefilter_sound",
@@ -60,7 +60,7 @@
       "title": "ACL reachability and resource binding",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "I1a exact ResourceKey grants and I1b inode/backend/policy binding feed the executable TransformCapability state. Every protected file, directory, CGI, FastCGI, proxy, WebSocket and cache sink calls AccessGrant::require_sink, which combines exact resource equality with the verified sink-specific admission predicate. I31 opens and reauthorizes CGI and FastCGI scripts before binding the selected inode; P15 FastCGI additionally binds transport, lexical SCRIPT_FILENAME, authorized canonical path and PATH_INFO, with fastcgi_script_identity_admit proving that neither script identity can be omitted. Authorization providers and request-plan refinement remain outside this obligation."
+      "evidence": "I1a exact ResourceKey grants and I1b inode/backend/policy binding feed the executable TransformCapability state. Every protected file, directory, CGI, FastCGI, proxy, WebSocket and cache sink calls AccessGrant::require_sink, which combines exact resource equality with the verified sink-specific admission predicate. I31 opens and reauthorizes CGI and FastCGI scripts before binding the selected inode; P15 FastCGI binds transport, lexical SCRIPT_FILENAME, authorized canonical path and PATH_INFO, with fastcgi_script_identity_admit proving that neither script identity can be omitted. P17 adds fastcgi_resolved_target_admit at the SetHandler constructor so its lexical classification/wire path cannot be replaced by the canonical authorization path. Authorization providers and request-plan refinement remain outside this obligation."
     },
     {
       "id": "mapping_order",
@@ -88,7 +88,7 @@
       "title": "Untrusted streams have bounded size and deadlines",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "I33 covers request/proxy trailer count and byte budgets, proxy chunk checked_add before resize, CGI worker path/env/body/output caps, FastCGI record/header/stdout/stderr caps, HTTP/2 budgets and compression; framing-limit unit cases cover oversized chunks, long lines, trailer floods and FastCGI stderr; the aggregate resource-exhaustion model is not mechanized"
+      "evidence": "I33 covers request/proxy trailer count and byte budgets, proxy chunk checked_add before resize, CGI worker path/env/body/output caps, FastCGI record/header/stdout/stderr caps, HTTP/2 budgets and compression. resource_budget_admit mechanizes overflow-free aggregate admission; RAII runtime leases enforce shared spool-byte, spool-file and CGI/FastCGI concurrency ceilings across graceful reloads, with focused exhaustion/release tests. Broader aggregate heap, socket and upstream resource exhaustion remains outside the model."
     },
     {
       "id": "response_header_policy",
@@ -319,7 +319,7 @@
       "title": "Component-aware containment composes across path identities",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "path_under_base_reflexive and path_under_base_transitive mechanize composition of the verified component-aware containment kernel: every base contains itself, and target-under-mid plus mid-under-base implies target-under-base for the lexical byte domain. expr file-test confinement consumes path_under_base. Protected filesystem sinks resolve with openat2/descriptor binding and FastCGI plus access-file parsing validate descriptor snapshots; parser-to-path construction remains a refinement boundary, while the external FastCGI backend's later SCRIPT_FILENAME open is the explicit residual contract."
+      "evidence": "path_under_base_reflexive and path_under_base_transitive mechanize composition of the verified component-aware containment kernel: every base contains itself, and target-under-mid plus mid-under-base implies target-under-base for the lexical byte domain. expr file-test confinement consumes path_under_base. Protected filesystem sinks resolve with openat2/descriptor binding and FastCGI plus access-file parsing validate descriptor snapshots; parser-to-path construction remains a refinement boundary. The optional endpoint-keyed VapacheFastCGIStablePath projection denies unregistered backends, checks Unix socket owner/inode stability, rejects POSIX ACLs and checks lexical/canonical component ownership and mode against the configured worker UID; leaving it Off retains the equivalent read-only-tree proof-debt assumption."
     },
     {
       "id": "expr_parser_totality",
@@ -469,7 +469,7 @@
     "partially_bound_sinks": [],
     "assumptions": [
       "PCRE2 implements the Apache expression-regex subset exercised by the differential gate",
-      "an external FastCGI backend opens SCRIPT_FILENAME after vapache's final descriptor/inode check; pathname stability beyond that protocol boundary is a backend contract",
+      "an external FastCGI backend opens SCRIPT_FILENAME after vapache's final descriptor/inode check; VapacheFastCGIStablePath can machine-enforce component ownership and mode admission for a configured backend UID, while deployments that leave it Off must provide the equivalent read-only script-tree invariant",
       "h2 wire framing, TLS client-certificate chain validation, and CGI/proxy protocol details are outside the model",
       "configuration tokenization and directive/pattern payloads refine the executable kind/phase model",
       "authorization backends implement their stated contracts",
@@ -494,8 +494,9 @@
   },
   "adversarial": {
     "conformance": 165,
-    "semantics": 237,
+    "semantics": 339,
     "random": 300,
+    "finding_replay_cases": 108,
     "cve_replay_cases": 29,
     "unexplained_replay_failures": 0,
     "max_unexplained_replay_failures": 0,
@@ -519,6 +520,7 @@
     "Rewrite backreference question-mark encoding and filesystem-target admission",
     "HTTP/2 settings, decoded-header budget and flow-control model",
     "HTTP/DoS connection and compression resource admission",
+    "Overflow-free aggregate spool and dynamic-backend resource admission",
     "Access-log escaping",
     "Cache lookup key/policy/freshness/Vary admission",
     "Proxy target identity key",
@@ -529,6 +531,8 @@
     "Rewrite target external/internal classification, internal joining and same-host authority identity",
     "Component-aware filesystem containment for alias, rewrite and FastCGI targets (path_under_base)",
     "FastCGI lexical/canonical dual script identity admission",
+    "Resolved-file FastCGI lexical wire-path and canonical authorization admission",
+    "FastCGI endpoint-keyed stable-path component and POSIX-ACL admission",
     "Expression value truthiness, integer/string comparison, glob matching and fail-closed regex results, plus rewrite condition-chain folding",
     "PCRE2 configuration-load admission for expression patterns",
     "Directive disposition and fail-closed security fallback",
@@ -554,6 +558,7 @@
     "Framing and resource-bound closure across HTTP, proxy, CGI and FastCGI streams",
     "Exhaustive .htaccess directive disposition and override-category matrix",
     "Mechanized AllowOverride/AllowOverrideList/Nonfatal admission and skip/reject gate",
+    "Independent access-file section-command admission by category or exact list entry",
     "Single-file alias target split and parent access-root admission",
     "Resolved-target basename selection for handlers, MIME and FastCGI",
     "Effectful <Limit> directive disposition (applied or rejected)",

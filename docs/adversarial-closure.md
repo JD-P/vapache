@@ -47,7 +47,7 @@ returning through a different directive or dispatch path.
 | F38 | Authenticated CGI/FastCGI requests lacked `REMOTE_USER`/`AUTH_TYPE` | The grant identity is carried into `CgiContext`; `build_env` emits both variables for CGI and FastCGI and keeps configured entries from overriding them | I27 |
 | F39 | Single-file `Alias`/`ScriptAlias` skipped the target `.htaccess` and served CGI/PHP as source | Prefix file targets map to `(parent, basename)`; the access-file walk root for a file target is its parent; handler/MIME/FastCGI selection uses the resolved target basename (`alias_file_target_split`, `alias_access_root_admit`, `handler_name_from_target`) | I35, I36, I37 |
 | F40 | Effectful directives inside `<Limit>` were warn-and-ignored | Main-configuration directives inside `<Limit>` are applied to the enclosing scope (auth directives remain method-scoped); `.htaccess` still rejects non-auth directives in `<Limit>` (`limit_directive_effect`) | I38 |
-| F41 | CGI/FastCGI dispatch used lexical symlink policy | Static, PATH_INFO, CGI and FastCGI handlers re-authorize the actual opened/canonicalized target and bind that target before execution/forwarding; FastCGI sends the canonical `SCRIPT_FILENAME` (`cgi_actual_target_admit`) | I39 |
+| F41 | CGI/FastCGI dispatch used lexical symlink policy | Static, PATH_INFO, CGI and FastCGI handlers re-authorize the actual opened/canonicalized target and bind that target before execution/forwarding. FastCGI keeps that authorization identity separate from the lexical `SCRIPT_FILENAME` required by Apache/backend policy (`cgi_actual_target_admit`, `fastcgi_script_identity_admit`) | I39 |
 | F42 | Capture-only `AliasMatch` used `ServerRoot` as an implicit base | Empty replacement prefixes produce an empty alias base, so `map_path()` fails closed; relative/explicit-prefix aliases keep their stable base (`capture_only_alias_admit`) | I40 |
 | F43 | FastCGI spool used a predictable `/tmp` name with truncate | Spool files use exclusive creation, mode `0600`, bounded collision retries and immediate unlink (`temp_file_create_admit`) | I41 |
 | F44 | Disk cache had no total quota or expiry cleanup | Persisted bytes are tracked per cache root; store enforces `CacheMaxDiskSize` and the entry cap by evicting the oldest stems, removes oversized entries, deletes expired/stale generations on load, and caps per-key variants (`cache_disk_size_admit`) | I42-adjacent cache bounds |
@@ -77,6 +77,8 @@ returning through a different directive or dispatch path.
 | F66 | `<DirectoryMatch ".../private/$">` was already fixed in pass 10; the pass-11 retest verified the trailing-slash directory URL (autoindex path) stays 403 on both sides | No new code; the F66 replay stays in the battery as a guard (`F61ToF69Pass11Tests::test_f66_directory_match_guard_stays_fixed`) | I11 |
 | F69 | Handler and MIME classification used the canonical symlink target basename, so `public/link.txt -> ../secret/secret.cgi` under a global `AddHandler cgi-script .cgi` executed a file Apache serves as static source | The dispatch binds the classification name to the lexical request-mapped basename (`fs_path.file_name()` first); `handler_identity_lexical_admit` is debug-asserted at the bind site. Authorization and containment still bind to the resolved canonical target | `handler_identity_lexical`, I61 |
 | P13-A–C | F69's lexical identity was enforced only at one direct extension-table lookup: FastCGI and CGI `PATH_INFO` re-derived the canonical basename, while a canonical-only Files-scoped `SetHandler` force bypassed the name entirely | Direct CGI, PATH_INFO and FastCGI consume the same lexical basename. Canonical authorization and lexical handler Files policy are evaluated from one request plan; only handler fields use the lexical view, preserving canonical access denials. `handler_scope_lexical_admit` guards the force-binding site | `handler_identity_lexical`, I70 |
+| P17-A | Resolved-file FastCGI `SetHandler` sent the canonical symlink target as `SCRIPT_FILENAME`, bypassing PHP-FPM's lexical extension gate | `handler_target_for_file` derives the wire path from the lexical mapped path and keeps the opened canonical target separate. `LexicalScriptPath` makes the wire identity explicit, `fastcgi_resolved_target_admit` binds lexical classification plus both containment checks, and the final inode reopen remains mandatory | `fastcgi_script_identity_admit`, `fastcgi_resolved_target_admit` |
+| P18-A | `AllowOverrideList Require` implicitly admitted unlisted `<Files>`/`<FilesMatch>` wrappers, allowing a file-scoped grant Apache rejects | Every supported access-file section is admitted through one section-command gate before its children. Category masks and exact `"<Section"` list entries are independent from inner directives; `htaccess_section_admit` proves a permitted child cannot admit an unlisted wrapper | `override_mode_allows`, `htaccess_section_admit`, `htaccess_gate_admit` |
 | Additional | `Require not valid-user` dropped negation; non-HTTP control bytes passed header serialization; `close, keep-alive` re-enabled a connection; mmap allowed other-owner write races | Negation is carried into `Require::ValidUser`; header values admit only HTAB/SP/VCHAR/obs-text; `close` is sticky; mmap requires no owner/group/other write bits | I23, I33-adjacent |
 
 ## Additional hardening before the next pass
@@ -313,6 +315,56 @@ Verus. Runtime regressions cover invalid UTF-8 config, MIME, access-file and
 filesystem identities, byte-exact proxy/WebSocket forwarding, CGI query bytes,
 and the cross-identity scope merge.
 
+## Pass 17 and 18 closure
+
+The two post-P16 adversarial findings are closed at their shared identity and
+admission boundaries:
+
+- P17's resolved-file `SetHandler` path now constructs `SCRIPT_FILENAME` from
+  the lexical request mapping. The canonical descriptor path remains the
+  authorization, containment and inode-binding identity and is never reused as
+  the backend spelling. A private `LexicalScriptPath` field forces every
+  FastCGI target constructor to make that choice explicitly; the pre-send
+  lexical reopen still has to resolve to the authorized inode.
+- P18's section admission is centralized before section parsing. `<Files>`,
+  `<FilesMatch>`, `<If*>`, `<Require*>`, `<Limit*>` and execute-on-read
+  conditional wrappers each require their Apache category mask or an exact
+  `AllowOverrideList "<Section"` entry. A listed child such as `Require` cannot
+  admit its wrapper. `Nonfatal=Override` may skip the whole rejected section,
+  but no rejected section reaches the effectful parser.
+
+`fastcgi_resolved_target_admit` and `htaccess_section_admit` add executable
+Verus gates plus fail-closed lemmas. Runtime coverage includes the P17 fake
+FastCGI parameter oracle, the retained inode-binding controls, exhaustive
+section-family unit cases, six Apache differential cases, and the P18 CGI
+remediation battery with both exploit and `AuthConfig` parity controls.
+
+## Post-P18 pre-pass hardening
+
+Four additional attack surfaces are closed before the next adversarial pass:
+
+- `VapacheFastCGIStablePath` is repeatable and keyed to one exact Unix socket.
+  Enabling it rejects every unregistered backend, authenticates the socket by
+  type, owner and inode before and after connect, and rejects TCP because a
+  loopback address does not authenticate the process that owns it.
+- Stable script and socket paths reject POSIX ACLs as well as backend-owned or
+  group/other-writable components. Concurrent atomic-swap tests exercise both
+  the final FastCGI inode binding and the access-file descriptor/pathname
+  snapshot check rather than assuming a quiescent filesystem.
+- Shared RAII budgets bound spool bytes, spool files and concurrent CGI plus
+  FastCGI requests across graceful reloads. Request bodies, FastCGI responses
+  and the CGI worker's duplicate body copy reserve and release from the same
+  counters; FastCGI output also has a per-request ceiling.
+- LibFuzzer entry points cover HTTP request framing, configuration sections,
+  CGI response heads and FastCGI records. The fail-closed pre-pass compiles
+  and smoke-runs all four targets, while the documented cargo-fuzz commands
+  support longer sanitizer campaigns.
+
+`resource_budget_admit` adds an overflow-safe executable Verus admission gate
+with bounded and exhausted proofs. Focused runtime tests cover exact endpoint
+registration, socket replacement metadata, ACL rejection, reservation
+exhaustion/release and reload-shared accounting.
+
 ## Transform-to-sink and filesystem-race closure
 
 The two pre-review hardening items after Pass 14 are now runtime-enforced
@@ -344,8 +396,13 @@ invariants:
 
 FastCGI itself cannot pass an open file descriptor to PHP-FPM. Consequently,
 an external backend still opens SCRIPT_FILENAME after vapache's final
-identity check. That last protocol-boundary race is documented as a backend
-contract rather than hidden as a stable-filesystem assumption.
+identity check. The verified deployment boundary therefore requires the script
+and every ancestor directory to remain non-writable by the backend and all
+less-trusted principals for the full request lifetime. Read-only release trees
+meet the requirement; writable upload trees must never inherit a FastCGI
+handler. A deployment that cannot enforce this is explicitly outside the
+verified FastCGI boundary rather than relying on a hidden stable-filesystem
+assumption.
 
 ## Regression surface
 
@@ -369,7 +426,7 @@ The closure is exercised by:
 - `tests/conformance.py`, `tests/config_semantics.py`,
   `tests/config_validity.py` and `tests/config_grammar.py`;
 - `tests/adversarial_regressions.py`, which starts fresh servers and replays
-  the F23–P15 exploit shapes (rewrite-to-proxy/redirect authorization, cache
+  the F23–P18 exploit shapes (rewrite-to-proxy/redirect authorization, cache
   reload plus PATH_INFO, relative and capture-only aliases, autoindex schemes,
   negated/env providers, `IndexIgnore`, `DirectorySlash Off`,
   `UnsafePrefixStat` re-rooting, header-selected cache entries,

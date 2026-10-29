@@ -1,0 +1,7 @@
+<Directory /srv/www>
+<FilesMatch "\\.php$">
+<RequireAll>
+Require all granted
+</RequireAll>
+</FilesMatch>
+</Directory>

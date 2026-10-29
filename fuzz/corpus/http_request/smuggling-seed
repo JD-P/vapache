@@ -1,0 +1,9 @@
+POST /upload HTTP/1.1
+Host: localhost
+Transfer-Encoding: chunked
+
+4
+test
+0
+X-Trailer: value
+

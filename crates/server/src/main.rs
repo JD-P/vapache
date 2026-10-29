@@ -822,7 +822,7 @@ fn main() {
             break; // coverage:ignore-line - external fd failure
         }
         logger.info("SIGHUP received; reloading configuration");
-        let new_cfg =
+        let mut new_cfg =
             match Config::load(&config_path, &server_root, &env, &args.defines, args.strict) {
                 Ok(c) => c,
                 Err(errors) => {
@@ -833,6 +833,10 @@ fn main() {
                     continue;
                 }
             };
+        // Old keep-alive requests can overlap a graceful reload.  Share the
+        // usage counters so the aggregate limits remain process-wide across
+        // both configuration generations.
+        new_cfg.resource_budget = cfg.resource_budget.clone();
         let new_bound = match server::rebind(&new_cfg, &bound) {
             Ok(b) => b,
             Err(e) => {

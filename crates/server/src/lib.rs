@@ -38,6 +38,7 @@ pub mod log;
 pub mod ocsp;
 pub mod policy_ref;
 pub mod proxy;
+pub mod resource;
 pub mod request_plan;
 pub mod rewrite;
 pub mod scope_policy;

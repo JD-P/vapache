@@ -1,0 +1,46 @@
+[package]
+name = "vapache-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vapached = { path = "../crates/server", features = ["fuzzing"] }
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_sections"
+path = "fuzz_targets/config_sections.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cgi_response"
+path = "fuzz_targets/cgi_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fastcgi_records"
+path = "fuzz_targets/fastcgi_records.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
+[patch.crates-io]
+h2 = { path = "../vendor/h2-0.4.20" }

@@ -1,4 +1,5 @@
 #[cfg(fuzzing)]
+/// Fuzzing adapters for internal HPACK parsing and encoding.
 pub mod fuzz_logic {
     use crate::hpack;
     use bytes::BytesMut;
@@ -6,6 +7,7 @@ pub mod fuzz_logic {
     use std::io::Cursor;
     use std::ops::ControlFlow;
 
+    /// Exercise the HPACK decoder and, for valid textual methods, the encoder.
     pub fn fuzz_hpack(data_: &[u8]) {
         let mut decoder_ = hpack::Decoder::new(0);
         let mut buf = BytesMut::new();
