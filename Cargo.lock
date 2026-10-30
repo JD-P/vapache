@@ -1122,6 +1122,7 @@ dependencies = [
  "proptest",
  "regex",
  "ring",
+ "rustix",
  "rustls",
  "rustls-webpki",
  "sha1",

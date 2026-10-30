@@ -2,7 +2,9 @@
 """External HTTP/2 and TLS protocol checks against a real vapached process."""
 
 import argparse
+import grp
 import os
+import pwd
 import socket
 import ssl
 import subprocess
@@ -12,6 +14,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target/release/vapached"))
+SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
+SERVICE_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
 
 
 def free_port():
@@ -33,7 +37,7 @@ def wait_for_port(port, process):
     raise RuntimeError("timed out waiting for vapached")
 
 
-def start_tls_server(base):
+def start_tls_server(base, protocols="h2 http/1.1"):
     base = Path(base)
     (base / "logs").mkdir()
     (base / "www").mkdir()
@@ -51,9 +55,11 @@ def start_tls_server(base):
 Listen 127.0.0.1:{port}
 PidFile "{base}/logs/vapached.pid"
 ErrorLog "{base}/logs/error.log"
+User {SERVICE_USER}
+Group {SERVICE_GROUP}
 ServerName localhost
 TraceEnable Off
-Protocols h2 http/1.1
+Protocols {protocols}
 DocumentRoot "{base}/www"
 <Directory "{base}/www">
     AllowOverride None
@@ -81,6 +87,16 @@ DocumentRoot "{base}/www"
         output.close()
         raise
     return process, output, port
+
+
+def stop_tls_server(process, output):
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+    output.close()
 
 
 def tls_connection(port, minimum, maximum, alpn=None):
@@ -116,6 +132,42 @@ def check_tls(port):
     print("protocol-conformance: TLS versions and ALPN pass")
 
 
+def check_alpn_policy():
+    with tempfile.TemporaryDirectory(prefix="vapache-http1-only-") as temporary:
+        process, output, port = start_tls_server(temporary, "http/1.1")
+        try:
+            with tls_connection(
+                port, ssl.TLSVersion.TLSv1_2,
+                ssl.TLSVersion.MAXIMUM_SUPPORTED, ["h2", "http/1.1"],
+            ) as connection:
+                assert connection.selected_alpn_protocol() == "http/1.1"
+        finally:
+            stop_tls_server(process, output)
+
+    with tempfile.TemporaryDirectory(prefix="vapache-h2-only-") as temporary:
+        process, output, port = start_tls_server(temporary, "h2")
+        try:
+            with tls_connection(
+                port, ssl.TLSVersion.TLSv1_2,
+                ssl.TLSVersion.MAXIMUM_SUPPORTED, ["h2"],
+            ) as connection:
+                assert connection.selected_alpn_protocol() == "h2"
+
+            with tls_connection(
+                port, ssl.TLSVersion.TLSv1_2,
+                ssl.TLSVersion.MAXIMUM_SUPPORTED,
+            ) as connection:
+                connection.settimeout(2)
+                try:
+                    connection.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    assert connection.recv(1) == b""
+                except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+                    pass
+        finally:
+            stop_tls_server(process, output)
+    print("protocol-conformance: Protocols ALPN policy pass")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--h2spec", help="path to the h2spec executable")
@@ -131,6 +183,7 @@ def main():
         try:
             if args.tls:
                 check_tls(port)
+                check_alpn_policy()
             if args.h2spec:
                 subprocess.run([
                     args.h2spec, "--tls", "--insecure", "--strict",
@@ -138,13 +191,7 @@ def main():
                     "--timeout", "3",
                 ], check=True, timeout=300)
         finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-            output.close()
+            stop_tls_server(process, output)
 
 
 if __name__ == "__main__":

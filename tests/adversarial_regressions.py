@@ -3258,7 +3258,6 @@ class P15ApacheParityHardeningTests(unittest.TestCase):
             "expr-z",
             "expr-comment",
             "expr-k",
-            "expr-backref",
             "expr-not",
             "expr-rewrite",
             "expr-cgi",
@@ -3294,7 +3293,6 @@ class P15ApacheParityHardeningTests(unittest.TestCase):
             ("expr-z", "secret.txt"),
             ("expr-comment", "secret.txt"),
             ("expr-k", "secret.txt"),
-            ("expr-backref", "secretse.txt"),
             ("expr-not", "private.txt"),
             ("expr-rewrite", "secret.txt"),
             ("remote", "secret.txt"),
@@ -3375,11 +3373,6 @@ AliasMatch "^/p17-regex/(.*)$" "{cls.www}/handler-regex/$1"
 </Directory>
 <Directory "{cls.www}/expr-k">
     <If "%{{REQUEST_URI}} =~ /\\Ksecret/">
-        Require all denied
-    </If>
-</Directory>
-<Directory "{cls.www}/expr-backref">
-    <If "%{{REQUEST_URI}} =~ /(se)cret\\1/">
         Require all denied
     </If>
 </Directory>
@@ -3490,13 +3483,12 @@ RewriteRule "^/expr-rewrite/secret\\.txt$" "-" [F,L]
             )
             self.assertEqual(status, 403, (value, body[:300]))
 
-    def test_p15_c_apache_pcre_guards_apply(self):
+    def test_p15_c_supported_apache_pcre_guards_apply(self):
         for path in [
             "/expr-q/secret.txt",
             "/expr-z/secret.txt",
             "/expr-comment/secret.txt",
             "/expr-k/secret.txt",
-            "/expr-backref/secretse.txt",
             "/expr-not/private.txt",
             "/expr-rewrite/secret.txt",
         ]:

@@ -79,13 +79,19 @@ Implemented today:
   Plaintext and unknown hash formats fail closed.
 - TLS 1.2/1.3 via Rustls with `SSLEngine`, certificate chains, SNI virtual-host
   certificate selection, ALPN and `-t` certificate validation on startup.
+  `Protocols http/1.1` disables HTTP/2 at the ALPN boundary; TLS virtual hosts
+  sharing one listener must use the same `Protocols` policy because ALPN is
+  negotiated before the HTTP host is known. Unsupported values, including
+  the unimplemented cleartext `h2c`, fail configuration loading. An `h2`-only
+  listener closes clients that omit ALPN instead of falling back to HTTP/1.1.
   A root-started daemon retains a minimal pre-thread TLS file broker whose
   numeric allowlist is fixed by the startup configuration, so SIGHUP can
   rotate root-only keys without restoring arbitrary root pathname access.
   The broker closes every unrelated descriptor and standard stream, disables
   dumps and privilege acquisition, installs tight core/file/descriptor/CPU/
   address-space limits, and runs under a read-only seccomp syscall allowlist.
-- HTTP/2 over TLS (ALPN `h2`) with bounded header/stream limits, Apache
+- HTTP/2 over TLS (ALPN `h2`, enabled by the default
+  `Protocols h2 http/1.1`) with bounded header/stream limits, Apache
   request/body limits, content-length validation, CGI POST, ranges and HEAD.
   Request bodies retain at most a 64 KiB prefix per stream and then use the
   same process-wide spool budget as HTTP/1. Cleartext h2c is not implemented.

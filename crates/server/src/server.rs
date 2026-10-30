@@ -1064,6 +1064,30 @@ impl Conn for TlsH1 {
 }
 impl ResponseWrite for TlsH1 {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TlsHttpProtocol {
+    Http2,
+    Http11,
+}
+
+fn admitted_tls_http_protocol(
+    allows_h2: bool,
+    allows_http11: bool,
+    negotiated: Option<&[u8]>,
+) -> io::Result<TlsHttpProtocol> {
+    match negotiated {
+        Some(b"h2") if allows_h2 => Ok(TlsHttpProtocol::Http2),
+        Some(b"http/1.1") if allows_http11 => Ok(TlsHttpProtocol::Http11),
+        // HTTP/1.1 predates ALPN, so omission remains a valid HTTP/1.1
+        // fallback only when the listener explicitly permits HTTP/1.1.
+        None if allows_http11 => Ok(TlsHttpProtocol::Http11),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS client did not negotiate an enabled HTTP protocol",
+        )),
+    }
+}
+
 fn handle_tls_connection(
     cfg: Arc<Config>,
     logger: Arc<Logger>,
@@ -1073,6 +1097,14 @@ fn handle_tls_connection(
     local_port: u16,
     tls_config: Arc<rustls::ServerConfig>,
 ) -> io::Result<()> {
+    let allows_h2 = tls_config
+        .alpn_protocols
+        .iter()
+        .any(|protocol| protocol == b"h2");
+    let allows_http11 = tls_config
+        .alpn_protocols
+        .iter()
+        .any(|protocol| protocol == b"http/1.1");
     stream.set_nodelay(true).ok();
     stream.set_nonblocking(true)?;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1085,9 +1117,12 @@ fn handle_tls_connection(
         let tls = tokio::time::timeout(Duration::from_secs(20), acceptor.accept(tcp))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
-        let alpn = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
-        if alpn.as_deref() == Some(b"h2") {
-            return crate::h2::serve(cfg, logger, tls, peer, local_ip, local_port).await;
+        let alpn = tls.get_ref().1.alpn_protocol();
+        match admitted_tls_http_protocol(allows_h2, allows_http11, alpn)? {
+            TlsHttpProtocol::Http2 => {
+                return crate::h2::serve(cfg, logger, tls, peer, local_ip, local_port).await;
+            }
+            TlsHttpProtocol::Http11 => {}
         }
         let bridge = TlsH1::new(tls, tokio::runtime::Handle::current());
         tokio::task::spawn_blocking(move || {
@@ -4417,6 +4452,23 @@ mod tests {
 
     #[test]
     fn coverage_server_support_and_failure_helpers() {
+        assert_eq!(
+            admitted_tls_http_protocol(true, true, Some(b"h2")).unwrap(),
+            TlsHttpProtocol::Http2
+        );
+        assert_eq!(
+            admitted_tls_http_protocol(true, true, Some(b"http/1.1")).unwrap(),
+            TlsHttpProtocol::Http11
+        );
+        assert_eq!(
+            admitted_tls_http_protocol(false, true, None).unwrap(),
+            TlsHttpProtocol::Http11
+        );
+        assert!(admitted_tls_http_protocol(true, false, None).is_err());
+        assert!(admitted_tls_http_protocol(true, false, Some(b"http/1.1")).is_err());
+        assert!(admitted_tls_http_protocol(false, true, Some(b"h2")).is_err());
+        assert!(admitted_tls_http_protocol(true, true, Some(b"unknown")).is_err());
+
         assert!(first_resolved_addr(std::iter::empty()).is_err());
         assert_eq!(
             first_resolved_addr(vec!["127.0.0.1:80".parse::<SocketAddr>().unwrap()].into_iter())
@@ -4502,6 +4554,7 @@ mod tests {
             custom_logs: Vec::new(),
             error_log: None,
             server_admin: None,
+            protocols: cfg.protocols.clone(),
             ssl: Default::default(),
         };
         let mut cfg_name = cfg.clone();

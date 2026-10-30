@@ -5,7 +5,7 @@
 //! usable certificate/key pair is a startup error, and only TLS 1.2/1.3 are
 //! offered even if an old configuration mentions SSLv3/TLSv1.0.
 
-use crate::config::{vhost_port, Config, SslConfig, VHost};
+use crate::config::{vhost_port, Config, HttpProtocol, SslConfig, VHost};
 use rustls::crypto::{ring, CryptoProvider};
 use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -806,6 +806,26 @@ fn ensure_uniform_protocol_policy(policies: &[&SslConfig], port: u16) -> Result<
     Ok(())
 }
 
+/// ALPN is selected before the HTTP Host header is available. Every TLS
+/// virtual host on one listener must therefore offer the same application
+/// protocols, or an HTTP/1.1-only vhost could still be exposed to h2.
+fn ensure_uniform_application_protocols(
+    policies: &[&[HttpProtocol]],
+    port: u16,
+) -> Result<(), String> {
+    let Some(first) = policies.first() else {
+        return Ok(());
+    };
+    for protocols in policies.iter().skip(1) {
+        if protocols != first {
+            return Err(format!(
+                "TLS port {port} has virtual hosts with different Protocols policies; use separate Listen directives so ALPN cannot expose a disabled protocol"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Build the TLS configuration for a listening port, if any virtual host on
 /// that port has `SSLEngine on` (or a global SSLEngine is configured).
 /// `local_ip` filters address-bound vhosts when the listener itself is bound
@@ -848,12 +868,20 @@ pub(crate) fn prepare_server_config(
     let policies: Vec<&SslConfig> = vhosts.iter().map(|v| &v.ssl).collect();
     ensure_uniform_client_policy(&policies, port)?;
     ensure_uniform_protocol_policy(&policies, port)?;
+    let application_protocols: Vec<&[HttpProtocol]> =
+        vhosts.iter().map(|v| v.protocols.as_slice()).collect();
+    ensure_uniform_application_protocols(&application_protocols, port)?;
 
     // Apache's first matching virtual host is the default server.
     let default_ssl = if global_only {
         &cfg.ssl
     } else {
         &vhosts[0].ssl
+    };
+    let default_protocols = if global_only {
+        cfg.protocols.as_slice()
+    } else {
+        vhosts[0].protocols.as_slice()
     };
     // Keep privileged stapling state directly below the root-owned ServerRoot,
     // not below a legacy logs directory that older releases handed to the
@@ -947,8 +975,10 @@ pub(crate) fn prepare_server_config(
         .map_err(|e| format!("invalid TLS protocol configuration: {e}"))?
         .with_client_cert_verifier(verifier)
         .with_cert_resolver(Arc::new(resolver));
-    // Prefer HTTP/2; clients that do not offer h2 fall back to HTTP/1.1.
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.alpn_protocols = default_protocols
+        .iter()
+        .map(|protocol| protocol.alpn().to_vec())
+        .collect();
     Ok(PreparedServerConfig {
         config: Some(Arc::new(config)),
         refreshes,
@@ -1512,7 +1542,20 @@ mod tests {
                 "Listen 127.0.0.1:443\nSSLEngine on\nSSLCertificateFile \"{cert_s}\"\nSSLCertificateKeyFile \"{key_s}\"\n"
             ),
         );
-        assert!(server_config(&global, 443, None).unwrap().is_some());
+        let global_tls = server_config(&global, 443, None).unwrap().unwrap();
+        assert_eq!(
+            global_tls.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+
+        let http1_only = test_config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:443\nProtocols http/1.1\nSSLEngine on\nSSLCertificateFile \"{cert_s}\"\nSSLCertificateKeyFile \"{key_s}\"\n"
+            ),
+        );
+        let http1_tls = server_config(&http1_only, 443, None).unwrap().unwrap();
+        assert_eq!(http1_tls.alpn_protocols, vec![b"http/1.1".to_vec()]);
 
         let vhosts = test_config(
             &dir,
@@ -1536,6 +1579,28 @@ mod tests {
             ),
         );
         assert!(server_config(&vhosts, 443, None).unwrap().is_some());
+
+        let protocol_mismatch = test_config(
+            &dir,
+            &format!(
+                "Listen 127.0.0.1:443\n\
+                 <VirtualHost *:443>\n\
+                     Protocols http/1.1\n\
+                     SSLEngine on\n\
+                     SSLCertificateFile \"{cert_s}\"\n\
+                     SSLCertificateKeyFile \"{key_s}\"\n\
+                 </VirtualHost>\n\
+                 <VirtualHost *:443>\n\
+                     Protocols h2 http/1.1\n\
+                     SSLEngine on\n\
+                     SSLCertificateFile \"{cert_s}\"\n\
+                     SSLCertificateKeyFile \"{key_s}\"\n\
+                 </VirtualHost>\n"
+            ),
+        );
+        assert!(server_config(&protocol_mismatch, 443, None)
+            .unwrap_err()
+            .contains("different Protocols policies"));
 
         let address_bound = test_config(
             &dir,

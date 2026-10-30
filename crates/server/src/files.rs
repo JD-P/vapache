@@ -14,7 +14,7 @@ use crate::verified::{parse_byte_range, RangeDecision};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::fmt::Write as _;
 use std::fs::{File, Metadata};
 use std::io::{self, Read};
@@ -420,28 +420,203 @@ pub fn resolve_target(root: &Path, rel: &Path, follow_symlinks: bool) -> Target 
     resolve_target_checked(root, rel, follow_symlinks, false)
 }
 
-/// `Options +SymLinksIfOwnerMatch` (without `FollowSymLinks`) follows a
-/// symlink only when its target is owned by the same account.  `openat2`
-/// contains the target but cannot enforce that ownership relation.
-fn symlink_owner_matches(root: &Path, rel: &Path) -> bool {
-    let mut prefix = PathBuf::new();
-    for component in rel.components() {
-        prefix.push(component.as_os_str());
-        let candidate = root.join(&prefix);
-        let Ok(link_meta) = std::fs::symlink_metadata(&candidate) else {
-            return false;
-        };
-        if !link_meta.file_type().is_symlink() {
-            continue;
-        }
-        let Ok(resolved) = std::fs::metadata(&candidate) else {
-            return false;
-        };
-        if resolved.uid() != link_meta.uid() {
-            return false; // coverage:ignore-line - requires a root-owned target mismatch
+const MAX_SYMLINKS: usize = 40;
+const MAX_SYMLINK_BYTES: usize = 64 * 1024;
+const MAX_OWNER_PATH_DIRECTORIES: usize = 64;
+
+#[derive(Clone)]
+enum OwnedPathComponent {
+    Parent,
+    Normal(OsString),
+}
+
+struct OwnerMatchedTarget {
+    file: File,
+    meta: Metadata,
+    /// Present only for directories.  The full stack is retained so `..` in
+    /// a subsequent relative symlink target cannot climb above the root.
+    directories: Option<Vec<Arc<File>>>,
+}
+
+fn owner_path_components(path: &Path) -> io::Result<Vec<OwnedPathComponent>> {
+    use std::path::Component;
+
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => components.push(OwnedPathComponent::Parent),
+            Component::Normal(name) => {
+                components.push(OwnedPathComponent::Normal(name.to_os_string()))
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(io::Error::from_raw_os_error(libc::EXDEV));
+            }
         }
     }
-    true
+    Ok(components)
+}
+
+fn open_component_nofollow(dir: &File, name: &OsString, flags: i32) -> io::Result<File> {
+    let name =
+        CString::new(name.as_bytes()).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    openat2_file(
+        dir,
+        &name,
+        &OpenHow {
+            flags: (flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
+            mode: 0,
+            // `name` is exactly one component and the parent is already
+            // pinned. O_NOFOLLOW must be allowed to return an O_PATH handle
+            // to a final symlink so its inode can be inspected.
+            resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
+        },
+    )
+}
+
+/// Read the contents of an already-open `O_PATH|O_NOFOLLOW` symlink.  Linux's
+/// empty-path `readlinkat` form binds the bytes to that inode even if its
+/// directory entry is concurrently replaced.
+fn read_pinned_symlink(file: &File) -> io::Result<PathBuf> {
+    let value = rustix::fs::readlinkat(file, "", Vec::with_capacity(256))
+        .map_err(io::Error::from)?
+        .into_bytes();
+    if value.len() >= MAX_SYMLINK_BYTES {
+        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+    }
+    Ok(PathBuf::from(OsString::from_vec(value)))
+}
+
+fn resolve_owner_components(
+    mut directories: Vec<Arc<File>>,
+    components: &[OwnedPathComponent],
+    final_flags: i32,
+    symlinks: &mut usize,
+) -> io::Result<OwnerMatchedTarget> {
+    if components.is_empty() {
+        let file = directories
+            .last()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EXDEV))?
+            .try_clone()?;
+        let meta = file.metadata()?;
+        return Ok(OwnerMatchedTarget {
+            file,
+            meta,
+            directories: Some(directories),
+        });
+    }
+
+    let mut index = 0usize;
+    while index < components.len() {
+        match &components[index] {
+            OwnedPathComponent::Parent => {
+                if directories.len() == 1 {
+                    return Err(io::Error::from_raw_os_error(libc::EXDEV));
+                }
+                directories.pop();
+                index += 1;
+            }
+            OwnedPathComponent::Normal(name) => {
+                let current = directories
+                    .last()
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EXDEV))?;
+                let pinned = open_component_nofollow(current, name, libc::O_PATH)?;
+                let pinned_meta = pinned.metadata()?;
+                let remaining = &components[index + 1..];
+
+                if pinned_meta.file_type().is_symlink() {
+                    *symlinks += 1;
+                    if *symlinks > MAX_SYMLINKS {
+                        return Err(io::Error::from_raw_os_error(libc::ELOOP));
+                    }
+                    let target = read_pinned_symlink(&pinned)?;
+                    let target_components = owner_path_components(&target)?;
+                    let target_flags = if remaining.is_empty() {
+                        final_flags
+                    } else {
+                        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_DIRECTORY | libc::O_NOFOLLOW
+                    };
+                    let resolved = resolve_owner_components(
+                        directories.clone(),
+                        &target_components,
+                        target_flags,
+                        symlinks,
+                    )?;
+                    if resolved.meta.uid() != pinned_meta.uid() {
+                        return Err(io::Error::from_raw_os_error(libc::EACCES));
+                    }
+                    if remaining.is_empty() {
+                        return Ok(resolved);
+                    }
+                    directories = resolved
+                        .directories
+                        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOTDIR))?;
+                    index += 1;
+                    continue;
+                }
+
+                if !remaining.is_empty() {
+                    if directories.len() >= MAX_OWNER_PATH_DIRECTORIES {
+                        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+                    }
+                    let directory = open_component_nofollow(
+                        current,
+                        name,
+                        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_DIRECTORY,
+                    )?;
+                    directories.push(Arc::new(directory));
+                    index += 1;
+                    continue;
+                }
+
+                let file = open_component_nofollow(current, name, final_flags)?;
+                let meta = file.metadata()?;
+                let directories = if meta.is_dir() {
+                    if directories.len() >= MAX_OWNER_PATH_DIRECTORIES {
+                        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+                    }
+                    let directory = Arc::new(file);
+                    let file = directory.try_clone()?;
+                    directories.push(directory);
+                    return Ok(OwnerMatchedTarget {
+                        file,
+                        meta,
+                        directories: Some(directories),
+                    });
+                } else {
+                    None
+                };
+                return Ok(OwnerMatchedTarget {
+                    file,
+                    meta,
+                    directories,
+                });
+            }
+        }
+    }
+
+    let file = directories
+        .last()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EXDEV))?
+        .try_clone()?;
+    let meta = file.metadata()?;
+    Ok(OwnerMatchedTarget {
+        file,
+        meta,
+        directories: Some(directories),
+    })
+}
+
+/// Resolve `root/rel` for `SymLinksIfOwnerMatch` without a pathname re-walk.
+/// Every traversed directory and symlink is pinned before it is inspected, so
+/// the ownership decision applies to the same object returned to the caller.
+fn open_owner_matched(root: &Path, rel: &Path, flags: i32) -> io::Result<(File, Metadata)> {
+    crate::fault::hit("fs.open_beneath")?;
+    let root = root_file(root)?;
+    let components = owner_path_components(rel)?;
+    let mut symlinks = 0usize;
+    let resolved = resolve_owner_components(vec![root], &components, flags, &mut symlinks)?;
+    Ok((resolved.file, resolved.meta))
 }
 
 pub fn resolve_target_checked(
@@ -454,13 +629,15 @@ pub fn resolve_target_checked(
     if rel.as_os_str().is_empty() {
         flags |= libc::O_DIRECTORY as u64;
     }
-    let opened = if rel.as_os_str().is_empty() {
-        File::open(root)
+    let opened = if owner_match_only {
+        open_owner_matched(root, rel, flags as i32).map(|(file, meta)| (file, Some(meta)))
+    } else if rel.as_os_str().is_empty() {
+        File::open(root).map(|file| (file, None))
     } else {
-        open_beneath(root, rel, flags, follow_symlinks)
+        open_beneath(root, rel, flags, follow_symlinks).map(|file| (file, None))
     };
-    let file = match opened {
-        Ok(f) => f,
+    let (file, checked_meta) = match opened {
+        Ok(opened) => opened,
         Err(e) => {
             return match e.raw_os_error() {
                 Some(libc::ENOENT) | Some(libc::ENOTDIR) => Target::NotFound,
@@ -474,15 +651,12 @@ pub fn resolve_target_checked(
     // An owned, successfully opened descriptor remains stat-able for its
     // lifetime on Unix; keep the defensive failure closed without requiring
     // an impossible-to-construct test fixture.
-    let meta = match file.metadata() {
-        Ok(m) => m,
+    let meta = match checked_meta.map_or_else(|| file.metadata(), Ok) {
+        Ok(meta) => meta,
         // coverage:ignore-start - owned descriptor lifetime invariant
         Err(_) => return Target::Forbidden,
         // coverage:ignore-stop
     };
-    if owner_match_only && !symlink_owner_matches(root, rel) {
-        return Target::Forbidden; // coverage:ignore-line - requires a root-owned target mismatch
-    }
     if meta.is_dir() {
         Target::Directory { file, meta }
     } else if meta.is_file() {
@@ -763,6 +937,24 @@ fn current_etag_matches(value: &[u8], etag: Option<&str>, weak: bool) -> bool {
     etag.is_some_and(|etag| header_etag_list_matches(value, etag, weak))
 }
 
+/// RFC 9110 § 13.1.5 permits either one strong entity-tag or one HTTP date.
+/// A weak tag (or a list accepted by the other conditional headers) must not
+/// authorize a partial response because the bytes may be from a different
+/// representation.
+fn if_range_matches(value: &[u8], etag: Option<&str>, mtime: i64) -> bool {
+    let Ok(value) = std::str::from_utf8(value) else {
+        return false;
+    };
+    let value = value.trim();
+    if value.starts_with("W/") {
+        return false;
+    }
+    if value.starts_with('"') {
+        return etag.is_some_and(|etag| !etag.starts_with("W/") && value == etag);
+    }
+    parse_http_date(value.as_bytes()).is_some_and(|time| time == mtime)
+}
+
 /// Serve an opened regular file, applying HTTP conditional and range rules.
 fn serve_file_inner(
     cfg: &Config,
@@ -842,14 +1034,7 @@ fn serve_file_inner(
         if let Some(range) = req.header("range") {
             let use_range = match req.header("if-range") {
                 None => true,
-                Some(ir) => {
-                    if ir.first() == Some(&b'"') || ir.starts_with(b"W/") {
-                        tag.as_deref()
-                            .is_some_and(|tag| header_etag_list_matches(ir, tag, true))
-                    } else {
-                        parse_http_date(ir).map(|t| t == mtime).unwrap_or(false)
-                    }
-                }
+                Some(ir) => if_range_matches(ir, tag.as_deref(), mtime),
             };
             if use_range {
                 match parse_byte_range(range, size) {
@@ -1634,11 +1819,23 @@ mod tests {
             resolve_target_checked(&root, Path::new("dangling"), true, true),
             Target::NotFound
         ));
-        assert!(!symlink_owner_matches(
-            &root,
-            Path::new("missing-component")
+        std::fs::create_dir(root.join("owner-dir")).unwrap();
+        std::fs::write(root.join("owner-dir/nested.txt"), b"nested").unwrap();
+        std::os::unix::fs::symlink("owner-dir", root.join("owner-dir-link")).unwrap();
+        assert!(matches!(
+            resolve_target_checked(&root, Path::new("owner-dir-link/nested.txt"), true, true,),
+            Target::File { .. }
         ));
-        assert!(!symlink_owner_matches(&root, Path::new("dangling")));
+        std::os::unix::fs::symlink("owner-dir/../plain.txt", root.join("parent-link")).unwrap();
+        assert!(matches!(
+            resolve_target_checked(&root, Path::new("parent-link"), true, true),
+            Target::File { .. }
+        ));
+        std::os::unix::fs::symlink("../../etc/passwd", root.join("owner-escape")).unwrap();
+        assert!(matches!(
+            resolve_target_checked(&root, Path::new("owner-escape"), true, true),
+            Target::Forbidden
+        ));
         assert!(matches!(
             resolve_target_checked(
                 &root,
@@ -1653,10 +1850,6 @@ mod tests {
             std::os::unix::fs::symlink("plain.txt", &link).unwrap();
             let link_c = CString::new(link.as_os_str().as_encoded_bytes()).unwrap();
             assert_eq!(unsafe { libc::lchown(link_c.as_ptr(), 1, u32::MAX) }, 0);
-            assert!(!symlink_owner_matches(
-                &root,
-                Path::new("different-owner-link")
-            ));
             assert!(matches!(
                 resolve_target_checked(&root, Path::new("different-owner-link"), true, true,),
                 Target::Forbidden
@@ -1908,6 +2101,66 @@ mod tests {
             )
             .status,
             206
+        );
+
+        let (file, meta) = make();
+        let tag = etag(&meta, ETAG_ALL);
+        let mut req = request("GET", b"/file.txt");
+        req.headers.insert("range", b"bytes=1-2".to_vec());
+        req.headers.insert("if-range", tag.as_bytes().to_vec());
+        assert_eq!(
+            serve_file_inner(
+                &cfg,
+                &scope,
+                &req,
+                file,
+                &meta,
+                b"file.txt",
+                peer,
+                "127.0.0.1"
+            )
+            .status,
+            206
+        );
+
+        let (file, meta) = make();
+        let mut req = request("GET", b"/file.txt");
+        req.headers.insert("range", b"bytes=1-2".to_vec());
+        req.headers
+            .insert("if-range", format!("W/{tag}").into_bytes());
+        assert_eq!(
+            serve_file_inner(
+                &cfg,
+                &scope,
+                &req,
+                file,
+                &meta,
+                b"file.txt",
+                peer,
+                "127.0.0.1"
+            )
+            .status,
+            200
+        );
+
+        let (file, meta) = make();
+        let mut req = request("GET", b"/file.txt");
+        req.headers.insert("range", b"bytes=1-2".to_vec());
+        req.headers
+            .insert("if-range", format!("{tag}, \"other\"").into_bytes());
+        assert_eq!(
+            serve_file_inner(
+                &cfg,
+                &scope,
+                &req,
+                file,
+                &meta,
+                b"file.txt",
+                peer,
+                "127.0.0.1"
+            )
+            .status,
+            200
         );
 
         let (file, meta) = make();

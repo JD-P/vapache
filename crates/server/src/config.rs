@@ -2106,6 +2106,7 @@ pub struct VHost {
     pub custom_logs: Vec<CustomLog>,
     pub error_log: Option<String>,
     pub server_admin: Option<String>,
+    pub protocols: Vec<HttpProtocol>,
     pub ssl: SslConfig,
 }
 
@@ -2257,6 +2258,46 @@ pub enum ClientVerify {
     None,
     Optional,
     Require,
+}
+
+/// Application protocols offered by a TLS listener through ALPN. Keep this
+/// separate from `SslConfig::protocols`, which models `SSLProtocol` and thus
+/// selects TLS versions rather than HTTP versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpProtocol {
+    Http2,
+    Http11,
+}
+
+impl HttpProtocol {
+    pub(crate) fn alpn(self) -> &'static [u8] {
+        match self {
+            Self::Http2 => b"h2",
+            Self::Http11 => b"http/1.1",
+        }
+    }
+}
+
+fn parse_http_protocols(args: &[String]) -> Result<Vec<HttpProtocol>, String> {
+    if args.is_empty() {
+        return Err("Protocols requires at least one protocol".into());
+    }
+    let mut protocols = Vec::with_capacity(args.len());
+    for raw in args {
+        let protocol = if raw.eq_ignore_ascii_case("h2") {
+            HttpProtocol::Http2
+        } else if raw.eq_ignore_ascii_case("http/1.1") {
+            HttpProtocol::Http11
+        } else if raw.eq_ignore_ascii_case("h2c") {
+            return Err("Protocols h2c is unsupported; cleartext HTTP/2 is not implemented".into());
+        } else {
+            return Err(format!("unsupported Protocols token '{raw}'"));
+        };
+        if !protocols.contains(&protocol) {
+            protocols.push(protocol);
+        }
+    }
+    Ok(protocols)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2590,6 +2631,7 @@ pub struct Config {
     pub max_keep_alive_requests: usize,
     pub server_tokens: ServerTokens,
     pub server_signature: ServerSignature,
+    pub protocols: Vec<HttpProtocol>,
     pub trace_enable: bool,
     pub capabilities: Capabilities,
     /// Capabilities required by effectful directives in the loaded main
@@ -3796,6 +3838,7 @@ impl Compile {
             max_keep_alive_requests: 100,
             server_tokens: ServerTokens::Full,
             server_signature: ServerSignature::On,
+            protocols: vec![HttpProtocol::Http2, HttpProtocol::Http11],
             trace_enable: false,
             capabilities: Capabilities::default(),
             required_capabilities: Vec::new(),
@@ -4056,6 +4099,9 @@ impl Compile {
             proxy_containers.extend(v.proxy_containers.clone());
             v.proxy_containers = proxy_containers;
             v.ssl.inherit(&global_ssl);
+            if v.protocols.is_empty() {
+                v.protocols = self.cfg.protocols.clone();
+            }
             if v.error_log.is_none() {
                 v.error_log = Some(self.cfg.error_log.clone());
             }
@@ -4304,6 +4350,7 @@ impl Compile {
                                 custom_logs: Vec::new(),
                                 error_log: None,
                                 server_admin: None,
+                                protocols: Vec::new(),
                                 ssl: SslConfig::default(),
                             };
                             self.vhosts_raw.push(vh);
@@ -4943,6 +4990,32 @@ impl Compile {
                     "vapachemaxdynamicrequests" => self.cfg.max_dynamic_requests = value,
                     "vapachemaxfastcgioutput" => self.cfg.max_fastcgi_output = value,
                     _ => unreachable!(),
+                }
+            }
+            "protocols" => {
+                if !matches!(section, SectionKind::Server | SectionKind::VirtualHost) {
+                    self.errors.push(ConfigError {
+                        file: loc.file.clone(),
+                        line: loc.line,
+                        msg: "Protocols is only allowed in server or virtual-host context".into(),
+                    });
+                    return;
+                }
+                let protocols = match parse_http_protocols(args) {
+                    Ok(protocols) => protocols,
+                    Err(msg) => {
+                        self.errors.push(ConfigError {
+                            file: loc.file.clone(),
+                            line: loc.line,
+                            msg,
+                        });
+                        return;
+                    }
+                };
+                if let Some(i) = self.current_vhost {
+                    self.vhosts_raw[i].protocols = protocols;
+                } else {
+                    self.cfg.protocols = protocols;
                 }
             }
             "servername" => {
@@ -9420,6 +9493,37 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
     }
 
     #[test]
+    fn protocols_is_effectful_ordered_and_fail_closed() {
+        let c = load_text("Listen 127.0.0.1:443\nProtocols http/1.1\n", true).unwrap();
+        assert_eq!(c.protocols, vec![HttpProtocol::Http11]);
+        assert!(c
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("Protocols")));
+
+        let c = load_text(
+            "Listen 127.0.0.1:443\nProtocols http/1.1 h2 http/1.1\n\
+             <VirtualHost *:443>\nProtocols h2 http/1.1\n</VirtualHost>\n",
+            true,
+        )
+        .unwrap();
+        assert_eq!(c.protocols, vec![HttpProtocol::Http11, HttpProtocol::Http2]);
+        assert_eq!(
+            c.vhosts[0].protocols,
+            vec![HttpProtocol::Http2, HttpProtocol::Http11]
+        );
+
+        assert!(load_text("Listen 127.0.0.1:443\nProtocols\n", false).is_err());
+        assert!(load_text("Listen 127.0.0.1:443\nProtocols h2c\n", false).is_err());
+        assert!(load_text("Listen 127.0.0.1:443\nProtocols quic\n", false).is_err());
+        assert!(load_text(
+            "Listen 127.0.0.1:443\n<Directory /srv>\nProtocols http/1.1\n</Directory>\n",
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn allow_override_all_is_supported() {
         let cfg = "Listen 127.0.0.1:0\n<Directory /srv>\nAllowOverride All\n</Directory>\n";
         let c = load_text(cfg, false).unwrap();
@@ -10143,7 +10247,6 @@ SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1\n\
             "SessionCookieName session path=/",
             "Substitute \"s/a/b/\"",
             "CharsetDefault utf-8",
-            "Protocols h2 http/1.1",
         ] {
             let text = format!("Listen 127.0.0.1:0\n{directive}\n");
             let cfg = load_text(&text, false)

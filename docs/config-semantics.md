@@ -439,7 +439,12 @@ transforms.  In particular:
   (I47); the URL-selected alias root is used only for URL-base derivation
   (I48);
 - `SymLinksIfOwnerMatch` compares each symlink owner with the resolved target
-  owner unless unconditional `FollowSymLinks` is also enabled.
+  owner unless unconditional `FollowSymLinks` is also enabled. The owner-only
+  walk pins every directory and symlink descriptor, reads the link through
+  that descriptor, and resolves its target from the pinned parent; a rename
+  cannot make the ownership check and returned file refer to different
+  objects. Relative targets cannot climb above the mapping root, symlink depth
+  is capped at 40, and at most 64 directory descriptors are retained.
 
 The complete transform inventory and the original/current target gate are
 specified in I30.  The CGI/FastCGI execution boundary is closed in I31 and the
