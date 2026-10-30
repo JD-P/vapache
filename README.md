@@ -221,7 +221,9 @@ Implemented today:
   through `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`, optionally
   `RESOLVE_NO_SYMLINKS`. Linux `openat2` support is mandatory: configuration
   testing and startup fail closed if the syscall or required resolution flags
-  are unavailable, and there is no canonicalize-then-open fallback.
+  are unavailable. A readable `/proc/self/fd` is also mandatory so policy can
+  be re-evaluated against an opened symlink's resolved target; there is no
+  canonicalize-then-open or lexical-path fallback.
 
 Not yet implemented: OCSP responder error-cache timeout tuning, rare
 expression forms such as `LogMessage` interpolation, `RewriteMap dbm`, exact

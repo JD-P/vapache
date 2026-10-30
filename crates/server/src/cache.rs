@@ -547,8 +547,7 @@ pub fn request_scope_with_plan(
             // Reject a non-UTF-8 index name rather than sharing a lossy key.
             let index_name = std::str::from_utf8(&index.name).ok()?;
             let index_url = format!("{}/{}", url_path.trim_end_matches('/'), index_name);
-            let index_fs = crate::files::fd_path(&index.file)
-                .unwrap_or_else(|| fs_path.join(std::ffi::OsStr::from_bytes(&index.name)));
+            let index_fs = crate::files::fd_path(&index.file)?;
             let target = crate::request_plan::CanonicalTarget::from_url_path(&index_url)?;
             let index_plan = crate::request_plan::RequestPlan::from_fs_target(
                 cfg,

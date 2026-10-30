@@ -291,8 +291,10 @@ serve. A grant for one URL/path/proxy target/cache entry cannot be reused for
 another.  Static file and directory sinks additionally bind the grant to the
 opened `dev`/`inode`; if `/proc/self/fd/N` resolves to a different path (a
 symlink target), policy is re-evaluated for that target path before the file
-is served.  Proxy, WebSocket and FastCGI grants are bound to the exact outbound
-backend/script target.  CGI scripts are bound to the opened script inode and executed via
+is served. Failure to resolve the descriptor path fails the request closed,
+and configuration testing/startup require readable `/proc/self/fd`. Proxy,
+WebSocket and FastCGI grants are bound to the exact outbound backend/script
+target. CGI scripts are bound to the opened script inode and executed via
 `/proc/self/fd`; cache grants are policy-key-bound.
 
 ### I1b — Opened-object binding
@@ -2091,7 +2093,8 @@ regex semantics are explicit assumptions, not hidden axioms. Filesystem
 objects used by protected sinks and access-file parsing are descriptor/inode
 bound. Secure path opening requires Linux `openat2` with
 `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`; configuration testing and startup
-fail closed if that kernel boundary is unavailable, with no pathname fallback.
+fail closed if that kernel boundary or readable `/proc/self/fd` descriptor
+links are unavailable, with no pathname fallback.
 The external FastCGI backend's later open of `SCRIPT_FILENAME` is covered when
 the required stable-path check admits both identities. The equivalent
 read-only requirement stated in I31 applies only after the explicit

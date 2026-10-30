@@ -218,6 +218,54 @@ fn alter_etag(resp: &mut Response, kind: CompressionKind, scope: &Scope) {
     }
 }
 
+/// Return the entity-tag for the representation selected by the static-file
+/// output filter. Preconditions run before the body is materialized, so they
+/// cannot wait for `finalize_inner`; nevertheless a gzip tag must never match
+/// an identity or Brotli representation (and vice versa).
+///
+/// `response` contains the static representation headers after `Header`
+/// policy has run. This keeps an operator-supplied `Content-Encoding`,
+/// `Cache-Control: no-transform`, or ETag mutation in the same decision path
+/// as the real output filter.
+pub(crate) fn conditional_static_etag(
+    scope: &Scope,
+    req: &Request,
+    response: &Response,
+    path: &[u8],
+    body_len: u64,
+) -> Option<String> {
+    let current = header_str(response, "etag")?;
+    let media = media_type(response);
+    let kinds = configured_kinds(scope, media.as_deref(), path);
+    if kinds.is_empty()
+        || req.is_head()
+        || body_len == 0
+        || body_len > MAX_COMPRESS_BODY
+        || req.header("range").is_some()
+        || req.header("if-range").is_some()
+        || header(response, "content-encoding").is_some()
+        || header_str(response, "cache-control").is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("no-transform"))
+        })
+    {
+        return Some(current);
+    }
+    let Some(kind) = [CompressionKind::Brotli, CompressionKind::Gzip]
+        .into_iter()
+        .find(|kind| kinds.contains(kind) && accepts_encoding(req, *kind))
+    else {
+        return Some(current);
+    };
+    let mut selected = Response::new(200);
+    selected
+        .headers
+        .push((Cow::Borrowed("ETag"), current.into_bytes()));
+    alter_etag(&mut selected, kind, scope);
+    header_str(&selected, "etag")
+}
+
 fn read_body(body: Body) -> Result<Vec<u8>, Body> {
     match body {
         Body::Empty => Ok(Vec::new()),
@@ -295,13 +343,11 @@ pub fn finalize_budgeted(
     finalize_inner(scope, req, resp, path, Some(budget));
 }
 
-fn finalize_inner(
-    scope: &Scope,
-    req: &Request,
-    resp: &mut Response,
-    path: &[u8],
-    budget: Option<&Arc<crate::resource::ResourceBudget>>,
-) {
+/// Apply response metadata that shares the output-filter phase but does not
+/// depend on compression. Callers that intentionally bypass body filtering
+/// (for example `OPTIONS`) still need rewrite-generated `Vary`/cookies and
+/// `mod_expires` policy.
+pub(crate) fn finalize_metadata(scope: &Scope, resp: &mut Response) {
     for value in &scope.header_policy.vary {
         add_vary_value(resp, value);
     }
@@ -314,6 +360,16 @@ fn finalize_inner(
         }
     }
     crate::expires::apply(scope, resp);
+}
+
+fn finalize_inner(
+    scope: &Scope,
+    req: &Request,
+    resp: &mut Response,
+    path: &[u8],
+    budget: Option<&Arc<crate::resource::ResourceBudget>>,
+) {
+    finalize_metadata(scope, resp);
     if resp.status == 204 || (100..200).contains(&resp.status) {
         return;
     }

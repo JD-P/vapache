@@ -1775,6 +1775,7 @@ class StaticTests(Base):
         st, h, _ = self.get("*", method="OPTIONS")
         self.assertEqual(st, 200)
         self.assertIn("allow", h)
+        self.assertEqual(h["x-iffile"][0], "yes")
         self.differential("OPTIONS *", "*", method="OPTIONS")
 
     def test_unknown_method(self):
@@ -1803,8 +1804,9 @@ class StaticTests(Base):
     def test_if_none_match(self):
         _, h, _ = self.get("/hello.txt")
         etag = h["etag"][0]
-        st, _, b = self.get("/hello.txt", headers={"If-None-Match": etag})
+        st, h, b = self.get("/hello.txt", headers={"If-None-Match": etag})
         self.assertEqual((st, b), (304, b""))
+        self.assertEqual(h["x-iffile"][0], "yes")
 
     def test_if_modified_since(self):
         _, h, _ = self.get("/hello.txt")
@@ -1876,6 +1878,9 @@ class StaticTests(Base):
         self.assertIn("GET", allow)
         self.assertIn("HEAD", allow)
         self.assertEqual(h["content-type"][0].split(";")[0], "text/plain")
+        self.assertEqual(h["x-iffile"][0], "yes")
+        self.assertIn("expires", h)
+        self.assertTrue(any("max-age=3600" in v for v in h.get("cache-control", [])))
         self.assertEqual(self.get("/missing", method="OPTIONS")[0], 200)
         # Resource OPTIONS must not bypass access control.
         self.assertEqual(self.get("/secret.txt", method="OPTIONS")[0], 403)
@@ -2081,14 +2086,29 @@ class CompressionTests(Base):
     def test_compressed_etag_conditional(self):
         st, h, b = self.get("/hello.txt", headers={"Accept-Encoding": "gzip"})
         self.assertEqual(st, 200)
-        etag = h["etag"][0]
+        gzip_etag = h["etag"][0]
         st, h, b = self.get(
             "/hello.txt",
-            headers={"Accept-Encoding": "gzip", "If-None-Match": etag},
+            headers={"Accept-Encoding": "gzip", "If-None-Match": gzip_etag},
         )
         self.assertEqual(st, 304)
-        self.assertEqual(h["etag"][0], etag)
+        self.assertEqual(h["etag"][0], gzip_etag)
         self.assertEqual(b, b"")
+
+        # Validators identify encoded representations, not just the source
+        # file. A gzip tag must not validate identity or Brotli bytes.
+        st, h, b = self.get(
+            "/hello.txt", headers={"If-None-Match": gzip_etag}
+        )
+        self.assertEqual((st, b), (200, b"hello world\n"))
+        self.assertNotEqual(h["etag"][0], gzip_etag)
+
+        st, h, _ = self.get(
+            "/hello.txt",
+            headers={"Accept-Encoding": "br", "If-None-Match": gzip_etag},
+        )
+        self.assertEqual(st, 200)
+        self.assertEqual(h["content-encoding"][0], "br")
 
     def test_range_bypasses_compression(self):
         st, h, b = self.get(

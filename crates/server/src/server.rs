@@ -1175,7 +1175,7 @@ fn allow_header(cfg: &Config) -> String {
     allowed_methods(cfg).join(", ")
 }
 
-fn options_response(cfg: &Config, mime: Option<String>) -> Response {
+fn options_response(cfg: &Config, scope: &Scope, mime: Option<String>) -> Response {
     let mut r = Response::new(200);
     r.headers
         .push(("Allow".into(), allow_header(cfg).into_bytes()));
@@ -1183,6 +1183,8 @@ fn options_response(cfg: &Config, mime: Option<String>) -> Response {
     if let Some(mime) = mime {
         r.headers.push(("Content-Type".into(), mime.into_bytes()));
     }
+    scope.header_policy.apply(&mut r.headers, true);
+    crate::compression::finalize_metadata(scope, &mut r);
     r
 }
 
@@ -2198,7 +2200,7 @@ fn dispatch_inner(
     // OPTIONS requests continue through access control and path mapping so
     // they cannot bypass a Require rule or report the wrong media type.
     if req.method == "OPTIONS" && req.raw_path == b"*" {
-        return options_response(cfg, None);
+        return options_response(cfg, base_scope, None);
     }
 
     // Build one immutable request plan and reuse it for cache and dispatch.
@@ -3081,7 +3083,20 @@ fn dispatch_inner(
             // Re-authorize and bind the actual opened target before selecting
             // any handler.  A symlink must not inherit the lexical URL's
             // policy (F41/I39).
-            let actual_path = crate::files::fd_path_cow(&file, &fs_path);
+            let Some(actual_path) = crate::files::fd_path_cow(&file, &fs_path) else {
+                return error_response(
+                    cfg,
+                    vhost,
+                    &scope,
+                    500,
+                    req,
+                    &url_path,
+                    local_port,
+                    &server_name,
+                    peer.ip(),
+                    local_ip,
+                );
+            };
             let (target_grant, target_resource, target_scope) = match bind_target_grant(
                 cfg,
                 vhost,
@@ -3132,7 +3147,7 @@ fn dispatch_inner(
                 .map(PathBuf::from)
                 .unwrap_or_default();
             if req.method == "OPTIONS" {
-                return options_response(cfg, mime_type(cfg, scope, name));
+                return options_response(cfg, scope, mime_type(cfg, scope, name));
             }
             if !scope.mapping_policy.unsupported_filters.is_empty() {
                 eprintln!(
@@ -3271,7 +3286,7 @@ fn dispatch_inner(
         }
         Target::Directory { file, meta } => {
             if req.method == "OPTIONS" {
-                return options_response(cfg, None);
+                return options_response(cfg, &scope, None);
             }
             if req.method != "GET" && req.method != "HEAD" {
                 let mut r = error_response(
@@ -3329,7 +3344,20 @@ fn dispatch_inner(
                 );
                 return internal_dispatch(cfg, req, &index_url, peer, local_ip, local_port);
             }
-            let actual_path = crate::files::fd_path_cow(&file, &fs_path);
+            let Some(actual_path) = crate::files::fd_path_cow(&file, &fs_path) else {
+                return error_response(
+                    cfg,
+                    vhost,
+                    &scope,
+                    500,
+                    req,
+                    &url_path,
+                    local_port,
+                    &server_name,
+                    peer.ip(),
+                    local_ip,
+                );
+            };
             let (target_grant, target_resource, target_scope) = match bind_target_grant(
                 cfg,
                 vhost,
@@ -3382,7 +3410,7 @@ fn dispatch_inner(
         ),
         Target::NotFound => {
             if req.method == "OPTIONS" {
-                return options_response(cfg, None);
+                return options_response(cfg, &scope, None);
             }
             // CGI PATH_INFO: try progressively shorter script names.  The
             // requested suffix must not select the handler: `/protected.sh/x.cgi`
@@ -3391,7 +3419,20 @@ fn dispatch_inner(
             // path before the script inode is executed.
             if let Some(st) = cgi::find_script_checked(&root, &rel, follow, owner_match_only) {
                 let lexical_script = root.join(&st.rel_script);
-                let actual_path = crate::files::fd_path_cow(&st.file, &lexical_script);
+                let Some(actual_path) = crate::files::fd_path_cow(&st.file, &lexical_script) else {
+                    return error_response(
+                        cfg,
+                        vhost,
+                        &scope,
+                        500,
+                        req,
+                        &url_path,
+                        local_port,
+                        &server_name,
+                        peer.ip(),
+                        local_ip,
+                    );
+                };
                 let actual_name = st
                     .rel_script
                     .file_name()
@@ -5227,6 +5268,7 @@ mod tests {
         let cfg = cov_config(
             &dir,
             "TraceEnable On\n\
+             Header always set X-Static-Policy present\n\
              Redirect 302 /redir /dest\n\
              Redirect 404 /gone\n\
              Redirect 302 /relrel dest\n\
@@ -5241,6 +5283,27 @@ mod tests {
             _ => panic!("trace body"),
         };
         assert!(String::from_utf8_lossy(&body).contains("x-test: yes"));
+
+        for path in ["*", "/file.txt"] {
+            let response = cov_dispatch(&cfg, "OPTIONS", path);
+            assert_eq!(response.status, 200);
+            assert!(response.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("x-static-policy") && value == b"present"
+            }));
+        }
+
+        let mut metadata_scope = Scope::default();
+        metadata_scope.header_policy.vary.push("Origin".into());
+        metadata_scope.header_policy.cookies.push("a=1".into());
+        metadata_scope.header_policy.expires_active = Some(true);
+        metadata_scope.header_policy.expires_default = Some("access plus 1 hour".into());
+        let metadata = options_response(&cfg, &metadata_scope, Some("text/plain".into()));
+        for name in ["vary", "set-cookie", "expires", "cache-control"] {
+            assert!(metadata
+                .headers
+                .iter()
+                .any(|(header, _)| header.eq_ignore_ascii_case(name)));
+        }
 
         let mut cfg_no_trace = cov_config(&dir, "TraceEnable Off\n");
         assert_eq!(cov_dispatch(&cfg_no_trace, "TRACE", "/").status, 405);

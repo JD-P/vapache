@@ -400,19 +400,17 @@ pub fn fd_path(file: &File) -> Option<PathBuf> {
 }
 
 /// Resolve an opened descriptor while borrowing `expected` when the kernel
-/// reports the same path.  This is the common case for non-symlink targets and
-/// preserves the previous fail-closed fallback when the link cannot be read.
-pub fn fd_path_cow<'a>(file: &File, expected: &'a Path) -> Cow<'a, Path> {
-    match with_fd_link(file, |bytes| {
+/// reports the same path. Descriptor resolution is part of the authorization
+/// boundary: failure must propagate instead of treating a potentially
+/// symlinked target as its lexical pathname.
+pub fn fd_path_cow<'a>(file: &File, expected: &'a Path) -> Option<Cow<'a, Path>> {
+    with_fd_link(file, |bytes| {
         if bytes == expected.as_os_str().as_bytes() {
-            None
+            Cow::Borrowed(expected)
         } else {
-            Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+            Cow::Owned(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
         }
-    }) {
-        Some(Some(path)) => Cow::Owned(path),
-        _ => Cow::Borrowed(expected),
-    }
+    })
 }
 
 /// Open `root/rel` without ever escaping `root`.
@@ -789,16 +787,21 @@ fn open_beneath(root: &Path, rel: &Path, flags: u64, follow: bool) -> OpenResult
 /// race and is not an acceptable security boundary.
 pub fn require_secure_path_resolution() -> io::Result<()> {
     let flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY) as u64;
-    open_beneath(Path::new("/"), Path::new("."), flags, true)
-        .map(drop)
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "secure path resolution requires Linux openat2 with RESOLVE_BENEATH and RESOLVE_NO_MAGICLINKS: {error}"
-                ),
-            )
-        })
+    let root = open_beneath(Path::new("/"), Path::new("."), flags, true).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "secure path resolution requires Linux openat2 with RESOLVE_BENEATH and RESOLVE_NO_MAGICLINKS: {error}"
+            ),
+        )
+    })?;
+    if fd_path(&root).as_deref() != Some(Path::new("/")) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure resolved-target authorization requires readable /proc/self/fd",
+        ));
+    }
+    Ok(())
 }
 
 fn open_at(dir: &File, name: &[u8], follow: bool) -> OpenResult {
@@ -889,16 +892,6 @@ fn etag(meta: &Metadata, bits: u32) -> String {
     s
 }
 
-fn etag_opaque(etag: &str) -> String {
-    let s = etag.trim().strip_prefix("W/").unwrap_or(etag.trim());
-    let s = s.strip_prefix('"').unwrap_or(s);
-    let s = s.strip_suffix('"').unwrap_or(s);
-    s.strip_suffix("-gzip")
-        .or_else(|| s.strip_suffix("-br"))
-        .unwrap_or(s)
-        .to_string()
-}
-
 fn header_etag_list_matches(value: &[u8], etag: &str, weak: bool) -> bool {
     let v = std::str::from_utf8(value).unwrap_or("");
     for part in v.split(',') {
@@ -916,8 +909,6 @@ fn header_etag_list_matches(value: &[u8], etag: &str, weak: bool) -> bool {
         } else {
             (false, etag)
         };
-        let pt = etag_opaque(pt);
-        let et = etag_opaque(et);
         if weak {
             if pt == et {
                 return true;
@@ -935,6 +926,47 @@ fn current_etag_matches(value: &[u8], etag: Option<&str>, weak: bool) -> bool {
         return true;
     }
     etag.is_some_and(|etag| header_etag_list_matches(value, etag, weak))
+}
+
+fn representation_headers(
+    mime: Option<&str>,
+    last_mod: &str,
+    tag: Option<&str>,
+) -> Vec<(Cow<'static, str>, Vec<u8>)> {
+    let mut headers = Vec::new();
+    if let Some(mime) = mime {
+        headers.push(("Content-Type".into(), mime.as_bytes().to_vec()));
+    }
+    headers.push(("Last-Modified".into(), last_mod.as_bytes().to_vec()));
+    if let Some(tag) = tag {
+        headers.push(("ETag".into(), tag.as_bytes().to_vec()));
+    }
+    headers.push(("Accept-Ranges".into(), b"bytes".to_vec()));
+    headers
+}
+
+fn not_modified_response(
+    scope: &Scope,
+    mime: Option<&str>,
+    last_mod: &str,
+    tag: Option<&str>,
+) -> Response {
+    let mut response = Response::new(304);
+    if let Some(mime) = mime {
+        response
+            .headers
+            .push(("Content-Type".into(), mime.as_bytes().to_vec()));
+    }
+    response
+        .headers
+        .push(("Last-Modified".into(), last_mod.as_bytes().to_vec()));
+    if let Some(tag) = tag {
+        response
+            .headers
+            .push(("ETag".into(), tag.as_bytes().to_vec()));
+    }
+    scope.header_policy.apply(&mut response.headers, true);
+    response
 }
 
 /// RFC 9110 § 13.1.5 permits either one strong entity-tag or one HTTP date.
@@ -972,13 +1004,19 @@ fn serve_file_inner(
     let tag = vapache_verified::file_etag_emit_admit(etag_bits).then(|| etag(meta, etag_bits));
     let last_mod = http_date(mtime);
     let mime = mime_type(cfg, scope, mime_name);
+    let headers = representation_headers(mime.as_deref(), &last_mod, tag.as_deref());
+    let mut representation = Response::new(200);
+    representation.headers = headers.clone();
+    scope.header_policy.apply(&mut representation.headers, true);
+    let validator_tag =
+        crate::compression::conditional_static_etag(scope, req, &representation, mime_name, size);
 
     let is_get = req.method == "GET";
     let is_head = req.method == "HEAD";
 
     // RFC 9110 §13.2.2 evaluation order.
     if let Some(v) = req.header("if-match") {
-        if !current_etag_matches(v, tag.as_deref(), false) {
+        if !current_etag_matches(v, validator_tag.as_deref(), false) {
             return error_response(cfg, None, scope, 412, req, "", 0, "", peer, local_ip);
         }
     } else if let Some(v) = req.header("if-unmodified-since") {
@@ -989,19 +1027,9 @@ fn serve_file_inner(
         }
     }
     if let Some(v) = req.header("if-none-match") {
-        if current_etag_matches(v, tag.as_deref(), true) {
+        if current_etag_matches(v, validator_tag.as_deref(), true) {
             if is_get || is_head {
-                let mut r = Response::new(304);
-                if let Some(tag) = &tag {
-                    r.headers.push(("ETag".into(), tag.as_bytes().to_vec()));
-                }
-                r.headers
-                    .push(("Last-Modified".into(), last_mod.into_bytes()));
-                if let Some(mime) = &mime {
-                    r.headers
-                        .push(("Content-Type".into(), mime.as_bytes().to_vec()));
-                }
-                return r;
+                return not_modified_response(scope, mime.as_deref(), &last_mod, tag.as_deref());
             }
             return error_response(cfg, None, scope, 412, req, "", 0, "", peer, local_ip);
         }
@@ -1009,17 +1037,12 @@ fn serve_file_inner(
         if let Some(v) = req.header("if-modified-since") {
             if let Some(t) = parse_http_date(v) {
                 if mtime <= t {
-                    let mut r = Response::new(304);
-                    if let Some(tag) = &tag {
-                        r.headers.push(("ETag".into(), tag.as_bytes().to_vec()));
-                    }
-                    r.headers
-                        .push(("Last-Modified".into(), last_mod.into_bytes()));
-                    if let Some(mime) = &mime {
-                        r.headers
-                            .push(("Content-Type".into(), mime.as_bytes().to_vec()));
-                    }
-                    return r;
+                    return not_modified_response(
+                        scope,
+                        mime.as_deref(),
+                        &last_mod,
+                        tag.as_deref(),
+                    );
                 }
             }
         }
@@ -1068,15 +1091,7 @@ fn serve_file_inner(
     }
 
     let mut r = Response::new(status);
-    if let Some(mime) = mime {
-        r.headers.push(("Content-Type".into(), mime.into_bytes()));
-    }
-    r.headers
-        .push(("Last-Modified".into(), last_mod.into_bytes()));
-    if let Some(tag) = tag {
-        r.headers.push(("ETag".into(), tag.into_bytes()));
-    }
-    r.headers.push(("Accept-Ranges".into(), b"bytes".to_vec()));
+    r.headers = headers;
     if let Some(cr) = content_range {
         r.headers.push(("Content-Range".into(), cr.into_bytes()));
     }
@@ -2009,6 +2024,110 @@ mod tests {
             "\"abc\"",
             false
         ));
+        assert!(!header_etag_list_matches(b"\"abc-gzip\"", "\"abc\"", true));
+        assert!(!header_etag_list_matches(b"abc", "\"abc\"", true));
+
+        let mut header_scope = Scope::default();
+        header_scope
+            .header_policy
+            .always_set_headers
+            .push(("X-Static-Policy".into(), "present".into()));
+        let (file, meta) = make();
+        let tag = etag(&meta, ETAG_ALL);
+        let mut conditional = request("GET", b"/file.txt");
+        conditional
+            .headers
+            .insert("if-none-match", tag.as_bytes().to_vec());
+        let not_modified = serve_file_inner(
+            &cfg,
+            &header_scope,
+            &conditional,
+            file,
+            &meta,
+            b"file.txt",
+            peer,
+            "127.0.0.1",
+        );
+        assert_eq!(not_modified.status, 304);
+        assert!(not_modified.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-static-policy") && value == b"present"
+        }));
+
+        let mut compressed_scope = Scope::default();
+        compressed_scope.compression_policy.compression_rules.push(
+            crate::config::CompressionRule::Set(vec![
+                crate::config::CompressionKind::Gzip,
+                crate::config::CompressionKind::Brotli,
+            ]),
+        );
+        let gzip_tag = format!("{}-gzip\"", tag.trim_end_matches('"'));
+
+        let (file, meta) = make();
+        let mut identity = request("GET", b"/file.txt");
+        identity
+            .headers
+            .insert("if-none-match", gzip_tag.as_bytes().to_vec());
+        assert_eq!(
+            serve_file_inner(
+                &cfg,
+                &compressed_scope,
+                &identity,
+                file,
+                &meta,
+                b"file.txt",
+                peer,
+                "127.0.0.1",
+            )
+            .status,
+            200
+        );
+
+        let (file, meta) = make();
+        let mut brotli = request("GET", b"/file.txt");
+        brotli.headers.insert("accept-encoding", b"br".to_vec());
+        brotli
+            .headers
+            .insert("if-none-match", gzip_tag.as_bytes().to_vec());
+        assert_eq!(
+            serve_file_inner(
+                &cfg,
+                &compressed_scope,
+                &brotli,
+                file,
+                &meta,
+                b"file.txt",
+                peer,
+                "127.0.0.1",
+            )
+            .status,
+            200
+        );
+
+        let (file, meta) = make();
+        let mut gzip = request("GET", b"/file.txt");
+        gzip.headers.insert("accept-encoding", b"gzip".to_vec());
+        gzip.headers
+            .insert("if-none-match", gzip_tag.as_bytes().to_vec());
+        let mut gzip_not_modified = serve_file_inner(
+            &cfg,
+            &compressed_scope,
+            &gzip,
+            file,
+            &meta,
+            b"file.txt",
+            peer,
+            "127.0.0.1",
+        );
+        assert_eq!(gzip_not_modified.status, 304);
+        crate::compression::finalize(
+            &compressed_scope,
+            &gzip,
+            &mut gzip_not_modified,
+            b"file.txt",
+        );
+        assert!(gzip_not_modified.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("etag") && value == gzip_tag.as_bytes()
+        }));
 
         let mut no_etag_scope = Scope::default();
         no_etag_scope.content_policy.file_etag = Some(0);
@@ -2491,7 +2610,7 @@ mod tests {
 
         let file = File::open(&target).unwrap();
         assert_eq!(fd_path(&file).unwrap(), target);
-        match fd_path_cow(&file, &target) {
+        match fd_path_cow(&file, &target).expect("descriptor path") {
             Cow::Borrowed(path) => assert_eq!(path, target),
             Cow::Owned(path) => panic!("matching target allocated {path:?}"),
         }
@@ -2499,7 +2618,7 @@ mod tests {
         let link = root.join("link.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let linked = File::open(&link).unwrap();
-        match fd_path_cow(&linked, &link) {
+        match fd_path_cow(&linked, &link).expect("symlink target") {
             Cow::Owned(path) => assert_eq!(path, target),
             Cow::Borrowed(path) => panic!("symlink target was not resolved: {path:?}"),
         }
