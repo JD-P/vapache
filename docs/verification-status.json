@@ -482,7 +482,7 @@
     "unverified_security_components": [],
     "partially_bound_sinks": [],
     "assumptions": [
-      "PCRE2 implements the Apache expression-regex subset exercised by the differential gate",
+      "the statically linked lockfile-pinned PCRE2 10.46 interpreter implements the Apache expression-regex subset exercised by the differential gate; its native implementation remains trusted and expression matching does not enable JIT",
       "when VapacheCapability UnstableFastCgiPaths is explicitly enabled, an external FastCGI backend opens SCRIPT_FILENAME after vapache's final descriptor/inode check and the deployment must provide the read-only script-tree invariant that VapacheFastCGIStablePath otherwise machine-enforces",
       "h2 wire framing, TLS client-certificate chain validation, and CGI/proxy protocol details are outside the model",
       "configuration tokenization and directive/pattern payloads refine the executable kind/phase model",

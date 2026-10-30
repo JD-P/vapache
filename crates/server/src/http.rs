@@ -109,8 +109,33 @@ impl Headers {
         self.entries.push((name.to_ascii_lowercase(), value.into()));
     }
 
+    /// Append a field line to the canonical request-header view.  HTTP/2's
+    /// decoder preserves repeated field lines, while HTTP/1 collapses them
+    /// before constructing `Request`; keeping that difference here lets an
+    /// authorization consumer see a different value than CGI/proxy sinks.
+    pub(crate) fn push_merged(&mut self, name: &str, value: &[u8]) {
+        let lname = name.to_ascii_lowercase();
+        if let Some((_, current)) = self.entries.iter_mut().find(|(n, _)| *n == lname) {
+            current.extend_from_slice(header_merge_separator(lname.as_bytes()));
+            current.extend_from_slice(value);
+        } else {
+            self.entries.push((lname, value.to_vec()));
+        }
+    }
+
     pub(crate) fn hold_resident(&mut self, lease: ResidentLease) {
         self.resident_lease = Some(std::sync::Arc::new(lease));
+    }
+}
+
+fn header_merge_separator(name: &[u8]) -> &'static [u8] {
+    // RFC 9113 permits a peer to split Cookie for HPACK efficiency and
+    // requires recipients to join those lines with "; ".  Other combinable
+    // request fields use the normal comma-list representation.
+    if name.eq_ignore_ascii_case(b"cookie") {
+        b"; "
+    } else {
+        b", "
     }
 }
 
@@ -900,7 +925,7 @@ fn parse_head(head: &[u8], limits: &Limits) -> Result<Request, ParseError> {
     let mut merged: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(headers.len());
     for (name, value) in headers {
         if let Some(i) = vapache_verified::header_merge_index(&merged, &name) {
-            merged[i].1.extend_from_slice(b", ");
+            merged[i].1.extend_from_slice(header_merge_separator(&name));
             merged[i].1.extend_from_slice(&value);
         } else {
             merged.push((name, value));
@@ -1401,14 +1426,31 @@ mod tests {
 
     #[test]
     fn duplicate_http1_fields_are_merged_before_policy_consumers() {
-        let raw = b"GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: benign\r\nuser-agent: scanner\r\nX-Forwarded-For: 198.51.100.1\r\nX-Forwarded-For: 127.0.0.1\r\n\r\n";
+        let raw = b"GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: benign\r\nuser-agent: scanner\r\nX-Forwarded-For: 198.51.100.1\r\nX-Forwarded-For: 127.0.0.1\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n";
         let req = parse_head(raw, &limits()).unwrap();
         assert_eq!(req.header("user-agent"), Some(&b"benign, scanner"[..]));
         assert_eq!(
             req.header("x-forwarded-for"),
             Some(&b"198.51.100.1, 127.0.0.1"[..])
         );
+        assert_eq!(req.header("cookie"), Some(&b"a=1; b=2"[..]));
         assert_eq!(req.headers.get_all("user-agent").count(), 1);
+    }
+
+    #[test]
+    fn h2_style_duplicate_fields_share_the_http1_canonical_view() {
+        let mut headers = Headers::default();
+        headers.push_merged("authorization", b"Basic first");
+        headers.push_merged("Authorization", b"Basic second");
+        headers.push_merged("cookie", b"a=1");
+        headers.push_merged("cookie", b"b=2");
+
+        assert_eq!(
+            headers.get("authorization"),
+            Some(&b"Basic first, Basic second"[..])
+        );
+        assert_eq!(headers.get_all("authorization").count(), 1);
+        assert_eq!(headers.get("cookie"), Some(&b"a=1; b=2"[..]));
     }
 
     #[test]

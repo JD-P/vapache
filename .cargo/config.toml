@@ -1,0 +1,6 @@
+[env]
+# pcre2-sys otherwise prefers whatever libpcre2 happens to be installed on the
+# build host. Force its lockfile-versioned bundled source so the native parser
+# is reproducible, represented by pcre2-sys in the SBOM, and covered by Cargo
+# dependency review instead of becoming an untracked runtime dependency.
+PCRE2_SYS_STATIC = { value = "1", force = true }

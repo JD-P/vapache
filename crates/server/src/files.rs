@@ -9,7 +9,7 @@
 
 use crate::config::{Config, ErrorDoc, Scope, ServerSignature, VHost, ETAG_ALL};
 use crate::http::{reason_phrase, Body, Request, Response};
-use crate::util::{html_escape, http_date, parse_http_date};
+use crate::util::{html_escape, http_date, parse_http_date, url_encode_query};
 use crate::verified::{parse_byte_range, RangeDecision};
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -934,7 +934,7 @@ pub fn serve_file(
 }
 
 enum DirAction {
-    Redirect(String),
+    Redirect(Vec<u8>),
     Index(File, Metadata, Vec<u8>),
     List(Vec<(Vec<u8>, bool, u64)>),
     Overloaded,
@@ -960,9 +960,9 @@ fn directory_action(
         loc.push(b'/');
         if !req.query.is_empty() {
             loc.push(b'?');
-            loc.extend_from_slice(&req.query);
+            loc.extend_from_slice(&url_encode_query(&req.query));
         }
-        return DirAction::Redirect(String::from_utf8_lossy(&loc).into_owned());
+        return DirAction::Redirect(loc);
     }
     for name in cfg.directory_index_for(scope) {
         if name.contains('/') || name == ".." || name == "." || name.is_empty() {
@@ -1137,21 +1137,22 @@ fn serve_directory_inner(
             } else {
                 "http"
             };
-            let loc = if loc.starts_with('/') {
-                format!("{scheme}://{authority}{loc}")
+            let loc = if loc.starts_with(b"/") {
+                let mut absolute = format!("{scheme}://{authority}").into_bytes();
+                absolute.extend_from_slice(&loc);
+                absolute
             } else {
                 loc
             };
             let mut r = Response::new(301);
-            r.headers
-                .push(("Location".into(), loc.clone().into_bytes()));
+            r.headers.push(("Location".into(), loc.clone()));
             r.headers.push((
                 "Content-Type".into(),
                 b"text/html; charset=iso-8859-1".to_vec(),
             ));
             let body = format!(
                 "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n<html><head>\n<title>301 Moved Permanently</title>\n</head><body>\n<h1>Moved Permanently</h1>\n<p>The document has moved <a href=\"{}\">here</a>.</p>\n</body></html>\n",
-                html_escape(loc.as_bytes())
+                html_escape(&loc)
             );
             r.body = Body::Bytes(body.into_bytes());
             r
@@ -1975,10 +1976,12 @@ mod tests {
         std::fs::write(root.join("#ignored"), b"x").unwrap();
         let dir = File::open(&root).unwrap();
         let mut req = request("GET", b"/dir");
-        req.query = b"a=1".to_vec();
+        req.query = b"raw=\xff&escaped=%FE".to_vec();
         let mut scope = Scope::default();
         match directory_action(&cfg, &scope, &req, &dir, "/dir", b"/dir", true) {
-            DirAction::Redirect(loc) => assert!(loc.ends_with("/dir/?a=1")),
+            DirAction::Redirect(loc) => {
+                assert_eq!(loc, b"/dir/?raw=%FF&escaped=%FE")
+            }
             _ => panic!("expected redirect"),
         }
 

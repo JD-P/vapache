@@ -1628,11 +1628,20 @@ where
             "access grant does not cover websocket target",
         ));
     }
+    if target.path.bytes().any(|byte| byte < b' ' || byte == 0x7f) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid websocket target path",
+        ));
+    }
     let client_ip = crate::access::canonical_ip(peer.ip());
     let _websocket_lease = cfg.resource_budget.try_websocket_for(client_ip)?;
     let timeout = cfg.timeout.max(Duration::from_secs(5));
     let mut upstream = connect_async(&target.backend, scope, timeout).await?;
-    let mut path = target.path.as_bytes().to_vec();
+    // `Target::path` is the decoded authorization identity. Re-encode bytes
+    // that could be interpreted as delimiters or a second escape by the
+    // upstream, exactly as the ordinary reverse-proxy path does.
+    let mut path = encode_proxy_path(&target.path).into_bytes();
     if !req.query.is_empty() {
         path.push(b'?');
         path.extend_from_slice(&req.query);
@@ -4811,9 +4820,10 @@ mod coverage_tests {
         .into_bytes()
     }
 
-    fn ws_context(
+    fn ws_context_with_path(
         port: u16,
         r: &Request,
+        target_path: &str,
     ) -> (
         Arc<Config>,
         Arc<Scope>,
@@ -4835,7 +4845,7 @@ mod coverage_tests {
             base: "/".into(),
             tls: false,
         };
-        let path = "/ws".to_string();
+        let path = target_path.to_string();
         let proxy_url = canonical_proxy_url(&backend, &path);
         let target = Target {
             backend,
@@ -4868,6 +4878,20 @@ mod coverage_tests {
         )
     }
 
+    fn ws_context(
+        port: u16,
+        r: &Request,
+    ) -> (
+        Arc<Config>,
+        Arc<Scope>,
+        Arc<Request>,
+        Arc<Target>,
+        Arc<crate::access::AccessGrant>,
+        Arc<crate::access::ResourceKey>,
+    ) {
+        ws_context_with_path(port, r, "/ws")
+    }
+
     #[tokio::test]
     async fn websocket_async_success_query_and_initial() {
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
@@ -4876,7 +4900,8 @@ mod coverage_tests {
         let mut r = ws_request(key);
         r.query = b"x=\xff".to_vec();
         r.headers.insert("x-raw", b"a\xffb".to_vec());
-        let (cfg, scope, r, target, grant, resource) = ws_context(port, &r);
+        let (cfg, scope, r, target, grant, resource) =
+            ws_context_with_path(port, &r, "/ws/%2e?x#y z");
         let initial = b"hello".to_vec();
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let task = tokio::spawn(async move {
@@ -4909,8 +4934,8 @@ mod coverage_tests {
         assert!(result.is_ok());
         let request = upstream.await.unwrap();
         assert!(request
-            .windows(b"GET /ws?x=\xff HTTP/1.1".len())
-            .any(|window| window == b"GET /ws?x=\xff HTTP/1.1"));
+            .windows(b"GET /ws/%252e%3Fx%23y%20z?x=\xff HTTP/1.1".len())
+            .any(|window| window == b"GET /ws/%252e%3Fx%23y%20z?x=\xff HTTP/1.1"));
         assert!(request
             .windows(b"x-raw: a\xffb\r\n".len())
             .any(|window| window == b"x-raw: a\xffb\r\n"));
@@ -5464,6 +5489,7 @@ mod coverage_tests {
         .await
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        upstream.abort();
         let _ = upstream.await;
         let _ = std::fs::remove_dir_all(&dir);
     }

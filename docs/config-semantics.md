@@ -1643,7 +1643,9 @@ The first Verus model should cover:
 
 The following remain assumptions or separate proofs:
 
-- the PCRE2 and Rust regex engines implement their stated language subsets;
+- the statically linked, lockfile-pinned PCRE2 10.46 interpreter and the Rust
+  regex engine implement their stated language subsets (PCRE2 remains a
+  trusted native-code boundary; expression matching does not enable its JIT);
 - the filesystem contents match what the access-file walk sees;
 - path canonicalization and `openat` containment (already separately
   verified in `crates/verified`);

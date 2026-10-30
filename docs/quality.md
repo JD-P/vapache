@@ -88,6 +88,15 @@ explicitly reviewed and added or imported before `cargo vet --locked` passes.
 Weekly jobs also build a CycloneDX SBOM, check public API compatibility and
 compare two isolated release-build hashes.
 
+PCRE2 is an explicit native dependency used for Apache-compatible expression
+regular expressions. `.cargo/config.toml` forces `pcre2-sys` to compile its
+lockfile-pinned bundled PCRE2 10.46 instead of dynamically selecting a build
+host library, and expression matching does not enable PCRE2 JIT. The pull-
+request native-dependency gate inspects the produced binary and rejects a
+dynamic `libpcre2` dependency. `pcre2` and `pcre2-sys` remain visible in the
+Cargo review ledger and CycloneDX SBOM; their C implementation is a trusted
+boundary, not covered by Rust's memory-safety argument.
+
 The pinned Verus installer uses release `0.2026.10.18.7d82994`, matching the
 `vstd` revision in the lockfile. `tests/verification_status.py --run-verus`
 machine-checks the security kernels and rejects proof escapes or ledger drift.

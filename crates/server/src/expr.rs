@@ -50,10 +50,11 @@ impl ExprRegex {
             return Err("bad expression regex: pattern is too large or contains controls".into());
         }
         let mut builder = pcre2::bytes::RegexBuilder::new();
-        builder
-            .caseless(nocase)
-            .jit_if_available(true)
-            .max_jit_stack_size(Some(512 * 1024));
+        // Keep request-controlled subjects on PCRE2's interpreter. The JIT is
+        // an unnecessary executable-memory/native-code boundary here; regex
+        // work is already input-bounded and protected by the expensive-work
+        // concurrency budget.
+        builder.caseless(nocase);
         let compiled = builder
             .build(&pattern)
             .map_err(|error| format!("bad expression regex: {error}"))?;

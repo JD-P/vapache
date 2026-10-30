@@ -300,16 +300,21 @@ fn head_error_response(decision: vapache_verified::H2HeadDecision) -> Option<Res
 fn declared_content_length(headers: &crate::http::Headers) -> Result<Option<u64>, ()> {
     let mut declared = None;
     for value in headers.get_all("content-length") {
-        let Some(n) = std::str::from_utf8(value)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-        else {
-            return Err(());
-        };
-        if declared.is_some_and(|previous| previous != n) {
-            return Err(());
+        // A repeated Content-Length is canonicalized into a comma list with
+        // the other H2 fields. RFC 9110 permits that representation only when
+        // every value is valid and identical.
+        for item in value.split(|byte| *byte == b',') {
+            let Some(n) = std::str::from_utf8(item)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+            else {
+                return Err(());
+            };
+            if declared.is_some_and(|previous| previous != n) {
+                return Err(());
+            }
+            declared = Some(n);
         }
-        declared = Some(n);
     }
     Ok(declared)
 }
@@ -714,7 +719,14 @@ async fn handle_stream(
             total
                 .saturating_add(name.as_str().len() as u64)
                 .saturating_add(value.as_bytes().len() as u64)
-        });
+                // Canonical duplicate lines add either ", " or "; ".
+                .saturating_add(2)
+        })
+        .saturating_add(
+            uri.authority()
+                .map(|authority| 4u64.saturating_add(authority.as_str().len() as u64))
+                .unwrap_or(0),
+        );
     if request_resident.reserve(header_bytes).is_err() {
         return send_response(
             respond,
@@ -727,36 +739,13 @@ async fn handle_stream(
     }
 
     let mut headers = crate::http::Headers::default();
-    for (name, value) in parts.headers.iter() {
-        // :authority is authoritative in HTTP/2.  Ignore any legacy Host
-        // header so a conflicting pair cannot select a different vhost than
-        // the one used for TLS SNI/absolute redirects.
-        if name.as_str() == "host" {
-            continue;
-        }
-        headers.push(name.as_str(), value.as_bytes().to_vec());
-    }
-    // HTTP/2 carries the authority in :authority (exposed through the URI),
-    // not in a Host header.  Apache exposes it as Host to modules/CGI.
-    if let Some(authority) = uri.authority() {
-        headers.push("host", authority.as_str().as_bytes().to_vec());
-    }
-
-    // Apply the same request bounds as the HTTP/1 parser.  HTTP/2's HPACK
-    // decoder has its own table limits, but that does not replace Apache's
-    // LimitRequestLine/Fields/FieldSize policy.  The whole head is admitted by
-    // one verified decision function so rejection precedence cannot drift
-    // between the h2 and HTTP/1 paths.
     let mut header_budget =
         vapache_verified::h2_header_init(vapache_verified::h2_settings().max_header_list as u64);
-    for (name, value) in headers.iter() {
-        let Some(next) = vapache_verified::h2_header_add(
-            header_budget,
-            name.len().saturating_add(value.len()) as u64,
-        ) else {
-            // The server builder's identical max-header-list limit rejects
-            // this in h2 before an accepted request reaches the adapter.
-            // coverage:ignore-start - upstream h2 admission invariant
+    let mut header_count = 0u64;
+    let mut largest_field = 0u64;
+    for (name, value) in parts.headers.iter() {
+        let field_len = name.as_str().len().saturating_add(value.as_bytes().len()) as u64;
+        let Some(next) = vapache_verified::h2_header_add(header_budget, field_len) else {
             let _ = send_response(
                 respond,
                 &cfg,
@@ -765,20 +754,50 @@ async fn handle_stream(
             )
             .await;
             return true;
-            // coverage:ignore-stop
         };
         header_budget = next;
+        header_count = header_count.saturating_add(1);
+        largest_field = largest_field.max(field_len);
+
+        // :authority is authoritative in HTTP/2.  Ignore any legacy Host
+        // header so a conflicting pair cannot select a different vhost than
+        // the one used for TLS SNI/absolute redirects. It still counts toward
+        // all request-head limits above.
+        if name.as_str() == "host" {
+            continue;
+        }
+        headers.push_merged(name.as_str(), value.as_bytes());
     }
-    let largest_field = headers
-        .iter()
-        .map(|(n, v)| n.len().saturating_add(v.len()) as u64)
-        .max()
-        .unwrap_or(0);
+    // HTTP/2 carries the authority in :authority (exposed through the URI),
+    // not in a Host header.  Apache exposes it as Host to modules/CGI.
+    if let Some(authority) = uri.authority() {
+        let value = authority.as_str().as_bytes();
+        let field_len = b"host".len().saturating_add(value.len()) as u64;
+        let Some(_next) = vapache_verified::h2_header_add(header_budget, field_len) else {
+            let _ = send_response(
+                respond,
+                &cfg,
+                bad(431, "request header list too large"),
+                false,
+            )
+            .await;
+            return true;
+        };
+        header_count = header_count.saturating_add(1);
+        largest_field = largest_field.max(field_len);
+        headers.push("host", value.to_vec());
+    }
+
+    // Apply the same request bounds as the HTTP/1 parser.  HTTP/2's HPACK
+    // decoder has its own table limits, but that does not replace Apache's
+    // LimitRequestLine/Fields/FieldSize policy.  The whole head is admitted by
+    // one verified decision function so rejection precedence cannot drift
+    // between the h2 and HTTP/1 paths.
     let head_error = head_error_response(vapache_verified::h2_head_admit(
         method.as_bytes(),
         target.len() as u64,
         cfg.limit_request_line as u64,
-        headers.iter().count() as u64,
+        header_count,
         cfg.limit_request_fields as u64,
         largest_field,
         cfg.limit_request_field_size as u64,
@@ -1171,7 +1190,10 @@ mod tests {
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
-    fn test_config(name: &str) -> (Arc<Config>, Arc<Logger>, std::path::PathBuf) {
+    fn test_config_with_extra(
+        name: &str,
+        extra: &str,
+    ) -> (Arc<Config>, Arc<Logger>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("vapache-h2-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("www")).unwrap();
@@ -1184,10 +1206,12 @@ mod tests {
                  Listen 127.0.0.1:0\n\
                  ServerName localhost\n\
                  DocumentRoot \"{}/www\"\n\
-                 ErrorLog \"{}/error.log\"\n",
+                 ErrorLog \"{}/error.log\"\n\
+                 {}\n",
                 dir.display(),
                 dir.display(),
-                dir.display()
+                dir.display(),
+                extra
             ),
         )
         .unwrap();
@@ -1195,6 +1219,10 @@ mod tests {
             Arc::new(Config::load(&conf, &dir, &HashMap::new(), &HashMap::new(), false).unwrap());
         let logger = Arc::new(Logger::new(&cfg).unwrap());
         (cfg, logger, dir)
+    }
+
+    fn test_config(name: &str) -> (Arc<Config>, Arc<Logger>, std::path::PathBuf) {
+        test_config_with_extra(name, "")
     }
 
     async fn round_trip(
@@ -1504,6 +1532,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn h2_duplicate_fields_are_canonicalized_before_policy() {
+        let name = "duplicate-policy";
+        let dir = std::env::temp_dir().join(format!("vapache-h2-{name}-{}", std::process::id()));
+        let directory = dir.join("www");
+        let extra = format!(
+            "<Directory \"{}\">\nRequire expr \"%{{HTTP:X-Gate}} == 'allow, deny'\"\n</Directory>",
+            directory.display()
+        );
+        let (cfg, logger, dir) = test_config_with_extra(name, &extra);
+        let mut request = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/file.txt")
+            .body(())
+            .unwrap();
+        request
+            .headers_mut()
+            .append("x-gate", http::HeaderValue::from_static("allow"));
+        request
+            .headers_mut()
+            .append("x-gate", http::HeaderValue::from_static("deny"));
+
+        let (status, body, reset) = round_trip(cfg.clone(), logger.clone(), request, &[]).await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(body, b"hello h2");
+        assert!(!reset);
+
+        // LimitRequestFields counts wire field lines before canonicalization;
+        // merging duplicates must not let them evade the raw-line limit.
+        let mut limited = (*cfg).clone();
+        limited.limit_request_fields = 2;
+        let mut request = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/file.txt")
+            .body(())
+            .unwrap();
+        request
+            .headers_mut()
+            .append("x-gate", http::HeaderValue::from_static("allow"));
+        request
+            .headers_mut()
+            .append("x-gate", http::HeaderValue::from_static("deny"));
+        assert_eq!(
+            round_trip(Arc::new(limited), logger, request, &[]).await.0,
+            431
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn h2_connection_loop_handles_completion_reset_and_reclaim() {
         async fn run(reset: bool) {
             let (cfg, logger, dir) = test_config(if reset { "serve-reset" } else { "serve-ok" });
@@ -1794,10 +1871,10 @@ mod tests {
 
         let mut headers = crate::http::Headers::default();
         assert_eq!(declared_content_length(&headers), Ok(None));
-        headers.push("content-length", b"7".to_vec());
-        headers.push("content-length", b"7".to_vec());
+        headers.push_merged("content-length", b"7");
+        headers.push_merged("content-length", b"7");
         assert_eq!(declared_content_length(&headers), Ok(Some(7)));
-        headers.push("content-length", b"8".to_vec());
+        headers.push_merged("content-length", b"8");
         assert_eq!(declared_content_length(&headers), Err(()));
         let mut malformed = crate::http::Headers::default();
         malformed.push("content-length", b"not-a-number".to_vec());

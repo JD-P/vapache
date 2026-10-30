@@ -175,7 +175,7 @@ OVERRIDES: dict[str, tuple[str, str, str, str]] = {
     "CVE-2025-53020": ("prevented", "memory-lifetime", "Rust RAII and bounded caches/streams replace Apache pool late-release lifetime", "high"),
     "CVE-2019-10097": ("fail_closed", "remoteip-proxy", "PROXY protocol input is not implemented and is rejected", "high"),
     "CVE-2021-30641": ("prevented", "path", "Vapache canonicalizes duplicate slashes rather than supporting MergeSlashes Off", "medium"),
-    "CVE-2026-44631": ("prevented", "regex", "Rust regex/string handling cannot underwrite the config buffer; unsupported regex config fails startup", "medium"),
+    "CVE-2026-44631": ("prevented", "regex-native", "the Apache configuration-buffer implementation is absent; expression regexes use lockfile-pinned statically linked PCRE2 10.46 without JIT, compile at startup, and retain PCRE2 as an explicit trusted native boundary", "medium"),
     "CVE-2002-0840": ("prevented", "error-page", "error bodies HTML-escape URL/host data", "high"),
     "CVE-2007-4465": ("prevented", "autoindex", "autoindex file names are HTML-escaped", "high"),
     "CVE-2006-5752": ("prevented", "status", "server-status page contains no attacker-controlled request fields", "high"),

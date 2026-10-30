@@ -323,6 +323,46 @@ pub fn url_encode_path(path: &[u8]) -> String {
     out
 }
 
+/// URL-encode raw query octets for an externally visible redirect. Existing
+/// percent escapes and RFC 3986 query delimiters remain intact; bytes that
+/// cannot appear literally in a URI are represented reversibly as `%XX`.
+pub fn url_encode_query(query: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(query.len());
+    for &b in query {
+        if b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_'
+                    | b'.'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+                    | b'/'
+                    | b'?'
+                    | b'%'
+            )
+        {
+            out.push(b);
+        } else {
+            out.push(b'%');
+            out.push(HEX[(b >> 4) as usize]);
+            out.push(HEX[(b & 0xf) as usize]);
+        }
+    }
+    out
+}
+
 /// Encode an autoindex entry as a relative hyperlink.  The leading `./`
 /// is mandatory: it prevents a hostile filename such as `javascript:...`,
 /// `data:...` or `//attacker.example/...` from becoming an absolute/scheme
@@ -468,6 +508,10 @@ mod tests {
         assert_eq!(url_encode_path(b"/a b"), "/a%20b");
         assert_eq!(url_encode_path(b"/caf\xc3\xa9"), "/caf%C3%A9");
         assert_eq!(url_encode_path(b"/a?b"), "/a%3Fb");
+        assert_eq!(
+            url_encode_query(b"raw=\xff&escaped=%FE/path?x#fragment"),
+            b"raw=%FF&escaped=%FE/path?x%23fragment"
+        );
     }
 
     #[test]
