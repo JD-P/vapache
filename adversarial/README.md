@@ -24,7 +24,7 @@ prevents re-deriving them from scratch.
 | `findings_p20.md` | Pass 20 write-ups: **P20-A** HTTP/2 request bodies are buffered in heap up to 32 MiB per stream × 100 concurrent streams per connection (≈3.2 GiB per connection) while HTTP/1 spools bodies above 1 MiB to disk — 20 × 8 MiB streams peak +162 MiB RSS versus Apache `mod_http2` +1.3 MiB, one 32 MiB stream holds +32.9 MiB, and 60 × 8 MiB under a 512 MiB address-space bound aborts the process (`memory allocation of 8388608 bytes failed`); **P20-B** the request spooler reserves the declared `Content-Length` from the process-global `VapacheMaxSpoolBytes` budget before reading any body, so one ~100-byte request declaring 1 GiB denies all large identity and all chunked uploads process-wide (dropped connections, no response) until the body deadline, with recovery on close |
 | `findings_p21.md` | Pass 21 write-up (**P21-A**, now remediated): the ≤1 MiB identity-body branch reserved the declared `Content-Length` against the process-wide `MAX_REQUEST_RESIDENT_BYTES` budget before receiving body bytes, so 128 header-only POSTs denied every HTTP/1 and HTTP/2 request. The fixed reader charges only actual received chunks and the retained harness records the original Apache differential |
 | `findings_p22.md` | Pass 22 write-ups (**P22-A/B**, now remediated): HTTP/2 zero-window file responses materialized uncharged bodies and streamed proxy responses pinned all blocking-read leases. File/stream sends now wait for capacity, use response-accounted 64 KiB chunks, and scope each blocking lease to one read; the retained harness records the original Apache differentials |
-| `findings_p23.md` | Pass 23 write-ups (**P23-A–P23-N**): exact counted repetition bypasses the verified pattern×subject work ceiling (`a{60000}` takes 15.8 s on 64 KiB; live `a{8000}` ~363–383 ms versus Apache 0.4 ms), the `$`/`\Z` final-newline fallback is not PCRE2's zero-width anchor semantics, negated POSIX classes and hyphen ranges are silently rewritten (live Apache 403 versus vapache 200), inline `(?x)` is not tracked, `\R` splits CRLF, `\K` user names collide with the internal keep namespace, and valid escapes/captures/blanket guards are over-rejected; lower-severity CRLF, multiline-iterator and compile-time observations are included |
+| `findings_p23.md` | Pass 23 write-ups (**P23-A–P23-N**) and remediation dispositions: counted-repetition work charging, final-newline fail-closed contexts, exact byte/POSIX classes and ranges, inline `x`, CRLF atomics, internal `\K` captures, escapes/capture histories, CRLF iteration and linear class parsing |
 | `p11/exploit_p11.py` | Pass-11 differential exploit battery: 13 micro-apps run against Apache 2.4.69 and vapached, one per finding row |
 | `p11/case01-F61-A` … `case13-F61-C` | Captured case dossiers (rendered `apache.conf` / `vp.conf`, fixture tree, server logs, `ap.strace`) |
 | `p11/f70_accessfilename.py` | F70 probe (dead finding: Apache rejects the configuration) |
@@ -365,9 +365,9 @@ CARGO_TARGET_DIR=/tmp/opencode/p23-probe-target \
 
 The live battery uses a shared `<Directory>` guard on both servers and sends
 the same request to Apache 2.4.69 and vapached on sibling loopback ports. The
-A1/A2/A3 cases expect Apache to deny and vapache to grant (or the reverse for
-the inline-`(?x)` overmatch), while B1 expects the same `403` on both but a
-large CPU gap; C1/C2 and the A1/A2 controls must agree. The harness writes
+A1/A2/A3 cases now require status parity, while B1 requires the same
+fail-closed status without the former CPU delay; C1/C2 and the A1/A2 controls
+must agree. The harness writes
 per-case configs, fixtures and server logs under `/tmp/opencode/p23-harness`
 and exits non-zero if any verdict fails. The probe crate is standalone and
 uses `[workspace]` so it does not join the product workspace.

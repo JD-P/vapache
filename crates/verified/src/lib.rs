@@ -1799,6 +1799,51 @@ pub proof fn regex_match_work_is_bounded(
 {
 }
 
+/// Once the frontend's structural complexity charge dominates an expanded
+/// counted repetition, the ordinary match-work ceiling also bounds every
+/// repeated atom evaluation.  This closes the P23-A gap where `{n}` was
+/// previously charged as only the few source bytes spelling the quantifier.
+pub proof fn regex_expanded_charge_bounds_counted_repetition(
+    atom: nat,
+    copies: nat,
+    subject: nat,
+    charge: nat,
+    work_limit: nat,
+)
+    requires
+        charge >= atom * copies,
+        charge * subject <= work_limit,
+    ensures atom * copies * subject <= work_limit,
+{
+    vstd::arithmetic::mul::lemma_mul_inequality(
+        (atom * copies) as int,
+        charge as int,
+        subject as int,
+    );
+}
+
+/// A compatibility lowering that performs more than one deterministic pass
+/// (the terminal-newline anchor case uses two) must include every pass in its
+/// charged complexity.
+pub proof fn regex_multipass_charge_bounds_all_passes(
+    automaton: nat,
+    passes: nat,
+    subject: nat,
+    charge: nat,
+    work_limit: nat,
+)
+    requires
+        charge >= automaton * passes,
+        charge * subject <= work_limit,
+    ensures automaton * passes * subject <= work_limit,
+{
+    vstd::arithmetic::mul::lemma_mul_inequality(
+        (automaton * passes) as int,
+        charge as int,
+        subject as int,
+    );
+}
+
 /// Shipping policy for the regex execution backend.  Neither recursive
 /// backtracking nor executable-memory JIT is available in the production
 /// engine; both properties are fixed at construction and cannot be selected

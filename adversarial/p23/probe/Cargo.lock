@@ -230,6 +230,7 @@ name = "vapache-pcre2"
 version = "0.1.0"
 dependencies = [
  "regex",
+ "regex-syntax",
  "vapache-verified",
 ]
 

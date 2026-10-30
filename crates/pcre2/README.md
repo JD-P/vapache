@@ -29,13 +29,15 @@ Resource policy is part of the API, not a timeout:
 - patterns and translated expansion are byte-capped;
 - compiled automata and parser nesting are capped;
 - subjects and capture slots are capped;
-- every match must satisfy an overflow-free `pattern_complexity × subject`
-  work ceiling before execution.
+- every match must satisfy an overflow-free `automaton_complexity × subject`
+  work ceiling before execution; finite repetition expansion and additional
+  compatibility passes are included in that structural charge.
 
 The corresponding admission predicates and product-bound proof are in
 `vapache-verified`: `regex_compile_resource_admit`,
 `regex_capture_resource_admit`, `regex_match_resource_admit`, and
-`regex_match_work_is_bounded`. `regex_engine_mode_admit` proves that the
+`regex_match_work_is_bounded`. The counted-repetition and multipass dominance
+lemmas close P23-A's undercharge. `regex_engine_mode_admit` proves that the
 shipping mode excludes both backtracking and executable-memory JIT.
 
 ## Conformance and fuzzing
@@ -61,3 +63,6 @@ the repository's `fuzz` package. It feeds the same pattern, flags, and raw byte
 subject to this crate and the C oracle and compares every capture span. The C
 crate is a dev/fuzz dependency only and is absent from vapached's normal Cargo
 graph and release binary.
+
+The reproducible C interpreter/JIT comparison and latest measurements are in
+[`docs/pcre2-benchmark.md`](../../docs/pcre2-benchmark.md).

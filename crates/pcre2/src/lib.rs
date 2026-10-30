@@ -98,6 +98,8 @@ impl std::error::Error for Error {}
 pub mod bytes {
     use super::*;
 
+    type CaptureSpans = Vec<Option<(usize, usize)>>;
+
     /// A byte range in a matched subject.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct Match<'s> {
@@ -185,15 +187,25 @@ pub mod bytes {
 
             let translation = translate(
                 pattern,
+                self.config.caseless,
                 self.config.multi_line,
                 self.config.crlf,
                 self.config.extended,
             )?;
-            if translation.pattern.len() > self.config.pattern_limit.saturating_mul(4) {
+            if translation.pattern.len() > self.config.pattern_limit.saturating_mul(16) {
                 return Err(Error::resource(
                     "translated pattern exceeds the expansion limit",
                 ));
             }
+
+            let complexity = deterministic_complexity(&translation.pattern, &self.config)?
+                .max(translation.pattern.len() as u64)
+                .max(1)
+                .saturating_mul(if translation.final_newline_fallback {
+                    2
+                } else {
+                    1
+                });
 
             let mut builder = regex::bytes::RegexBuilder::new(&translation.pattern);
             builder
@@ -220,7 +232,7 @@ pub mod bytes {
             for (index, name) in inner_names.iter().enumerate().skip(1) {
                 if name
                     .as_deref()
-                    .is_some_and(|name| name.starts_with(KEEP_PREFIX))
+                    .is_some_and(|name| name.starts_with(&translation.keep_prefix))
                 {
                     keep_groups.push(index);
                     continue;
@@ -248,8 +260,9 @@ pub mod bytes {
                 config: Arc::new(self.config.clone()),
                 pattern: pattern.to_owned(),
                 translated_pattern: translation.pattern,
-                complexity: translation.complexity.max(1),
+                complexity,
                 final_newline_fallback: translation.final_newline_fallback,
+                multiline_start_anchor: translation.multiline_start_anchor,
                 inner,
                 public_to_inner: Arc::new(public_to_inner),
                 keep_groups: Arc::new(keep_groups),
@@ -358,8 +371,9 @@ pub mod bytes {
         config: Arc<Config>,
         pattern: String,
         translated_pattern: String,
-        complexity: usize,
+        complexity: u64,
         final_newline_fallback: bool,
+        multiline_start_anchor: bool,
         inner: regex::bytes::Regex,
         public_to_inner: Arc<Vec<usize>>,
         keep_groups: Arc<Vec<usize>>,
@@ -381,7 +395,7 @@ pub mod bytes {
         fn check_subject(&self, subject_len: usize, start: usize) -> Result<(), Error> {
             assert!(start <= subject_len, "start must be <= subject.len()");
             if !vapache_verified::regex_match_resource_admit(
-                self.complexity as u64,
+                self.complexity,
                 subject_len.saturating_sub(start) as u64,
                 self.config.subject_limit as u64,
                 self.config.work_limit,
@@ -440,14 +454,15 @@ pub mod bytes {
             &self,
             subject: &[u8],
             start: usize,
-        ) -> Result<Option<Vec<Option<(usize, usize)>>>, Error> {
+        ) -> Result<Option<CaptureSpans>, Error> {
             self.check_subject(subject.len(), start)?;
             let full = self.inner.captures_at(subject, start);
             let mut trimmed = None;
             if self.final_newline_fallback {
                 let trim = if self.config.crlf && subject.ends_with(b"\r\n") {
                     2
-                } else if subject.ends_with(b"\n") {
+                } else if subject.ends_with(b"\n") || (self.config.crlf && subject.ends_with(b"\r"))
+                {
                     1
                 } else {
                     0
@@ -459,13 +474,17 @@ pub mod bytes {
                 }
             }
             // PCRE2 exposes both end-of-subject and pre-final-newline anchor
-            // positions. Select the earlier leftmost match; if starts tie,
-            // retain the full-subject result and its normal greedy priority.
+            // positions. Contexts whose greedy priority cannot be represented
+            // by this two-pass lowering are rejected during translation.
             let captures = match (full, trimmed) {
                 (Some(full), Some(trimmed)) => {
-                    let full_start = full.get(0).expect("group zero matches").start();
-                    let trimmed_start = trimmed.get(0).expect("group zero matches").start();
-                    if trimmed_start < full_start {
+                    let full_match = full.get(0).expect("group zero matches");
+                    let trimmed_match = trimmed.get(0).expect("group zero matches");
+                    if trimmed_match.start() < full_match.start()
+                        || (trimmed_match.start() == full_match.start()
+                            && trimmed_match.end() < full_match.end()
+                            && !self.config.dotall)
+                    {
                         Some(trimmed)
                     } else {
                         Some(full)
@@ -571,11 +590,23 @@ pub mod bytes {
                 spans: vec![None; self.captures_len()],
             }
         }
+
+        fn suppress_terminal_multiline_anchor(
+            &self,
+            subject: &[u8],
+            start: usize,
+            end: usize,
+        ) -> bool {
+            self.multiline_start_anchor
+                && start == end
+                && end == subject.len()
+                && (subject.ends_with(b"\n") || (self.config.crlf && subject.ends_with(b"\r")))
+        }
     }
 
     #[derive(Clone, Debug)]
     pub struct CaptureLocations {
-        spans: Vec<Option<(usize, usize)>>,
+        spans: CaptureSpans,
     }
 
     impl CaptureLocations {
@@ -595,7 +626,7 @@ pub mod bytes {
     #[derive(Clone)]
     pub struct Captures<'s> {
         subject: &'s [u8],
-        spans: Vec<Option<(usize, usize)>>,
+        spans: CaptureSpans,
         idx: Arc<HashMap<String, usize>>,
     }
 
@@ -672,6 +703,14 @@ pub mod bytes {
                 }
                 match self.re.find_at(self.subject, self.last_end) {
                     Ok(Some(matched)) => {
+                        if self.re.suppress_terminal_multiline_anchor(
+                            self.subject,
+                            matched.start(),
+                            matched.end(),
+                        ) {
+                            self.done = true;
+                            return None;
+                        }
                         if matched.start() == matched.end() {
                             self.last_end = matched.end() + 1;
                             // Match PCRE2's global-search rule: after a
@@ -719,6 +758,14 @@ pub mod bytes {
                 match self.re.captures_at(self.subject, self.last_end) {
                     Ok(Some(captures)) => {
                         let matched = captures.get(0).expect("group zero always matches");
+                        if self.re.suppress_terminal_multiline_anchor(
+                            self.subject,
+                            matched.start(),
+                            matched.end(),
+                        ) {
+                            self.done = true;
+                            return None;
+                        }
                         if matched.start() == matched.end() {
                             self.last_end = matched.end() + 1;
                             if self.last_match == Some(matched.end()) {
@@ -745,42 +792,93 @@ pub mod bytes {
 
     struct Translation {
         pattern: String,
-        complexity: usize,
         final_newline_fallback: bool,
+        multiline_start_anchor: bool,
+        keep_prefix: String,
+    }
+
+    fn deterministic_complexity(pattern: &str, config: &Config) -> Result<u64, Error> {
+        let unicode = config.ucp || config.utf;
+        let mut builder = regex_syntax::ParserBuilder::new();
+        builder
+            .utf8(unicode)
+            .unicode(unicode)
+            .ignore_whitespace(config.extended)
+            .case_insensitive(config.caseless)
+            .multi_line(config.multi_line)
+            .dot_matches_new_line(config.dotall)
+            .crlf(config.crlf)
+            .nest_limit(config.nest_limit);
+        let hir = builder
+            .build()
+            .parse(pattern)
+            .map_err(|error| Error::syntax(error.to_string()))?;
+        Ok(hir_complexity(&hir))
+    }
+
+    fn hir_complexity(hir: &regex_syntax::hir::Hir) -> u64 {
+        use regex_syntax::hir::HirKind;
+        match hir.kind() {
+            HirKind::Empty | HirKind::Class(_) | HirKind::Look(_) => 1,
+            HirKind::Literal(literal) => (literal.0.len() as u64).max(1),
+            HirKind::Capture(capture) => hir_complexity(&capture.sub).saturating_add(1),
+            HirKind::Concat(parts) | HirKind::Alternation(parts) => parts
+                .iter()
+                .fold(1u64, |sum, part| sum.saturating_add(hir_complexity(part))),
+            HirKind::Repetition(repetition) => {
+                let copies = repetition
+                    .max
+                    .map(u64::from)
+                    .unwrap_or_else(|| u64::from(repetition.min).saturating_add(1))
+                    .max(1);
+                hir_complexity(&repetition.sub).saturating_mul(copies)
+            }
+        }
     }
 
     /// Translate PCRE-only regular constructs while rejecting every construct
-    /// whose behavior depends on recursive backtracking.
+    /// whose exact semantics cannot be represented by the automata backend.
     fn translate(
         pattern: &str,
-        _multi_line: bool,
-        _crlf: bool,
+        caseless: bool,
+        multi_line: bool,
+        crlf: bool,
         extended: bool,
     ) -> Result<Translation, Error> {
-        if let Some(offset) = invalid_quantifier_placement(pattern, extended) {
+        let quantifier_extended = extended || inline_option_may_enable(pattern, b'x');
+        let invalid_quantifier = invalid_quantifier_placement(pattern, false, crlf).or_else(|| {
+            quantifier_extended
+                .then(|| invalid_quantifier_placement(pattern, true, crlf))
+                .flatten()
+        });
+        if let Some(offset) = invalid_quantifier {
             return Err(Error::syntax_at(
                 offset,
                 "quantifier does not follow a repeatable item",
             ));
         }
-        if let Some(offset) = ambiguous_nested_capture_repeat(pattern) {
+        if let Some(offset) = ambiguous_nested_capture_repeat(pattern, crlf) {
             return Err(Error::unsupported(
                 offset,
-                "nested quantification with ambiguous capture history",
+                "quantified capture with ambiguous capture history",
             ));
         }
-        if pattern.contains("[:") && pattern.contains('-') {
-            // PCRE2's range validation around POSIX classes differs from
-            // Rust's class-set grammar. Reject the ambiguous combination
-            // instead of accepting a pattern PCRE2 diagnoses as invalid.
-            return Err(Error::unsupported(0, "POSIX class combined with a range"));
-        }
+        let effective_multiline = leading_global_flag(pattern, b'm').unwrap_or(multi_line);
+        let effective_extended = leading_global_flag(pattern, b'x').unwrap_or(extended);
+        validate_line_constructs(pattern, effective_extended, effective_multiline, crlf)?;
+
         let bytes = pattern.as_bytes();
+        let captures = capture_count(pattern, crlf);
+        let keep_prefix = choose_keep_prefix(pattern);
+        let absolute_end = contains_escape(pattern, b'z', crlf);
         let mut out = Vec::with_capacity(bytes.len());
         let mut i = 0;
-        let mut in_class = false;
         let mut keep_count = 0;
         let mut final_newline_fallback = false;
+        let mut saw_line_start = false;
+        let mut alternation_offset = None;
+        let mut effective_caseless = caseless;
+        let mut caseless_scopes = Vec::new();
         while i < bytes.len() {
             if bytes[i] >= 0x80 {
                 let ch = pattern[i..].chars().next().expect("valid UTF-8 pattern");
@@ -789,66 +887,41 @@ pub mod bytes {
                 continue;
             }
             match bytes[i] {
-                b'[' if !in_class => {
-                    in_class = true;
-                    out.push(b'[');
+                b'[' => {
+                    let (class, end) =
+                        translate_byte_class_caseless(pattern, i, crlf, effective_caseless)?;
+                    out.extend_from_slice(class.as_bytes());
+                    i = end;
+                }
+                b'(' if bytes.get(i + 1) != Some(&b'?') && bytes.get(i + 1) != Some(&b'*') => {
+                    caseless_scopes.push(effective_caseless);
+                    out.push(b'(');
                     i += 1;
                 }
-                b'[' if in_class => {
-                    if bytes.get(i + 1) == Some(&b':') {
-                        if let Some(relative_end) =
-                            bytes[i + 2..].windows(2).position(|pair| pair == b":]")
-                        {
-                            let name_end = i + 2 + relative_end;
-                            let name = &pattern[i + 2..name_end];
-                            if matches!(
-                                name,
-                                "alnum"
-                                    | "alpha"
-                                    | "ascii"
-                                    | "blank"
-                                    | "cntrl"
-                                    | "digit"
-                                    | "graph"
-                                    | "lower"
-                                    | "print"
-                                    | "punct"
-                                    | "space"
-                                    | "upper"
-                                    | "word"
-                                    | "xdigit"
-                            ) {
-                                let end = name_end + 2;
-                                out.extend_from_slice(&bytes[i..end]);
-                                i = end;
-                                continue;
-                            }
-                        }
-                        out.extend_from_slice(b"\\x5B");
-                    } else if matches!(bytes.get(i + 1), Some(b'.' | b'=')) {
-                        return Err(Error::unsupported(i, "collating character class"));
-                    } else {
-                        // Rust classes allow nested set expressions; PCRE2
-                        // treats an ordinary inner `[` as a member byte.
-                        out.extend_from_slice(b"\\x5B");
-                    }
-                    i += 1;
-                }
-                b']' if in_class => {
-                    in_class = false;
-                    out.push(b']');
-                    i += 1;
-                }
-                b'(' if !in_class && bytes.get(i + 1) == Some(&b'*') => {
+                b'(' if bytes.get(i + 1) == Some(&b'*') => {
                     return Err(Error::unsupported(i, "backtracking control verb"));
                 }
-                b'(' if !in_class && bytes.get(i + 1) == Some(&b'?') => {
+                b'(' if bytes.get(i + 1) == Some(&b'?') => {
                     if bytes.get(i + 2) == Some(&b'#') {
                         let Some(relative_end) = bytes[i + 3..].iter().position(|&b| b == b')')
                         else {
                             return Err(Error::syntax("unterminated PCRE comment group"));
                         };
                         i += 4 + relative_end;
+                        continue;
+                    }
+                    if bytes[i..].starts_with(b"(?J)") {
+                        return Err(Error::unsupported(i, "duplicate capture names"));
+                    }
+                    if let Some((end, scoped, updated)) =
+                        inline_caseless_option(bytes, i, effective_caseless)
+                    {
+                        if scoped {
+                            caseless_scopes.push(effective_caseless);
+                        }
+                        effective_caseless = updated;
+                        out.extend_from_slice(&bytes[i..end]);
+                        i = end;
                         continue;
                     }
                     match bytes.get(i + 2).copied() {
@@ -868,6 +941,7 @@ pub mod bytes {
                             return Err(Error::unsupported(i, "named backreference or recursion"));
                         }
                         Some(b'\'') => {
+                            caseless_scopes.push(effective_caseless);
                             let name_start = i + 3;
                             let Some(relative_end) =
                                 bytes[name_start..].iter().position(|&b| b == b'\'')
@@ -881,18 +955,34 @@ pub mod bytes {
                             i = name_end + 1;
                         }
                         _ => {
+                            caseless_scopes.push(effective_caseless);
                             out.push(b'(');
                             i += 1;
                         }
                     }
                 }
-                b'$' if !in_class => {
-                    // Rust's `$` is strict in non-multiline mode. A retry on
-                    // the subject without its final newline supplies PCRE2's
-                    // default pre-final-newline position without introducing
-                    // synthetic capture groups or consuming the newline.
+                b')' => {
+                    effective_caseless = caseless_scopes
+                        .pop()
+                        .ok_or_else(|| Error::syntax_at(i, "unmatched closing parenthesis"))?;
+                    out.push(b')');
+                    i += 1;
+                }
+                b'^' => {
+                    saw_line_start = true;
+                    out.push(b'^');
+                    i += 1;
+                }
+                b'|' => {
+                    alternation_offset.get_or_insert(i);
+                    out.push(b'|');
+                    i += 1;
+                }
+                b'$' => {
                     out.push(b'$');
-                    final_newline_fallback = true;
+                    if !effective_multiline && !absolute_end {
+                        final_newline_fallback = true;
+                    }
                     i += 1;
                 }
                 b'\\' => {
@@ -907,61 +997,53 @@ pub mod bytes {
                                 .position(|pair| pair == b"\\E")
                                 .map(|relative| start + relative)
                                 .unwrap_or(bytes.len());
-                            append_quoted_literal(&mut out, &pattern[start..end], extended);
+                            append_quoted_literal(&mut out, &pattern[start..end]);
                             i = if end < bytes.len() { end + 2 } else { end };
                         }
-                        b'K' if !in_class => {
+                        b'K' => {
                             out.extend_from_slice(
-                                format!("(?P<{KEEP_PREFIX}{keep_count}>)").as_bytes(),
+                                format!("(?P<{keep_prefix}{keep_count}>)").as_bytes(),
                             );
                             keep_count += 1;
                             i += 2;
                         }
-                        b'Z' if !in_class => {
+                        b'Z' => {
                             out.extend_from_slice(b"(?-m:$)");
-                            final_newline_fallback = true;
+                            if !absolute_end {
+                                final_newline_fallback = true;
+                            }
                             i += 2;
                         }
-                        b'C' if !in_class => {
+                        b'C' => {
                             out.extend_from_slice(b"(?s:.)");
                             i += 2;
                         }
-                        b'R' if !in_class => {
+                        b'R' => {
                             out.extend_from_slice(b"(?:\\r\\n|[\\n\\x0B\\f\\r\\x85])");
                             i += 2;
                         }
-                        b'N' if !in_class => {
-                            out.extend_from_slice(b"[^\\n]");
+                        b'N' => {
+                            if crlf {
+                                out.extend_from_slice(b"[^\\r\\n]");
+                            } else {
+                                out.extend_from_slice(b"[^\\n]");
+                            }
                             i += 2;
                         }
                         b'h' => {
-                            if in_class {
-                                out.extend_from_slice(b"\\x09\\x20\\xA0");
-                            } else {
-                                out.extend_from_slice(b"[\\x09\\x20\\xA0]");
-                            }
+                            out.extend_from_slice(b"[\\x09\\x20\\xA0]");
                             i += 2;
                         }
                         b'v' => {
-                            if in_class {
-                                out.extend_from_slice(b"\\n\\x0B\\f\\r\\x85");
-                            } else {
-                                out.extend_from_slice(b"[\\n\\x0B\\f\\r\\x85]");
-                            }
+                            out.extend_from_slice(b"[\\n\\x0B\\f\\r\\x85]");
                             i += 2;
                         }
-                        b'H' | b'V' => {
-                            if in_class {
-                                return Err(Error::unsupported(
-                                    i,
-                                    "complement class escape inside a class",
-                                ));
-                            }
-                            if escaped == b'H' {
-                                out.extend_from_slice(b"[^\\x09\\x20\\xA0]");
-                            } else {
-                                out.extend_from_slice(b"[^\\n\\x0B\\f\\r\\x85]");
-                            }
+                        b'H' => {
+                            out.extend_from_slice(b"[^\\x09\\x20\\xA0]");
+                            i += 2;
+                        }
+                        b'V' => {
+                            out.extend_from_slice(b"[^\\n\\x0B\\f\\r\\x85]");
                             i += 2;
                         }
                         b'a' => {
@@ -972,10 +1054,6 @@ pub mod bytes {
                             out.extend_from_slice(b"\\x1B");
                             i += 2;
                         }
-                        b'b' if in_class => {
-                            out.extend_from_slice(b"\\x08");
-                            i += 2;
-                        }
                         b'c' => {
                             let Some(&control) = bytes.get(i + 2) else {
                                 return Err(Error::syntax("incomplete control escape"));
@@ -983,27 +1061,30 @@ pub mod bytes {
                             if control >= 0x80 {
                                 return Err(Error::syntax("control escape must be ASCII"));
                             }
-                            // PCRE2 uppercases the ASCII byte and toggles bit
-                            // 6. This intentionally differs from `& 0x1f`
-                            // for punctuation (`\c:` is `z`).
-                            let value = control.to_ascii_uppercase() ^ 0x40;
-                            out.extend_from_slice(format!("\\x{value:02X}").as_bytes());
+                            push_hex(&mut out, control.to_ascii_uppercase() ^ 0x40);
                             i += 3;
                         }
-                        b'0' => {
-                            let mut end = i + 2;
-                            while end < bytes.len()
-                                && end < i + 4
-                                && matches!(bytes[end], b'0'..=b'7')
-                            {
-                                end += 1;
-                            }
-                            let value = u8::from_str_radix(&pattern[i + 1..end], 8)
-                                .map_err(|_| Error::syntax("octal escape is outside byte range"))?;
-                            out.extend_from_slice(format!("\\x{value:02X}").as_bytes());
+                        b'x' => {
+                            let (value, end) = parse_hex_escape(bytes, i)?;
+                            push_hex(&mut out, value);
                             i = end;
                         }
-                        b'1'..=b'9' | b'g' | b'k' => {
+                        b'o' => {
+                            let (value, end) = parse_braced_octal(bytes, i)?;
+                            push_hex(&mut out, value);
+                            i = end;
+                        }
+                        b'0'..=b'7' => {
+                            let (decimal, decimal_end) = decimal_escape(bytes, i + 1);
+                            if escaped != b'0' && decimal > 0 && decimal <= captures {
+                                return Err(Error::unsupported(i, "backreference"));
+                            }
+                            let (value, end) = parse_octal_escape(bytes, i + 1)?;
+                            let _ = decimal_end;
+                            push_hex(&mut out, value);
+                            i = end;
+                        }
+                        b'8' | b'9' | b'g' | b'k' => {
                             return Err(Error::unsupported(i, "backreference"));
                         }
                         b'p' | b'P' | b'X' => {
@@ -1019,91 +1100,658 @@ pub mod bytes {
                         }
                     }
                 }
-                b'+' if !in_class && matches!(out.last(), Some(b'*' | b'+' | b'?' | b'}')) => {
+                b'+' if matches!(out.last(), Some(b'*' | b'+' | b'?' | b'}')) => {
                     return Err(Error::unsupported(i, "possessive quantifier"));
                 }
-                b'{' if !in_class
-                    && (bytes[i..].starts_with(b"{0}") || bytes[i..].starts_with(b"{0,0}")) =>
-                {
-                    // Rust's optimizer elides captures in an always-zero
-                    // repetition, while PCRE2 retains their public slots.
+                b'{' if bytes[i..].starts_with(b"{0}") || bytes[i..].starts_with(b"{0,0}") => {
                     return Err(Error::unsupported(i, "zero-count repetition"));
                 }
-                b'|' if !in_class
-                    && (i == 0
-                        || matches!(bytes.get(i.wrapping_sub(1)), Some(b'(' | b'|'))
-                        || matches!(bytes.get(i + 1), None | Some(b')') | Some(b'|'))) =>
-                {
-                    // Captures in a quantified empty alternative use PCRE2's
-                    // last-participating iteration rule, which differs from
-                    // the automata engine's capture preference.
-                    return Err(Error::unsupported(i, "empty alternative"));
-                }
                 byte => {
-                    // PCRE extended mode keeps whitespace and `#` literal
-                    // inside a class. Rust's extended syntax ignores them in
-                    // classes too, so preserve PCRE's meaning explicitly.
-                    if in_class
-                        && (byte == b'&'
-                            || byte == b'~'
-                            || (byte == b'-'
-                                && (bytes.get(i.wrapping_sub(1)) == Some(&b'-')
-                                    || bytes.get(i + 1) == Some(&b'-'))))
-                    {
-                        // Prevent Rust character-class set operators from
-                        // acquiring meaning absent from PCRE2 byte classes.
-                        out.extend_from_slice(format!("\\x{byte:02X}").as_bytes());
-                    } else if in_class && extended && (byte.is_ascii_whitespace() || byte == b'#') {
-                        out.extend_from_slice(format!("\\x{byte:02X}").as_bytes());
-                    } else {
-                        out.push(byte);
-                    }
+                    out.push(byte);
                     i += 1;
                 }
             }
         }
-        if in_class {
-            return Err(Error::syntax("unterminated character class"));
+        if effective_multiline && saw_line_start {
+            if let Some(offset) = alternation_offset {
+                return Err(Error::unsupported(
+                    offset,
+                    "multiline start anchor across alternation",
+                ));
+            }
         }
         let pattern = String::from_utf8(out).expect("translation preserves UTF-8");
         Ok(Translation {
-            complexity: pattern.len(),
             pattern,
             final_newline_fallback,
+            multiline_start_anchor: effective_multiline && saw_line_start,
+            keep_prefix,
         })
     }
 
-    fn append_quoted_literal(out: &mut Vec<u8>, literal: &str, extended: bool) {
-        for ch in literal.chars() {
-            if extended && ch.is_ascii() && (ch.is_ascii_whitespace() || ch == '#') {
-                out.extend_from_slice(format!("\\x{:02X}", ch as u8).as_bytes());
+    /// Return the byte just after an inline option header, whether it opens a
+    /// scoped group, and the effective caseless state inside/after it.
+    fn inline_caseless_option(
+        bytes: &[u8],
+        start: usize,
+        initial: bool,
+    ) -> Option<(usize, bool, bool)> {
+        let mut i = start + 2;
+        let mut enabled = true;
+        let mut caseless = initial;
+        while let Some(&byte) = bytes.get(i) {
+            match byte {
+                b'i' => {
+                    caseless = enabled;
+                    i += 1;
+                }
+                b'm' | b's' | b'x' => i += 1,
+                b'-' => {
+                    enabled = false;
+                    i += 1;
+                }
+                b':' => return Some((i + 1, true, caseless)),
+                b')' if i > start + 2 => return Some((i + 1, false, caseless)),
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn append_quoted_literal(out: &mut Vec<u8>, literal: &str) {
+        for byte in literal.as_bytes() {
+            if byte.is_ascii_whitespace() || *byte == b'#' || *byte >= 0x80 {
+                push_hex(out, *byte);
             } else {
-                out.extend_from_slice(regex::escape(&ch.to_string()).as_bytes());
+                out.extend_from_slice(regex::escape(&(*byte as char).to_string()).as_bytes());
             }
         }
     }
 
-    /// PCRE2 diagnoses a quantifier without a preceding repeatable atom.
-    /// Rust regex intentionally accepts some of these metacharacters as
-    /// literals, so validate PCRE placement before handing off to its parser.
-    fn invalid_quantifier_placement(pattern: &str, extended: bool) -> Option<usize> {
+    fn choose_keep_prefix(pattern: &str) -> String {
+        for nonce in 0u64.. {
+            let candidate = format!("{KEEP_PREFIX}{nonce}_");
+            if !pattern.contains(&candidate) {
+                return candidate;
+            }
+        }
+        unreachable!("finite pattern cannot contain every generated prefix")
+    }
+
+    fn leading_global_flag(pattern: &str, flag: u8) -> Option<bool> {
         let bytes = pattern.as_bytes();
         let mut i = 0;
-        let mut repeatable = false;
-        let mut in_class = false;
+        let mut result = None;
+        while bytes.get(i..i + 2) == Some(b"(?") {
+            let start = i + 2;
+            let close = bytes[start..].iter().position(|&byte| byte == b')')? + start;
+            if bytes[start..close].contains(&b':')
+                || !bytes[start..close]
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphabetic() || *byte == b'-')
+            {
+                break;
+            }
+            let mut enabled = true;
+            for &byte in &bytes[start..close] {
+                if byte == b'-' {
+                    enabled = false;
+                } else if byte == flag {
+                    result = Some(enabled);
+                }
+            }
+            i = close + 1;
+        }
+        result
+    }
+
+    fn inline_option_may_enable(pattern: &str, flag: u8) -> bool {
+        let bytes = pattern.as_bytes();
+        let mut i = 0;
+        while i + 2 < bytes.len() {
+            if bytes.get(i..i + 2) != Some(b"(?") {
+                i += 1;
+                continue;
+            }
+            let mut cursor = i + 2;
+            let mut enabled = true;
+            while let Some(&byte) = bytes.get(cursor) {
+                match byte {
+                    b'-' => enabled = false,
+                    b':' | b')' => break,
+                    byte if byte.is_ascii_alphabetic() => {
+                        if byte == flag && enabled {
+                            return true;
+                        }
+                    }
+                    _ => break,
+                }
+                cursor += 1;
+            }
+            i += 2;
+        }
+        false
+    }
+
+    fn validate_line_constructs(
+        pattern: &str,
+        extended: bool,
+        effective_multiline: bool,
+        crlf: bool,
+    ) -> Result<(), Error> {
+        let bytes = pattern.as_bytes();
+        let mut i = 0;
         while i < bytes.len() {
-            if in_class {
-                if bytes[i] == b'\\' {
-                    i = (i + 2).min(bytes.len());
-                } else {
-                    if bytes[i] == b']' {
-                        in_class = false;
-                        repeatable = true;
+            match bytes[i] {
+                b'[' => {
+                    let (_, end) = translate_byte_class(pattern, i, false)?;
+                    i = end;
+                }
+                b'\\' if bytes.get(i + 1) == Some(&b'Q') => {
+                    i = escape_atom_end(bytes, i);
+                }
+                b'\\' if bytes.get(i + 1) == Some(&b'R') => {
+                    let end = i + 2;
+                    let mut enclosing_end = end;
+                    while bytes.get(enclosing_end) == Some(&b')') {
+                        enclosing_end += 1;
+                    }
+                    if matches!(bytes.get(end), Some(b'*' | b'+' | b'?' | b'{'))
+                        || bytes.get(end..end + 2) == Some(b"\\R")
+                        || bytes.get(end..end + 2) == Some(b"\\C")
+                        || matches!(bytes.get(enclosing_end), Some(b'*' | b'+' | b'?' | b'{'))
+                    {
+                        return Err(Error::unsupported(i, "atomic CRLF line sequence"));
+                    }
+                    i = end;
+                }
+                b'\\' if crlf && bytes.get(i + 1) == Some(&b'B') => {
+                    return Err(Error::unsupported(
+                        i,
+                        "CRLF start-offset non-boundary assertion",
+                    ));
+                }
+                b'\\'
+                    if bytes.get(i + 1) == Some(&b'N')
+                        && bytes.get(i + 2..i + 6) == Some(b"*?\\R") =>
+                {
+                    return Err(Error::unsupported(
+                        i,
+                        "PCRE2 auto-possessified line sequence",
+                    ));
+                }
+                b'\\' if bytes.get(i + 1) == Some(&b'Z') => {
+                    if !anchor_is_terminal(bytes, i + 2, extended) {
+                        return Err(Error::unsupported(i, "non-terminal final-newline anchor"));
+                    }
+                    i += 2;
+                }
+                b'\\' => i = escape_atom_end(bytes, i),
+                b'$' if crlf && effective_multiline => {
+                    return Err(Error::unsupported(i, "CRLF multiline final-newline anchor"));
+                }
+                b'$' if !effective_multiline => {
+                    if !anchor_is_terminal(bytes, i + 1, extended) {
+                        return Err(Error::unsupported(i, "non-terminal final-newline anchor"));
+                    }
+                    let previous = bytes[..i]
+                        .iter()
+                        .rposition(|byte| !byte.is_ascii_whitespace())
+                        .and_then(|index| bytes.get(index));
+                    if previous == Some(&b'?') {
+                        return Err(Error::unsupported(i, "lazy final-newline anchor priority"));
                     }
                     i += 1;
                 }
+                _ => i += 1,
+            }
+        }
+        Ok(())
+    }
+
+    fn anchor_is_terminal(bytes: &[u8], mut i: usize, extended: bool) -> bool {
+        loop {
+            while extended && bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+                i += 1;
+            }
+            if extended && bytes.get(i) == Some(&b'#') {
+                i = bytes[i..]
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .map_or(bytes.len(), |relative| i + relative + 1);
                 continue;
             }
+            return matches!(bytes.get(i), None | Some(b'|' | b')'));
+        }
+    }
+
+    fn contains_escape(pattern: &str, wanted: u8, crlf: bool) -> bool {
+        let bytes = pattern.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'[' {
+                if let Ok((_, end)) = translate_byte_class(pattern, i, crlf) {
+                    i = end;
+                    continue;
+                }
+            }
+            if bytes[i] == b'\\' {
+                if bytes.get(i + 1) == Some(&wanted) {
+                    return true;
+                }
+                i = escape_atom_end(bytes, i);
+            } else {
+                i += 1;
+            }
+        }
+        false
+    }
+
+    fn capture_count(pattern: &str, crlf: bool) -> usize {
+        let bytes = pattern.as_bytes();
+        let mut count = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'[' {
+                if let Ok((_, end)) = translate_byte_class(pattern, i, crlf) {
+                    i = end;
+                    continue;
+                }
+            }
+            if bytes[i] == b'\\' {
+                i = escape_atom_end(bytes, i);
+                continue;
+            }
+            if bytes[i] == b'(' {
+                let capturing = bytes.get(i + 1) != Some(&b'?')
+                    || (bytes.get(i + 2) == Some(&b'<')
+                        && !matches!(bytes.get(i + 3), Some(b'=') | Some(b'!')))
+                    || bytes.get(i + 2..i + 4) == Some(b"P<")
+                    || bytes.get(i + 2) == Some(&b'\'');
+                if capturing {
+                    count += 1;
+                }
+            }
+            i += 1;
+        }
+        count
+    }
+
+    fn push_hex(out: &mut Vec<u8>, value: u8) {
+        out.extend_from_slice(format!("\\x{value:02X}").as_bytes());
+    }
+
+    fn decimal_escape(bytes: &[u8], start: usize) -> (usize, usize) {
+        let mut end = start;
+        let mut value = 0usize;
+        while let Some(byte @ b'0'..=b'9') = bytes.get(end).copied() {
+            value = value
+                .saturating_mul(10)
+                .saturating_add(usize::from(byte - b'0'));
+            end += 1;
+        }
+        (value, end)
+    }
+
+    fn parse_octal_escape(bytes: &[u8], start: usize) -> Result<(u8, usize), Error> {
+        let mut end = start;
+        while end < bytes.len() && end < start + 3 && matches!(bytes[end], b'0'..=b'7') {
+            end += 1;
+        }
+        if end == start {
+            return Err(Error::syntax_at(start, "invalid octal escape"));
+        }
+        let value = parse_radix(&bytes[start..end], 8)?;
+        Ok((value, end))
+    }
+
+    fn parse_hex_escape(bytes: &[u8], slash: usize) -> Result<(u8, usize), Error> {
+        let start = slash + 2;
+        if bytes.get(start) == Some(&b'{') {
+            let close = bytes[start + 1..]
+                .iter()
+                .position(|&byte| byte == b'}')
+                .map(|relative| start + 1 + relative)
+                .ok_or_else(|| Error::syntax_at(slash, "unterminated hexadecimal escape"))?;
+            let value = parse_radix(&bytes[start + 1..close], 16)?;
+            return Ok((value, close + 1));
+        }
+        let mut end = start;
+        while end < bytes.len() && end < start + 2 && bytes[end].is_ascii_hexdigit() {
+            end += 1;
+        }
+        if end == start {
+            return Err(Error::syntax_at(slash, "empty hexadecimal escape"));
+        }
+        Ok((parse_radix(&bytes[start..end], 16)?, end))
+    }
+
+    fn parse_braced_octal(bytes: &[u8], slash: usize) -> Result<(u8, usize), Error> {
+        let start = slash + 2;
+        if bytes.get(start) != Some(&b'{') {
+            return Err(Error::syntax_at(slash, "octal escape requires braces"));
+        }
+        let close = bytes[start + 1..]
+            .iter()
+            .position(|&byte| byte == b'}')
+            .map(|relative| start + 1 + relative)
+            .ok_or_else(|| Error::syntax_at(slash, "unterminated octal escape"))?;
+        Ok((parse_radix(&bytes[start + 1..close], 8)?, close + 1))
+    }
+
+    fn parse_radix(bytes: &[u8], radix: u32) -> Result<u8, Error> {
+        let text = std::str::from_utf8(bytes).map_err(|_| Error::syntax("non-ASCII escape"))?;
+        let value = u16::from_str_radix(text, radix)
+            .map_err(|_| Error::syntax("escape is outside the byte range"))?;
+        u8::try_from(value).map_err(|_| Error::syntax("escape is outside the byte range"))
+    }
+
+    fn escape_atom_end(bytes: &[u8], slash: usize) -> usize {
+        let Some(&escaped) = bytes.get(slash + 1) else {
+            return bytes.len();
+        };
+        match escaped {
+            b'Q' => bytes[slash + 2..]
+                .windows(2)
+                .position(|pair| pair == b"\\E")
+                .map_or(bytes.len(), |relative| slash + 4 + relative),
+            b'c' => (slash + 3).min(bytes.len()),
+            b'x' if bytes.get(slash + 2) == Some(&b'{') => bytes[slash + 3..]
+                .iter()
+                .position(|&byte| byte == b'}')
+                .map_or(bytes.len(), |relative| slash + 4 + relative),
+            b'o' if bytes.get(slash + 2) == Some(&b'{') => bytes[slash + 3..]
+                .iter()
+                .position(|&byte| byte == b'}')
+                .map_or(bytes.len(), |relative| slash + 4 + relative),
+            b'x' => {
+                let mut end = slash + 2;
+                while end < bytes.len() && end < slash + 4 && bytes[end].is_ascii_hexdigit() {
+                    end += 1;
+                }
+                end
+            }
+            b'0'..=b'9' => {
+                let mut end = slash + 1;
+                while end < bytes.len() && end < slash + 4 && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                end
+            }
+            _ => (slash + 2).min(bytes.len()),
+        }
+    }
+
+    type ByteSet = [bool; 256];
+
+    fn translate_byte_class(
+        pattern: &str,
+        start: usize,
+        crlf: bool,
+    ) -> Result<(String, usize), Error> {
+        translate_byte_class_caseless(pattern, start, crlf, false)
+    }
+
+    fn translate_byte_class_caseless(
+        pattern: &str,
+        start: usize,
+        crlf: bool,
+        caseless: bool,
+    ) -> Result<(String, usize), Error> {
+        let bytes = pattern.as_bytes();
+        let mut i = start + 1;
+        let negated = bytes.get(i) == Some(&b'^');
+        if negated {
+            i += 1;
+        }
+        let mut first = true;
+        let mut result = [false; 256];
+        while i < bytes.len() {
+            if bytes[i] == b']' && !first {
+                if negated {
+                    invert_set(&mut result);
+                }
+                let rendered = render_byte_class(&result);
+                return Ok((
+                    if caseless {
+                        format!("(?-i:{rendered})")
+                    } else {
+                        rendered
+                    },
+                    i + 1,
+                ));
+            }
+            let (mut left, left_single, next) = class_atom(bytes, i, crlf)?;
+            first = false;
+            if bytes.get(next) == Some(&b'-') && bytes.get(next + 1) != Some(&b']') {
+                let (right, right_single, end) = class_atom(bytes, next + 1, crlf)?;
+                let (Some(left), Some(right)) = (left_single, right_single) else {
+                    let _ = (left, right);
+                    return Err(Error::syntax_at(next, "invalid character-class range"));
+                };
+                if left > right {
+                    return Err(Error::syntax_at(
+                        next,
+                        "range out of order in character class",
+                    ));
+                }
+                let mut range = [false; 256];
+                for byte in left..=right {
+                    range[usize::from(byte)] = true;
+                }
+                if caseless {
+                    ascii_casefold_set(&mut range);
+                }
+                union_set(&mut result, &range);
+                i = end;
+            } else {
+                if caseless {
+                    ascii_casefold_set(&mut left);
+                }
+                union_set(&mut result, &left);
+                i = next;
+            }
+        }
+        Err(Error::syntax_at(start, "unterminated character class"))
+    }
+
+    fn class_atom(
+        bytes: &[u8],
+        i: usize,
+        crlf: bool,
+    ) -> Result<(ByteSet, Option<u8>, usize), Error> {
+        if bytes.get(i..i + 2) == Some(b"[:") {
+            let close = bytes[i + 2..]
+                .windows(2)
+                .position(|pair| pair == b":]")
+                .map(|relative| i + 2 + relative)
+                .ok_or_else(|| Error::syntax_at(i, "unterminated POSIX class"))?;
+            let mut name = &bytes[i + 2..close];
+            let negated = name.first() == Some(&b'^');
+            if negated {
+                name = &name[1..];
+            }
+            let mut set =
+                posix_set(name).ok_or_else(|| Error::syntax_at(i, "unknown POSIX class"))?;
+            if negated {
+                invert_set(&mut set);
+            }
+            return Ok((set, None, close + 2));
+        }
+        if matches!(bytes.get(i..i + 2), Some(b"[.") | Some(b"[=")) {
+            return Err(Error::unsupported(i, "collating character class"));
+        }
+        if bytes.get(i) == Some(&b'\\') {
+            return class_escape(bytes, i, crlf);
+        }
+        let byte = *bytes
+            .get(i)
+            .ok_or_else(|| Error::syntax_at(i, "unterminated character class"))?;
+        Ok((singleton_set(byte), Some(byte), i + 1))
+    }
+
+    fn class_escape(
+        bytes: &[u8],
+        i: usize,
+        crlf: bool,
+    ) -> Result<(ByteSet, Option<u8>, usize), Error> {
+        let escaped = *bytes
+            .get(i + 1)
+            .ok_or_else(|| Error::syntax_at(i, "trailing class escape"))?;
+        let (set, single, end) = match escaped {
+            b'd' => (posix_set(b"digit").unwrap(), None, i + 2),
+            b'D' => (complement(posix_set(b"digit").unwrap()), None, i + 2),
+            b's' => (posix_set(b"space").unwrap(), None, i + 2),
+            b'S' => (complement(posix_set(b"space").unwrap()), None, i + 2),
+            b'w' => (posix_set(b"word").unwrap(), None, i + 2),
+            b'W' => (complement(posix_set(b"word").unwrap()), None, i + 2),
+            b'h' => (bytes_set(&[0x09, 0x20, 0xA0]), None, i + 2),
+            b'H' => (complement(bytes_set(&[0x09, 0x20, 0xA0])), None, i + 2),
+            b'v' => (bytes_set(&[b'\n', 0x0B, 0x0C, b'\r', 0x85]), None, i + 2),
+            b'V' => (
+                complement(bytes_set(&[b'\n', 0x0B, 0x0C, b'\r', 0x85])),
+                None,
+                i + 2,
+            ),
+            b'b' => (singleton_set(0x08), Some(0x08), i + 2),
+            b'a' => (singleton_set(0x07), Some(0x07), i + 2),
+            b'e' => (singleton_set(0x1B), Some(0x1B), i + 2),
+            b'f' => (singleton_set(0x0C), Some(0x0C), i + 2),
+            b'n' => (singleton_set(b'\n'), Some(b'\n'), i + 2),
+            b'r' => (singleton_set(b'\r'), Some(b'\r'), i + 2),
+            b't' => (singleton_set(b'\t'), Some(b'\t'), i + 2),
+            b'x' => {
+                let (value, end) = parse_hex_escape(bytes, i)?;
+                (singleton_set(value), Some(value), end)
+            }
+            b'o' => {
+                let (value, end) = parse_braced_octal(bytes, i)?;
+                (singleton_set(value), Some(value), end)
+            }
+            b'0'..=b'7' => {
+                let (value, end) = parse_octal_escape(bytes, i + 1)?;
+                (singleton_set(value), Some(value), end)
+            }
+            b'N' if crlf => (complement(bytes_set(b"\r\n")), None, i + 2),
+            b'N' => (complement(singleton_set(b'\n')), None, i + 2),
+            byte if !byte.is_ascii_alphanumeric() => (singleton_set(byte), Some(byte), i + 2),
+            _ => return Err(Error::syntax_at(i, "unsupported escape in character class")),
+        };
+        Ok((set, single, end))
+    }
+
+    fn posix_set(name: &[u8]) -> Option<ByteSet> {
+        let mut set = [false; 256];
+        let ranges: &[(u8, u8)] = match name {
+            b"alnum" => &[(b'0', b'9'), (b'A', b'Z'), (b'a', b'z')],
+            b"alpha" => &[(b'A', b'Z'), (b'a', b'z')],
+            b"ascii" => &[(0x00, 0x7F)],
+            b"blank" => &[(0x09, 0x09), (0x20, 0x20)],
+            b"cntrl" => &[(0x00, 0x1F), (0x7F, 0x7F)],
+            b"digit" => &[(b'0', b'9')],
+            b"graph" => &[(0x21, 0x7E)],
+            b"lower" => &[(b'a', b'z')],
+            b"print" => &[(0x20, 0x7E)],
+            b"punct" => &[(0x21, 0x2F), (0x3A, 0x40), (0x5B, 0x60), (0x7B, 0x7E)],
+            b"space" => &[(0x09, 0x0D), (0x20, 0x20)],
+            b"upper" => &[(b'A', b'Z')],
+            b"word" => &[(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')],
+            b"xdigit" => &[(b'0', b'9'), (b'A', b'F'), (b'a', b'f')],
+            _ => return None,
+        };
+        for &(start, end) in ranges {
+            for byte in start..=end {
+                set[usize::from(byte)] = true;
+            }
+        }
+        Some(set)
+    }
+
+    fn singleton_set(byte: u8) -> ByteSet {
+        let mut set = [false; 256];
+        set[usize::from(byte)] = true;
+        set
+    }
+
+    fn bytes_set(bytes: &[u8]) -> ByteSet {
+        let mut set = [false; 256];
+        for &byte in bytes {
+            set[usize::from(byte)] = true;
+        }
+        set
+    }
+
+    fn union_set(target: &mut ByteSet, source: &ByteSet) {
+        for (target, source) in target.iter_mut().zip(source) {
+            *target |= *source;
+        }
+    }
+
+    fn invert_set(set: &mut ByteSet) {
+        for member in set {
+            *member = !*member;
+        }
+    }
+
+    fn ascii_casefold_set(set: &mut ByteSet) {
+        for offset in 0..26 {
+            let upper = usize::from(b'A') + offset;
+            let lower = usize::from(b'a') + offset;
+            if set[upper] || set[lower] {
+                set[upper] = true;
+                set[lower] = true;
+            }
+        }
+    }
+
+    fn complement(mut set: ByteSet) -> ByteSet {
+        invert_set(&mut set);
+        set
+    }
+
+    fn render_byte_class(set: &ByteSet) -> String {
+        let positive = render_class_members(set);
+        let inverse = complement(*set);
+        let negative = render_class_members(&inverse);
+        if !negative.is_empty() && negative.len() + 1 < positive.len() {
+            format!("[^{negative}]")
+        } else {
+            format!("[{positive}]")
+        }
+    }
+
+    fn render_class_members(set: &ByteSet) -> String {
+        let mut out = String::new();
+        let mut i = 0usize;
+        while i < set.len() {
+            if !set[i] {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i + 1 < set.len() && set[i + 1] {
+                i += 1;
+            }
+            let end = i;
+            if end >= start + 2 {
+                out.push_str(&format!("\\x{start:02X}-\\x{end:02X}"));
+            } else {
+                for byte in start..=end {
+                    out.push_str(&format!("\\x{byte:02X}"));
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// PCRE2 diagnoses a quantifier without a preceding repeatable atom.
+    /// Rust regex accepts some of these metacharacters as literals.
+    fn invalid_quantifier_placement(pattern: &str, extended: bool, crlf: bool) -> Option<usize> {
+        let bytes = pattern.as_bytes();
+        let mut i = 0;
+        let mut repeatable = false;
+        while i < bytes.len() {
             if extended && bytes[i].is_ascii_whitespace() {
                 i += 1;
                 continue;
@@ -1117,36 +1765,23 @@ pub mod bytes {
             }
             match bytes[i] {
                 b'[' => {
-                    in_class = true;
-                    i += 1;
-                }
-                b'\\' => {
-                    let Some(&escaped) = bytes.get(i + 1) else {
+                    let Ok((_, end)) = translate_byte_class(pattern, i, crlf) else {
                         return None;
                     };
-                    if escaped == b'Q' {
-                        let start = i + 2;
-                        let end = bytes[start..]
-                            .windows(2)
-                            .position(|pair| pair == b"\\E")
-                            .map_or(bytes.len(), |relative| start + relative);
-                        if end > start {
-                            repeatable = true;
-                        }
-                        i = if end < bytes.len() { end + 2 } else { end };
-                    } else {
-                        repeatable =
-                            !matches!(escaped, b'A' | b'B' | b'G' | b'K' | b'Z' | b'b' | b'z');
-                        i = (i + 2).min(bytes.len());
-                    }
+                    repeatable = true;
+                    i = end;
+                }
+                b'\\' => {
+                    let escaped = *bytes.get(i + 1)?;
+                    repeatable = !matches!(escaped, b'A' | b'B' | b'G' | b'K' | b'Z' | b'b' | b'z');
+                    i = escape_atom_end(bytes, i);
                 }
                 b'(' => {
                     if bytes[i..].starts_with(b"(?#") {
-                        let end = bytes[i + 3..]
+                        i = bytes[i + 3..]
                             .iter()
                             .position(|&byte| byte == b')')
                             .map_or(bytes.len(), |relative| i + 4 + relative);
-                        i = end;
                         continue;
                     }
                     repeatable = false;
@@ -1242,58 +1877,152 @@ pub mod bytes {
         valid.then_some(close + 1)
     }
 
-    fn ambiguous_nested_capture_repeat(pattern: &str) -> Option<usize> {
+    #[derive(Clone, Copy)]
+    struct CaptureFrame {
+        capturing: bool,
+        variable_repeat: bool,
+        alternation: bool,
+        zero_width: bool,
+    }
+
+    fn ambiguous_nested_capture_repeat(pattern: &str, crlf: bool) -> Option<usize> {
         let bytes = pattern.as_bytes();
-        let mut stack: Vec<(usize, bool)> = Vec::new();
-        let mut class = false;
-        let mut escaped = false;
-        for (index, &byte) in bytes.iter().enumerate() {
-            if escaped {
-                escaped = false;
+        let mut stack: Vec<CaptureFrame> = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'[' {
+                if let Ok((_, end)) = translate_byte_class(pattern, i, crlf) {
+                    i = end;
+                    continue;
+                }
+            }
+            if bytes[i] == b'\\' {
+                if matches!(
+                    bytes.get(i + 1),
+                    Some(b'A' | b'B' | b'G' | b'K' | b'Z' | b'b' | b'z')
+                ) {
+                    for frame in &mut stack {
+                        frame.zero_width = true;
+                    }
+                }
+                i = escape_atom_end(bytes, i);
                 continue;
             }
-            if byte == b'\\' {
-                escaped = true;
-                continue;
-            }
-            if byte == b'[' && !class {
-                class = true;
-                continue;
-            }
-            if byte == b']' && class {
-                class = false;
-                continue;
-            }
-            if class {
-                continue;
-            }
-            if byte == b'(' {
-                let capturing = !bytes[index..].starts_with(b"(?:")
-                    && !bytes[index..].starts_with(b"(?#")
-                    && !bytes[index..].starts_with(b"(?=")
-                    && !bytes[index..].starts_with(b"(?!")
-                    && !bytes[index..].starts_with(b"(?<=")
-                    && !bytes[index..].starts_with(b"(?<!");
-                stack.push((index, capturing));
-                continue;
-            }
-            if byte != b')' {
-                continue;
-            }
-            let Some((start, capturing)) = stack.pop() else {
-                continue;
-            };
-            if !capturing || !matches!(bytes.get(index + 1), Some(b'*' | b'+' | b'?' | b'{')) {
-                continue;
-            }
-            if bytes[start + 1..index]
-                .iter()
-                .any(|byte| matches!(byte, b'*' | b'+' | b'?' | b'{'))
-            {
-                return Some(index + 1);
+            match bytes[i] {
+                b'(' => {
+                    if bytes.get(i..i + 3) == Some(b"(?#") {
+                        i = bytes[i + 3..]
+                            .iter()
+                            .position(|&byte| byte == b')')
+                            .map_or(bytes.len(), |relative| i + 4 + relative);
+                        continue;
+                    }
+                    if let Some(end) = global_option_group_end(bytes, i) {
+                        i = end;
+                        continue;
+                    }
+                    let capturing = bytes.get(i + 1) != Some(&b'?')
+                        || (bytes.get(i + 2) == Some(&b'<')
+                            && !matches!(bytes.get(i + 3), Some(b'=') | Some(b'!')))
+                        || bytes.get(i + 2..i + 4) == Some(b"P<")
+                        || bytes.get(i + 2) == Some(&b'\'');
+                    stack.push(CaptureFrame {
+                        capturing,
+                        variable_repeat: false,
+                        alternation: false,
+                        zero_width: false,
+                    });
+                    i = group_body_start(bytes, i);
+                }
+                b'|' => {
+                    let empty_branch = matches!(bytes.get(i + 1), None | Some(b')' | b'|'))
+                        || matches!(bytes.get(i.wrapping_sub(1)), Some(b'(' | b'|'));
+                    for frame in &mut stack {
+                        frame.alternation = true;
+                        frame.zero_width |= empty_branch;
+                    }
+                    i += 1;
+                }
+                b'^' | b'$' => {
+                    for frame in &mut stack {
+                        frame.zero_width = true;
+                    }
+                    i += 1;
+                }
+                b'*' | b'+' | b'?' => {
+                    for frame in &mut stack {
+                        frame.variable_repeat = true;
+                    }
+                    i += 1;
+                }
+                b'{' if quantifier_end(&bytes[i..]).is_some() => {
+                    let end = quantifier_end(&bytes[i..]).unwrap_or(1);
+                    let body = &bytes[i + 1..i + end - 1];
+                    if body.contains(&b',') {
+                        for frame in &mut stack {
+                            frame.variable_repeat = true;
+                        }
+                    }
+                    i += end;
+                }
+                b')' => {
+                    let frame = stack.pop()?;
+                    let repeated = matches!(bytes.get(i + 1), Some(b'*' | b'+' | b'?' | b'{'));
+                    if frame.capturing
+                        && repeated
+                        && (frame.variable_repeat || (frame.alternation && frame.zero_width))
+                    {
+                        return Some(i + 1);
+                    }
+                    i += 1;
+                }
+                _ => i += 1,
             }
         }
         None
+    }
+
+    fn global_option_group_end(bytes: &[u8], start: usize) -> Option<usize> {
+        if bytes.get(start..start + 2) != Some(b"(?") {
+            return None;
+        }
+        let close = bytes[start + 2..].iter().position(|&byte| byte == b')')? + start + 2;
+        let flags = &bytes[start + 2..close];
+        (!flags.is_empty()
+            && flags
+                .iter()
+                .all(|byte| byte.is_ascii_alphabetic() || *byte == b'-'))
+        .then_some(close + 1)
+    }
+
+    fn group_body_start(bytes: &[u8], start: usize) -> usize {
+        if bytes.get(start..start + 3) == Some(b"(?:") {
+            return start + 3;
+        }
+        if bytes.get(start..start + 4) == Some(b"(?P<") {
+            return bytes[start + 4..]
+                .iter()
+                .position(|&byte| byte == b'>')
+                .map_or(start + 2, |relative| start + 5 + relative);
+        }
+        if bytes.get(start..start + 3) == Some(b"(?<") {
+            return bytes[start + 3..]
+                .iter()
+                .position(|&byte| byte == b'>')
+                .map_or(start + 2, |relative| start + 4 + relative);
+        }
+        if bytes.get(start..start + 3) == Some(b"(?'") {
+            return bytes[start + 3..]
+                .iter()
+                .position(|&byte| byte == b'\'')
+                .map_or(start + 2, |relative| start + 4 + relative);
+        }
+        if bytes.get(start..start + 2) == Some(b"(?") {
+            if let Some(relative) = bytes[start + 2..].iter().position(|&byte| byte == b':') {
+                return start + 3 + relative;
+            }
+        }
+        start + 1
     }
 }
 

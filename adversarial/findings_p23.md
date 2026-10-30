@@ -1,10 +1,34 @@
 # Pass 23 — adversarial break of HEAD `a54bcdd` (PCRE2 compatibility engine)
 
-> Remediation status (2026-10-29): findings are open in the current tree. No
-> product source was edited in this pass. The retained additions are
-> `adversarial/p23/exploit_p23.py`, the standalone probe/fuzzer under
-> `adversarial/p23/probe/`, this write-up and the `adversarial/README.md`
-> index entries.
+> Remediation status (2026-10-30): remediated in the product tree. Constructs
+> with exact regular semantics now match the PCRE2 oracle; constructs whose
+> priority requires look-around, atomics or PCRE2 capture history fail closed
+> at configuration load. The original evidence below is retained unchanged.
+
+### Remediation disposition
+
+| Finding | Disposition |
+|---|---|
+| P23-A | Fixed. Runtime work complexity is derived from the parsed HIR, including finite repetition expansion; the final-newline second pass is charged twice. `a{60000}` on 64 KiB now returns `ResourceLimit` in sub-microsecond match time. |
+| P23-B | Fixed/fail closed. Terminal `$`/`\Z` cases use bounded dual-position matching with `\z` isolation; non-terminal and lazy-priority forms that a look-around-free DFA cannot represent are rejected. |
+| P23-C/D | Fixed. A single-pass PCRE byte-class parser handles negated POSIX classes, leading `]`, literal/range hyphens and out-of-order rejection. |
+| P23-E | Fail closed. `\R` remains available in non-splitting contexts; quantified or adjacent split-capable CRLF forms are rejected. |
+| P23-F | Fixed. Quoted bytes and class members are emitted as mode-independent byte escapes, including scoped/global inline `x`. |
+| P23-G | Fixed. Each compile chooses a collision-free internal `\K` capture namespace. |
+| P23-H | Fixed for the reported byte-mode forms: octal fallback, one-digit/braced hex, braced octal and quantification of escaped atoms. |
+| P23-I | Fixed/fail closed. Fixed repetitions retain correct last-capture behavior; variable or zero-width-alternative capture histories are rejected precisely. |
+| P23-J | Fixed/fail closed. Blanket POSIX/range and empty-alternative guards were removed; duplicate names remain a targeted unsupported feature. |
+| P23-K/L | Fixed. CRLF `\N`/final-newline behavior and terminal multiline-empty iteration match the oracle. |
+| P23-M | Fail closed. The ungrouped PCRE2 auto-possessification special case is rejected. |
+| P23-N | Fixed. Byte classes are scanned once and rendered from a bounded 256-member set. |
+
+Post-remediation validation uses the same fixed fuzzer seed against PCRE2
+10.46. A 100,000-pattern run reports `match-diffs=0` and
+`rust-accepts-pcre2-rejects=0`; 15,399 PCRE2-accepted cases are deliberately
+outside the non-backtracking dialect and fail closed. The Rust port of
+`testinput1` checks 1,002 admitted upstream subject cases, and the focused P23
+suite contains seven regression groups. Performance results and the
+reproducible runner are recorded in [`docs/pcre2-benchmark.md`](../docs/pcre2-benchmark.md).
 
 - **Date:** 2026-10-29
 - **Subject:** `target/release/vapached` built at HEAD `a54bcdd`. The binary
