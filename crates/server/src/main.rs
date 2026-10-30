@@ -1,5 +1,12 @@
 //! `vapached` command line, daemon lifecycle and privilege handling.
 
+// musl's allocator serializes Vapache's allocation-heavy policy path under
+// concurrent static requests. Keep the portable static build, but give it the
+// same scalable allocation behavior as the native glibc build.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom, Write};
