@@ -25,6 +25,7 @@ prevents re-deriving them from scratch.
 | `findings_p21.md` | Pass 21 write-up (**P21-A**, now remediated): the ≤1 MiB identity-body branch reserved the declared `Content-Length` against the process-wide `MAX_REQUEST_RESIDENT_BYTES` budget before receiving body bytes, so 128 header-only POSTs denied every HTTP/1 and HTTP/2 request. The fixed reader charges only actual received chunks and the retained harness records the original Apache differential |
 | `findings_p22.md` | Pass 22 write-ups (**P22-A/B**, now remediated): HTTP/2 zero-window file responses materialized uncharged bodies and streamed proxy responses pinned all blocking-read leases. File/stream sends now wait for capacity, use response-accounted 64 KiB chunks, and scope each blocking lease to one read; the retained harness records the original Apache differentials |
 | `findings_p23.md` | Pass 23 write-ups (**P23-A–P23-N**) and remediation dispositions: counted-repetition work charging, final-newline fail-closed contexts, exact byte/POSIX classes and ranges, inline `x`, CRLF atomics, internal `\K` captures, escapes/capture histories, CRLF iteration and linear class parsing |
+| `findings_p24.md` | Pass 24 write-ups (**P24-A**, open; **P24-B**, secondary): the expression parser is not total — a non-ASCII `=~`/`!~` delimiter leaves the parse position inside a UTF-8 character, `Parser::and()` panics with "not a char boundary", and `panic = "abort"` kills the whole process; an attacker-written `.htaccess` (`<If>`, `Require expr`, `RewriteCond expr`) or a main-config expression aborts vapached (Apache 500 + alive); plus the nested counted-repetition work-gate calibration gap |
 | `p11/exploit_p11.py` | Pass-11 differential exploit battery: 13 micro-apps run against Apache 2.4.69 and vapached, one per finding row |
 | `p11/case01-F61-A` … `case13-F61-C` | Captured case dossiers (rendered `apache.conf` / `vp.conf`, fixture tree, server logs, `ap.strace`) |
 | `p11/f70_accessfilename.py` | F70 probe (dead finding: Apache rejects the configuration) |
@@ -41,6 +42,8 @@ prevents re-deriving them from scratch.
 | `p22/exploit_p22.py` | Pass-22 HTTP/2 zero-window battery (P22-A/B, 3 verdicts): 32 `nghttp -w 0 -W 0` streams holding 8 MiB response bodies for the RSS differential against an Apache `mod_http2`/`mod_ssl` oracle, the same 64 streams under `RLIMIT_AS=550 MiB` for the allocator abort, and a `mod_proxy_http` route used to pin all 32 process-wide blocking-read leases while a concurrent static h2 download, a 128 KiB h2 control and an HTTP/1 control are probed. Loopback only; fixtures under `/tmp/opencode/p22-harness` |
 | `p23/exploit_p23.py` | Pass-23 PCRE2 differential battery (9 verdicts): negated-POSIX, character-class range and inline-`(?x)` ACL divergences under `<If … =~ /…/>`, both directions of the inline-`(?x)` mismatch, and the exact counted-repetition CPU amplification (`a{8000}` on an 8,000-byte header) against Apache 2.4.69. Requires only `mpm_event`, `mime`, `dir`, `authz_core` and `authz_host`; loopback only; fixtures under `/tmp/opencode/p23-harness` |
 | `p23/probe/` | Retained standalone Rust differential probe (path dependency on `crates/pcre2`; excluded from the product workspace): `repro.rs` exact span/compile cases, deterministic grammar fuzzer `fuzz.rs` (`CLEAN`, `EXPR`, `ONLY_MATCH`, `ONLY_ACCEPT`, `ONLY_REJECT`), and `work2.rs` 64 KiB counted-repetition benchmark, and `work3.rs` 8,190-byte/subject-size sweep |
+| `p24/exploit_p24.py` | Pass-24 expression-parser abort battery (7 verdicts): A1 `<If>` under `AllowOverride AuthConfig`, A2 `Require expr` under AuthConfig, A3 `RewriteCond expr` under `FileInfo`, A4 `<If>` under FileInfo — each must SIGABRT vapached on the first request; A5 ASCII control must stay 200; the identical `.htaccess` served by Apache 2.4.69 must be 500 with the server alive; B1 a main-config `<If>` must make `vapached -t` exit with signal 6. Loopback only; fixtures under `/tmp/opencode/p24-harness` |
+| `p24/crash-input.bin` | Retained libFuzzer `rewrite_expr` artifact (`%{RUE( 'M(?THO`} =~\xd8\x92#^\`} =~\xd8\x92#^H1`) |
 
 ## Pre-adversarial gate
 
@@ -371,3 +374,20 @@ must agree. The harness writes
 per-case configs, fixtures and server logs under `/tmp/opencode/p23-harness`
 and exits non-zero if any verdict fails. The probe crate is standalone and
 uses `[workspace]` so it does not join the product workspace.
+
+## Running the pass-24 expression-parser abort battery
+
+```sh
+cargo build --release -p vapached
+python3 adversarial/p24/exploit_p24.py     # all 7 verdicts
+```
+
+A1–A4 each start a fresh vapached with an attacker-written `.htaccess`
+(`<If "%{REQUEST_URI} =~ éé">`, `Require expr "… =~ éé"` or
+`RewriteCond expr "… =~ éé"`), send one request into the directory and
+require the process to die with SIGABRT; A5 is the ASCII `<If>` control that
+must answer 200. The Apache oracle serves the identical `.htaccess` and must
+return 500 while staying alive; B1 requires `vapached -t` with the
+main-config `<If>` to exit with signal 6. Fixtures and server output are
+under `/tmp/opencode/p24-harness`; the harness exits non-zero if any verdict
+differs.
