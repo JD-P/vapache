@@ -44,6 +44,9 @@ prevents re-deriving them from scratch.
 | `p23/probe/` | Retained standalone Rust differential probe (path dependency on `crates/pcre2`; excluded from the product workspace): `repro.rs` exact span/compile cases, deterministic grammar fuzzer `fuzz.rs` (`CLEAN`, `EXPR`, `ONLY_MATCH`, `ONLY_ACCEPT`, `ONLY_REJECT`), and `work2.rs` 64 KiB counted-repetition benchmark, and `work3.rs` 8,190-byte/subject-size sweep |
 | `p24/exploit_p24.py` | Pass-24 expression-parser remediation battery (7 verdicts): A1 `<If>` under `AllowOverride AuthConfig`, A2 `Require expr` under AuthConfig, A3 `RewriteCond expr` under `FileInfo`, A4 `<If>` under FileInfo — each must return 500 with vapached alive; A5 ASCII control must stay 200; the identical `.htaccess` served by Apache 2.4.69 must be 500 with the server alive; B1 a main-config `<If>` must make `vapached -t` fail normally, never by signal. Loopback only; fixtures under `/tmp/opencode/p24-harness` |
 | `p24/crash-input.bin` | Retained libFuzzer `rewrite_expr` artifact (`%{RUE( 'M(?THO`} =~\xd8\x92#^\`} =~\xd8\x92#^H1`) |
+| `p25/exploit_p25.py` | Pass-25 P25-A differential battery (30 verdicts): trailing-slash static-file URLs (`/private.txt/`) are `404` on Apache but `200` with the protected body on vapached while the exact URL stays `403` on both; groups A `<LocationMatch "^/private\.txt$">`, B `.htaccess RewriteRule ^private\.txt$ - [F]`, C `<If "%{REQUEST_URI} == '/private.txt'">`, D slash-tolerant `<LocationMatch "^/private\.txt/?$">` positive control, E basename `<Files>` control. Loopback only; fixtures under a `p25-harness-*` temp tree |
+| `p25/exploit_p25_dos.py` | Pass-25 P25-B worker-exhaustion battery (7 verdicts): `MaxRequestWorkers 8` + `Timeout 2` + 64 MiB fixture, 8 stalled downloads from 127.0.0.2/3 make a fresh client receive `503` on vapached (workers survive past `Timeout`), while Apache `mpm_event` serves the fresh client `200`; recovery control after the stalls close. Loopback only; fixtures under a `p25-dos-harness-*` temp tree |
+| `findings_p25.md` | Pass-25 write-ups (P25-A/P25-B): trailing-slash URL-identity authorization bypass and stalled-`sendfile` worker pinning (≈5.13–5.16× `Timeout`) |
 
 ## Pre-adversarial gate
 
@@ -391,3 +394,34 @@ return 500 while staying alive; B1 requires `vapached -t` with the
 main-config `<If>` to exit with signal 6. Fixtures and server output are
 under `/tmp/opencode/p24-harness`; the harness exits non-zero if any verdict
 differs.
+
+## Running the pass-25 static-hosting batteries
+
+```sh
+cargo build --release -p vapached
+python3 adversarial/p25/exploit_p25.py        # P25-A trailing-slash ACL bypass (30 verdicts)
+python3 adversarial/p25/exploit_p25_dos.py    # P25-B stalled-download worker exhaustion (7 verdicts)
+```
+
+**P25-A** runs five Apache/vapached groups over the same fixture
+(`www/private.txt` = `SECRET-CONTENT`, `www/hello.txt` control). The exact
+URL `/private.txt` must be `403` on both servers, while `/private.txt/` must
+be `404` on Apache and `200` with the secret body on vapached. Group A is a
+main-config `<LocationMatch "^/private\.txt$"> Require all denied`; B is a
+`.htaccess` `RewriteRule ^private\.txt$ - [F]` under `AllowOverride All`; C is
+`<If "%{REQUEST_URI} == '/private.txt'"> Require all denied`; D is the
+slash-tolerant `^/private\.txt/?$` positive control that must deny both
+spellings; E is the basename `<Files "private.txt">` control that must deny
+both. Apache runs `-X` on sibling loopback ports with separate pid/error
+logs; both temp trees are removed unless `--keep` is given.
+
+**P25-B** runs both servers with `MaxRequestWorkers 8` and `Timeout 2` over a
+64 MiB file. Eight stalled downloads (127.0.0.2 and 127.0.0.3, four each)
+must make a fresh client receive `503 Server busy` on vapached, must leave
+the stalled connection workers alive past `Timeout`, and must recover to
+`200` once the stalls close; the Apache `mpm_event` oracle must keep serving
+the fresh client `200` throughout. A single stalled download on this host is
+released after ≈5.13–5.16 × `Timeout` (measured with
+`/tmp/opencode/p25/probe_lifetime_scaling.py`), so the default `Timeout 60`
+pins a worker for ≈5 minutes. Loopback only; fixtures are removed unless
+`--keep` is given.
