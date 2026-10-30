@@ -25,6 +25,8 @@ Implemented today:
   `ForceType`, `AddHandler`/`RemoveHandler`, `AddDefaultCharset`, MIME types
   and custom error documents. Regex aliases and redirects expand `$1`..`$9`
   captures and are resolved through the same target mapping as prefix aliases.
+  A trailing-slash URL never serves a regular file; real CGI/FastCGI handlers
+  still dispatch trailing path-info spellings.
 - Byte ranges, `If-Range`, `If-Match`, `If-None-Match`,
   `If-Modified-Since`, `If-Unmodified-Since`, ETags and `Last-Modified`.
 - Access control (`Require all`, `ip`, `host`, `method`, `local`, legacy
@@ -200,7 +202,10 @@ Implemented today:
   exact IPv4 addresses and verified IPv6 `/64` keys; HTTP/2 and WebSocket
   quotas use the validated `RemoteIPHeader` identity, while an explicitly
   trusted transport proxy remains bounded by the process-wide worker ceiling
-  instead of being mistaken for a single end user.
+  instead of being mistaken for a single end user. HTTP/1 response writes,
+  including zero-copy static-file sends, use a non-blocking absolute deadline
+  derived from `Timeout`; a client that stops reading cannot pin a connection
+  worker beyond that budget.
 - Privileged startup refuses uid/gid 0 and fails when an unprivileged launch
   does not already match the configured identity. Configuration/includes,
   TLS material, environment files, `TypesConfig`, and file-backed rewrite maps

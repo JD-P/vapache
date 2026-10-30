@@ -141,6 +141,7 @@ def tree():
     (www / "handler.fphp").write_text("<?php echo 'handler target';\n")
     (www / "empty").write_bytes(b"")
     (www / "secret.txt").write_text("classified\n")
+    (www / "trailing-guard.txt").write_text("trailing guard secret\n")
     (www / ".hidden").write_text("hidden\n")
     (www / "dir" / "index.html").write_text("<html>dir index</html>\n")
     (www / "dir" / "file.txt").write_text("dir file\n")
@@ -806,6 +807,9 @@ def common(port, root, apache, tls_port):
         '<Location "/access/ip-ok.txt">',
         "    Require ip 127.0.0.1",
         "</Location>",
+        '<LocationMatch "^/trailing-guard\\.txt$">',
+        "    Require all denied",
+        "</LocationMatch>",
         '<Location "/access/ip-no.txt">',
         "    Require ip 10.0.0.0/8",
         "</Location>",
@@ -1771,12 +1775,42 @@ class StaticTests(Base):
         st, _, _ = self.get("/dir%5cfile.txt")
         self.assertIn(st, (400, 404))
 
+    def test_trailing_slash_never_serves_a_regular_file(self):
+        for path in (
+            "/hello.txt/",
+            "/hello.txt//",
+            "/dir/../hello.txt/",
+        ):
+            st, _, body = self.get(path)
+            self.assertEqual(st, 404, path)
+            self.assertNotIn(b"hello world", body, path)
+            self.differential(f"regular file trailing slash {path}", path)
+
+        # The exact URL is denied by the anchored LocationMatch; its slash
+        # spelling must be rejected as a non-directory rather than serving
+        # the same protected inode under a different URL identity.
+        self.assertEqual(self.get("/trailing-guard.txt")[0], 403)
+        st, _, body = self.get("/trailing-guard.txt/")
+        self.assertEqual(st, 404)
+        self.assertNotIn(b"trailing guard secret", body)
+
+        # Preserve real-handler dispatch for trailing path-info spellings.
+        st, _, body = self.get("/cgi-bin/env.sh/")
+        self.assertEqual(st, 200)
+        self.assertIn(b"METHOD=GET", body)
+
     def test_options_star(self):
         st, h, _ = self.get("*", method="OPTIONS")
         self.assertEqual(st, 200)
         self.assertIn("allow", h)
         self.assertEqual(h["x-iffile"][0], "yes")
         self.differential("OPTIONS *", "*", method="OPTIONS")
+
+    def test_asterisk_target_is_options_only(self):
+        for method in ("GET", "HEAD"):
+            st, _, body = self.get("*", method=method)
+            self.assertEqual(st, 400)
+            self.assertNotIn(b"index", body.lower())
 
     def test_unknown_method(self):
         st, _, _ = self.get("/hello.txt", method="FROBNICATE")

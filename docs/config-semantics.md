@@ -570,6 +570,7 @@ proxy response head/body/trailer: capped
 proxy chunk arithmetic          : checked_add and MAX_PROXY_BODY
 proxy DNS / TLS CA              : bounded queue/deadline; CA parsed once per generation
 accepted connections            : MaxRequestWorkers plus per-source half-budget/32 cap
+HTTP/1 response writes          : absolute Timeout deadline; non-blocking send/poll
 HTTP/2 streams                  : 256 process slots, 64 per source
 WebSocket tunnels               : 64 process slots, 8 per effective client, plus idle/write deadline
 handlers/descriptors            : only stdio + script fd cross exec
@@ -577,6 +578,12 @@ handlers/descriptors            : only stdio + script fd cross exec
 
 Exceeding a bound is an error response or connection close, never an
 unbounded allocation or an indefinitely pinned worker.
+
+Plain HTTP/1 socket writes use non-blocking `send`/`sendfile` plus `poll`
+against one response-wide deadline. TLS writes receive the same absolute
+deadline through the async adapter. Kernel `SO_SNDTIMEO` is defense in depth,
+not the resource boundary: a stalled receiver is closed at `Timeout` and its
+connection-worker reservation is released.
 
 Resident-byte and compression reservations are made before extending request,
 proxy, autoindex or encoded-response buffers. HTTP/1 retains the reservation

@@ -12,6 +12,7 @@ use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -1159,11 +1160,41 @@ pub trait ResponseWrite: Write {
     fn raw_fd(&self) -> Option<RawFd> {
         None
     }
+
+    /// Return the plain socket descriptor that can safely be written with
+    /// `send(2)`/`poll(2)`. This is separate from `raw_fd`: test and adapter
+    /// implementations may expose a descriptor to exercise sendfile fallback
+    /// without being a real socket.
+    fn deadline_fd(&self) -> Option<BorrowedFd<'_>> {
+        None
+    }
+
+    /// Put a plain socket in non-blocking mode while `sendfile(2)` runs.
+    /// Implementations that do not expose a plain socket leave this
+    /// unsupported and use the bounded copy path.
+    fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "non-blocking response writes are unsupported",
+        ))
+    }
+
+    /// Inform encrypted/adapted writers of the absolute response deadline.
+    /// Plain sockets are bounded directly with non-blocking I/O below.
+    fn set_write_deadline(&mut self, _deadline: Option<Instant>) {}
 }
 
 impl ResponseWrite for TcpStream {
     fn raw_fd(&self) -> Option<RawFd> {
         Some(self.as_raw_fd())
+    }
+
+    fn deadline_fd(&self) -> Option<BorrowedFd<'_>> {
+        Some(self.as_fd())
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        TcpStream::set_nonblocking(self, nonblocking)
     }
 }
 
@@ -1173,6 +1204,136 @@ pub struct ResponseOptions<'a> {
     pub head_only: bool,
     pub protocol: Version,
     pub request_keep_alive: bool,
+    /// Absolute budget for serializing and writing this response.
+    pub write_timeout: Duration,
+}
+
+fn write_timeout_error() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "response write deadline exceeded")
+}
+
+fn poll_writable(fd: BorrowedFd<'_>, deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(write_timeout_error)?;
+        let timeout =
+            rustix::event::Timespec::try_from(remaining).unwrap_or(rustix::event::Timespec {
+                tv_sec: i64::MAX,
+                tv_nsec: 0,
+            });
+        let mut pollfd = rustix::event::PollFd::from_borrowed_fd(fd, rustix::event::PollFlags::OUT);
+        let rc = match rustix::event::poll(std::slice::from_mut(&mut pollfd), Some(&timeout))
+            .map_err(io::Error::from)
+        {
+            Ok(rc) => rc,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if rc == 0 {
+            return Err(write_timeout_error());
+        }
+        let revents = pollfd.revents();
+        if revents.contains(rustix::event::PollFlags::NVAL) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid response socket",
+            ));
+        }
+        if revents.intersects(rustix::event::PollFlags::ERR | rustix::event::PollFlags::HUP) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "response socket closed",
+            ));
+        }
+        if revents.contains(rustix::event::PollFlags::OUT) {
+            return Ok(());
+        }
+    }
+}
+
+fn write_socket_all(fd: BorrowedFd<'_>, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(write_timeout_error());
+        }
+        match rustix::net::send(
+            fd,
+            bytes,
+            rustix::net::SendFlags::DONTWAIT | rustix::net::SendFlags::NOSIGNAL,
+        )
+        .map_err(io::Error::from)
+        {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "response socket wrote zero bytes",
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => poll_writable(fd, deadline)?,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_all_until<W: ResponseWrite>(
+    stream: &mut W,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    if let Some(fd) = stream.deadline_fd() {
+        return write_socket_all(fd, bytes, deadline);
+    }
+    while !bytes.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(write_timeout_error());
+        }
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write response",
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn sendfile_until(
+    socket: BorrowedFd<'_>,
+    file: BorrowedFd<'_>,
+    offset: &mut u64,
+    remaining: &mut u64,
+    deadline: Instant,
+) -> io::Result<()> {
+    while *remaining > 0 {
+        if Instant::now() >= deadline {
+            return Err(write_timeout_error());
+        }
+        let chunk = (*remaining).min(i32::MAX as u64) as usize;
+        match rustix::fs::sendfile(socket, file, Some(offset), chunk).map_err(io::Error::from) {
+            Ok(0) => break,
+            Ok(written) => {
+                *remaining -= written as u64;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                poll_writable(socket, deadline)?
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Serialize a response and send its body.  Returns the number of body bytes
@@ -1182,6 +1343,10 @@ pub fn write_response<W: ResponseWrite>(
     resp: &mut Response,
     opts: &ResponseOptions,
 ) -> io::Result<u64> {
+    let deadline = Instant::now()
+        .checked_add(opts.write_timeout)
+        .ok_or_else(write_timeout_error)?;
+    stream.set_write_deadline(Some(deadline));
     let body_len = resp.body_len();
     let status = resp.status;
     let mut have_date = false;
@@ -1289,12 +1454,15 @@ pub fn write_response<W: ResponseWrite>(
             file.read_exact(&mut head[start..])?;
             sent = *len;
         }
-        stream.write_all(&head)?;
+        write_all_until(stream, &head, deadline)?;
+        if Instant::now() >= deadline {
+            return Err(write_timeout_error());
+        }
         stream.flush()?;
         return Ok(sent);
     }
 
-    stream.write_all(&head)?;
+    write_all_until(stream, &head, deadline)?;
     let mut sent = 0u64;
     if opts.head_only || no_body_status {
         return Ok(0);
@@ -1302,7 +1470,7 @@ pub fn write_response<W: ResponseWrite>(
     match &mut resp.body {
         Body::Empty => {}
         Body::Bytes(b) => {
-            stream.write_all(b)?;
+            write_all_until(stream, b, deadline)?;
             sent = b.len() as u64;
         }
         Body::Stream { reader, len } => {
@@ -1317,7 +1485,7 @@ pub fn write_response<W: ResponseWrite>(
                         "short streamed response body",
                     ));
                 }
-                stream.write_all(&tmp[..got])?;
+                write_all_until(stream, &tmp[..got], deadline)?;
                 sent += got as u64;
                 remaining -= got as u64;
             }
@@ -1329,31 +1497,38 @@ pub fn write_response<W: ResponseWrite>(
             // `sendfile` uses the explicit offset below, so the plain-TCP path
             // does not need an lseek first.  The TLS fallback seeks its own
             // cloned handle.
-            let mut off = *offset as i64;
+            let mut off = *offset;
             let mut remaining = *len;
-            if let Some(fd) = stream.raw_fd() {
-                while remaining > 0 {
-                    let chunk = remaining.min(i32::MAX as u64) as usize;
-                    let n = unsafe {
-                        libc::sendfile(fd, file.as_raw_fd(), &mut off as *mut i64, chunk)
-                    };
-                    if n < 0 {
-                        // Fall through to the bounded copy path.  Never spin
-                        // here on a non-blocking destination (EAGAIN): a full
-                        // socket buffer is not a truncated response budget.
-                        break;
+            if let Some(fd) = stream.deadline_fd() {
+                // A blocking sendfile can outlive SO_SNDTIMEO by several
+                // multiples. Temporarily make the destination non-blocking,
+                // then poll it against the response-wide deadline.
+                if stream.set_nonblocking(true).is_ok() {
+                    let before_sendfile = remaining;
+                    let result =
+                        sendfile_until(fd, file.as_fd(), &mut off, &mut remaining, deadline);
+                    // sendfile can make progress before reporting an error.
+                    // Preserve that progress for access-log byte accounting
+                    // and let the fallback resume at the updated offset.
+                    sent += before_sendfile - remaining;
+                    let restore = stream.set_nonblocking(false);
+                    match result {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                            let _ = restore;
+                            return Err(error);
+                        }
+                        // Filesystems that do not support sendfile continue
+                        // through the bounded userspace copy path.
+                        Err(_) => {}
                     }
-                    if n == 0 {
-                        break;
-                    }
-                    sent += n as u64;
-                    remaining -= n as u64;
+                    restore?;
                 }
             }
             // TLS and other non-socket destinations: copy through `Write`.
             if remaining > 0 {
                 let mut f = file.try_clone()?;
-                f.seek(SeekFrom::Start(off.max(0) as u64))?;
+                f.seek(SeekFrom::Start(off))?;
                 let mut tmp = vec![0u8; 64 * 1024];
                 while remaining > 0 {
                     let want = remaining.min(tmp.len() as u64) as usize;
@@ -1364,12 +1539,15 @@ pub fn write_response<W: ResponseWrite>(
                             "short file response body",
                         ));
                     }
-                    stream.write_all(&tmp[..got])?;
+                    write_all_until(stream, &tmp[..got], deadline)?;
                     sent += got as u64;
                     remaining -= got as u64;
                 }
             }
         }
+    }
+    if Instant::now() >= deadline {
+        return Err(write_timeout_error());
     }
     stream.flush()?;
     Ok(sent)
@@ -1911,6 +2089,14 @@ mod tests {
         fn raw_fd(&self) -> Option<RawFd> {
             Some(self.0.as_raw_fd())
         }
+
+        fn deadline_fd(&self) -> Option<BorrowedFd<'_>> {
+            Some(self.0.as_fd())
+        }
+
+        fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+            self.0.set_nonblocking(nonblocking)
+        }
     }
 
     fn response_options() -> ResponseOptions<'static> {
@@ -1920,6 +2106,7 @@ mod tests {
             head_only: false,
             protocol: Version::Http11,
             request_keep_alive: true,
+            write_timeout: Duration::from_secs(5),
         }
     }
 
@@ -2594,6 +2781,41 @@ mod tests {
         assert!(write_response(&mut writer, &mut response, &response_options()).is_err());
         drop(writer);
         drop(b);
+    }
+
+    #[test]
+    fn stalled_socket_file_write_obeys_absolute_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut response = Response {
+                status: 200,
+                headers: Vec::new(),
+                body: Body::File {
+                    file: temp_file(&vec![b's'; 32 * 1024 * 1024]),
+                    offset: 0,
+                    len: 32 * 1024 * 1024,
+                },
+                spool_lease: None,
+                resident_lease: None,
+            };
+            let mut opts = response_options();
+            opts.write_timeout = Duration::from_millis(200);
+            let started = Instant::now();
+            let result = write_response(&mut server, &mut response, &opts);
+            let _ = tx.send((started.elapsed(), result));
+        });
+
+        // Keep the peer open without reading. The writer must release itself;
+        // closing this socket is cleanup, not the event that unblocks it.
+        let outcome = rx.recv_timeout(Duration::from_secs(2));
+        drop(client);
+        handle.join().unwrap();
+        let (elapsed, result) = outcome.expect("stalled writer exceeded its deadline");
+        assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

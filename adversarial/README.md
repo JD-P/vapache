@@ -405,8 +405,9 @@ python3 adversarial/p25/exploit_p25_dos.py    # P25-B stalled-download worker ex
 
 **P25-A** runs five Apache/vapached groups over the same fixture
 (`www/private.txt` = `SECRET-CONTENT`, `www/hello.txt` control). The exact
-URL `/private.txt` must be `403` on both servers, while `/private.txt/` must
-be `404` on Apache and `200` with the secret body on vapached. Group A is a
+URL `/private.txt` must be `403` on both servers, while remediated vapache
+must match Apache's `404` for `/private.txt/` without returning the secret.
+Group A is a
 main-config `<LocationMatch "^/private\.txt$"> Require all denied`; B is a
 `.htaccess` `RewriteRule ^private\.txt$ - [F]` under `AllowOverride All`; C is
 `<If "%{REQUEST_URI} == '/private.txt'"> Require all denied`; D is the
@@ -417,11 +418,7 @@ logs; both temp trees are removed unless `--keep` is given.
 
 **P25-B** runs both servers with `MaxRequestWorkers 8` and `Timeout 2` over a
 64 MiB file. Eight stalled downloads (127.0.0.2 and 127.0.0.3, four each)
-must make a fresh client receive `503 Server busy` on vapached, must leave
-the stalled connection workers alive past `Timeout`, and must recover to
-`200` once the stalls close; the Apache `mpm_event` oracle must keep serving
-the fresh client `200` throughout. A single stalled download on this host is
-released after ≈5.13–5.16 × `Timeout` (measured with
-`/tmp/opencode/p25/probe_lifetime_scaling.py`), so the default `Timeout 60`
-pins a worker for ≈5 minutes. Loopback only; fixtures are removed unless
-`--keep` is given.
+must be aborted by remediated vapache's response-wide deadline, release their
+connection workers, and leave a fresh client at `200`; the Apache `mpm_event`
+oracle must likewise keep serving the fresh client. Loopback only; fixtures
+are removed unless `--keep` is given.

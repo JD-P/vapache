@@ -504,6 +504,7 @@ fn reject_busy_connection(mut stream: TcpStream, tls: bool, cfg: &Config) {
             head_only: false,
             protocol: Version::Http11,
             request_keep_alive: false,
+            write_timeout: cfg.timeout,
         },
     );
 }
@@ -550,6 +551,7 @@ fn write_ws_error<C: ResponseWrite>(
             head_only: false,
             protocol: Version::Http11,
             request_keep_alive: false,
+            write_timeout: cfg.timeout,
         },
     )?;
     Ok(())
@@ -569,6 +571,7 @@ fn write_ws_response<C: ResponseWrite>(
             head_only: false,
             protocol: Version::Http11,
             request_keep_alive: false,
+            write_timeout: cfg.timeout,
         },
     )
     .map(|_| ())
@@ -639,6 +642,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                         head_only: false,
                         protocol: Version::Http11,
                         request_keep_alive: false,
+                        write_timeout: cfg.timeout,
                     },
                 );
                 return Ok(());
@@ -659,6 +663,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
                         head_only: false,
                         protocol: Version::Http11,
                         request_keep_alive: false,
+                        write_timeout: cfg.timeout,
                     },
                 );
                 return Ok(());
@@ -912,6 +917,7 @@ fn handle_connection<C: Conn + ResponseWrite>(
             head_only: req.is_head(),
             protocol: req.version,
             request_keep_alive: req.keep_alive,
+            write_timeout: cfg.timeout,
         };
         if !keep_alive {
             opts.keep_alive = false;
@@ -973,6 +979,7 @@ struct TlsH1 {
     stream: Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
     handle: tokio::runtime::Handle,
     read_timeout: Duration,
+    write_deadline: Option<Instant>,
 }
 
 fn timed_io<T>(result: Option<io::Result<T>>, message: &str) -> io::Result<T> {
@@ -991,7 +998,20 @@ impl TlsH1 {
             stream: Some(stream),
             handle,
             read_timeout: Duration::from_secs(20),
+            write_deadline: None,
         }
+    }
+
+    fn remaining_write_time(&self) -> io::Result<Duration> {
+        self.write_deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(30))
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "TLS response write deadline exceeded",
+                )
+            })
     }
 }
 
@@ -1015,15 +1035,14 @@ impl Read for TlsH1 {
 impl Write for TlsH1 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let handle = self.handle.clone();
+        let timeout = self.remaining_write_time()?;
         let stream = self
             .stream
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "TLS stream closed"))?;
         handle.block_on(async move {
             timed_io(
-                tokio::time::timeout(Duration::from_secs(30), stream.write(buf))
-                    .await
-                    .ok(),
+                tokio::time::timeout(timeout, stream.write(buf)).await.ok(),
                 "TLS write timeout",
             )
         })
@@ -1031,15 +1050,14 @@ impl Write for TlsH1 {
 
     fn flush(&mut self) -> io::Result<()> {
         let handle = self.handle.clone();
+        let timeout = self.remaining_write_time()?;
         let stream = self
             .stream
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "TLS stream closed"))?;
         handle.block_on(async move {
             timed_io(
-                tokio::time::timeout(Duration::from_secs(30), stream.flush())
-                    .await
-                    .ok(),
+                tokio::time::timeout(timeout, stream.flush()).await.ok(),
                 "TLS flush timeout",
             )
         })
@@ -1062,7 +1080,11 @@ impl Conn for TlsH1 {
         self.stream.take().map(|s| (s, self.handle.clone()))
     }
 }
-impl ResponseWrite for TlsH1 {}
+impl ResponseWrite for TlsH1 {
+    fn set_write_deadline(&mut self, deadline: Option<Instant>) {
+        self.write_deadline = deadline;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TlsHttpProtocol {
@@ -2166,6 +2188,24 @@ fn dispatch_inner(
         return r;
     }
 
+    // RFC 9112 permits the asterisk-form request target only for OPTIONS.
+    // Mapping it to `/` for GET/HEAD would serve the root resource under a
+    // request-target spelling that URL policy never sees.
+    if req.raw_path == b"*" && req.method != "OPTIONS" {
+        return error_response(
+            cfg,
+            vhost,
+            &vhost.map(|v| &v.scope).unwrap_or(&cfg.global),
+            400,
+            req,
+            "*",
+            local_port,
+            server_name,
+            peer.ip(),
+            local_ip,
+        );
+    }
+
     if req.method == "TRACE" {
         if !vapache_verified::capability_admit(cfg.capability_enabled(Capability::Trace), true)
             || !cfg.trace_enable
@@ -3252,6 +3292,25 @@ fn dispatch_inner(
                         local_ip,
                     );
                 }
+            }
+            // A trailing slash asserts a directory-like target. Once all
+            // real CGI/FastCGI handlers have had the opportunity to consume
+            // PATH_INFO, never serve a regular file through that spelling:
+            // URL-anchored authorization intentionally distinguishes
+            // `/file` from `/file/`.
+            if url_path.len() > 1 && url_path.ends_with('/') {
+                return error_response(
+                    cfg,
+                    vhost,
+                    scope,
+                    404,
+                    req,
+                    &url_path,
+                    local_port,
+                    &server_name,
+                    peer.ip(),
+                    local_ip,
+                );
             }
             if !matches!(req.method.as_str(), "GET" | "HEAD") {
                 let mut r = error_response(
@@ -5291,6 +5350,9 @@ mod tests {
                 name.eq_ignore_ascii_case("x-static-policy") && value == b"present"
             }));
         }
+        assert_eq!(cov_dispatch(&cfg, "GET", "*").status, 400);
+        assert_eq!(cov_dispatch(&cfg, "HEAD", "*").status, 400);
+        assert_eq!(cov_dispatch(&cfg, "GET", "/file.txt/").status, 404);
 
         let mut metadata_scope = Scope::default();
         metadata_scope.header_policy.vary.push("Origin".into());
@@ -5313,10 +5375,10 @@ mod tests {
         let mut star = cov_req("GET", "/");
         star.raw_path = b"*".to_vec();
         star.target = b"*".to_vec();
-        assert!(matches!(
+        assert_eq!(
             dispatch(&cfg, &star, cov_peer(), "127.0.0.1", 80).status,
-            200 | 403 | 404
-        ));
+            400
+        );
         assert_eq!(cov_dispatch(&cfg, "GET", "/%zz").status, 404);
         let mut non_utf8 = cov_req("GET", "/");
         non_utf8.target = b"/\xff".to_vec();
