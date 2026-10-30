@@ -1092,8 +1092,9 @@ name = "vapache-pcre2"
 version = "0.1.0"
 dependencies = [
  "pcre2",
- "regex",
+ "regex-automata",
  "regex-syntax",
+ "smallvec",
  "vapache-verified",
 ]
 

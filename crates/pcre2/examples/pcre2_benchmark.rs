@@ -99,6 +99,37 @@ fn main() {
             v_compile_ns / c_compile_ns,
         );
 
+        // Tiered engines can make construction cheap by deferring work. Keep
+        // that trade-off visible by measuring construction plus the first
+        // capture search as a separate cold-path operation.
+        let cold_iterations = if case.subject.len() > 1024 { 50 } else { 250 };
+        let v_first_ns = sample(
+            || {
+                let regex = v_compile(case.pattern);
+                black_box(regex.captures(black_box(&case.subject)).unwrap());
+            },
+            cold_iterations,
+        );
+        let c_first_ns = sample(
+            || {
+                let regex = c_compile(case.pattern, false);
+                black_box(regex.captures(black_box(&case.subject)).unwrap());
+            },
+            cold_iterations,
+        );
+        let c_jit_first_ns = sample(
+            || {
+                let regex = c_compile(case.pattern, true);
+                black_box(regex.captures(black_box(&case.subject)).unwrap());
+            },
+            cold_iterations,
+        );
+        println!(
+            "{},compile+first-captures,{v_first_ns:.1},{c_first_ns:.1},{c_jit_first_ns:.1},{:.3}",
+            case.name,
+            v_first_ns / c_first_ns,
+        );
+
         let v_regex = v_compile(case.pattern);
         let c_regex = c_compile(case.pattern, false);
         let c_jit_regex = c_compile(case.pattern, true);

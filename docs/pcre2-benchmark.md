@@ -7,8 +7,11 @@ uses release builds, reports the median of seven samples, and compares the same
 
 The “vapache” column is the safe-Rust compatibility frontend and deterministic
 automata backend guarded by the Verus-verified engine-mode and resource
-admission kernels. The automata implementation itself is a documented proof
-assumption, not code translated from Verus.
+admission kernels. The engine is tiered: construction creates a bounded Pike
+VM, the first search uses it, and the second search builds a shared lazy-DFA
+tier. Neither tier enables bounded or recursive backtracking. The automata
+implementation itself is a documented proof assumption, not code translated
+from Verus.
 
 ```sh
 cargo run -p vapache-pcre2 --release --example pcre2_benchmark
@@ -20,28 +23,36 @@ operation; lower is better.
 
 | Case | Operation | vapache | C interpreter | C JIT | vapache / C interpreter |
 |---|---|---:|---:|---:|---:|
-| literal anchor | compile | 7,766.7 | 560.1 | 2,721.4 | 13.867 |
-| literal anchor | captures | 103.4 | 124.4 | 93.2 | 0.831 |
-| captures over 4 KiB | compile | 27,848.6 | 1,055.9 | 6,182.9 | 26.375 |
-| captures over 4 KiB | captures | 65.1 | 6,014,311.4 | 2,481.4 | 0.000011 |
-| alternation over 4 KiB | compile | 25,794.2 | 795.4 | 5,646.4 | 32.429 |
-| alternation over 4 KiB | captures | 347.4 | 141,907.2 | 235.2 | 0.002448 |
-| byte/POSIX class | compile | 65,779.3 | 685.4 | 3,447.4 | 95.973 |
-| byte/POSIX class | captures | 133.4 | 193.3 | 89.7 | 0.690 |
-| `\Q…\E\Z` lowering | compile | 8,583.5 | 501.1 | 4,040.0 | 17.130 |
-| `\Q…\E\Z` lowering | captures | 122.7 | 117.3 | 86.6 | 1.046 |
-| `a{8000}` / 8,190 bytes | resource guard / captures | 10.3 | 4,547.0 | 2,274.0 | 0.002258 |
+| literal anchor | compile | 3,634.1 | 511.5 | 2,498.2 | 7.104 |
+| literal anchor | compile + first captures | 4,106.6 | 666.5 | 2,618.6 | 6.162 |
+| literal anchor | captures | 48.4 | 114.6 | 76.6 | 0.423 |
+| captures over 4 KiB | compile | 8,118.9 | 992.2 | 5,697.5 | 8.183 |
+| captures over 4 KiB | compile + first captures | 207,810.8 | 5,964,188.0 | 8,028.1 | 0.035 |
+| captures over 4 KiB | captures | 64.5 | 6,015,957.3 | 2,480.0 | 0.000011 |
+| alternation over 4 KiB | compile | 18,312.9 | 740.5 | 5,689.0 | 24.731 |
+| alternation over 4 KiB | compile + first captures | 19,302.2 | 137,004.2 | 5,859.4 | 0.141 |
+| alternation over 4 KiB | captures | 301.8 | 132,475.0 | 228.1 | 0.002278 |
+| byte/POSIX class | compile | 7,517.4 | 686.5 | 3,483.5 | 10.951 |
+| byte/POSIX class | compile + first captures | 9,079.3 | 977.9 | 3,789.0 | 9.284 |
+| byte/POSIX class | captures | 82.2 | 181.9 | 83.5 | 0.452 |
+| `\Q…\E\Z` lowering | compile | 4,822.3 | 499.9 | 4,068.7 | 9.647 |
+| `\Q…\E\Z` lowering | compile + first captures | 5,786.3 | 685.5 | 4,117.3 | 8.441 |
+| `\Q…\E\Z` lowering | captures | 61.7 | 116.5 | 77.2 | 0.530 |
+| `a{8000}` / 8,190 bytes | resource guard / captures | 10.6 | 4,547.0 | 2,284.0 | 0.002320 |
 
 Interpretation:
 
-- Compilation is 13.9–96.0× slower than the C interpreter because vapache
-  performs compatibility parsing, byte-class normalization, structural work
-  accounting and automata compilation. Configuration load is the intended
-  place to pay this cost; compiled expressions are reused.
-- Warm captures are close to the C interpreter on simple cases (0.69–1.05×)
-  and 1.11–1.49× the C JIT on the simple literal/class cases. The automata
-  engine is dramatically faster than the C interpreter on the deliberately
-  backtracking-sensitive 4 KiB capture and alternation subjects.
+- Compilation is now 7.1–24.7× the C interpreter (previously 13.9–96.0×) and
+  1.2–3.2× C JIT compilation. Parsing and structural work accounting remain
+  deliberate costs; lazy-DFA construction is deferred until reuse proves the
+  expression hot.
+- “Compile + first captures” makes that deferral visible. The first search is
+  bounded Pike-VM execution, so one-shot long scans beat the C interpreter but
+  can trail C JIT. The second and later searches use the shared lazy-DFA tier.
+- Warm captures beat the C interpreter in every case. They also beat C JIT in
+  four of five cases; the remaining alternation case is 1.32× C JIT. Inline
+  capture slots and a group-zero fast path remove allocator and submatch work
+  from the common no-explicit-capture case.
 - The counted-repetition row is a security-policy comparison rather than a
   successful-match throughput comparison. Vapache rejects the request at its
   verified work gate in about 0.24 µs; PCRE2 executes it. Before P23-A, the

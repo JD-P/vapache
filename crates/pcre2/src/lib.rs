@@ -14,7 +14,13 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Index;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use regex_automata::{
+    meta::Regex as AutomataRegex, util::primitives::NonMaxUsize, Input, MatchKind, PatternID,
+};
+use smallvec::SmallVec;
 
 const DEFAULT_PATTERN_LIMIT: usize = 64 * 1024;
 const DEFAULT_SUBJECT_LIMIT: usize = 64 * 1024;
@@ -23,6 +29,7 @@ const DEFAULT_CAPTURE_LIMIT: usize = 128;
 const DEFAULT_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 const DEFAULT_NEST_LIMIT: u32 = 64;
 const KEEP_PREFIX: &str = "__vapache_pcre2_keep_";
+const HOT_TIER_AFTER_SEARCHES: u8 = 1;
 
 /// Error category.  Unsupported syntax is distinct from malformed syntax so
 /// callers can report a deliberate fail-closed compatibility decision.
@@ -98,7 +105,12 @@ impl std::error::Error for Error {}
 pub mod bytes {
     use super::*;
 
-    type CaptureSpans = Vec<Option<(usize, usize)>>;
+    // The common no-explicit-capture case stays inline without making the
+    // by-value `Captures` result expensive to move. Patterns with explicit
+    // groups retain a bounded heap fallback.
+    type CaptureSpans = SmallVec<[Option<(usize, usize)>; 1]>;
+    // Four slots cover group zero plus the synthetic group used for `\K`.
+    type EngineSlots = SmallVec<[Option<NonMaxUsize>; 4]>;
 
     /// A byte range in a matched subject.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,7 +210,8 @@ pub mod bytes {
                 ));
             }
 
-            let complexity = deterministic_complexity(&translation.pattern, &self.config)?
+            let hir = parse_hir(&translation.pattern, &self.config)?;
+            let complexity = hir_complexity(&hir)
                 .max(translation.pattern.len() as u64)
                 .max(1)
                 .saturating_mul(if translation.final_newline_fallback {
@@ -207,22 +220,11 @@ pub mod bytes {
                     1
                 });
 
-            let mut builder = regex::bytes::RegexBuilder::new(&translation.pattern);
-            builder
-                .case_insensitive(self.config.caseless)
-                .dot_matches_new_line(self.config.dotall)
-                .ignore_whitespace(self.config.extended)
-                .multi_line(self.config.multi_line)
-                .crlf(self.config.crlf)
-                .unicode(self.config.ucp || self.config.utf)
-                .size_limit(self.config.size_limit)
-                .nest_limit(self.config.nest_limit);
-            let inner = builder
-                .build()
-                .map_err(|error| Error::syntax(error.to_string()))?;
+            let cold = build_automata(&hir, self.config.size_limit, false)?;
 
-            let inner_names: Vec<Option<String>> = inner
-                .capture_names()
+            let inner_names: Vec<Option<String>> = cold
+                .group_info()
+                .pattern_names(PatternID::ZERO)
                 .map(|name| name.map(ToOwned::to_owned))
                 .collect();
             let mut public_to_inner = vec![0];
@@ -263,7 +265,7 @@ pub mod bytes {
                 complexity,
                 final_newline_fallback: translation.final_newline_fallback,
                 multiline_start_anchor: translation.multiline_start_anchor,
-                inner,
+                inner: TieredEngine::new(cold, hir, self.config.size_limit),
                 public_to_inner: Arc::new(public_to_inner),
                 keep_groups: Arc::new(keep_groups),
                 capture_names: Arc::new(capture_names),
@@ -311,8 +313,8 @@ pub mod bytes {
             self
         }
 
-        /// Accepted for source compatibility. The Rust automata are always
-        /// compiled ahead of use and never allocate executable memory.
+        /// Accepted for source compatibility. The Rust automata use bounded
+        /// interpreter/DFA tiers and never allocate executable memory.
         pub fn jit(&mut self, _yes: bool) -> &mut Self {
             self
         }
@@ -365,6 +367,27 @@ pub mod bytes {
         }
     }
 
+    fn build_automata(
+        hir: &regex_syntax::hir::Hir,
+        size_limit: usize,
+        hybrid: bool,
+    ) -> Result<AutomataRegex, Error> {
+        AutomataRegex::builder()
+            .configure(
+                AutomataRegex::config()
+                    .match_kind(MatchKind::LeftmostFirst)
+                    .utf8_empty(false)
+                    .nfa_size_limit(Some(size_limit))
+                    .hybrid_cache_capacity(2 * 1024 * 1024)
+                    .hybrid(hybrid)
+                    .dfa(false)
+                    .onepass(false)
+                    .backtrack(false),
+            )
+            .build_from_hir(hir)
+            .map_err(|error| Error::syntax(error.to_string()))
+    }
+
     /// A compiled, shareable regular expression.
     #[derive(Clone)]
     pub struct Regex {
@@ -374,11 +397,53 @@ pub mod bytes {
         complexity: u64,
         final_newline_fallback: bool,
         multiline_start_anchor: bool,
-        inner: regex::bytes::Regex,
+        inner: TieredEngine,
         public_to_inner: Arc<Vec<usize>>,
         keep_groups: Arc<Vec<usize>>,
         capture_names: Arc<Vec<Option<String>>>,
         capture_names_idx: Arc<HashMap<String, usize>>,
+    }
+
+    /// A bounded Pike VM provides low cold-start latency. After the first
+    /// search, a lazy DFA tier is built once and shared by every clone. Both
+    /// tiers use the same HIR and Thompson-NFA size ceiling; neither permits
+    /// the bounded-backtracking fallback.
+    #[derive(Clone)]
+    struct TieredEngine(Arc<TieredEngineInner>);
+
+    struct TieredEngineInner {
+        cold: AutomataRegex,
+        hot: OnceLock<Option<AutomataRegex>>,
+        hir: regex_syntax::hir::Hir,
+        size_limit: usize,
+        searches: AtomicU8,
+    }
+
+    impl TieredEngine {
+        fn new(cold: AutomataRegex, hir: regex_syntax::hir::Hir, size_limit: usize) -> Self {
+            Self(Arc::new(TieredEngineInner {
+                cold,
+                hot: OnceLock::new(),
+                hir,
+                size_limit,
+                searches: AtomicU8::new(0),
+            }))
+        }
+
+        fn for_search(&self) -> &AutomataRegex {
+            if let Some(hot) = self.0.hot.get() {
+                return hot.as_ref().unwrap_or(&self.0.cold);
+            }
+            let searches = self.0.searches.fetch_add(1, Ordering::Relaxed);
+            if searches < HOT_TIER_AFTER_SEARCHES {
+                return &self.0.cold;
+            }
+            self.0
+                .hot
+                .get_or_init(|| build_automata(&self.0.hir, self.0.size_limit, true).ok())
+                .as_ref()
+                .unwrap_or(&self.0.cold)
+        }
     }
 
     impl fmt::Debug for Regex {
@@ -446,7 +511,8 @@ pub mod bytes {
             Ok(self.capture_spans(subject, start)?.map(|spans| Captures {
                 subject,
                 spans,
-                idx: Arc::clone(&self.capture_names_idx),
+                idx: (!self.capture_names_idx.is_empty())
+                    .then(|| Arc::clone(&self.capture_names_idx)),
             }))
         }
 
@@ -456,7 +522,11 @@ pub mod bytes {
             start: usize,
         ) -> Result<Option<CaptureSpans>, Error> {
             self.check_subject(subject.len(), start)?;
-            let full = self.inner.captures_at(subject, start);
+            let engine = self.inner.for_search();
+            if self.public_to_inner.len() == 1 && self.keep_groups.is_empty() {
+                return Ok(self.group_zero_spans(engine, subject, start));
+            }
+            let full = Self::engine_captures_at(engine, subject, start);
             let mut trimmed = None;
             if self.final_newline_fallback {
                 let trim = if self.config.crlf && subject.ends_with(b"\r\n") {
@@ -468,9 +538,8 @@ pub mod bytes {
                     0
                 };
                 if trim > 0 && start <= subject.len() - trim {
-                    trimmed = self
-                        .inner
-                        .captures_at(&subject[..subject.len() - trim], start);
+                    trimmed =
+                        Self::engine_captures_at(engine, &subject[..subject.len() - trim], start);
                 }
             }
             // PCRE2 exposes both end-of-subject and pre-final-newline anchor
@@ -478,11 +547,12 @@ pub mod bytes {
             // by this two-pass lowering are rejected during translation.
             let captures = match (full, trimmed) {
                 (Some(full), Some(trimmed)) => {
-                    let full_match = full.get(0).expect("group zero matches");
-                    let trimmed_match = trimmed.get(0).expect("group zero matches");
-                    if trimmed_match.start() < full_match.start()
-                        || (trimmed_match.start() == full_match.start()
-                            && trimmed_match.end() < full_match.end()
+                    let full_match = Self::engine_group(&full, 0).expect("group zero matches");
+                    let trimmed_match =
+                        Self::engine_group(&trimmed, 0).expect("group zero matches");
+                    if trimmed_match.0 < full_match.0
+                        || (trimmed_match.0 == full_match.0
+                            && trimmed_match.1 < full_match.1
                             && !self.config.dotall)
                     {
                         Some(trimmed)
@@ -495,25 +565,85 @@ pub mod bytes {
             let Some(captures) = captures else {
                 return Ok(None);
             };
-            let mut spans = Vec::with_capacity(self.public_to_inner.len());
+            let mut spans = CaptureSpans::with_capacity(self.public_to_inner.len());
             for &inner in self.public_to_inner.iter() {
-                spans.push(
-                    captures
-                        .get(inner)
-                        .map(|matched| (matched.start(), matched.end())),
-                );
+                spans.push(Self::engine_group(&captures, inner));
             }
             if let Some((_, end)) = spans[0] {
                 let keep_start = self
                     .keep_groups
                     .iter()
-                    .filter_map(|&group| captures.get(group).map(|matched| matched.start()))
+                    .filter_map(|&group| {
+                        Self::engine_group(&captures, group).map(|matched| matched.0)
+                    })
                     .max();
                 if let Some(keep_start) = keep_start {
                     spans[0] = Some((keep_start, end));
                 }
             }
             Ok(Some(spans))
+        }
+
+        fn group_zero_spans(
+            &self,
+            engine: &AutomataRegex,
+            subject: &[u8],
+            start: usize,
+        ) -> Option<CaptureSpans> {
+            let full = engine
+                .search(&Input::new(subject).span(start..subject.len()))
+                .map(|matched| (matched.start(), matched.end()));
+            let mut trimmed = None;
+            if self.final_newline_fallback {
+                let trim = if self.config.crlf && subject.ends_with(b"\r\n") {
+                    2
+                } else if subject.ends_with(b"\n") || (self.config.crlf && subject.ends_with(b"\r"))
+                {
+                    1
+                } else {
+                    0
+                };
+                if trim > 0 && start <= subject.len() - trim {
+                    trimmed = engine
+                        .search(
+                            &Input::new(&subject[..subject.len() - trim])
+                                .span(start..subject.len() - trim),
+                        )
+                        .map(|matched| (matched.start(), matched.end()));
+                }
+            }
+            let matched = match (full, trimmed) {
+                (Some(full), Some(trimmed))
+                    if trimmed.0 < full.0
+                        || (trimmed.0 == full.0 && trimmed.1 < full.1 && !self.config.dotall) =>
+                {
+                    trimmed
+                }
+                (Some(full), _) => full,
+                (None, Some(trimmed)) => trimmed,
+                (None, None) => return None,
+            };
+            let mut spans = CaptureSpans::new();
+            spans.push(Some(matched));
+            Some(spans)
+        }
+
+        fn engine_group(slots: &EngineSlots, group: usize) -> Option<(usize, usize)> {
+            let slot = group.checked_mul(2)?;
+            Some((
+                slots.get(slot)?.as_ref()?.get(),
+                slots.get(slot + 1)?.as_ref()?.get(),
+            ))
+        }
+
+        fn engine_captures_at(
+            engine: &AutomataRegex,
+            subject: &[u8],
+            start: usize,
+        ) -> Option<EngineSlots> {
+            let mut slots = EngineSlots::from_elem(None, engine.group_info().slot_len());
+            engine.search_slots(&Input::new(subject).span(start..subject.len()), &mut slots)?;
+            Some(slots)
         }
 
         pub fn find_iter<'r, 's>(&'r self, subject: &'s [u8]) -> Matches<'r, 's> {
@@ -587,7 +717,7 @@ pub mod bytes {
 
         pub fn capture_locations(&self) -> CaptureLocations {
             CaptureLocations {
-                spans: vec![None; self.captures_len()],
+                spans: CaptureSpans::from_elem(None, self.captures_len()),
             }
         }
 
@@ -627,7 +757,7 @@ pub mod bytes {
     pub struct Captures<'s> {
         subject: &'s [u8],
         spans: CaptureSpans,
-        idx: Arc<HashMap<String, usize>>,
+        idx: Option<Arc<HashMap<String, usize>>>,
     }
 
     impl<'s> Captures<'s> {
@@ -644,7 +774,10 @@ pub mod bytes {
         }
 
         pub fn name(&self, name: &str) -> Option<Match<'s>> {
-            self.idx.get(name).and_then(|&index| self.get(index))
+            self.idx
+                .as_ref()?
+                .get(name)
+                .and_then(|&index| self.get(index))
         }
 
         pub fn len(&self) -> usize {
@@ -797,11 +930,11 @@ pub mod bytes {
         keep_prefix: String,
     }
 
-    fn deterministic_complexity(pattern: &str, config: &Config) -> Result<u64, Error> {
+    fn parse_hir(pattern: &str, config: &Config) -> Result<regex_syntax::hir::Hir, Error> {
         let unicode = config.ucp || config.utf;
         let mut builder = regex_syntax::ParserBuilder::new();
         builder
-            .utf8(unicode)
+            .utf8(false)
             .unicode(unicode)
             .ignore_whitespace(config.extended)
             .case_insensitive(config.caseless)
@@ -809,11 +942,10 @@ pub mod bytes {
             .dot_matches_new_line(config.dotall)
             .crlf(config.crlf)
             .nest_limit(config.nest_limit);
-        let hir = builder
+        builder
             .build()
             .parse(pattern)
-            .map_err(|error| Error::syntax(error.to_string()))?;
-        Ok(hir_complexity(&hir))
+            .map_err(|error| Error::syntax(error.to_string()))
     }
 
     fn hir_complexity(hir: &regex_syntax::hir::Hir) -> u64 {
@@ -989,6 +1121,13 @@ pub mod bytes {
                     let Some(&escaped) = bytes.get(i + 1) else {
                         return Err(Error::syntax("trailing backslash"));
                     };
+                    // Advancing by two bytes would land inside a multi-byte
+                    // UTF-8 scalar and make the next string slice panic.
+                    // PCRE2's escaped non-ASCII behavior also depends on its
+                    // UTF mode, so keep the byte-oriented subset fail closed.
+                    if escaped >= 0x80 {
+                        return Err(Error::unsupported(i, "non-ASCII escape"));
+                    }
                     match escaped {
                         b'Q' => {
                             let start = i + 2;
@@ -1076,11 +1215,13 @@ pub mod bytes {
                         }
                         b'0'..=b'7' => {
                             let (decimal, decimal_end) = decimal_escape(bytes, i + 1);
-                            if escaped != b'0' && decimal > 0 && decimal <= captures {
+                            let single_digit = decimal_end == i + 2;
+                            if escaped != b'0'
+                                && (single_digit || (decimal > 0 && decimal <= captures))
+                            {
                                 return Err(Error::unsupported(i, "backreference"));
                             }
                             let (value, end) = parse_octal_escape(bytes, i + 1)?;
-                            let _ = decimal_end;
                             push_hex(&mut out, value);
                             i = end;
                         }
@@ -1163,7 +1304,11 @@ pub mod bytes {
             if byte.is_ascii_whitespace() || *byte == b'#' || *byte >= 0x80 {
                 push_hex(out, *byte);
             } else {
-                out.extend_from_slice(regex::escape(&(*byte as char).to_string()).as_bytes());
+                let ch = *byte as char;
+                if regex_syntax::is_meta_character(ch) {
+                    out.push(b'\\');
+                }
+                out.push(*byte);
             }
         }
     }
@@ -1244,7 +1389,7 @@ pub mod bytes {
         while i < bytes.len() {
             match bytes[i] {
                 b'[' => {
-                    let (_, end) = translate_byte_class(pattern, i, false)?;
+                    let end = byte_class_end(pattern, i, false)?;
                     i = end;
                 }
                 b'\\' if bytes.get(i + 1) == Some(&b'Q') => {
@@ -1330,7 +1475,7 @@ pub mod bytes {
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'[' {
-                if let Ok((_, end)) = translate_byte_class(pattern, i, crlf) {
+                if let Ok(end) = byte_class_end(pattern, i, crlf) {
                     i = end;
                     continue;
                 }
@@ -1353,7 +1498,7 @@ pub mod bytes {
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'[' {
-                if let Ok((_, end)) = translate_byte_class(pattern, i, crlf) {
+                if let Ok(end) = byte_class_end(pattern, i, crlf) {
                     i = end;
                     continue;
                 }
@@ -1484,20 +1629,34 @@ pub mod bytes {
 
     type ByteSet = [bool; 256];
 
-    fn translate_byte_class(
-        pattern: &str,
-        start: usize,
-        crlf: bool,
-    ) -> Result<(String, usize), Error> {
-        translate_byte_class_caseless(pattern, start, crlf, false)
-    }
-
     fn translate_byte_class_caseless(
         pattern: &str,
         start: usize,
         crlf: bool,
         caseless: bool,
     ) -> Result<(String, usize), Error> {
+        let (set, end) = parse_byte_class(pattern, start, crlf, caseless)?;
+        let rendered = render_byte_class(&set);
+        if !caseless {
+            return Ok((rendered, end));
+        }
+        let mut scoped = String::with_capacity(rendered.len() + 6);
+        scoped.push_str("(?-i:");
+        scoped.push_str(&rendered);
+        scoped.push(')');
+        Ok((scoped, end))
+    }
+
+    fn byte_class_end(pattern: &str, start: usize, crlf: bool) -> Result<usize, Error> {
+        parse_byte_class(pattern, start, crlf, false).map(|(_, end)| end)
+    }
+
+    fn parse_byte_class(
+        pattern: &str,
+        start: usize,
+        crlf: bool,
+        caseless: bool,
+    ) -> Result<(ByteSet, usize), Error> {
         let bytes = pattern.as_bytes();
         let mut i = start + 1;
         let negated = bytes.get(i) == Some(&b'^');
@@ -1511,15 +1670,7 @@ pub mod bytes {
                 if negated {
                     invert_set(&mut result);
                 }
-                let rendered = render_byte_class(&result);
-                return Ok((
-                    if caseless {
-                        format!("(?-i:{rendered})")
-                    } else {
-                        rendered
-                    },
-                    i + 1,
-                ));
+                return Ok((result, i + 1));
             }
             let (mut left, left_single, next) = class_atom(bytes, i, crlf)?;
             first = false;
@@ -1710,18 +1861,24 @@ pub mod bytes {
     }
 
     fn render_byte_class(set: &ByteSet) -> String {
-        let positive = render_class_members(set);
         let inverse = complement(*set);
-        let negative = render_class_members(&inverse);
-        if !negative.is_empty() && negative.len() + 1 < positive.len() {
-            format!("[^{negative}]")
-        } else {
-            format!("[{positive}]")
+        let positive_len = class_members_len(set);
+        let negative_len = class_members_len(&inverse);
+        let use_negative = negative_len > 0 && negative_len + 1 < positive_len;
+        let members = if use_negative { &inverse } else { set };
+        let mut out =
+            String::with_capacity(2 + class_members_len(members) + usize::from(use_negative));
+        out.push('[');
+        if use_negative {
+            out.push('^');
         }
+        render_class_members(members, &mut out);
+        out.push(']');
+        out
     }
 
-    fn render_class_members(set: &ByteSet) -> String {
-        let mut out = String::new();
+    fn class_members_len(set: &ByteSet) -> usize {
+        let mut len = 0;
         let mut i = 0usize;
         while i < set.len() {
             if !set[i] {
@@ -1734,15 +1891,46 @@ pub mod bytes {
             }
             let end = i;
             if end >= start + 2 {
-                out.push_str(&format!("\\x{start:02X}-\\x{end:02X}"));
+                len += 9;
+            } else {
+                len += (end - start + 1) * 4;
+            }
+            i += 1;
+        }
+        len
+    }
+
+    fn render_class_members(set: &ByteSet, out: &mut String) {
+        let mut i = 0usize;
+        while i < set.len() {
+            if !set[i] {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i + 1 < set.len() && set[i + 1] {
+                i += 1;
+            }
+            let end = i;
+            if end >= start + 2 {
+                push_hex_string(out, start as u8);
+                out.push('-');
+                push_hex_string(out, end as u8);
             } else {
                 for byte in start..=end {
-                    out.push_str(&format!("\\x{byte:02X}"));
+                    push_hex_string(out, byte as u8);
                 }
             }
             i += 1;
         }
-        out
+    }
+
+    fn push_hex_string(out: &mut String, byte: u8) {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        out.push('\\');
+        out.push('x');
+        out.push(HEX[usize::from(byte >> 4)] as char);
+        out.push(HEX[usize::from(byte & 0x0F)] as char);
     }
 
     /// PCRE2 diagnoses a quantifier without a preceding repeatable atom.
@@ -1765,7 +1953,7 @@ pub mod bytes {
             }
             match bytes[i] {
                 b'[' => {
-                    let Ok((_, end)) = translate_byte_class(pattern, i, crlf) else {
+                    let Ok(end) = byte_class_end(pattern, i, crlf) else {
                         return None;
                     };
                     repeatable = true;
@@ -1891,7 +2079,7 @@ pub mod bytes {
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'[' {
-                if let Ok((_, end)) = translate_byte_class(pattern, i, crlf) {
+                if let Ok(end) = byte_class_end(pattern, i, crlf) {
                     i = end;
                     continue;
                 }
@@ -2061,6 +2249,14 @@ mod tests {
             ErrorKind::ResourceLimit
         );
         assert_eq!(Regex::new("^?<wo").unwrap_err().kind(), ErrorKind::Syntax);
+    }
+
+    #[test]
+    fn fuzzed_escape_edges_fail_closed_without_panicking() {
+        let error = Regex::new(r"\ҭend").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let error = Regex::new(r"\7<sords+").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
     }
 
     #[test]

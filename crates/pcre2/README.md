@@ -10,8 +10,11 @@ The frontend follows the PCRE2 10.46 pattern documentation and source:
 - <https://www.pcre.org/current/doc/html/pcre2pattern.html>
 - <https://github.com/PCRE2Project/pcre2/tree/pcre2-10.46>
 
-The executable backend is Rust `regex`'s compiled finite-automata stack. It
-uses no recursive matcher, native code, executable memory, or unsafe Rust.
+The executable backend uses `regex-automata` directly: a bounded Pike VM keeps
+cold starts small, and a shared lazy DFA is compiled after the first search
+for steady-state speed. Bounded backtracking is explicitly disabled in both
+tiers. The engine uses no recursive matcher, native code, executable memory,
+or unsafe Rust.
 PCRE-only regular constructs are lowered before compilation, including
 `\Q...\E`, `\Z`, `\K`, comment groups, control/octal escapes, byte classes,
 and PCRE extended-mode class rules. Numbered and named captures are projected
@@ -54,7 +57,7 @@ PCRE2_TESTDATA=/path/to/pcre2-10.46/testdata \
   cargo test -p vapache-pcre2 --test upstream_testdata -- --nocapture
 ```
 
-The current importer checks 1,008 supported subject/capture records from
+The current importer checks 1,002 supported subject/capture records from
 `testinput1`; records using the deliberately unsupported dialect or complex
 `pcre2test` control commands are skipped.
 
