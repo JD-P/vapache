@@ -1731,6 +1731,93 @@ pub proof fn expr_regex_oversize_rejected(pattern: u64, subject: u64, limit: u64
 {
 }
 
+/// Compilation admits only a pattern within the configured byte ceiling.
+/// The compatibility front-end applies its independently bounded expansion
+/// before handing the result to the automata compiler.
+pub open spec fn regex_compile_resource_spec(pattern: u64, limit: u64) -> bool {
+    pattern <= limit
+}
+
+pub fn regex_compile_resource_admit(pattern: u64, limit: u64) -> (ok: bool)
+    ensures ok == regex_compile_resource_spec(pattern, limit),
+{
+    pattern <= limit
+}
+
+/// Captures are stored in a fixed-size locations vector per match.  Bounding
+/// the number of public groups therefore bounds capture-result allocation.
+pub open spec fn regex_capture_resource_spec(captures: u64, limit: u64) -> bool {
+    captures <= limit
+}
+
+pub fn regex_capture_resource_admit(captures: u64, limit: u64) -> (ok: bool)
+    ensures ok == regex_capture_resource_spec(captures, limit),
+{
+    captures <= limit
+}
+
+/// The non-backtracking engine has O(pattern * subject) worst-case work.  The
+/// division form makes the executable check overflow-free while proving the
+/// same product ceiling for every non-empty pattern.
+pub open spec fn regex_match_resource_spec(
+    complexity: u64,
+    subject: u64,
+    subject_limit: u64,
+    work_limit: u64,
+) -> bool {
+    complexity > 0
+        && subject <= subject_limit
+        && complexity <= work_limit
+        && subject <= work_limit / complexity
+}
+
+pub fn regex_match_resource_admit(
+    complexity: u64,
+    subject: u64,
+    subject_limit: u64,
+    work_limit: u64,
+) -> (ok: bool)
+    ensures ok == regex_match_resource_spec(complexity, subject, subject_limit, work_limit),
+{
+    complexity > 0
+        && subject <= subject_limit
+        && complexity <= work_limit
+        && subject <= work_limit / complexity
+}
+
+pub proof fn regex_match_work_is_bounded(
+    complexity: u64,
+    subject: u64,
+    subject_limit: u64,
+    work_limit: u64,
+)
+    requires regex_match_resource_spec(complexity, subject, subject_limit, work_limit),
+    ensures
+        subject <= subject_limit,
+        complexity > 0,
+        subject <= work_limit / complexity,
+{
+}
+
+/// Shipping policy for the regex execution backend.  Neither recursive
+/// backtracking nor executable-memory JIT is available in the production
+/// engine; both properties are fixed at construction and cannot be selected
+/// by a pattern.
+pub open spec fn regex_engine_mode_spec(backtracking: bool, executable_jit: bool) -> bool {
+    !backtracking && !executable_jit
+}
+
+pub fn regex_engine_mode_admit(backtracking: bool, executable_jit: bool) -> (ok: bool)
+    ensures ok == regex_engine_mode_spec(backtracking, executable_jit),
+{
+    !backtracking && !executable_jit
+}
+
+pub proof fn regex_backtracking_default_is_required(executable_jit: bool)
+    ensures !regex_engine_mode_spec(true, executable_jit),
+{
+}
+
 /// Add the single leading slash required for an internal rewrite target.
 /// External targets are classified before this function is called.
 pub fn rewrite_internal_path(joined: &[u8]) -> (out: Vec<u8>)

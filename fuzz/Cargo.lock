@@ -710,7 +710,17 @@ name = "vapache-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "pcre2",
+ "vapache-pcre2",
  "vapached",
+]
+
+[[package]]
+name = "vapache-pcre2"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "vapache-verified",
 ]
 
 [[package]]
@@ -733,7 +743,6 @@ dependencies = [
  "http",
  "libc",
  "md-5",
- "pcre2",
  "regex",
  "ring",
  "rustls",
@@ -741,6 +750,7 @@ dependencies = [
  "sha1",
  "tokio",
  "tokio-rustls",
+ "vapache-pcre2",
  "vapache-verified",
  "webpki-roots",
 ]

@@ -1643,9 +1643,9 @@ The first Verus model should cover:
 
 The following remain assumptions or separate proofs:
 
-- the statically linked, lockfile-pinned PCRE2 10.46 interpreter and the Rust
-  regex engine implement their stated language subsets (PCRE2 remains a
-  trusted native-code boundary; expression matching does not enable its JIT);
+- the safe-Rust regex automata backend implements its documented regular
+  language and capture semantics; the PCRE2 compatibility frontend is checked
+  against the test-only PCRE2 10.46 oracle and rejects backtracking constructs;
 - the filesystem contents match what the access-file walk sees;
 - path canonicalization and `openat` containment (already separately
   verified in `crates/verified`);
@@ -1834,11 +1834,13 @@ construction: there is no second production interleaver.
   consumed by `cache.rs` (I51, I54).
 - `regex_dialect_admit` / `guard_regex` / `compile_regex`. Directive regexes
   backed by Rust `regex` are admitted only after the verified dialect guard.
-  Expression regexes instead compile as PCRE2 at configuration load so valid
-  Apache constructs retain their meaning; size/control admission remains
-  bounded, and `expr_regex_result` proves that an evaluation error cannot
-  grant even through negation. The external engines still supply matching
-  semantics for their accepted languages.
+  Expression regexes compile through the in-tree PCRE2 compatibility frontend
+  at configuration load. Regular Apache constructs retain their meaning while
+  backreferences, recursion, look-around and other recursive-backtracking
+  constructs fail closed. `regex_match_resource_admit` proves the overflow-free
+  pattern-times-subject work bound and `expr_regex_result` proves that an
+  evaluation error cannot grant even through negation. The Rust automata
+  backend still supplies matching semantics for the accepted bytecode.
 - `directive_disposition`.  The configuration fallback uses a verified
   four-way disposition: security-sensitive unhandled directives fail closed;
   in strict mode every unhandled directive (known or unknown) fails; in
@@ -1900,9 +1902,10 @@ construction: there is no second production interleaver.
   count and rendered-byte growth, so checked subtraction establishes the
   configured ceiling before allocation.
 - `bcrypt_cost_admit` rejects bcrypt costs outside 4..=17 before invoking the
-  password library. `expr_regex_size_admit` binds PCRE2 pattern and subject
-  sizes to 64 KiB; runtime JIT stack and global expensive-work admission add
-  independent memory and concurrency limits.
+  password library. `expr_regex_size_admit` binds compatibility-pattern and
+  subject sizes to 64 KiB; `regex_match_resource_admit` additionally proves
+  the overflow-free pattern-times-subject ceiling, while compile/capture
+  limits and global expensive-work admission bound memory and concurrency.
 - `rewrite_backref_no_qmark`, `rewrite_filesystem_admit`,
   `rewrite_target_external`, `rewrite_internal_path` and
   `rewrite_authority_equal`.  Rewrite backreference/variable expansion uses

@@ -277,12 +277,13 @@ closed as follows:
   chain is external. IPv4-mapped IPv6 values are canonicalized before this
   decision. VApache deliberately remains stricter than Apache when no trust
   list exists: a header alone never authorizes address rewriting.
-- Expression regexes compile as PCRE2 when configuration is loaded. The P15
-  PCRE constructs therefore have Apache-compatible meaning instead of being
-  rejected lazily by a different regex dialect. Any later expression error is
-  a fail-closed result: `Require expr` denies, rewrite evaluation errors stop
-  the rewrite, and conditional configuration records a misconfiguration that
-  cannot silently remove an ACL, handler or Options guard.
+- Expression regexes compile through the in-tree PCRE2 compatibility frontend
+  when configuration is loaded. Regular P15 constructs retain Apache meaning;
+  backreferences and other recursive-backtracking features are rejected at
+  load time. Any later resource error is fail closed: `Require expr` denies,
+  rewrite evaluation errors stop the rewrite, and conditional configuration
+  records a misconfiguration that cannot silently remove an ACL, handler or
+  Options guard.
 
 The production code consumes Verus kernels for the expression error result,
 RemoteIP proxy transition/candidate admission and dual FastCGI identity. Five
@@ -444,8 +445,9 @@ per-request limit cannot contain:
   tree for every rejected POST;
 - autoindex counts every directory record, including filtered dot/backup and
   unreadable entries, before metadata lookup; it admits at most 4096 records
-  and 4 MiB of HTML. Compression, PCRE2, bcrypt/MD5 and access-file parsing
-  share a 32-operation gate. PCRE2 inputs/JIT stack, bcrypt cost, DNS resolver
+  and 4 MiB of HTML. Compression, regex matching, bcrypt/MD5 and access-file
+  parsing share a 32-operation gate. Regex pattern, subject, capture and
+  deterministic pattern-times-subject work, bcrypt cost, DNS resolver
   workers/queue/operands and auth, access-file and request-policy cache bytes
   are independently bounded;
 - connection admission is a compare/exchange reservation with RAII release.

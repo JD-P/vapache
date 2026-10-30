@@ -16,15 +16,15 @@ use std::path::{Component, Path, PathBuf};
 const MAX_EXPR_FILE_BYTES: u64 = 64 * 1024;
 const MAX_EXPR_REGEX_BYTES: u64 = 64 * 1024;
 
-/// A PCRE2 expression compiled while the configuration is parsed.  Apache's
-/// `ap_expr` uses PCRE; retaining only Rust `regex` syntax made valid Apache
-/// guards disappear at request time when constructs such as `\Q...\E`, `\Z`,
-/// `\K`, comments or backreferences were encountered (P15-C).
+/// A PCRE2-compatible expression compiled while the configuration is parsed.
+/// The in-tree engine accepts the regular PCRE2 subset used by Apache guards
+/// (including `\Q...\E`, `\Z`, `\K` and comments) and rejects constructs such
+/// as backreferences whose semantics require recursive backtracking.
 #[derive(Clone)]
 pub struct ExprRegex {
     pattern: String,
     nocase: bool,
-    compiled: pcre2::bytes::Regex,
+    compiled: vapache_pcre2::bytes::Regex,
 }
 
 impl std::fmt::Debug for ExprRegex {
@@ -38,9 +38,9 @@ impl std::fmt::Debug for ExprRegex {
 
 impl ExprRegex {
     fn compile(pattern: String, nocase: bool) -> Result<Self, String> {
-        // Keep the same verified resource ceiling used by the other regex
-        // surfaces, but deliberately do not apply the Rust-regex dialect
-        // filter: this surface is backed by the same PCRE family as Apache.
+        // Keep the verified resource ceiling used by the other regex
+        // surfaces. The compatibility parser performs its own structural
+        // admission and fails closed on non-regular PCRE2 constructs.
         if pattern.len() > 65_536
             || pattern
                 .as_bytes()
@@ -49,11 +49,10 @@ impl ExprRegex {
         {
             return Err("bad expression regex: pattern is too large or contains controls".into());
         }
-        let mut builder = pcre2::bytes::RegexBuilder::new();
-        // Keep request-controlled subjects on PCRE2's interpreter. The JIT is
-        // an unnecessary executable-memory/native-code boundary here; regex
-        // work is already input-bounded and protected by the expensive-work
-        // concurrency budget.
+        let mut builder = vapache_pcre2::bytes::RegexBuilder::new();
+        // The engine is non-backtracking and uses no executable-memory JIT.
+        // Its deterministic pattern×subject work ceiling is checked on every
+        // call in addition to the server-wide expensive-work budget.
         builder.caseless(nocase);
         let compiled = builder
             .build(&pattern)
@@ -795,7 +794,7 @@ impl Expr {
                         .ok_or_else(|| {
                             format!(
                                 "expression regex evaluation failed: {}",
-                                eval_error.as_deref().unwrap_or("unknown PCRE2 error")
+                                eval_error.as_deref().unwrap_or("unknown regex error")
                             )
                         })?;
                 ctx.captures = caps
@@ -1766,7 +1765,7 @@ mod tests {
         assert_eq!(eval_result("base64('abc')").unwrap().string(), "YWJj");
         assert_eq!(eval_result("unbase64('YWJj')").unwrap().string(), "abc");
         assert!(eval_result("bogus()").is_err());
-        assert!(eval_result("'aa' =~ /(a)\\1/").unwrap().truthy());
+        assert!(eval_result("'aa' =~ /(a)\\1/").is_err());
 
         let r = req();
         let mut c = Context::new(
@@ -1830,8 +1829,8 @@ mod tests {
         assert!(parse("x =~  ").is_err());
         // The delimiter still works normally at every position.
         assert!(eval("'abc' =~ /bc/"));
-        // Apache-compatible PCRE backreferences compile and evaluate.
-        assert!(eval_result("'aa' =~ /(a)\\1/").unwrap().truthy());
+        // Backreferences require backtracking and fail closed at load time.
+        assert!(parse("'aa' =~ /(a)\\1/").is_err());
     }
 
     #[test]
@@ -1841,7 +1840,6 @@ mod tests {
             r"'secret.txt' =~ /secret\.txt\Z/",
             r"'secret' =~ /sec(?#match)ret/",
             r"'secret' =~ /\Ksecret/",
-            r"'secretse' =~ /(se)cret\1/",
         ] {
             assert!(eval_result(expression).unwrap().truthy(), "{expression}");
         }
@@ -1849,6 +1847,7 @@ mod tests {
         // Compilation occurs in Parser::compare, so an invalid PCRE pattern
         // is a configuration/load error rather than a request-time branch.
         assert!(parse(r"'secret' =~ /(?unterminated/").is_err());
+        assert!(parse(r"'secretse' =~ /(se)cret\1/").is_err());
 
         let regex = ExprRegex::compile("secret".into(), true).unwrap();
         let debug = format!("{regex:?}");

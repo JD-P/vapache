@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "updated": "2026-10-29",
+  "updated": "2026-10-30",
   "verus": {
-    "verified_functions": 498,
+    "verified_functions": 506,
     "errors": 0
   },
   "obligations": [
@@ -32,7 +32,7 @@
       "title": "Require/PolicyResult semantics",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "PolicyResult combinators and require_none are verified; expression integer/string comparison and glob matching run through verified kernels (expr_compare_ints, expr_compare_strs, expr_glob_match). P15 expression regexes compile as PCRE2 at configuration load, and expr_regex_result proves an evaluation error cannot grant even through negation. auth_file_immutable_admit is consumed by the no-symlink authentication-file opener; its proofs reject service ownership (because an owner can restore write permission) and group/other write authority. Strict UTF-8 decoding, provider/hash semantics, parent-chain kernel enforcement and PCRE2's internal matching semantics remain outside the model."
+      "evidence": "PolicyResult combinators and require_none are verified; expression integer/string comparison and glob matching run through verified kernels (expr_compare_ints, expr_compare_strs, expr_glob_match). P15 expression regexes compile through the safe-Rust non-backtracking PCRE2 compatibility frontend at configuration load; expr_regex_result proves an evaluation error cannot grant through negation, regex_engine_mode_admit excludes recursive backtracking/JIT, and the compile/capture/match resource predicates bound allocation and pattern-times-subject work. The admitted dialect is differentially checked against the test-only PCRE2 10.46 oracle. auth_file_immutable_admit is consumed by the no-symlink authentication-file opener; its proofs reject service ownership and group/other write authority. Strict UTF-8 decoding, provider/hash semantics, parent-chain kernel enforcement and the Rust automata backend's internal matching semantics remain outside the model."
     },
     {
       "id": "require_none_never_grants",
@@ -88,7 +88,7 @@
       "title": "Untrusted streams have bounded size and deadlines",
       "status": "partial",
       "weight": 1.0,
-      "evidence": "I33 covers request/proxy trailer count and byte budgets, proxy chunk checked_add before resize, CGI worker path/env/body/output caps, FastCGI record/header/stdout/stderr caps, HTTP/2 budgets and compression. resource_budget_admit and connection_admit mechanize overflow-free global/per-client admission; client_quota_ipv6_key is the executable IPv6 /64 fairness key, with proofs that the host half is zeroed and the allocation prefix is preserved. RAII runtime leases enforce shared spool-byte/file, request/response resident-byte, blocking-read, HTTP/2-stream, accepted-connection and CGI/FastCGI concurrency ceilings across reloads. IPv4 quotas remain exact; HTTP/2/WebSocket admission uses the validated RemoteIP effective identity, and trusted transport proxies receive only the process-wide connection ceiling rather than a single-client cap. P20 makes both HTTP adapters consume one incremental BodyAccumulator and request_body_memory_admit proves each resident-prefix extension is bounded. The fixed HTTP/1 identity reader charges only body chunks actually received; HTTP/2 file/stream responses wait for flow-control capacity, retain response-byte leases on 64 KiB chunks and scope blocking-read leases to the read itself. Follow-up gates prove successful-only cache invalidation, autoindex scan/render arithmetic, bcrypt cost and PCRE2 input bounds; runtime limits proxy and CGI responses, DNS workers, expensive CPU work and byte-counted policy/auth/access caches. Body/header parsing uses hard deadlines, HTTP/2 is capped at 32 streams per connection and 256 process-wide, and connection spawn/descriptor exhaustion paths are regression-tested. Request-time expression and authentication-file reads reject non-regular descriptors, use O_NONBLOCK/O_NOFOLLOW and bounded reads; authentication cache hits re-open the path and require the same inode. Kernel/socket scheduling and upstream protocol implementations remain outside the model."
+      "evidence": "I33 covers request/proxy trailer count and byte budgets, proxy chunk checked_add before resize, CGI worker path/env/body/output caps, FastCGI record/header/stdout/stderr caps, HTTP/2 budgets and compression. resource_budget_admit and connection_admit mechanize overflow-free global/per-client admission; client_quota_ipv6_key is the executable IPv6 /64 fairness key, with proofs that the host half is zeroed and the allocation prefix is preserved. RAII runtime leases enforce shared spool-byte/file, request/response resident-byte, blocking-read, HTTP/2-stream, accepted-connection and CGI/FastCGI concurrency ceilings across reloads. IPv4 quotas remain exact; HTTP/2/WebSocket admission uses the validated RemoteIP effective identity, and trusted transport proxies receive only the process-wide connection ceiling rather than a single-client cap. P20 makes both HTTP adapters consume one incremental BodyAccumulator and request_body_memory_admit proves each resident-prefix extension is bounded. The fixed HTTP/1 identity reader charges only body chunks actually received; HTTP/2 file/stream responses wait for flow-control capacity, retain response-byte leases on 64 KiB chunks and scope blocking-read leases to the read itself. Follow-up gates prove successful-only cache invalidation, autoindex scan/render arithmetic, bcrypt cost and regex compile/capture/pattern-times-subject work bounds; runtime limits proxy and CGI responses, DNS workers, expensive CPU work and byte-counted policy/auth/access caches. Body/header parsing uses hard deadlines, HTTP/2 is capped at 32 streams per connection and 256 process-wide, and connection spawn/descriptor exhaustion paths are regression-tested. Request-time expression and authentication-file reads reject non-regular descriptors, use O_NONBLOCK/O_NOFOLLOW and bounded reads; authentication cache hits re-open the path and require the same inode. Kernel/socket scheduling and upstream protocol implementations remain outside the model."
     },
     {
       "id": "response_header_policy",
@@ -482,7 +482,7 @@
     "unverified_security_components": [],
     "partially_bound_sinks": [],
     "assumptions": [
-      "the statically linked lockfile-pinned PCRE2 10.46 interpreter implements the Apache expression-regex subset exercised by the differential gate; its native implementation remains trusted and expression matching does not enable JIT",
+      "the safe-Rust regex automata backend implements its documented regular-language/capture semantics; the PCRE2 compatibility frontend is differentially checked against the test-only 10.46 C oracle",
       "when VapacheCapability UnstableFastCgiPaths is explicitly enabled, an external FastCGI backend opens SCRIPT_FILENAME after vapache's final descriptor/inode check and the deployment must provide the read-only script-tree invariant that VapacheFastCGIStablePath otherwise machine-enforces",
       "h2 wire framing, TLS client-certificate chain validation, and CGI/proxy protocol details are outside the model",
       "configuration tokenization and directive/pattern payloads refine the executable kind/phase model",
@@ -554,7 +554,7 @@
     "Resolved-file FastCGI lexical wire-path and canonical authorization admission",
     "FastCGI endpoint-keyed stable-path component and POSIX-ACL admission",
     "Expression value truthiness, integer/string comparison, glob matching and fail-closed regex results, plus rewrite condition-chain folding",
-    "PCRE2 configuration-load admission for expression patterns",
+    "Non-backtracking PCRE2-compatibility admission and deterministic resource bounds for expression patterns",
     "Directive disposition and fail-closed security fallback",
     "Shared request-to-target mapping for dispatch and cache authorization",
     "Ordered alias/redirect/proxy route tables and handler operation ordering",

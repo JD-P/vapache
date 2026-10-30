@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce the explicit PCRE2 native-code boundary."""
+"""Enforce removal of PCRE2 C code from the production dependency graph."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import argparse
 import platform
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 
@@ -19,15 +18,14 @@ def fail(message: str) -> None:
 
 
 def check_source_policy() -> None:
-    config = tomllib.loads((ROOT / ".cargo" / "config.toml").read_text())
-    setting = config.get("env", {}).get("PCRE2_SYS_STATIC")
-    if setting != {"value": "1", "force": True}:
-        fail("PCRE2_SYS_STATIC must be forced to 1 in .cargo/config.toml")
-
-    expr = (ROOT / "crates" / "server" / "src" / "expr.rs").read_text()
-    for call in (".jit(", ".jit_if_available(", ".max_jit_stack_size("):
-        if call in expr:
-            fail(f"expression regexes must not enable PCRE2 JIT ({call})")
+    manifest = (ROOT / "crates" / "server" / "Cargo.toml").read_text()
+    if '\npcre2 = ' in manifest or 'package = "pcre2"' in manifest:
+        fail("vapached must not have a production dependency on the C-backed pcre2 crate")
+    engine = (ROOT / "crates" / "pcre2" / "src" / "lib.rs").read_text()
+    if "unsafe {" in engine or "unsafe fn" in engine:
+        fail("the in-tree regex engine must remain free of unsafe Rust")
+    if "backtracking: false" not in engine:
+        fail("the in-tree regex engine must default backtracking to false")
 
 
 def check_binary(binary: Path) -> None:
@@ -55,12 +53,12 @@ def main() -> None:
     check_source_policy()
     if args.binary is not None:
         check_binary(args.binary)
-    print("native dependency policy: pinned static PCRE2, JIT disabled")
+    print("native dependency policy: production PCRE2 C boundary removed")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, tomllib.TOMLDecodeError) as error:
+    except OSError as error:
         print(f"native dependency policy: {error}", file=sys.stderr)
         raise SystemExit(1) from error

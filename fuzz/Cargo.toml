@@ -10,6 +10,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 vapached = { path = "../crates/server", features = ["fuzzing"] }
+vapache-pcre2 = { path = "../crates/pcre2" }
+pcre2-c-oracle = { package = "pcre2", version = "0.2.11" }
 
 [[bin]]
 name = "http_request"
@@ -98,6 +100,13 @@ bench = false
 [[bin]]
 name = "ocsp_der"
 path = "fuzz_targets/ocsp_der.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pcre2_differential"
+path = "fuzz_targets/pcre2_differential.rs"
 test = false
 doc = false
 bench = false

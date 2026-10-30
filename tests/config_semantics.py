@@ -2188,15 +2188,14 @@ CASES = [
     },
 ]
 
-# P15-C: these are all valid Apache PCRE patterns. The access-control parity
-# suite treats Apache as the executable oracle, so a future regex-engine or
-# expression-parser change cannot silently erase the guard again.
+# P15-C: these are valid regular Apache PCRE patterns. The access-control
+# parity suite treats Apache as the executable oracle, so a future regex-engine
+# or expression-parser change cannot silently erase the guard again.
 for suffix, pattern, filename in [
     ("q", r"\Qsecret\E", "secret.txt"),
     ("z", r"secret\.txt\Z", "secret.txt"),
     ("comment", r"sec(?#match)ret", "secret.txt"),
     ("k", r"\Ksecret", "secret.txt"),
-    ("backref", r"(se)cret\1", "secretse.txt"),
 ]:
     name = f"p15-expr-pcre-{suffix}"
     CASES.append(

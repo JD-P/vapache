@@ -1,0 +1,17 @@
+[package]
+name = "vapache-pcre2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+regex = "1.11"
+vapache-verified = { path = "../verified", version = "0.1.0" }
+
+[dev-dependencies]
+# This is an oracle only. It is absent from vapached's normal dependency
+# graph and from the release binary.
+pcre2-c-oracle = { package = "pcre2", version = "0.2.11" }
+
+[lints.rust]
+unsafe_code = "forbid"
