@@ -38,7 +38,7 @@ jobs:
           - tls_policy
           - ocsp_der
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           rustup toolchain install nightly --profile minimal
           cargo install cargo-fuzz --locked
@@ -63,7 +63,7 @@ jobs:
       matrix:
         sanitizer: [address, leak, thread]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install nightly --profile minimal --component rust-src
       - name: ${{ matrix.sanitizer }} sanitizer
         run: tests/sanitizers.sh ${{ matrix.sanitizer }}
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install external reference implementations
         run: |
           sudo apt-get update
@@ -87,7 +87,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo build --locked --release -p vapached
       - name: Install h2spec
         run: |
@@ -110,7 +110,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo install cargo-llvm-cov --locked
       - name: LLVM branch coverage
         run: >-
