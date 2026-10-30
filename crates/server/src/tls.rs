@@ -663,7 +663,7 @@ fn spawn_ocsp_refresh(refresh: OcspRefresh) -> std::thread::JoinHandle<()> {
     })
 }
 
-fn protocol_versions(spec: Option<&str>) -> Result<Vec<&'static SupportedProtocolVersion>, String> {
+fn protocol_policy(spec: Option<&str>) -> Result<(bool, bool), String> {
     let mut tls12 = true;
     let mut tls13 = true;
     let mut replaced = false;
@@ -699,6 +699,11 @@ fn protocol_versions(spec: Option<&str>) -> Result<Vec<&'static SupportedProtoco
     if !tls12 && !tls13 {
         return Err("SSLProtocol disables both TLS 1.2 and TLS 1.3".into());
     }
+    Ok((tls12, tls13))
+}
+
+fn protocol_versions(spec: Option<&str>) -> Result<Vec<&'static SupportedProtocolVersion>, String> {
+    let (tls12, tls13) = protocol_policy(spec)?;
     let mut out = Vec::new();
     if tls12 {
         out.push(&rustls::version::TLS12);
@@ -782,6 +787,25 @@ fn ensure_uniform_client_policy(policies: &[&SslConfig], port: u16) -> Result<()
     Ok(())
 }
 
+/// Rustls selects protocol versions before SNI-based certificate resolution,
+/// so every virtual host sharing a listener must agree on the effective
+/// `SSLProtocol` policy. Applying only the default vhost's policy would
+/// silently weaken one host or make another unavailable.
+fn ensure_uniform_protocol_policy(policies: &[&SslConfig], port: u16) -> Result<(), String> {
+    let Some(first) = policies.first() else {
+        return Ok(());
+    };
+    let expected = protocol_policy(first.protocols.as_deref())?;
+    for ssl in policies.iter().skip(1) {
+        if protocol_policy(ssl.protocols.as_deref())? != expected {
+            return Err(format!(
+                "TLS port {port} has virtual hosts with different SSLProtocol policies; use separate Listen directives so protocol versions cannot be applied across vhosts"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Build the TLS configuration for a listening port, if any virtual host on
 /// that port has `SSLEngine on` (or a global SSLEngine is configured).
 /// `local_ip` filters address-bound vhosts when the listener itself is bound
@@ -823,6 +847,7 @@ pub(crate) fn prepare_server_config(
     }
     let policies: Vec<&SslConfig> = vhosts.iter().map(|v| &v.ssl).collect();
     ensure_uniform_client_policy(&policies, port)?;
+    ensure_uniform_protocol_policy(&policies, port)?;
 
     // Apache's first matching virtual host is the default server.
     let default_ssl = if global_only {
@@ -1181,6 +1206,27 @@ mod tests {
             ..SslConfig::default()
         };
         assert!(ensure_uniform_client_policy(&[&require, &require3], 443).is_err());
+    }
+
+    #[test]
+    fn vhosts_cannot_share_a_listener_with_different_protocol_policy() {
+        let both = SslConfig::default();
+        let tls12 = SslConfig {
+            protocols: Some("TLSv1.2".into()),
+            ..SslConfig::default()
+        };
+        let equivalent = SslConfig {
+            protocols: Some("all -SSLv3 -TLSv1 -TLSv1.1".into()),
+            ..SslConfig::default()
+        };
+        let invalid = SslConfig {
+            protocols: Some("bogus".into()),
+            ..SslConfig::default()
+        };
+
+        assert!(ensure_uniform_protocol_policy(&[&both, &equivalent], 443).is_ok());
+        assert!(ensure_uniform_protocol_policy(&[&both, &tls12], 443).is_err());
+        assert!(ensure_uniform_protocol_policy(&[&both, &invalid], 443).is_err());
     }
 
     #[test]

@@ -12,6 +12,7 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
 use md5::Md5;
 use sha1::{Digest, Sha1};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -27,6 +28,21 @@ const AUTH_FAILURE_CACHE_TTL: Duration = Duration::from_millis(250);
 
 const CRYPT_ALPHABET: &[u8; 64] =
     b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+thread_local! {
+    /// The authenticated identity for the synchronous request dispatch that
+    /// is currently running on this worker. Dispatch never yields while this
+    /// value is live, including on HTTP/2 worker threads.
+    static REQUEST_IDENTITY: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn reset_request_identity() {
+    REQUEST_IDENTITY.with(|identity| *identity.borrow_mut() = None);
+}
+
+pub(crate) fn take_request_identity() -> Option<String> {
+    REQUEST_IDENTITY.with(|identity| identity.borrow_mut().take())
+}
 
 /// Verify the request's Basic credentials against `AuthUserFile`.  Returns
 /// `None` for missing, malformed, unsupported or non-matching credentials.
@@ -70,10 +86,12 @@ pub fn authenticate(scope: &Scope, req: &Request, mutable_auth_files: bool) -> O
         Some(path) => groups_for(path, user, mutable_auth_files)?,
         None => Vec::new(),
     };
-    Some(Identity {
+    let identity = Identity {
         user: user.to_string(),
         groups,
-    })
+    };
+    REQUEST_IDENTITY.with(|current| *current.borrow_mut() = Some(identity.user.clone()));
+    Some(identity)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
