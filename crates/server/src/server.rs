@@ -901,7 +901,8 @@ fn handle_connection<C: Conn + ResponseWrite>(
             }
         }
 
-        let mut resp = dispatch_with_scheme(&cfg, &req, peer, &local_ip, local_port, tls);
+        let (mut resp, remote_user) =
+            dispatch_with_scheme_and_identity(&cfg, &req, peer, &local_ip, local_port, tls);
         let keep_alive = cfg.keep_alive
             && req.keep_alive
             && (cfg.max_keep_alive_requests == 0 || served + 1 < cfg.max_keep_alive_requests);
@@ -933,7 +934,6 @@ fn handle_connection<C: Conn + ResponseWrite>(
                     if host.is_empty() { None } else { Some(host) },
                 )
                 .and_then(|v| cfg.vhosts.iter().position(|x| std::ptr::eq(x, v)));
-            let uri = String::from_utf8_lossy(&req.target);
             logger.access(&AccessEntry {
                 remote_ip: &remote_ip,
                 remote_port: peer.port(),
@@ -941,7 +941,8 @@ fn handle_connection<C: Conn + ResponseWrite>(
                 local_port,
                 server_name: &server_name,
                 method: &req.method,
-                uri: &uri,
+                uri: &req.target,
+                remote_user: remote_user.as_deref(),
                 protocol: req.version.as_str(),
                 status: resp.status,
                 bytes_sent: body_sent,
@@ -1393,9 +1394,22 @@ pub(crate) fn dispatch_with_scheme(
     local_port: u16,
     tls: bool,
 ) -> Response {
+    dispatch_with_scheme_and_identity(cfg, req, peer, local_ip, local_port, tls).0
+}
+
+pub(crate) fn dispatch_with_scheme_and_identity(
+    cfg: &Config,
+    req: &Request,
+    peer: SocketAddr,
+    local_ip: &str,
+    local_port: u16,
+    tls: bool,
+) -> (Response, Option<String>) {
+    crate::auth::reset_request_identity();
     let mut response = crate::expr::with_connection(tls, local_port, || {
         dispatch_inner_request(cfg, req, peer, local_ip, local_port)
     });
+    let remote_user = crate::auth::take_request_identity();
     if response.admit_resident(&cfg.resource_budget).is_err() {
         response = Response::bytes(
             503,
@@ -1407,7 +1421,7 @@ pub(crate) fn dispatch_with_scheme(
         // uncharged is preferable to retaining the original large body.
         let _ = response.admit_resident(&cfg.resource_budget);
     }
-    response
+    (response, remote_user)
 }
 
 fn dispatch_inner_request(
@@ -1533,12 +1547,12 @@ pub(crate) fn internal_dispatch(
     local_port: u16,
 ) -> Response {
     let mut internal = req.clone();
-    let mut target = url.to_string();
+    let mut target = url.as_bytes().to_vec();
     if !internal.query.is_empty() {
-        target.push('?');
-        target.push_str(&String::from_utf8_lossy(&internal.query));
+        target.push(b'?');
+        target.extend_from_slice(&internal.query);
     }
-    internal.target = target.into_bytes();
+    internal.target = target;
     internal.raw_path = url.as_bytes().to_vec();
     internal.body.clear();
     internal.body_spool = None;
@@ -5046,6 +5060,43 @@ mod tests {
     fn cov_dispatch(cfg: &Config, method: &str, path: &str) -> Response {
         let req = cov_req(method, path);
         dispatch(cfg, &req, cov_peer(), "127.0.0.1", 80)
+    }
+
+    #[test]
+    fn dispatch_returns_authenticated_identity_for_access_logging() {
+        use base64::Engine as _;
+        use sha1::{Digest, Sha1};
+
+        let dir = cov_dir("access-log-identity");
+        std::fs::write(dir.join("www/file.txt"), "ok\n").unwrap();
+        let mut hasher = Sha1::new();
+        hasher.update(b"secret");
+        let digest = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let htpasswd = dir.join(".htpasswd");
+        std::fs::write(&htpasswd, format!("alice:{{SHA}}{digest}\n")).unwrap();
+        let cfg = cov_config(
+            &dir,
+            &format!(
+                "<Directory \"{}/www\">\n\
+                 AuthType Basic\n\
+                 AuthName test\n\
+                 AuthUserFile \"{}\"\n\
+                 Require valid-user\n\
+                 </Directory>\n",
+                dir.display(),
+                htpasswd.display(),
+            ),
+        );
+        let mut req = cov_req("GET", "/file.txt");
+        let token = base64::engine::general_purpose::STANDARD.encode(b"alice:secret");
+        req.headers
+            .insert("authorization", format!("Basic {token}").into_bytes());
+
+        let (response, remote_user) =
+            dispatch_with_scheme_and_identity(&cfg, &req, cov_peer(), "127.0.0.1", 80, false);
+        assert_eq!(response.status, 200);
+        assert_eq!(remote_user.as_deref(), Some("alice"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

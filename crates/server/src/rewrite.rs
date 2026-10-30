@@ -598,7 +598,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         if expanded.chars().any(|c| c.is_control()) {
             return Outcome::Error("control character in rewrite substitution".into());
         }
-        let (mut new_path, mut new_query, has_target_query) = if rule.flags.qslast {
+        let (mut new_path, new_query, has_target_query) = if rule.flags.qslast {
             match expanded.rsplit_once('?') {
                 Some((path, query)) => (path.to_string(), query.to_string(), true),
                 None => (expanded.clone(), String::new(), false),
@@ -609,6 +609,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                 None => (expanded.clone(), String::new(), false),
             }
         };
+        let mut new_query = new_query.into_bytes();
         if rule.flags.qslast {
             let encoded = vapache_verified::rewrite_backref_no_qmark(new_path.as_bytes());
             new_path = String::from_utf8_lossy(&encoded).into_owned();
@@ -639,21 +640,23 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             !query.is_empty(),
         ) {
             vapache_verified::RewriteQueryAction::Append => {
-                new_query = if new_query.is_empty() {
-                    String::from_utf8_lossy(&query).into_owned()
-                } else {
-                    format!("{}&{}", new_query, String::from_utf8_lossy(&query))
-                };
+                if !new_query.is_empty() {
+                    new_query.push(b'&');
+                }
+                new_query.extend_from_slice(&query);
             }
             vapache_verified::RewriteQueryAction::Preserve => {
                 // Apache copies the original query string when the
                 // substitution does not contain a replacement query string.
-                new_query = String::from_utf8_lossy(&query).into_owned();
+                new_query = query.clone();
             }
             vapache_verified::RewriteQueryAction::Replace
             | vapache_verified::RewriteQueryAction::Discard => {}
         }
-        if new_query.chars().any(|c| c.is_control()) {
+        if new_query.iter().any(|byte| byte.is_ascii_control())
+            || std::str::from_utf8(&new_query)
+                .is_ok_and(|query| query.chars().any(char::is_control))
+        {
             return Outcome::Error("control character in rewrite query".into());
         }
 
@@ -709,8 +712,11 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
             vapache_verified::RewriteSink::Proxy => {
                 let mut url = joined;
                 if !new_query.is_empty() {
+                    let Ok(new_query) = std::str::from_utf8(&new_query) else {
+                        return Outcome::Error("non-UTF-8 query in proxy rewrite".into());
+                    };
                     url.push(if url.contains('?') { '&' } else { '?' });
-                    url.push_str(&new_query);
+                    url.push_str(new_query);
                 }
                 return Outcome::Proxy { url, effects };
             }
@@ -718,8 +724,11 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
                 let status = rule.flags.redirect.unwrap_or(302);
                 let mut location = joined;
                 if !new_query.is_empty() {
+                    let Ok(new_query) = std::str::from_utf8(&new_query) else {
+                        return Outcome::Error("non-UTF-8 query in redirect rewrite".into());
+                    };
                     location.push(if location.contains('?') { '&' } else { '?' });
-                    location.push_str(&new_query);
+                    location.push_str(new_query);
                 }
                 if !rule.flags.noescape {
                     location = escape_redirect_location(&location);
@@ -734,7 +743,7 @@ pub fn process(scope: &Scope, req: &Request, ctx: &Context<'_>) -> Outcome {
         }
 
         path = new_path_from_joined(&joined);
-        query = new_query.into_bytes();
+        query = new_query;
         changed = true;
         match vapache_verified::rewrite_advance(
             idx,
@@ -2608,6 +2617,43 @@ mod tests {
         assert!(
             matches!(out, Outcome::Internal { path, query, .. } if path == "/new" && query == b"x=1")
         );
+    }
+
+    #[test]
+    fn internal_rewrites_preserve_non_utf8_query_bytes() {
+        let root = Path::new("/tmp");
+        let mut request = req();
+        request.query = b"raw=\xff\xfe".to_vec();
+
+        let old = root.join("old");
+        let mut preserve = ctx("/old", &old, root);
+        preserve.query = &request.query;
+        let mut scope = Scope::default();
+        scope.rewrite_policy.rewrite_engine = Some(true);
+        scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(&["^/old$".into(), "/new".into(), "[L]".into()], "/", false)
+                .unwrap(),
+        );
+        assert!(matches!(
+            process(&scope, &request, &preserve),
+            Outcome::Internal { path, query, .. }
+                if path == "/new" && query == b"raw=\xff\xfe"
+        ));
+
+        let mut append_scope = Scope::default();
+        append_scope.rewrite_policy.rewrite_engine = Some(true);
+        append_scope.rewrite_policy.rewrite_rules.push(
+            parse_rewrite_rule(
+                &["^/old$".into(), "/new?fixed=1".into(), "[QSA,L]".into()],
+                "/",
+                false,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            process(&append_scope, &request, &preserve),
+            Outcome::Internal { query, .. } if query == b"fixed=1&raw=\xff\xfe"
+        ));
     }
 
     #[test]

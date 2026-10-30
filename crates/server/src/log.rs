@@ -81,7 +81,9 @@ pub struct AccessEntry<'a> {
     pub local_port: u16,
     pub server_name: &'a str,
     pub method: &'a str,
-    pub uri: &'a str,
+    /// Original request-target bytes exactly as received from the client.
+    pub uri: &'a [u8],
+    pub remote_user: Option<&'a str>,
     pub protocol: &'a str,
     pub status: u16,
     pub bytes_sent: u64,
@@ -334,7 +336,7 @@ impl Logger {
                 line.clear();
                 format_access_into(&mut line, &log.format, e);
                 if let Ok(mut w) = log.writer.lock() {
-                    let _ = w.write_all(line.as_bytes());
+                    let _ = w.write_all(&line);
                     let _ = w.write_all(b"\n");
                     let _ = w.flush();
                 }
@@ -345,20 +347,22 @@ impl Logger {
 
 #[cfg(test)]
 fn escape_log(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    escape_log_into(&mut out, s);
-    out
+    String::from_utf8(vapache_verified::escape_log_bytes(s.as_bytes()))
+        .expect("valid UTF-8 remains valid after log escaping")
 }
 
-fn escape_log_into(out: &mut String, s: &str) {
-    let escaped = vapache_verified::escape_log_bytes(s.as_bytes());
-    out.push_str(&String::from_utf8_lossy(&escaped));
+fn escape_log_into(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&vapache_verified::escape_log_bytes(bytes));
+}
+
+fn push_str(out: &mut Vec<u8>, value: &str) {
+    out.extend_from_slice(value.as_bytes());
 }
 thread_local! {
     /// `%t` only changes once per second; format it once per connection thread.
     static LOG_TIME_CACHE: RefCell<(i64, String)> = const { RefCell::new((i64::MIN, String::new())) };
     /// Reuse the access-log line buffer on each connection thread.
-    static ACCESS_LINE: RefCell<String> = const { RefCell::new(String::new()) };
+    static ACCESS_LINE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 fn request_start_secs(started: Instant) -> i64 {
@@ -383,30 +387,35 @@ fn with_common_log_time<F: FnOnce(&str)>(started: Instant, f: F) {
 
 #[cfg(test)]
 fn format_access(fmt: &str, e: &AccessEntry) -> String {
-    let mut out = String::with_capacity(fmt.len() + 128);
+    String::from_utf8(format_access_bytes(fmt, e)).expect("test entry formats as UTF-8")
+}
+
+#[cfg(test)]
+fn format_access_bytes(fmt: &str, e: &AccessEntry) -> Vec<u8> {
+    let mut out = Vec::with_capacity(fmt.len() + 128);
     format_access_into(&mut out, fmt, e);
     out
 }
 
-fn format_access_into(out: &mut String, fmt: &str, e: &AccessEntry) {
+fn format_access_into(out: &mut Vec<u8>, fmt: &str, e: &AccessEntry) {
     let b = fmt.as_bytes();
     let mut i = 0;
     while i < b.len() {
         if b[i] != b'%' {
-            out.push(b[i] as char);
+            out.push(b[i]);
             i += 1;
             continue;
         }
         i += 1;
         if i >= b.len() {
-            out.push('%');
+            out.push(b'%');
             break;
         }
         if b[i] == b'{' {
             let end = match fmt[i..].find('}') {
                 Some(x) => i + x,
                 None => {
-                    out.push('%');
+                    out.push(b'%');
                     break;
                 }
             };
@@ -426,14 +435,14 @@ fn format_access_into(out: &mut String, fmt: &str, e: &AccessEntry) {
                         _ => "",
                     };
                     if v.is_empty() {
-                        out.push('-');
+                        out.push(b'-');
                     } else {
-                        escape_log_into(out, v);
+                        escape_log_into(out, v.as_bytes());
                     }
                 }
-                'o' => out.push('-'),
+                'o' => out.push(b'-'),
                 't' => format_time_into(out, arg, e.started),
-                'e' => out.push('-'),
+                'e' => out.push(b'-'),
                 _ => {}
             }
             continue;
@@ -448,23 +457,26 @@ fn format_access_into(out: &mut String, fmt: &str, e: &AccessEntry) {
         }
         i += 1;
         match conv {
-            'h' | 'a' => out.push_str(e.remote_ip),
-            'l' => out.push('-'),
-            'u' => out.push('-'),
+            'h' | 'a' => push_str(out, e.remote_ip),
+            'l' => out.push(b'-'),
+            'u' => match e.remote_user {
+                Some(user) if !user.is_empty() => escape_log_into(out, user.as_bytes()),
+                _ => out.push(b'-'),
+            },
             't' => {
-                out.push('[');
+                out.push(b'[');
                 format_time_into(out, "%d/%b/%Y:%H:%M:%S +0000", e.started);
-                out.push(']');
+                out.push(b']');
             }
             'r' => {
                 if e.uri.is_empty() {
-                    out.push('-');
+                    out.push(b'-');
                 } else {
-                    escape_log_into(out, e.method);
-                    out.push(' ');
+                    escape_log_into(out, e.method.as_bytes());
+                    out.push(b' ');
                     escape_log_into(out, e.uri);
-                    out.push(' ');
-                    out.push_str(e.protocol);
+                    out.push(b' ');
+                    push_str(out, e.protocol);
                 }
             }
             's' => {
@@ -472,7 +484,7 @@ fn format_access_into(out: &mut String, fmt: &str, e: &AccessEntry) {
             }
             'b' => {
                 if e.bytes_sent == 0 {
-                    out.push('-');
+                    out.push(b'-');
                 } else {
                     let _ = write!(out, "{}", e.bytes_sent);
                 }
@@ -486,20 +498,27 @@ fn format_access_into(out: &mut String, fmt: &str, e: &AccessEntry) {
             'B' => {
                 let _ = write!(out, "{}", e.bytes_sent);
             }
-            'v' => escape_log_into(out, e.server_name),
+            'v' => escape_log_into(out, e.server_name.as_bytes()),
             'p' => {
                 let _ = write!(out, "{}", e.local_port);
             }
-            'U' => escape_log_into(out, e.uri.split('?').next().unwrap_or("/")),
+            'U' => {
+                let path_end = e
+                    .uri
+                    .iter()
+                    .position(|byte| *byte == b'?')
+                    .unwrap_or(e.uri.len());
+                escape_log_into(out, &e.uri[..path_end]);
+            }
             'q' => {
-                if let Some(q) = e.uri.split_once('?').map(|(_, q)| q) {
-                    out.push('?');
-                    escape_log_into(out, q);
+                if let Some(query_start) = e.uri.iter().position(|byte| *byte == b'?') {
+                    out.push(b'?');
+                    escape_log_into(out, &e.uri[query_start + 1..]);
                 }
             }
-            'm' => out.push_str(e.method),
-            'H' => out.push_str(e.protocol),
-            'A' => out.push_str(e.local_ip),
+            'm' => push_str(out, e.method),
+            'H' => push_str(out, e.protocol),
+            'A' => push_str(out, e.local_ip),
             'D' => {
                 let _ = write!(out, "{}", e.started.elapsed().as_micros());
             }
@@ -509,16 +528,16 @@ fn format_access_into(out: &mut String, fmt: &str, e: &AccessEntry) {
             'P' => {
                 let _ = write!(out, "{}", std::process::id());
             }
-            '%' => out.push('%'),
+            '%' => out.push(b'%'),
             _ => {
-                out.push('%');
-                out.push(conv);
+                out.push(b'%');
+                out.push(conv as u8);
             }
         }
     }
 }
 
-fn format_time_into(out: &mut String, arg: &str, started: Instant) {
+fn format_time_into(out: &mut Vec<u8>, arg: &str, started: Instant) {
     match arg {
         "msec" | "msec_frac" => {
             let _ = write!(out, "{}", started.elapsed().as_millis());
@@ -529,7 +548,7 @@ fn format_time_into(out: &mut String, arg: &str, started: Instant) {
         "sec" => {
             let _ = write!(out, "{}", started.elapsed().as_secs());
         }
-        "%d/%b/%Y:%H:%M:%S +0000" => with_common_log_time(started, |s| out.push_str(s)),
+        "%d/%b/%Y:%H:%M:%S +0000" => with_common_log_time(started, |s| push_str(out, s)),
         _ => strftime_common_into(out, arg, started),
     }
 }
@@ -540,11 +559,11 @@ fn strftime_secs(fmt: &str, secs: i64) -> String {
     out
 }
 
-fn strftime_common_into(out: &mut String, fmt: &str, started: Instant) {
+fn strftime_common_into(out: &mut Vec<u8>, fmt: &str, started: Instant) {
     // Convert Instant to wall clock approximately: the only fields used by
     // standard formats are date/time, so use the current time adjusted by
     // elapsed milliseconds (adequate for sub-second request logging).
-    strftime_secs_into(out, fmt, request_start_secs(started));
+    push_str(out, &strftime_secs(fmt, request_start_secs(started)));
 }
 
 fn strftime_secs_into(out: &mut String, fmt: &str, secs: i64) {
@@ -626,7 +645,8 @@ mod tests {
             local_port: 8080,
             server_name: "example.com",
             method: "GET",
-            uri: "/a?b=1",
+            uri: b"/a?b=1",
+            remote_user: Some("alice"),
             protocol: "HTTP/1.1",
             status: 200,
             bytes_sent: 0,
@@ -641,13 +661,13 @@ mod tests {
             "%h %a %l %u %{Referer}i %{User-Agent}i %{Host}i %{Other}i %b %B %I %v %p %U %q %m %H %A %r %% %Z",
             &e,
         );
-        assert!(s.starts_with("192.0.2.1 192.0.2.1 - - - "));
+        assert!(s.starts_with("192.0.2.1 192.0.2.1 - alice - "));
         assert!(s.contains(
             "ua\\\"x example.com - - 0 7 example.com 8080 /a ?b=1 GET HTTP/1.1 127.0.0.1"
         ));
         assert!(s.ends_with("% %Z"));
 
-        let empty = AccessEntry { uri: "", ..e };
+        let empty = AccessEntry { uri: b"", ..e };
         assert!(format_access("%r %q", &empty).starts_with("- "));
         assert_eq!(format_access("trailing%", &empty), "trailing%");
         assert_eq!(format_access("%{unclosed", &empty), "%");
@@ -658,6 +678,15 @@ mod tests {
         assert_eq!(format_access("%{Referer}", &empty), "");
         assert_eq!(format_access("%<s", &empty), "200");
         assert!(format_access("%D %T %P", &empty).split_whitespace().count() == 3);
+
+        let raw = AccessEntry {
+            uri: b"/raw?x=\xff\xfe",
+            ..empty
+        };
+        assert_eq!(
+            format_access_bytes("%r|%U|%q|%u", &raw),
+            b"GET /raw?x=\xff\xfe HTTP/1.1|/raw|?x=\xff\xfe|alice"
+        );
     }
 
     #[test]
@@ -669,7 +698,8 @@ mod tests {
             local_port: 80,
             server_name: "x",
             method: "GET",
-            uri: "/",
+            uri: b"/",
+            remote_user: None,
             protocol: "HTTP/1.1",
             status: 200,
             bytes_sent: 0,
@@ -699,7 +729,8 @@ mod tests {
             local_port: 80,
             server_name: "example.com",
             method: "GET",
-            uri: "/a?b=1",
+            uri: b"/a?b=1",
+            remote_user: None,
             protocol: "HTTP/1.1",
             status: 200,
             bytes_sent: 42,
@@ -779,7 +810,8 @@ mod tests {
             local_port: 80,
             server_name: "example.test",
             method: "GET",
-            uri: "/",
+            uri: b"/",
+            remote_user: None,
             protocol: "HTTP/1.1",
             status: 200,
             bytes_sent: 5,

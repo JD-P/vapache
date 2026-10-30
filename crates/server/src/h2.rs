@@ -879,9 +879,11 @@ async fn handle_stream(
         framing: crate::verified::BodyFraming::None,
     };
     let peer = cfg.client_addr(peer, &req);
-    let resp = match early {
-        Some(resp) => resp,
-        None => crate::server::dispatch_with_scheme(&cfg, &req, peer, &local_ip, local_port, true),
+    let (resp, remote_user) = match early {
+        Some(resp) => (resp, None),
+        None => crate::server::dispatch_with_scheme_and_identity(
+            &cfg, &req, peer, &local_ip, local_port, true,
+        ),
     };
     let head_only = req.is_head();
     let status = resp.status;
@@ -906,7 +908,6 @@ async fn handle_stream(
             if host.is_empty() { None } else { Some(host) },
         )
         .and_then(|v| cfg.vhosts.iter().position(|x| std::ptr::eq(x, v)));
-    let uri_text = String::from_utf8_lossy(&req.target).into_owned();
     logger.access(&AccessEntry {
         remote_ip: &peer.ip().to_string(),
         remote_port: peer.port(),
@@ -914,7 +915,8 @@ async fn handle_stream(
         local_port,
         server_name: &server_name,
         method: &req.method,
-        uri: &uri_text,
+        uri: &req.target,
+        remote_user: remote_user.as_deref(),
         protocol: req.version.as_str(),
         status,
         bytes_sent: body_sent,
