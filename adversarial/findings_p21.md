@@ -1,5 +1,12 @@
 # Pass 21 — adversarial break of HEAD `5398493` ("Harden auth files, reload, and TLS broker")
 
+> Remediation status (2026-10-30): fixed in the current tree. The in-memory
+> identity-body reader now grows its resident lease only after each body chunk
+> is received; a header-only `Content-Length` declaration retains only its
+> bounded request-head bytes. The regression
+> `in_memory_content_length_charges_only_received_body_bytes` pins the
+> actual-byte accounting and release behavior.
+
 - **Date:** 2026-10-30
 - **Subject:** `target/release/vapached` built at HEAD `5398493`. No product source was edited. The retained additions for this pass are `adversarial/p21/exploit_p21.py`, this write-up and the `adversarial/README.md` index entries.
 - **Oracle:** Apache/2.4.69 (Debian), `/usr/sbin/apache2` with `mpm_event` and `mod_reqtimeout`, loopback only.

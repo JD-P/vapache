@@ -590,7 +590,6 @@ pub fn read_request<R: Read + Write>(
                 req.body = bytes;
                 req.body_spool = spool;
             } else {
-                request_resident.reserve(n)?;
                 read_exact_into(
                     stream,
                     buf,
@@ -598,6 +597,7 @@ pub fn read_request<R: Read + Write>(
                     n,
                     body_deadline,
                     limits.body_min_rate,
+                    &mut request_resident,
                 )?;
             }
         }
@@ -693,10 +693,11 @@ fn read_exact_into<R: Read>(
     n: u64,
     deadline: Instant,
     _min_rate: u64,
+    resident: &mut ResidentLease,
 ) -> io::Result<()> {
     let n = n as usize;
-    out.reserve(n.min(1 << 20));
     let take = n.min(buf.len());
+    resident.reserve(take as u64)?;
     out.extend_from_slice(&buf[..take]);
     buf.drain(..take);
     let mut remaining = n - take;
@@ -718,6 +719,10 @@ fn read_exact_into<R: Read>(
                 "EOF in request body",
             ));
         }
+        // Charge the owned body only after bytes arrive. A Content-Length is
+        // framing metadata, not evidence that the peer has supplied memory
+        // worth reserving process-wide.
+        resident.reserve(got as u64)?;
         out.extend_from_slice(&chunk[..got]);
         remaining -= got;
     }
@@ -1566,6 +1571,68 @@ mod tests {
         let mut read = Vec::new();
         reader.read_to_end(&mut read).unwrap();
         assert_eq!(read, body);
+    }
+
+    #[test]
+    fn in_memory_content_length_charges_only_received_body_bytes() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct HeaderOnly {
+            head: Vec<u8>,
+            sent: bool,
+            budget: std::sync::Arc<ResourceBudget>,
+            observed: std::sync::Arc<AtomicU64>,
+        }
+
+        impl Read for HeaderOnly {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if !self.sent {
+                    self.sent = true;
+                    out[..self.head.len()].copy_from_slice(&self.head);
+                    return Ok(self.head.len());
+                }
+                self.observed
+                    .store(self.budget.extended_usage().1, Ordering::Release);
+                Ok(0)
+            }
+        }
+
+        impl Write for HeaderOnly {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let head = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            MAX_REQUEST_BODY_IN_MEMORY
+        )
+        .into_bytes();
+        let budget = std::sync::Arc::new(ResourceBudget::default());
+        let observed = std::sync::Arc::new(AtomicU64::new(u64::MAX));
+        let mut limits = limits();
+        limits.resource_budget = budget.clone();
+        let mut stream = HeaderOnly {
+            head: head.clone(),
+            sent: false,
+            budget: budget.clone(),
+            observed: observed.clone(),
+        };
+
+        assert!(matches!(
+            read_request(&mut stream, &mut Vec::new(), &limits, |_| {}),
+            Err(ReadError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(
+            observed.load(Ordering::Acquire),
+            2 * head.len() as u64,
+            "the declaration itself must not reserve resident body bytes"
+        );
+        assert_eq!(budget.extended_usage().1, 0);
     }
 
     #[test]

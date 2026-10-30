@@ -11,13 +11,13 @@ use crate::http::{
     Body, BodyAccumulator, Request, Response, SpooledBody, Version, REQUEST_BODY_SPOOL_PREFIX,
 };
 use crate::log::{AccessEntry, Logger};
+use crate::resource::{ResidentLease, ResourceBudget};
 use crate::util::http_date_now;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, StatusCode};
 use std::io::{self, Read};
 use std::net::SocketAddr;
-use std::os::unix::fs::{FileExt, MetadataExt};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::net::TcpStream;
@@ -141,48 +141,6 @@ fn request_target(method: &str, uri: &http::Uri) -> Option<Vec<u8>> {
     admitted.then(|| path.expect("admitted path").as_str().as_bytes().to_vec())
 }
 
-/// A read-only mmap kept alive by `Bytes` for zero-copy HTTP/2 file bodies.
-struct MmapBytes {
-    ptr: *mut libc::c_void,
-    len: usize,
-}
-
-unsafe impl Send for MmapBytes {}
-unsafe impl Sync for MmapBytes {}
-
-impl MmapBytes {
-    fn new(file: &std::fs::File, len: usize) -> io::Result<Self> {
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self { ptr, len })
-    }
-}
-
-impl AsRef<[u8]> for MmapBytes {
-    fn as_ref(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
-    }
-}
-
-impl Drop for MmapBytes {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.ptr, self.len);
-        }
-    }
-}
-
 /// Positional reader for a response body.  `read_at` avoids changing the
 /// descriptor offset (and the extra `lseek` syscall) when several streams or
 /// range requests share a file.  `Read::take` + `read_to_end` fill a
@@ -201,14 +159,12 @@ impl Read for FileAt<'_> {
     }
 }
 
-/// Reuse file-body allocations across responses.  A fresh 1 MiB `Vec` is
-/// usually served by `mmap` in glibc, so allocating and freeing one per
-/// request makes the kernel zero and unmap a megabyte of pages each time.
-/// The pool keeps a bounded number of already-faulted buffers and returns one
-/// only after the last `Bytes` slice has been sent.
+/// Reuse bounded file/stream chunks across responses. The pool retains at
+/// most 4 MiB and receives a buffer only after h2 releases the last `Bytes`
+/// slice and its live response-resident lease.
 const POOL_MIN_CAPACITY: usize = 64 * 1024;
-const POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
-const POOL_MAX_TOTAL: usize = 128 * 1024 * 1024;
+const POOL_MAX_CAPACITY: usize = 64 * 1024;
+const POOL_MAX_TOTAL: usize = 4 * 1024 * 1024;
 const POOL_MAX_ENTRIES: usize = 64;
 
 #[derive(Default)]
@@ -237,6 +193,7 @@ fn take_body_buffer(len: usize) -> Vec<u8> {
 
 struct PooledBuffer {
     buf: Option<Vec<u8>>,
+    _resident: ResidentLease,
 }
 
 impl AsRef<[u8]> for PooledBuffer {
@@ -264,11 +221,25 @@ impl Drop for PooledBuffer {
     }
 }
 
-fn read_range(file: &std::fs::File, offset: u64, len: usize) -> io::Result<Bytes> {
+fn response_chunk_lease(budget: &Arc<ResourceBudget>, len: usize) -> io::Result<ResidentLease> {
+    let mut resident = budget.try_response_bytes();
+    resident.reserve(len as u64)?;
+    Ok(resident)
+}
+
+fn read_range(
+    file: &std::fs::File,
+    offset: u64,
+    len: usize,
+    resident: ResidentLease,
+) -> io::Result<Bytes> {
     let mut buf = take_body_buffer(len);
     let reader = FileAt { file, pos: offset };
     reader.take(len as u64).read_to_end(&mut buf)?;
-    Ok(Bytes::from_owner(PooledBuffer { buf: Some(buf) }))
+    Ok(Bytes::from_owner(PooledBuffer {
+        buf: Some(buf),
+        _resident: resident,
+    }))
 }
 
 fn bad(status: u16, message: &str) -> Response {
@@ -568,109 +539,85 @@ async fn send_response(
             send_data_bounded(&mut send, Bytes::from(data), true, send_timeout).await?;
         }
         Body::Stream { mut reader, len } => {
-            let _blocking_read = cfg.resource_budget.try_blocking_read()?;
             let mut left = len;
-            let mut buf = vec![0u8; 64 * 1024];
             while left > 0 {
-                let want = left.min(buf.len() as u64) as usize;
-                let (next_reader, next_buf, result) = tokio::task::spawn_blocking(move || {
-                    let result = reader.read(&mut buf[..want]);
-                    (reader, buf, result)
-                })
-                .await
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+                let want = left.min(64 * 1024) as usize;
+                // Wait for downstream capacity before reading from the
+                // upstream. A zero-window client therefore owns neither a
+                // response buffer nor a process-wide blocking-read lease.
+                let capacity = send_capacity(&mut send, want, Instant::now() + send_timeout)
+                    .await?
+                    .min(want);
+                let resident = response_chunk_lease(&cfg.resource_budget, capacity)?;
+                let blocking_read = cfg.resource_budget.try_blocking_read()?;
+                let (next_reader, mut buf, resident, result) =
+                    tokio::task::spawn_blocking(move || {
+                        let _blocking_read = blocking_read;
+                        let mut buf = take_body_buffer(capacity);
+                        buf.resize(capacity, 0);
+                        let result = reader.read(&mut buf[..capacity]);
+                        (reader, buf, resident, result)
+                    })
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
                 reader = next_reader;
-                buf = next_buf;
                 let n = result.map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
                 if n == 0 {
-                    send_data_bounded(&mut send, Bytes::new(), true, send_timeout).await?;
+                    send.send_data(Bytes::new(), true).map_err(send_io_error)?;
                     return Ok(sent);
                 }
+                buf.truncate(n);
                 left -= n as u64;
                 sent += n as u64;
-                send_data_bounded(
-                    &mut send,
-                    Bytes::copy_from_slice(&buf[..n]),
-                    left == 0,
-                    send_timeout,
-                )
-                .await?;
+                let data = Bytes::from_owner(PooledBuffer {
+                    buf: Some(buf),
+                    _resident: resident,
+                });
+                send.send_data(data, left == 0).map_err(send_io_error)?;
             }
         }
-        Body::File { file, offset, len } => {
-            // A synchronous read on this connection's current-thread runtime
-            // blocks every other stream on the same HTTP/2 connection.  For
-            // the common large-file case, read the representation on the
-            // blocking pool so multiplexed streams keep making progress.
+        Body::File {
+            mut file,
+            offset,
+            len,
+        } => {
+            // Reserve downstream capacity before materializing each bounded
+            // file chunk. This keeps zero-window streams allocation-free and
+            // attaches resident accounting to every chunk queued in h2.
             const OFFLOAD_MIN: u64 = 256 * 1024;
-            const OFFLOAD_MAX: u64 = 8 * 1024 * 1024;
-            if len >= OFFLOAD_MIN && len <= OFFLOAD_MAX {
-                let blocking_read = cfg.resource_budget.try_blocking_read()?;
-                let data = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
-                    let _blocking_read = blocking_read;
-                    // Range responses can start mid-file; only the common
-                    // full-file case can be mapped from offset zero.  Mapping
-                    // a file the server itself may write is avoided: a
-                    // concurrent truncate would turn into SIGBUS.
-                    if offset == 0 {
-                        if let Ok(meta) = file.metadata() {
-                            let euid = unsafe { libc::geteuid() } as u32;
-                            if vapache_verified::mmap_read_allowed(
-                                meta.len(),
-                                len,
-                                meta.uid(),
-                                euid,
-                                meta.mode(),
-                            ) {
-                                if let Ok(map) = MmapBytes::new(&file, len as usize) {
-                                    return Ok(Bytes::from_owner(map));
-                                }
-                            }
-                        }
-                    }
-                    let buf = read_range(&file, offset, len as usize)?;
-                    if buf.len() != len as usize {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "short HTTP/2 file read",
-                        ));
-                    }
-                    Ok(buf)
-                })
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
-                sent = data.len() as u64;
-                send_data_bounded(&mut send, data, true, send_timeout).await?;
-            } else if len < OFFLOAD_MIN {
-                let buf = read_range(&file, offset, len as usize)?;
-                if buf.len() != len as usize {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "short HTTP/2 file read",
-                    ));
+            const CHUNK: u64 = 64 * 1024;
+            let offload = len >= OFFLOAD_MIN;
+            let mut left = len;
+            let mut pos = offset;
+            while left > 0 {
+                let want = left.min(CHUNK) as usize;
+                let capacity = send_capacity(&mut send, want, Instant::now() + send_timeout)
+                    .await?
+                    .min(want);
+                let resident = response_chunk_lease(&cfg.resource_budget, capacity)?;
+                let data = if offload {
+                    let blocking_read = cfg.resource_budget.try_blocking_read()?;
+                    let (next_file, data) = tokio::task::spawn_blocking(move || {
+                        let _blocking_read = blocking_read;
+                        let data = read_range(&file, pos, capacity, resident);
+                        (file, data)
+                    })
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+                    file = next_file;
+                    data?
+                } else {
+                    read_range(&file, pos, capacity, resident)?
+                };
+                let filled = data.len();
+                if filled == 0 {
+                    send.send_data(Bytes::new(), true).map_err(send_io_error)?;
+                    return Ok(sent);
                 }
-                sent = buf.len() as u64;
-                send_data_bounded(&mut send, buf, true, send_timeout).await?;
-            } else {
-                const BATCH: u64 = 1024 * 1024;
-                let mut left = len;
-                let mut pos = offset;
-                while left > 0 {
-                    let want =
-                        vapache_verified::h2_batch_len(left, BATCH).min(usize::MAX as u64) as usize;
-                    let buf = read_range(&file, pos, want)?;
-                    let filled = buf.len();
-                    if filled == 0 {
-                        break;
-                    }
-                    left -= filled as u64;
-                    pos = pos.saturating_add(filled as u64);
-                    sent += filled as u64;
-                    send_data_bounded(&mut send, buf, left == 0, send_timeout).await?;
-                }
-                if sent == 0 {
-                    send_data_bounded(&mut send, Bytes::new(), true, send_timeout).await?;
-                }
+                left -= filled as u64;
+                pos = pos.saturating_add(filled as u64);
+                sent += filled as u64;
+                send.send_data(data, left == 0).map_err(send_io_error)?;
             }
         }
     }
@@ -1755,8 +1702,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn response_sender_covers_stream_and_every_file_strategy() {
-        use std::os::unix::fs::PermissionsExt;
-
         let (cfg, _logger, dir) = test_config("response-bodies");
         let mut stream = Response::new(200);
         stream.body = Body::Stream {
@@ -1794,7 +1739,6 @@ mod tests {
         let medium_path = dir.join("medium.bin");
         let medium = vec![b'm'; 300 * 1024 + 1];
         fs::write(&medium_path, &medium).unwrap();
-        fs::set_permissions(&medium_path, fs::Permissions::from_mode(0o444)).unwrap();
         let mut mapped = Response::new(200);
         mapped.body = Body::File {
             file: File::open(&medium_path).unwrap(),
@@ -1850,7 +1794,128 @@ mod tests {
         };
         assert!(response_round_trip(cfg, read_error, false).await.0.is_err());
 
-        assert!(MmapBytes::new(&File::open("/dev/null").unwrap(), 1).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn zero_window_stream_waits_before_reading_or_taking_a_global_lease() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountingReader(Arc<AtomicU64>);
+
+        impl Read for CountingReader {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                out.fill(b'x');
+                Ok(out.len())
+            }
+        }
+
+        let (cfg, _logger, dir) = test_config("zero-window-stream");
+        let reads = Arc::new(AtomicU64::new(0));
+        let mut body = Response::new(200);
+        body.body = Body::Stream {
+            reader: Box::new(CountingReader(reads.clone())),
+            len: 300 * 1024,
+        };
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server_cfg = cfg.clone();
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (_, respond) = connection.accept().await.unwrap().unwrap();
+            let sender = send_response(respond, &server_cfg, body, false);
+            tokio::pin!(sender);
+            loop {
+                tokio::select! {
+                    result = &mut sender => break result,
+                    accepted = connection.accept() => {
+                        if accepted.is_none() {
+                            break Err(io::Error::new(io::ErrorKind::BrokenPipe, "client closed"));
+                        }
+                    }
+                }
+            }
+        });
+        let mut builder = h2::client::Builder::new();
+        builder.initial_window_size(0);
+        let (mut client, connection) = builder.handshake::<_, Bytes>(client_io).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+        let request = http::Request::builder()
+            .uri("https://localhost/body")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(reads.load(Ordering::Acquire), 0);
+        let usage = cfg.resource_budget.extended_usage();
+        assert_eq!(usage.2, 0, "zero-window stream allocated response bytes");
+        assert_eq!(usage.3, 0, "zero-window stream pinned a blocking read");
+
+        drop(response);
+        drop(client);
+        driver.abort();
+        server.abort();
+        let _ = driver.await;
+        let _ = server.await;
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn zero_window_file_is_not_read_before_capacity() {
+        let (cfg, _logger, dir) = test_config("zero-window-file");
+        let mut body = Response::new(200);
+        // A pre-capacity read of this advertised mid-sized body reaches EOF
+        // immediately. The secure ordering leaves the sender pending on the
+        // zero flow-control window without touching the descriptor.
+        body.body = Body::File {
+            file: File::open("/dev/null").unwrap(),
+            offset: 0,
+            len: 300 * 1024,
+        };
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server_cfg = cfg.clone();
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (_, respond) = connection.accept().await.unwrap().unwrap();
+            let sender = send_response(respond, &server_cfg, body, false);
+            tokio::pin!(sender);
+            loop {
+                tokio::select! {
+                    result = &mut sender => break result,
+                    accepted = connection.accept() => {
+                        if accepted.is_none() {
+                            break Err(io::Error::new(io::ErrorKind::BrokenPipe, "client closed"));
+                        }
+                    }
+                }
+            }
+        });
+        let mut builder = h2::client::Builder::new();
+        builder.initial_window_size(0);
+        let (mut client, connection) = builder.handshake::<_, Bytes>(client_io).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+        let request = http::Request::builder()
+            .uri("https://localhost/body")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(!server.is_finished(), "file was read before send capacity");
+        let usage = cfg.resource_budget.extended_usage();
+        assert_eq!((usage.2, usage.3), (0, 0));
+
+        drop(response);
+        drop(client);
+        driver.abort();
+        server.abort();
+        let _ = driver.await;
+        let _ = server.await;
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1954,23 +2019,6 @@ mod tests {
         base.extend_from_slice(&[0x04, 0x0b]);
         base.extend_from_slice(b"/path#admin");
         raw_malformed_request_is_rejected(base).await;
-    }
-
-    #[test]
-    fn mmap_policy_rejects_writable_and_short_files() {
-        // Only a file with no write bits at all is safe: an owner (including
-        // a different uid) or group member could truncate it mid-map.
-        assert!(vapache_verified::mmap_read_allowed(10, 10, 0, 33, 0o444));
-        assert!(!vapache_verified::mmap_read_allowed(10, 10, 0, 33, 0o644));
-        assert!(!vapache_verified::mmap_read_allowed(10, 10, 33, 33, 0o644));
-        assert!(!vapache_verified::mmap_read_allowed(10, 10, 0, 33, 0o664));
-        assert!(!vapache_verified::mmap_read_allowed(10, 10, 0, 33, 0o646));
-        assert!(!vapache_verified::mmap_read_allowed(10, 10, 0, 33, 0o600));
-        assert!(!vapache_verified::mmap_read_allowed(10, 10, 0, 33, 0o640));
-
-        // Never map beyond the representation length.
-        assert!(!vapache_verified::mmap_read_allowed(9, 10, 0, 33, 0o444));
-        assert!(vapache_verified::mmap_read_allowed(10, 0, 0, 33, 0o444));
     }
 
     #[test]
@@ -2139,21 +2187,6 @@ mod tests {
     }
 
     #[test]
-    fn mmap_owner_exposes_file_bytes() {
-        let dir = std::env::temp_dir().join(format!("vapache-h2-mmap-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("body.bin");
-        let bytes = vec![0x5au8; 300 * 1024];
-        fs::write(&path, &bytes).unwrap();
-        let file = File::open(&path).unwrap();
-        let map = MmapBytes::new(&file, bytes.len()).unwrap();
-        assert_eq!(map.as_ref(), &bytes[..]);
-        drop(map);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn positional_read_range_does_not_depend_on_the_file_offset() {
         let dir = std::env::temp_dir().join(format!("vapache-h2-range-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -2161,12 +2194,13 @@ mod tests {
         let path = dir.join("body.bin");
         fs::write(&path, b"0123456789").unwrap();
         let file = File::open(&path).unwrap();
+        let budget = Arc::new(ResourceBudget::default());
 
-        let middle = read_range(&file, 3, 5).unwrap();
+        let middle = read_range(&file, 3, 5, response_chunk_lease(&budget, 5).unwrap()).unwrap();
         assert_eq!(&middle[..], b"34567");
-        let whole = read_range(&file, 0, 10).unwrap();
+        let whole = read_range(&file, 0, 10, response_chunk_lease(&budget, 10).unwrap()).unwrap();
         assert_eq!(&whole[..], b"0123456789");
-        let short = read_range(&file, 8, 5).unwrap();
+        let short = read_range(&file, 8, 5, response_chunk_lease(&budget, 5).unwrap()).unwrap();
         assert_eq!(&short[..], b"89");
 
         fs::remove_dir_all(&dir).unwrap();

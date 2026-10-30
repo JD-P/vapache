@@ -1020,7 +1020,7 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | FastCGI response head | bounded prefix/header scan before body streaming |
 | Aggregate dynamic I/O | RAII byte/file reservations across request, response, CGI-worker and FastCGI/proxy spools; 128 MiB request and response resident ceilings; shared CGI/FastCGI concurrency slots; 32 blocking reads |
 | HTTP/1 response framing | the writer discards caller `Content-Length`/`Transfer-Encoding`, emits the computed length, and treats a short file body as a connection-closing error |
-| HTTP/2 | verified settings, header-state, flow-control and reset budgets; at most 32 streams per connection, 64 per validated effective-client quota key and 256 process-wide, each with a 64 KiB resident body prefix before using the shared request-spool quota |
+| HTTP/2 | verified settings, header-state, flow-control and reset budgets; at most 32 streams per connection, 64 per validated effective-client quota key and 256 process-wide, each with a 64 KiB resident request-body prefix before using the shared request-spool quota. Response file/stream reads wait for assigned flow-control capacity, use at most 64 KiB per chunk, retain response-resident accounting until h2 releases the chunk, and hold blocking-read leases only during the actual read |
 | Compression/PCRE/password hashing | fixed input/cost bounds and a shared 32-operation CPU-work admission gate; optional compression falls back to identity under pressure |
 | Autoindex | at most 4096 examined directory records (including filtered names), 4096 rendered entries and 4 MiB of generated HTML |
 | DNS authorization | eight resolver workers, queue length 64, two-second caller deadline and bounded copied host operands |

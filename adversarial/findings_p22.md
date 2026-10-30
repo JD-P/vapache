@@ -1,5 +1,12 @@
 # Pass 22 — adversarial break of HEAD `5398493` (HTTP/2 zero-window response holds)
 
+> Remediation status (2026-10-30): fixed in the current tree. File and stream
+> responses wait for assigned HTTP/2 capacity before reading, allocate at most
+> a 64 KiB chunk, and keep that chunk charged to the response-resident budget
+> until h2 releases it. Blocking-read leases now cover one actual read only,
+> never a flow-control wait. The two `zero_window_*` regressions pin both
+> ordering and lease behavior.
+
 - **Date:** 2026-10-30
 - **Subject:** `target/release/vapached` built at HEAD `5398493`. No product source was edited. The retained additions for this pass are `adversarial/p22/exploit_p22.py`, this write-up and the `adversarial/README.md` index entries.
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` with `mod_http2`, `mod_ssl` and `mod_proxy_http`, loopback only.
