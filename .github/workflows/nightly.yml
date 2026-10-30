@@ -47,7 +47,7 @@ jobs:
           FUZZ_TARGETS: ${{ matrix.target }}
           FUZZ_SECONDS_PER_TARGET: ${{ inputs.fuzz_seconds || '900' }}
         run: tests/fuzz_campaign.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: fuzz-${{ matrix.target }}
@@ -116,7 +116,7 @@ jobs:
         run: >-
           cargo llvm-cov --workspace --all-features --branch --lcov
           --output-path branch-coverage.lcov
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: branch-coverage
           path: branch-coverage.lcov

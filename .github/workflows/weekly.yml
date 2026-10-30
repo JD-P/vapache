@@ -23,7 +23,7 @@ jobs:
         env:
           MUTATION_TIMEOUT: 360
         run: tests/mutation.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: mutation-results
@@ -60,7 +60,7 @@ jobs:
         run: cargo cyclonedx --all --format json
       - name: Public API compatibility
         run: cargo semver-checks check-release --baseline-rev HEAD~1
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: "**/*.cdx.json"
@@ -95,7 +95,7 @@ jobs:
         run: |
           python3 bench/bench.py --quick
           python3 tests/performance_regression.py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: performance-results
