@@ -71,14 +71,20 @@ Implemented today:
   `AuthGroupFile`, `Require valid-user`, `Require user` and `Require group`)
   with Apache-compatible `$apr1$`, `$1$`, bcrypt, `{SHA}` and `{SSHA}`
   htpasswd hashes. Password/group files are opened nonblocking through the
-  no-symlink resolver, must be bounded regular files, and are accepted only
-  while the pathname still names the inode that was read. Plaintext and
-  unknown hash formats fail closed.
+  no-symlink resolver, must be bounded strict UTF-8 regular files, and are
+  accepted only while the pathname still names the inode that was read. By
+  default their parent chain and file must be outside the service identity's
+  mutation authority; deployments that intentionally update them as the
+  service account must opt in with `VapacheCapability MutableAuthFiles On`.
+  Plaintext and unknown hash formats fail closed.
 - TLS 1.2/1.3 via Rustls with `SSLEngine`, certificate chains, SNI virtual-host
   certificate selection, ALPN and `-t` certificate validation on startup.
   A root-started daemon retains a minimal pre-thread TLS file broker whose
   numeric allowlist is fixed by the startup configuration, so SIGHUP can
   rotate root-only keys without restoring arbitrary root pathname access.
+  The broker closes every unrelated descriptor and standard stream, disables
+  dumps and privilege acquisition, installs tight core/file/descriptor/CPU/
+  address-space limits, and runs under a read-only seccomp syscall allowlist.
 - HTTP/2 over TLS (ALPN `h2`) with bounded header/stream limits, Apache
   request/body limits, content-length validation, CGI POST, ranges and HEAD.
   Request bodies retain at most a 64 KiB prefix per stream and then use the
@@ -160,7 +166,8 @@ Implemented today:
   `MaxRequestWorkers`/`ListenBacklog`, graceful `SIGHUP` reload with listener
   reuse, `SIGUSR1` log reopen, `-k graceful`/`graceful-stop` with connection
   draining, pidfd-based control actions bound to the daemon's boot/start/exe
-  identity, pre-thread daemonization, reload cache isolation, retained
+  identity, pre-thread daemonization, transactional reload preparation for
+  logs, TLS and background workers, reload cache isolation, retained
   root-ownership/parent trust for every administrative input, and rejection
   of reload-only changes to process identity, listeners, pid file, server root
   or listen backlog. Hard absolute body deadlines and
@@ -242,7 +249,7 @@ The security kernels live in `crates/verified` and are checked with Verus:
 cargo verus verify -p vapache-verified
 ```
 
-Current result: **494 verified functions, 0 errors** (percent-decoding,
+Current result: **498 verified functions, 0 errors** (percent-decoding,
 URI path canonicalization, request-head parsing and body framing, header-value
 sanitization, token validation, proxy request-line/header admission, byte-range
 arithmetic, the mmap/CGI protocol bounds, HTTP/2 method/head/body admission,
@@ -302,6 +309,7 @@ opts in with `VapacheCapability <name> On`:
 | `Trace` | `TraceEnable On`/`Extended` and the TRACE reflection handler |
 | `AccessFiles` | any effective `AllowOverride`/`AllowOverrideList` access-file walk |
 | `LegacyAuthz` | `Order`, `Allow`, `Deny`, and `Satisfy`, including access files |
+| `MutableAuthFiles` | password/group databases that the service identity can replace or modify |
 | `AutoIndex` | generated directory listings from `Options Indexes` |
 | `Cgi` | `ScriptAlias`, `cgi-script`, and `Options ExecCGI` execution |
 | `FastCgi` | FastCGI `ProxyPassMatch`/`ProxyPass` and handler execution |
@@ -405,12 +413,12 @@ python3 tests/verification_status.py
 python3 tests/verification_status.py --run-verus   # include the Verus gate
 ```
 
-Current ledger: **53.8% weighted obligations**, **6/6 proof debt**,
+Current ledger: **53.7% weighted obligations**, **6/6 proof debt**,
 **8/8 grant-required sinks**, **8/8 path-target-bound sinks**, **5/8
 inode-bound sinks**, **3/8 backend-target-bound sinks**, **3/8
 policy-key-bound sinks**, **0 partially bound sinks**, **0 unexplained replay
 failures**, **108 adversarial replay cases** covering the findings classes,
-and **486 Verus functions with 0 errors** (including the I3 fast-path
+and **498 Verus functions with 0 errors** (including the I3 fast-path
 prefilter, I14 first-match, the pass-4 I35–I42 alias/limit/CGI/spool/cache/
 expression dispositions, the pass-5 I43–I46 RequireNone/vhost/canonical-peer
 kernels, the pass-6 I47–I49 access-walk/alias-root/cache-target kernels, the
@@ -567,9 +575,9 @@ failure races and privileged-kernel failures are excluded from that metric.
 
 Latest snapshot: **20,020/20,548 executable server production lines (97.43%)**;
 the new aggregate-resource module is **62/62 (100%)**. The current suite is
-492 Rust library tests, 7 CLI unit tests, 3 CLI lifecycle
+515 Rust library tests, 8 CLI unit tests, 3 CLI lifecycle
 integration tests, 165 conformance tests and 339 fixed configuration cases.
-The separate Verus gate proves 486 functions with 0 errors; proof-only code is
+The separate Verus gate proves 498 functions with 0 errors; proof-only code is
 measured by that gate rather than runtime line coverage.
 
 Known, deliberate divergences from Apache (reported by the differential run):

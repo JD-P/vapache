@@ -27,6 +27,8 @@ import base64
 import hashlib
 import http.client
 import os
+import grp
+import pwd
 import shutil
 import signal
 import socket
@@ -42,7 +44,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 VAPACHED = Path(os.environ.get("VAPACHED", ROOT / "target" / "release" / "vapached"))
 
-VAPACHE_CAPABILITIES = """VapacheCapability AbsoluteRequestTarget On
+SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
+SERVICE_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
+
+VAPACHE_CAPABILITIES = f"""User {SERVICE_USER}
+Group {SERVICE_GROUP}
+VapacheCapability AbsoluteRequestTarget On
 VapacheCapability AccessFiles On
 VapacheCapability AutoIndex On
 VapacheCapability Cgi On
@@ -53,6 +60,7 @@ VapacheCapability RewriteProgram On
 VapacheCapability ServerStatus On
 VapacheCapability Trace On
 VapacheCapability UnstableFastCgiPaths On
+VapacheCapability MutableAuthFiles On
 """
 
 
@@ -943,6 +951,8 @@ class F48AddressBoundVhostTests(unittest.TestCase):
             f"""ServerRoot "{cls.base}"
 Listen 0.0.0.0:{cls.port}
 ServerName public.local
+User {SERVICE_USER}
+Group {SERVICE_GROUP}
 PidFile "{cls.logs}/httpd.pid"
 ErrorLog "{cls.logs}/error.log"
 LogLevel warn
@@ -1041,6 +1051,8 @@ class F49IPv4MappedPeerTests(unittest.TestCase):
             f"""ServerRoot "{cls.base}"
 Listen [::]:{cls.port}
 ServerName localhost
+User {SERVICE_USER}
+Group {SERVICE_GROUP}
 PidFile "{cls.logs}/httpd.pid"
 ErrorLog "{cls.logs}/error.log"
 LogLevel warn

@@ -23,8 +23,8 @@ Compatibility features that expand parsing, filesystem discovery, generated
 content, or execution are off by default. `VapacheCapability NAME On` is valid
 only in global server context. The supported names are
 `AbsoluteRequestTarget`, `AccessFiles`, `AutoIndex`, `Cgi`, `FastCgi`,
-`LegacyAuthz`, `RequestTrailers`, `RewriteProgram`, `ServerStatus`, `Trace`,
-and `UnstableFastCgiPaths`.
+`LegacyAuthz`, `MutableAuthFiles`, `RequestTrailers`, `RewriteProgram`,
+`ServerStatus`, `Trace`, and `UnstableFastCgiPaths`.
 
 The compiler records every effectful use, evaluates capability declarations
 independently of directive order, and refuses startup when the final global
@@ -52,6 +52,16 @@ enable those capabilities and does not infer trust from access-file contents.
 The resulting audit artifact is marked non-runnable and rejected by request
 dispatch, so callers cannot use suppressed audit diagnostics as a startup
 bypass.
+
+Authentication databases have a separate data-authority boundary. Both
+`AuthUserFile` and `AuthGroupFile` must be bounded strict UTF-8 regular files
+opened without following symlinks. Their complete parent chain and final file
+must be immutable to the service identity by default; file ownership is
+treated as mutation authority even when the owner-write bit is currently
+clear. `MutableAuthFiles` is an explicit compatibility opt-in for deployments
+that intentionally let the service update these databases. Startup, reload,
+and every runtime read repeat the check, including files named by access-file
+configuration.
 
 ## 1. Scope of the model
 
@@ -651,12 +661,23 @@ process is now unprivileged. Directives whose effects live in process identity,
 the pid guard, path base or kernel listeners require a full restart instead of
 creating a configuration/runtime split.
 
+Reload itself uses a prepare/commit boundary. The candidate logger, listener
+clones, complete TLS configuration, initial OCSP state and pending refresh
+workers are prepared before any live generation changes. A preparation error
+rejects the whole candidate; it cannot combine new policy with old logs or
+stop the old health-check generation. Only after every fallible step succeeds
+are OCSP/health workers activated, the configuration/logger/listener set
+swapped, and the cache generation invalidated.
+
 TLS is the one root-only input that must support same-path rotation during a
 graceful reload. Before threads and privilege drop, the parent forks a broker
 with an exact numeric allowlist of TLS paths compiled from the startup
 configuration. The helper accepts no pathname from the request process, closes
-unrelated inherited descriptors, rechecks root ownership, type, size and stable
-metadata on every read, and exits when its parent does. A reload may replace
+unrelated inherited descriptors and standard streams, disables dumps and new
+privileges, applies tight rlimits, and installs a seccomp allowlist limited to
+bounded file reads, memory management and its existing socket. It rechecks
+root ownership, type, size and stable metadata on every read, and exits when
+its parent does. A reload may replace
 the contents at an already-authorized path; adding a different TLS pathname
 requires a full restart.
 
@@ -1004,7 +1025,7 @@ The bound is part of the protocol adapter, not an incidental `Vec` limit:
 | Autoindex | at most 4096 examined directory records (including filtered names), 4096 rendered entries and 4 MiB of generated HTML |
 | DNS authorization | eight resolver workers, queue length 64, two-second caller deadline and bounded copied host operands |
 | Expression `file()` | confined regular descriptor, `O_NONBLOCK`/`O_NOFOLLOW`, 64 KiB read ceiling |
-| Administrative inputs | no-symlink regular descriptors with stable before/after metadata; retained root trust and service-nonwritable parents across reload; 4 MiB per configuration/certificate/TypesConfig file, 1 MiB per key/envvars file, existing RewriteMap limit, and 16 MiB aggregate configuration text |
+| Administrative inputs | no-symlink regular descriptors with stable before/after metadata; retained root trust and service-nonwritable parents across reload; authentication databases additionally require strict UTF-8 and service-immutable parents/files unless `MutableAuthFiles` is enabled; 4 MiB per configuration/certificate/TypesConfig/auth file, 1 MiB per key/envvars file, existing RewriteMap limit, and 16 MiB aggregate configuration text |
 
 A malformed or over-limit stream produces an error response or connection
 close; request-spool exhaustion specifically produces `503` and releases its
@@ -1671,7 +1692,7 @@ performs the interleaving.  Production dispatch, cache and websocket paths
 call this evaluator, so configuration/access-file ordering equivalence is by
 construction: there is no second production interleaver.
 
-`crates/verified` now reports **486 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
+`crates/verified` now reports **498 verified functions, 0 errors**.  The following pieces are Verus-checked; items marked model-only await a runtime projection/refinement:
 
 - `PolicyResult`, `combine_and`, `combine_or`, `combine_or_all`,
   `require_none_result`, `require_none_multi`, `require_none_multi_result`.
@@ -2079,7 +2100,7 @@ python3 tests/verification_status.py --run-verus
 
 The current ledger (2026-10-29) is:
 
-- weighted obligations: **35.5 / 66.0 (53.8%)** if partial obligations receive
+- weighted obligations: **36.0 / 67.0 (53.7%)** if partial obligations receive
   half credit;
 - proof debt: **6 / 6** — 0 named unverified security components, 0 partially
   bound sinks, 6 assumptions and 0 accepted unmodeled security-directive
@@ -2088,7 +2109,7 @@ The current ledger (2026-10-29) is:
   inode-bound, **3/8** backend-target-bound, **3/8** policy-key-bound;
 - unexplained adversarial replay failures: **0** (the CVE replay corpus is
   not yet systematic; the separate finding-replay suite covers F23–P18);
-- Verus: **486 functions, 0 errors**, with no `assume` or `external_body`
+- Verus: **498 functions, 0 errors**, with no `assume` or `external_body`
   proof escapes.
 
 The gate fails when proof debt exceeds its budget, the weighted score drops

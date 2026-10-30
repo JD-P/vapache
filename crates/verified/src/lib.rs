@@ -9561,6 +9561,42 @@ pub proof fn disabled_capability_rejects_request()
 {
 }
 
+/// An authentication database is immutable to the request-serving identity
+/// only when its complete parent chain is protected, the service does not own
+/// the file (an owner can restore write permission), and no less-trusted Unix
+/// write class is enabled.
+pub open spec fn auth_file_immutable_spec(
+    parent_chain_immutable: bool,
+    owner_is_service: bool,
+    group_or_other_writable: bool,
+) -> bool {
+    parent_chain_immutable && !owner_is_service && !group_or_other_writable
+}
+
+pub fn auth_file_immutable_admit(
+    parent_chain_immutable: bool,
+    owner_is_service: bool,
+    group_or_other_writable: bool,
+) -> (ok: bool)
+    ensures ok == auth_file_immutable_spec(
+        parent_chain_immutable,
+        owner_is_service,
+        group_or_other_writable,
+    ),
+{
+    parent_chain_immutable && !owner_is_service && !group_or_other_writable
+}
+
+pub proof fn service_owned_auth_file_is_mutable(group_or_other_writable: bool)
+    ensures !auth_file_immutable_spec(true, true, group_or_other_writable),
+{
+}
+
+pub proof fn writable_auth_file_is_mutable(owner_is_service: bool)
+    ensures !auth_file_immutable_spec(true, owner_is_service, true),
+{
+}
+
 /// P17 hardening: a pathname component is stable against a configured local
 /// FastCGI backend only when the backend is not root, the component has a
 /// trusted owner, and no untrusted write class can replace or modify it.

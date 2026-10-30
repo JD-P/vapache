@@ -2447,7 +2447,11 @@ fn authorize_failover(
         resource.fs_path.as_deref(),
     );
     if access == crate::access::Access::AuthRequired {
-        if let Some(id) = crate::auth::authenticate(&next_scope, req) {
+        if let Some(id) = crate::auth::authenticate(
+            &next_scope,
+            req,
+            cfg.capability_enabled(crate::config::Capability::MutableAuthFiles),
+        ) {
             identity = Some(id);
             access = crate::access::check(
                 &next_scope,
@@ -5196,7 +5200,7 @@ mod coverage_tests {
         std::fs::write(
             &config_path,
             format!(
-                "Listen 127.0.0.1:0\n<Proxy http://127.0.0.1:{port}>\nRequire valid-user\nAuthType Basic\nAuthName test\nAuthUserFile {}\n</Proxy>\n",
+                "VapacheCapability MutableAuthFiles On\nListen 127.0.0.1:0\n<Proxy http://127.0.0.1:{port}>\nRequire valid-user\nAuthType Basic\nAuthName test\nAuthUserFile {}\n</Proxy>\n",
                 password.display()
             ),
         )
@@ -5277,7 +5281,7 @@ mod coverage_tests {
         std::fs::write(
             &config_path,
             format!(
-                "Listen 127.0.0.1:0\n<Proxy balancer://{balancer}>\nBalancerMember http://127.0.0.1:{dead_port}\nBalancerMember http://127.0.0.1:{second_port}\n</Proxy>\n<Proxy http://127.0.0.1:{second_port}>\nRequire valid-user\nAuthType Basic\nAuthName test\nAuthUserFile {}\n</Proxy>\n",
+                "VapacheCapability MutableAuthFiles On\nListen 127.0.0.1:0\n<Proxy balancer://{balancer}>\nBalancerMember http://127.0.0.1:{dead_port}\nBalancerMember http://127.0.0.1:{second_port}\n</Proxy>\n<Proxy http://127.0.0.1:{second_port}>\nRequire valid-user\nAuthType Basic\nAuthName test\nAuthUserFile {}\n</Proxy>\n",
                 password.display()
             ),
         )

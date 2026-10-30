@@ -21,6 +21,8 @@ import gzip
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
+import grp
+import pwd
 import shutil
 import signal
 import socket
@@ -57,6 +59,8 @@ OCSP_RESPONDER_PORT = int(os.environ.get("VAPACHE_OCSP_RESPONDER_PORT", "18448")
 OCSP_SERVER = None
 OCSP_RESPONSE = None
 OCSP_REQUESTS = 0
+SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
+SERVICE_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
 
 DIFFS = []
 PROCS = []
@@ -472,7 +476,16 @@ def tree():
     )
     ocsp_index = BASE / "ocsp-index.txt"
     expiry = time.strftime("%y%m%d%H%M%SZ", time.gmtime(time.time() + 2 * 86400))
-    ocsp_index.write_text(f"V\t{expiry}\t\t01\tunknown\t/CN=ocsp.test\n")
+    serial_output = subprocess.run(
+        ["openssl", "x509", "-in", str(ocsp_cert), "-noout", "-serial"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    serial = serial_output.partition("=")[2]
+    if not serial:
+        raise RuntimeError("openssl did not report the OCSP leaf serial")
+    ocsp_index.write_text(f"V\t{expiry}\t\t{serial}\tunknown\t/CN=ocsp.test\n")
     ocsp_der = BASE / "ocsp-response.der"
     subprocess.run(
         [
@@ -752,8 +765,8 @@ def common(port, root, apache, tls_port):
         f'ServerRoot "{root}"',
         f"Listen {port}",
         f"Listen {tls_port}",
-        "User www-data",
-        "Group www-data",
+        f"User {SERVICE_USER}",
+        f"Group {SERVICE_GROUP}",
         f"PidFile {root}/logs/httpd.pid",
         f"ErrorLog {root}/logs/error.log",
         "LogLevel warn",
@@ -1108,6 +1121,7 @@ def common(port, root, apache, tls_port):
             "VapacheCapability ServerStatus On",
             "VapacheCapability Trace On",
             "VapacheCapability UnstableFastCgiPaths On",
+            "VapacheCapability MutableAuthFiles On",
         ]
     if not apache:
         # vapached records LoadModule names for <IfModule>; the paths are not
@@ -2661,7 +2675,7 @@ class OcspTests(Base):
         output = result.stdout + result.stderr
         self.assertIn(b"OCSP Response Status: successful", output)
         self.assertTrue(
-            list((BASE / "logs" / "ocsp-cache").glob("*.ocsp")),
+            list((BASE / ".vapache-ocsp-cache").glob("*.ocsp")),
             "OCSP response was not persisted",
         )
         before = OCSP_REQUESTS
@@ -2709,7 +2723,7 @@ class ConfigTests(unittest.TestCase):
     def test_strict_unknown_directive(self):
         p = BASE / "strict.conf"
         p.write_text(
-            f"ServerRoot \"{BASE}\"\nListen 19999\nUser root\nGroup root\n"
+            f"ServerRoot \"{BASE}\"\nListen 19999\nUser {SERVICE_USER}\nGroup {SERVICE_GROUP}\n"
             f"PidFile {BASE}/logs/x.pid\nErrorLog {BASE}/logs/e.log\n"
             "TotallyMadeUpDirective on\n"
         )
@@ -2725,7 +2739,7 @@ class ConfigTests(unittest.TestCase):
     def test_ssl_configtest_rejects_missing_certificate(self):
         p = BASE / "ssl-bad.conf"
         p.write_text(
-            f"ServerRoot \"{BASE}\"\nListen 19998\nUser root\nGroup root\n"
+            f"ServerRoot \"{BASE}\"\nListen 19998\nUser {SERVICE_USER}\nGroup {SERVICE_GROUP}\n"
             f"PidFile {BASE}/logs/x.pid\nErrorLog {BASE}/logs/e.log\n"
             "<VirtualHost *:19998>\n"
             "    SSLEngine on\n"
@@ -2745,7 +2759,7 @@ class ConfigTests(unittest.TestCase):
     def test_env_var_undefined(self):
         p = BASE / "var.conf"
         p.write_text(
-            "ServerRoot /tmp\nListen 19999\nUser root\nGroup root\n"
+            f"ServerRoot /tmp\nListen 19999\nUser {SERVICE_USER}\nGroup {SERVICE_GROUP}\n"
             "ErrorLog ${THIS_IS_NOT_SET}/e.log\n"
         )
         r = subprocess.run(

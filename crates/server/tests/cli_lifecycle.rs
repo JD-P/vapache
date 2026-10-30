@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -59,6 +59,7 @@ fn config_text(root: &Path, port: u16, extra: &str) -> String {
          VapacheCapability ServerStatus On\n\
          VapacheCapability Trace On\n\
          VapacheCapability UnstableFastCgiPaths On\n\
+         VapacheCapability MutableAuthFiles On\n\
          ServerRoot {root}\n\
          Listen 127.0.0.1:{port}\n\
          ServerName localhost\n\
@@ -129,6 +130,25 @@ fn read_pid(root: &Path) -> i32 {
 
 fn signal(pid: i32, sig: i32) {
     assert_eq!(unsafe { libc::kill(pid, sig) }, 0);
+}
+
+fn http_body(port: u16, path: &str) -> Vec<u8> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|split| response[split + 4..].to_vec())
+        .unwrap_or_default()
 }
 
 fn wait_success(mut child: Child) {
@@ -325,6 +345,9 @@ fn cli_information_explain_and_startup_failures() {
 fn foreground_reload_reopen_bind_and_actions() {
     let root = test_dir("foreground");
     fs::write(root.join("www/index.txt"), "ok\n").unwrap();
+    let alternate = root.join("alternate");
+    fs::create_dir_all(&alternate).unwrap();
+    fs::write(alternate.join("index.txt"), "candidate\n").unwrap();
     let port = free_port();
     let config = write_config(&root, port, "");
     let child = spawn_foreground(&root, &config, &[]);
@@ -359,16 +382,38 @@ fn foreground_reload_reopen_bind_and_actions() {
         config_text(
             &root,
             port,
-            &format!("ErrorLog {}/child.log", blocker.display()),
+            &format!(
+                "ErrorLog {}/child.log\nDocumentRoot {}\n<Directory {}>\nRequire all granted\n</Directory>",
+                blocker.display(),
+                alternate.display(),
+                alternate.display(),
+            ),
         ),
     )
     .unwrap();
     signal(pid, libc::SIGHUP);
-    thread::sleep(Duration::from_millis(150));
+    wait_until(|| {
+        fs::read_to_string(root.join("error.log"))
+            .is_ok_and(|log| log.contains("reload rejected: cannot prepare logger"))
+    });
+    assert_eq!(http_body(port, "/index.txt"), b"ok\n");
 
-    fs::write(&config, config_text(&root, port, "")).unwrap();
+    fs::write(
+        &config,
+        config_text(
+            &root,
+            port,
+            &format!(
+                "ErrorLog {}/reloaded.log\nDocumentRoot {}\n<Directory {}>\nRequire all granted\n</Directory>",
+                root.display(),
+                alternate.display(),
+                alternate.display(),
+            ),
+        ),
+    )
+    .unwrap();
     signal(pid, libc::SIGHUP);
-    thread::sleep(Duration::from_millis(150));
+    wait_until(|| http_body(port, "/index.txt") == b"candidate\n");
     assert!(output(&root, &config, &["-k", "stop"]).status.success());
     wait_success(child);
 

@@ -2481,6 +2481,7 @@ pub enum Capability {
     Cgi,
     FastCgi,
     LegacyAuthz,
+    MutableAuthFiles,
     RequestTrailers,
     RewriteProgram,
     ServerStatus,
@@ -2489,13 +2490,14 @@ pub enum Capability {
 }
 
 impl Capability {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::AbsoluteRequestTarget,
         Self::AccessFiles,
         Self::AutoIndex,
         Self::Cgi,
         Self::FastCgi,
         Self::LegacyAuthz,
+        Self::MutableAuthFiles,
         Self::RequestTrailers,
         Self::RewriteProgram,
         Self::ServerStatus,
@@ -2511,6 +2513,7 @@ impl Capability {
             Self::Cgi => "Cgi",
             Self::FastCgi => "FastCgi",
             Self::LegacyAuthz => "LegacyAuthz",
+            Self::MutableAuthFiles => "MutableAuthFiles",
             Self::RequestTrailers => "RequestTrailers",
             Self::RewriteProgram => "RewriteProgram",
             Self::ServerStatus => "ServerStatus",
@@ -2541,6 +2544,7 @@ VapacheCapability AutoIndex On\n\
 VapacheCapability Cgi On\n\
 VapacheCapability FastCgi On\n\
 VapacheCapability LegacyAuthz On\n\
+VapacheCapability MutableAuthFiles On\n\
 VapacheCapability RequestTrailers On\n\
 VapacheCapability RewriteProgram On\n\
 VapacheCapability ServerStatus On\n\
@@ -2659,6 +2663,9 @@ pub struct Config {
     /// account's control. Include globs and directories are represented by a
     /// synthetic child so an empty directory is still checked.
     admin_input_targets: Vec<PathBuf>,
+    /// Main-configuration password/group databases validated before serving.
+    /// Access-file declarations are checked on every runtime read instead.
+    auth_file_targets: Vec<PathBuf>,
     policy_cache: Arc<RwLock<BoundedPolicyCache<CachedPolicy>>>,
     dir_scope_cache: Arc<RwLock<BoundedPolicyCache<Scope>>>,
 }
@@ -2797,6 +2804,17 @@ impl Config {
                     target.display()
                 )
             })?;
+        }
+        Ok(())
+    }
+
+    /// Authentication databases are operator-controlled by default. The
+    /// explicit compatibility capability permits deployments whose service
+    /// account intentionally maintains htpasswd/group files.
+    pub fn validate_auth_files(&self, service_uid: u32) -> Result<(), String> {
+        let mutable = self.capability_enabled(Capability::MutableAuthFiles);
+        for path in &self.auth_file_targets {
+            crate::auth::validate_auth_file(path, mutable, service_uid)?;
         }
         Ok(())
     }
@@ -3829,6 +3847,7 @@ impl Compile {
             cache: CacheConfig::default(),
             admin_file_trust,
             admin_input_targets,
+            auth_file_targets: Vec::new(),
             policy_cache: Arc::new(RwLock::new(BoundedPolicyCache::default())),
             dir_scope_cache: Arc::new(RwLock::new(BoundedPolicyCache::default())),
         };
@@ -6755,19 +6774,27 @@ impl Compile {
             "authname" => scope.authorization.auth_name = Some(first()),
             "authuserfile" => {
                 let p = PathBuf::from(first());
-                scope.authorization.auth_user_file = Some(if p.is_absolute() {
+                let full = if p.is_absolute() {
                     p
                 } else {
                     self.cfg.server_root.join(p)
-                });
+                };
+                if !self.cfg.auth_file_targets.contains(&full) {
+                    self.cfg.auth_file_targets.push(full.clone());
+                }
+                scope.authorization.auth_user_file = Some(full);
             }
             "authgroupfile" => {
                 let p = PathBuf::from(first());
-                scope.authorization.auth_group_file = Some(if p.is_absolute() {
+                let full = if p.is_absolute() {
                     p
                 } else {
                     self.cfg.server_root.join(p)
-                });
+                };
+                if !self.cfg.auth_file_targets.contains(&full) {
+                    self.cfg.auth_file_targets.push(full.clone());
+                }
+                scope.authorization.auth_group_file = Some(full);
             }
             "authbasicprovider" => {
                 if !first().eq_ignore_ascii_case("file") {
@@ -9098,6 +9125,32 @@ mod tests {
         assert!(!cfg.capability_enabled(Capability::AutoIndex));
         assert!(cfg.required_capabilities.contains(&Capability::Trace));
         assert!(cfg.required_capabilities.contains(&Capability::AutoIndex));
+    }
+
+    #[test]
+    fn mutable_authentication_databases_require_the_global_capability() {
+        let auth_file =
+            std::env::temp_dir().join(format!("vapache-mutable-auth-{}", std::process::id()));
+        std::fs::write(&auth_file, "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n").unwrap();
+        let body = format!(
+            "Listen 127.0.0.1:0\n<Directory /srv>\nAuthType Basic\nAuthUserFile {}\nRequire valid-user\n</Directory>\n",
+            auth_file.display()
+        );
+        let service_uid = std::fs::metadata(&auth_file).unwrap().uid();
+        let strict = load_text_default(&body).unwrap();
+        assert!(strict.validate_auth_files(service_uid).is_err());
+        let mutable = load_text_with_prelude(
+            "VapacheCapability MutableAuthFiles On\n",
+            &body,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(mutable.validate_auth_files(service_uid).is_ok());
+
+        std::fs::write(&auth_file, b"alice:\xff\n").unwrap();
+        assert!(mutable.validate_auth_files(service_uid).is_err());
+        let _ = std::fs::remove_file(auth_file);
     }
 
     #[test]

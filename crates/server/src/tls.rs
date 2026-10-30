@@ -169,10 +169,143 @@ fn privileged_broker_child(
                 libc::close(inherited);
             }
         }
+        libc::close(0);
+        libc::close(1);
+        libc::close(2);
+        if harden_privileged_broker().is_err() {
+            libc::_exit(1);
+        }
         let mut stream = UnixStream::from_raw_fd(3);
         privileged_broker_loop(&mut stream, &specs, service_uid);
         libc::_exit(0);
     }
+}
+
+fn set_broker_limit(
+    resource: libc::__rlimit_resource_t,
+    value: libc::rlim_t,
+) -> std::io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: value,
+        rlim_max: value,
+    };
+    if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn harden_privileged_broker() -> std::io::Result<()> {
+    restrict_privileged_broker_process()?;
+    install_broker_seccomp()
+}
+
+fn restrict_privileged_broker_process() -> std::io::Result<()> {
+    set_broker_limit(libc::RLIMIT_CORE, 0)?;
+    set_broker_limit(libc::RLIMIT_FSIZE, 0)?;
+    set_broker_limit(libc::RLIMIT_NOFILE, 4)?;
+    set_broker_limit(libc::RLIMIT_CPU, 60)?;
+    set_broker_limit(libc::RLIMIT_AS, 512 * 1024 * 1024)?;
+    let restriction_failed = unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0
+            || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+    };
+    if restriction_failed {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn install_broker_seccomp() -> std::io::Result<()> {
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_RET_K: u16 = 0x06;
+    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH: u32 = 0xc000_003e;
+    #[cfg(target_arch = "aarch64")]
+    const AUDIT_ARCH: u32 = 0xc000_00b7;
+
+    fn statement(code: u16, k: u32) -> libc::sock_filter {
+        libc::sock_filter {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        }
+    }
+    fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+        libc::sock_filter { code, jt, jf, k }
+    }
+
+    // Keep this deliberately smaller than a general Rust process profile.
+    // The helper can read immutable files and answer its one socket; it cannot
+    // create sockets, execute, change identity, inspect processes, or write
+    // filesystem objects even though it retains uid 0.
+    let allowed = [
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_close,
+        libc::SYS_openat,
+        libc::SYS_openat2,
+        libc::SYS_fstat,
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+        libc::SYS_lseek,
+        libc::SYS_mmap,
+        libc::SYS_mprotect,
+        libc::SYS_munmap,
+        libc::SYS_mremap,
+        libc::SYS_brk,
+        libc::SYS_madvise,
+        libc::SYS_fcntl,
+        libc::SYS_futex,
+        libc::SYS_clock_gettime,
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_restart_syscall,
+        libc::SYS_exit,
+        libc::SYS_exit_group,
+    ];
+    let mut filter = Vec::with_capacity(5 + allowed.len() * 2);
+    // struct seccomp_data: syscall number at byte 0, audit arch at byte 4.
+    filter.push(statement(BPF_LD_W_ABS, 4));
+    filter.push(jump(BPF_JMP_JEQ_K, AUDIT_ARCH, 1, 0));
+    filter.push(statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
+    filter.push(statement(BPF_LD_W_ABS, 0));
+    for syscall in allowed {
+        filter.push(jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1));
+        filter.push(statement(BPF_RET_K, SECCOMP_RET_ALLOW));
+    }
+    filter.push(statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    if unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            &program as *const libc::sock_fprog,
+        )
+    } != 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn install_broker_seccomp() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the privileged TLS broker has no seccomp profile for this architecture",
+    ))
 }
 
 fn privileged_broker_loop(stream: &mut UnixStream, specs: &[(PathBuf, u64)], service_uid: u32) {
@@ -303,6 +436,27 @@ struct OcspRefresh {
     cache_path: PathBuf,
     // A refresher must not keep a retired TLS generation alive forever.
     key: Weak<RwLock<Arc<CertifiedKey>>>,
+}
+
+/// A TLS generation whose certificates, keys, client verifier, and initial
+/// OCSP responses have all been validated, but whose refresh threads have not
+/// yet been started.  Reload can therefore discard a failed candidate without
+/// giving it any process-wide side effects.
+pub(crate) struct PreparedServerConfig {
+    config: Option<Arc<ServerConfig>>,
+    refreshes: Vec<OcspRefresh>,
+}
+
+impl PreparedServerConfig {
+    pub(crate) fn config(&self) -> Option<Arc<ServerConfig>> {
+        self.config.clone()
+    }
+
+    pub(crate) fn activate(&mut self) {
+        for refresh in self.refreshes.drain(..) {
+            let _ = spawn_ocsp_refresh(refresh);
+        }
+    }
 }
 
 fn normalize_name(name: &str) -> String {
@@ -637,26 +791,17 @@ pub fn server_config(
     port: u16,
     local_ip: Option<IpAddr>,
 ) -> Result<Option<Arc<ServerConfig>>, String> {
-    server_config_inner(cfg, port, local_ip, true)
+    Ok(prepare_server_config(cfg, port, local_ip)?.config())
 }
 
-/// Build the pre-fork TLS generation without starting OCSP refresh threads.
-/// The daemon replaces it with a background-enabled generation immediately
-/// after daemonization and before dropping privileges.
-pub(crate) fn server_config_without_background(
+/// Fully validate and construct a TLS generation without starting any
+/// background worker.  Activation is deliberately a separate, infallible
+/// step so graceful reload has a real prepare/commit boundary.
+pub(crate) fn prepare_server_config(
     cfg: &Config,
     port: u16,
     local_ip: Option<IpAddr>,
-) -> Result<Option<Arc<ServerConfig>>, String> {
-    server_config_inner(cfg, port, local_ip, false)
-}
-
-fn server_config_inner(
-    cfg: &Config,
-    port: u16,
-    local_ip: Option<IpAddr>,
-    start_background: bool,
-) -> Result<Option<Arc<ServerConfig>>, String> {
+) -> Result<PreparedServerConfig, String> {
     let provider = Arc::new(ring::default_provider());
     let mut vhosts: Vec<&VHost> = cfg
         .vhosts
@@ -671,7 +816,10 @@ fn server_config_inner(
     }
     let global_only = cfg.ssl.engine && vhosts.is_empty();
     if vhosts.is_empty() && !global_only {
-        return Ok(None);
+        return Ok(PreparedServerConfig {
+            config: None,
+            refreshes: Vec::new(),
+        });
     }
     let policies: Vec<&SslConfig> = vhosts.iter().map(|v| &v.ssl).collect();
     ensure_uniform_client_policy(&policies, port)?;
@@ -686,18 +834,13 @@ fn server_config_inner(
     // not below a legacy logs directory that older releases handed to the
     // service account.
     let ocsp_cache_dir = cfg.server_root.join(".vapache-ocsp-cache");
-    let (default_cert, default_refresh) = load_key_with_ocsp(
-        default_ssl,
-        &provider,
-        Some(&ocsp_cache_dir),
-        start_background,
-    )?;
+    let (default_cert, default_refresh) =
+        load_key_with_ocsp(default_ssl, &provider, Some(&ocsp_cache_dir), true)?;
     let default_key: SharedKey = Arc::new(RwLock::new(default_cert));
-    if start_background {
-        if let Some(mut refresh) = default_refresh {
-            refresh.key = Arc::downgrade(&default_key);
-            let _ = spawn_ocsp_refresh(refresh);
-        }
+    let mut refreshes = Vec::new();
+    if let Some(mut refresh) = default_refresh {
+        refresh.key = Arc::downgrade(&default_key);
+        refreshes.push(refresh);
     }
     let mut resolver = SniResolver {
         default: default_key.clone(),
@@ -713,13 +856,11 @@ fn server_config_inner(
                 default_key.clone()
             } else {
                 let (cert, refresh) =
-                    load_key_with_ocsp(&v.ssl, &provider, Some(&ocsp_cache_dir), start_background)?;
+                    load_key_with_ocsp(&v.ssl, &provider, Some(&ocsp_cache_dir), true)?;
                 let shared = Arc::new(RwLock::new(cert));
-                if start_background {
-                    if let Some(mut refresh) = refresh {
-                        refresh.key = Arc::downgrade(&shared);
-                        let _ = spawn_ocsp_refresh(refresh);
-                    }
+                if let Some(mut refresh) = refresh {
+                    refresh.key = Arc::downgrade(&shared);
+                    refreshes.push(refresh);
                 }
                 shared
             };
@@ -783,13 +924,18 @@ fn server_config_inner(
         .with_cert_resolver(Arc::new(resolver));
     // Prefer HTTP/2; clients that do not offer h2 fall back to HTTP/1.1.
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(Some(Arc::new(config)))
+    Ok(PreparedServerConfig {
+        config: Some(Arc::new(config)),
+        refreshes,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::IntoRawFd;
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn protocol_selection_is_safe() {
@@ -822,6 +968,118 @@ mod tests {
         assert!(String::from_utf8(error).unwrap().contains("unrecognized"));
         client.write_all(&BROKER_SHUTDOWN.to_ne_bytes()).unwrap();
         helper.join().unwrap();
+    }
+
+    #[test]
+    fn privileged_broker_process_restrictions_are_tight() {
+        // SAFETY: this child-only probe owns both pipe descriptors, checks
+        // every syscall result used by the parent, and exits without running
+        // post-fork destructors.
+        unsafe {
+            let mut pipe = [-1; 2];
+            assert_eq!(libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC), 0);
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                libc::close(pipe[0]);
+                let mut core: libc::rlimit = std::mem::zeroed();
+                let mut files: libc::rlimit = std::mem::zeroed();
+                let ok = restrict_privileged_broker_process().is_ok()
+                    && libc::getrlimit(libc::RLIMIT_CORE, &mut core) == 0
+                    && libc::getrlimit(libc::RLIMIT_NOFILE, &mut files) == 0
+                    && core.rlim_cur == 0
+                    && core.rlim_max == 0
+                    && files.rlim_cur == 4
+                    && files.rlim_max == 4
+                    && libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) == 0;
+                let value = [u8::from(ok)];
+                libc::write(pipe[1], value.as_ptr().cast(), value.len());
+                libc::_exit(i32::from(!ok));
+            }
+            libc::close(pipe[1]);
+            let mut value = [0u8; 1];
+            assert_eq!(libc::read(pipe[0], value.as_mut_ptr().cast(), 1), 1);
+            libc::close(pipe[0]);
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            assert_eq!(value, [1]);
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn privileged_broker_seccomp_kills_unlisted_syscalls() {
+        // SAFETY: the child installs the filter and intentionally executes one
+        // forbidden syscall; the parent observes only its wait status.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                    || install_broker_seccomp().is_err()
+                {
+                    libc::_exit(1);
+                }
+                libc::syscall(libc::SYS_getpid);
+                libc::_exit(0);
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFSIGNALED(status));
+            assert_eq!(libc::WTERMSIG(status), libc::SIGSYS);
+        }
+    }
+
+    #[test]
+    fn root_broker_lifecycle_rotates_only_authorized_immutable_files() {
+        // SAFETY: the root-only child receives one owned socket descriptor;
+        // all pathname bytes are NUL-checked before chown and the child is
+        // synchronously reaped before fixture removal.
+        unsafe {
+            if libc::geteuid() != 0 {
+                return;
+            }
+            let dir = tempdir("root-broker-lifecycle");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let key = dir.join("key.pem");
+            std::fs::write(&key, b"first-secret").unwrap();
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let parent_pid = libc::getpid();
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                drop(client);
+                privileged_broker_child(server.into_raw_fd(), parent_pid, vec![(key, 64)], 65_534);
+            }
+            drop(server);
+            assert_eq!(
+                privileged_broker_read(&mut client, 0, 64).unwrap(),
+                b"first-secret"
+            );
+
+            let replacement = dir.join("replacement.pem");
+            std::fs::write(&replacement, b"rotated-secret").unwrap();
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::rename(&replacement, &key).unwrap();
+            assert_eq!(
+                privileged_broker_read(&mut client, 0, 64).unwrap(),
+                b"rotated-secret"
+            );
+
+            let key_c = std::ffi::CString::new(key.as_os_str().as_bytes()).unwrap();
+            assert_eq!(libc::chown(key_c.as_ptr(), 65_534, 65_534), 0);
+            assert!(privileged_broker_read(&mut client, 0, 64).is_err());
+            client.write_all(&BROKER_SHUTDOWN.to_ne_bytes()).unwrap();
+            drop(client);
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]

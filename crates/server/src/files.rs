@@ -63,7 +63,7 @@ pub fn make_admin_dir_root_owned(dir: &File, mode: libc::mode_t) -> io::Result<(
     }
 }
 
-fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
@@ -214,8 +214,9 @@ pub fn validate_admin_parents(path: &Path, service_uid: u32) -> io::Result<()> {
         let directory = open_admin_path(&current, libc::O_PATH | libc::O_DIRECTORY, 0)?;
         let metadata = directory.metadata()?;
         let parent_mode = parent_metadata.mode();
-        let parent_writable = (parent_metadata.uid() == service_uid && parent_mode & 0o200 != 0)
-            || parent_mode & 0o022 != 0;
+        // Ownership itself is authority: an owner can chmod a currently
+        // read-only directory and then replace its entries.
+        let parent_writable = parent_metadata.uid() == service_uid || parent_mode & 0o022 != 0;
         let sticky_protects_entry = parent_mode & libc::S_ISVTX != 0
             && parent_metadata.uid() != service_uid
             && metadata.uid() != service_uid;
@@ -231,7 +232,7 @@ pub fn validate_admin_parents(path: &Path, service_uid: u32) -> io::Result<()> {
         parent_metadata = metadata;
     }
     let mode = parent_metadata.mode();
-    if (parent_metadata.uid() == service_uid && mode & 0o200 != 0) || mode & 0o022 != 0 {
+    if parent_metadata.uid() == service_uid || mode & 0o022 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -241,6 +242,33 @@ pub fn validate_admin_parents(path: &Path, service_uid: u32) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Require a regular file and every pathname component to remain outside the
+/// service account's mutation authority. This deliberately treats ownership
+/// as mutable even when the current owner-write bit is clear, because owners
+/// can restore that bit with chmod.
+pub fn validate_service_immutable_file(path: &Path, service_uid: u32) -> io::Result<File> {
+    validate_admin_parents(path, service_uid)?;
+    let file = open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "protected input is not a regular file",
+        ));
+    }
+    if !vapache_verified::auth_file_immutable_admit(
+        true,
+        metadata.uid() == service_uid,
+        metadata.mode() & 0o022 != 0,
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "protected input is writable or owned by the service account",
+        ));
+    }
+    Ok(file)
 }
 
 /// Create/open every directory component from a retained descriptor.  No
@@ -2243,6 +2271,13 @@ mod tests {
         let (root, _cfg) = config("admin-parent-mode");
         let service_uid = std::fs::metadata(&root).unwrap().uid();
         assert!(validate_admin_parents(&root.join("state"), service_uid).is_err());
+        let mut permissions = std::fs::metadata(&root).unwrap().permissions();
+        permissions.set_mode(0o555);
+        std::fs::set_permissions(&root, permissions).unwrap();
+        assert!(validate_admin_parents(&root.join("state"), service_uid).is_err());
+        let mut permissions = std::fs::metadata(&root).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&root, permissions).unwrap();
         let safe = validate_admin_parents(Path::new("/dev/null"), u32::MAX);
         assert!(safe.is_ok(), "{safe:?}");
         let _ = std::fs::remove_dir_all(root);

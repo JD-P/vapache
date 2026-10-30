@@ -1081,6 +1081,10 @@ fn main() {
         eprintln!("vapached: {error}");
         std::process::exit(1);
     }
+    if let Err(error) = cfg.validate_auth_files(service_uid) {
+        eprintln!("vapached: {error}");
+        std::process::exit(1);
+    }
     let admin_service_uid = (effective_uid() == 0).then_some(service_uid);
 
     match args.action.as_deref() {
@@ -1267,6 +1271,11 @@ fn main() {
             logger.error("reload rejected; continuing with previous configuration");
             continue;
         }
+        if let Err(error) = new_cfg.validate_auth_files(service_uid) {
+            logger.error(&format!("reload rejected: {error}"));
+            logger.error("reload rejected; continuing with previous configuration");
+            continue;
+        }
         if let Err(error) = new_cfg.validate_reload_from(&cfg) {
             logger.error(&format!("reload rejected: {error}"));
             logger.error("reload rejected; continuing with previous configuration");
@@ -1276,13 +1285,6 @@ fn main() {
         // usage counters so the aggregate limits remain process-wide across
         // both configuration generations.
         new_cfg.resource_budget = cfg.resource_budget.clone();
-        let new_bound = match server::rebind(&new_cfg, &bound) {
-            Ok(b) => b,
-            Err(e) => {
-                logger.error(&format!("reload listener error: {e}"));
-                continue;
-            }
-        };
         let new_logger = match Logger::new(&new_cfg) {
             Ok(l) => {
                 let l = Arc::new(l);
@@ -1290,10 +1292,31 @@ fn main() {
                 l
             }
             Err(e) => {
-                logger.error(&format!("reload logger error: {e}; reusing existing logs"));
-                logger.clone()
+                logger.error(&format!("reload rejected: cannot prepare logger: {e}"));
+                logger.error("reload rejected; continuing with previous configuration");
+                continue;
             }
         };
+        let mut new_bound = match server::rebind(&new_cfg, &bound) {
+            Ok(b) => b,
+            Err(e) => {
+                logger.error(&format!(
+                    "reload rejected: listener/TLS preparation failed: {e}"
+                ));
+                logger.error("reload rejected; continuing with previous configuration");
+                continue;
+            }
+        };
+        // This is the commit boundary: every fallible candidate resource has
+        // been prepared, and activate_background validates the whole listener
+        // set before starting any candidate worker.
+        if let Err(e) = server::activate_background(&new_cfg, &mut new_bound) {
+            logger.error(&format!(
+                "reload rejected: background preparation failed: {e}"
+            ));
+            logger.error("reload rejected; continuing with previous configuration");
+            continue;
+        }
         cfg = new_cfg;
         bound = new_bound;
         logger = new_logger;

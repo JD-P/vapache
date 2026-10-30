@@ -35,6 +35,7 @@ pub struct Bound {
     pub port: u16,
     pub addr: String,
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    pending_tls: Option<crate::tls::PreparedServerConfig>,
 }
 
 fn listener_local_ip(l: &crate::config::ListenSpec) -> Option<IpAddr> {
@@ -68,14 +69,16 @@ pub fn bind(cfg: &Config) -> io::Result<Vec<Bound>> {
             let addrs = (addr_str, l.port).to_socket_addrs()?;
             first_resolved_addr(addrs)?
         };
-        let tls = crate::tls::server_config_without_background(cfg, l.port, listener_local_ip(l))
+        let pending_tls = crate::tls::prepare_server_config(cfg, l.port, listener_local_ip(l))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let tls = pending_tls.config();
         let listener = bind_reuse(sock_addr, cfg.listen_backlog)?;
         out.push(Bound {
             listener,
             port: l.port,
             addr: l.addr.clone(),
             tls,
+            pending_tls: Some(pending_tls),
         });
     }
     Ok(out)
@@ -91,16 +94,27 @@ pub fn activate_background(cfg: &Config, bound: &mut [Bound]) -> io::Result<()> 
             "listener set changed before background activation",
         ));
     }
-    for (listener, active) in cfg.listeners.iter().zip(bound.iter_mut()) {
+    // Validate the complete set before activating even the first candidate.
+    for (listener, active) in cfg.listeners.iter().zip(bound.iter()) {
         if listener.port != active.port || listener.addr != active.addr {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "listener identity changed before background activation",
             ));
         }
-        active.tls = crate::tls::server_config(cfg, listener.port, listener_local_ip(listener))
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        if active.pending_tls.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TLS generation was already activated",
+            ));
+        }
     }
+    for active in bound.iter_mut() {
+        if let Some(mut pending) = active.pending_tls.take() {
+            pending.activate();
+        }
+    }
+    crate::cache::prepare(cfg);
     crate::proxy::start_health_checks(cfg);
     Ok(())
 }
@@ -124,18 +138,18 @@ pub fn rebind(cfg: &Config, previous: &[Bound]) -> io::Result<Vec<Bound>> {
             ));
         }
         let listener = old.listener.try_clone()?;
-        let tls = crate::tls::server_config(cfg, l.port, listener_local_ip(l))
+        let pending_tls = crate::tls::prepare_server_config(cfg, l.port, listener_local_ip(l))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let tls = pending_tls.config();
         out.push(Bound {
             listener,
             port: l.port,
             addr: l.addr.clone(),
             tls,
+            pending_tls: Some(pending_tls),
         });
     }
-    crate::cache::prepare(cfg);
     crate::ocsp::prepare_cache_dir(&cfg.server_root.join(".vapache-ocsp-cache"))?;
-    crate::proxy::start_health_checks(cfg);
     Ok(out)
 }
 
@@ -1192,7 +1206,11 @@ fn helper_access_response(
     // `Require expr`.
     let mut access = access::check(scope, req, peer, None, url_path, Some(fs_path));
     if access == Access::AuthRequired {
-        if let Some(identity) = crate::auth::authenticate(scope, req) {
+        if let Some(identity) = crate::auth::authenticate(
+            scope,
+            req,
+            cfg.capability_enabled(Capability::MutableAuthFiles),
+        ) {
             resource.identity = Some(identity.user.clone());
             access = authenticated_access_result(access::check(
                 scope,
@@ -5527,6 +5545,7 @@ mod tests {
             port: addr.port(),
             addr: "127.0.0.1".into(),
             tls: None,
+            pending_tls: None,
         }];
         let server = Server::new(Arc::new(cfg.clone()), Arc::new(cov_logger(&cfg)));
         let err = server

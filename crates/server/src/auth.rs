@@ -30,7 +30,7 @@ const CRYPT_ALPHABET: &[u8; 64] =
 
 /// Verify the request's Basic credentials against `AuthUserFile`.  Returns
 /// `None` for missing, malformed, unsupported or non-matching credentials.
-pub fn authenticate(scope: &Scope, req: &Request) -> Option<Identity> {
+pub fn authenticate(scope: &Scope, req: &Request, mutable_auth_files: bool) -> Option<Identity> {
     if !scope
         .authorization
         .auth_type
@@ -62,16 +62,14 @@ pub fn authenticate(scope: &Scope, req: &Request) -> Option<Identity> {
         return None;
     }
     let file = scope.authorization.auth_user_file.as_ref()?;
-    let stored = lookup_user(file, user)?;
+    let stored = lookup_user(file, user, mutable_auth_files)?;
     if !verify_password(password, &stored) {
         return None;
     }
-    let groups = scope
-        .authorization
-        .auth_group_file
-        .as_ref()
-        .map(|p| groups_for(p, user))
-        .unwrap_or_default();
+    let groups = match scope.authorization.auth_group_file.as_ref() {
+        Some(path) => groups_for(path, user, mutable_auth_files)?,
+        None => Vec::new(),
+    };
     Some(Identity {
         user: user.to_string(),
         groups,
@@ -93,7 +91,7 @@ struct AuthFileKey {
 #[derive(Default)]
 struct AuthFileCache {
     entries: HashMap<AuthFileKey, (Arc<String>, usize)>,
-    failures: HashMap<PathBuf, Instant>,
+    failures: HashMap<(PathBuf, bool, u32), Instant>,
     bytes: usize,
 }
 
@@ -115,7 +113,9 @@ fn auth_key(path: &Path, meta: &std::fs::Metadata) -> AuthFileKey {
     }
 }
 
-fn read_small(path: &Path) -> Option<Arc<String>> {
+fn read_small(path: &Path, mutable: bool) -> Option<Arc<String>> {
+    let service_uid = crate::files::effective_uid();
+    let failure_key = (path.to_path_buf(), mutable, service_uid);
     let now = Instant::now();
     {
         let mut cache = auth_file_cache()
@@ -124,11 +124,11 @@ fn read_small(path: &Path) -> Option<Arc<String>> {
         cache
             .failures
             .retain(|_, failed| now.saturating_duration_since(*failed) < AUTH_FAILURE_CACHE_TTL);
-        if cache.failures.contains_key(path) {
+        if cache.failures.contains_key(&failure_key) {
             return None;
         }
     }
-    let data = read_small_uncached(path);
+    let data = read_small_uncached(path, mutable, service_uid);
     if data.is_none() {
         let mut cache = auth_file_cache()
             .lock()
@@ -138,15 +138,19 @@ fn read_small(path: &Path) -> Option<Arc<String>> {
                 cache.failures.remove(&victim);
             }
         }
-        cache.failures.insert(path.to_path_buf(), Instant::now());
+        cache.failures.insert(failure_key, Instant::now());
     }
     data
 }
 
-fn read_small_uncached(path: &Path) -> Option<Arc<String>> {
+fn read_small_uncached(path: &Path, mutable: bool, service_uid: u32) -> Option<Arc<String>> {
     // O_NONBLOCK is security-significant: opening an attacker-selected FIFO
     // must not park a request worker before the regular-file check runs.
-    let file = crate::files::open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0).ok()?;
+    let file = if mutable {
+        crate::files::open_admin_path(path, libc::O_RDONLY | libc::O_NONBLOCK, 0).ok()?
+    } else {
+        crate::files::validate_service_immutable_file(path, service_uid).ok()?
+    };
     let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > MAX_PASSWORD_FILE {
         return None;
@@ -220,11 +224,25 @@ fn read_bounded(reader: impl Read) -> Option<String> {
     if data.len() as u64 > MAX_PASSWORD_FILE {
         return None;
     }
-    Some(String::from_utf8_lossy(&data).into_owned())
+    String::from_utf8(data).ok()
 }
 
-fn lookup_user(path: &Path, user: &str) -> Option<String> {
-    let data = read_small(path)?;
+/// Validate a main-configuration authentication database before serving.
+/// Runtime reads repeat every property so later replacement still fails
+/// closed, including for paths introduced by an access file.
+pub fn validate_auth_file(path: &Path, mutable: bool, service_uid: u32) -> Result<(), String> {
+    read_small_uncached(path, mutable, service_uid)
+        .map(|_| ())
+        .ok_or_else(|| {
+            format!(
+                "authentication file {} must be bounded strict UTF-8 and, unless MutableAuthFiles is enabled, operator-controlled",
+                path.display()
+            )
+        })
+}
+
+fn lookup_user(path: &Path, user: &str, mutable: bool) -> Option<String> {
+    let data = read_small(path, mutable)?;
     let mut found = None;
     for line in data.lines() {
         if line.is_empty() || line.starts_with('#') {
@@ -244,9 +262,9 @@ fn lookup_user(path: &Path, user: &str) -> Option<String> {
     found
 }
 
-fn groups_for(path: &Path, user: &str) -> Vec<String> {
-    let Some(data) = read_small(path) else {
-        return Vec::new();
+fn groups_for(path: &Path, user: &str, mutable: bool) -> Option<Vec<String>> {
+    let Some(data) = read_small(path, mutable) else {
+        return None;
     };
     let mut out = Vec::new();
     for line in data.lines() {
@@ -257,7 +275,7 @@ fn groups_for(path: &Path, user: &str) -> Vec<String> {
             out.push(group.trim().to_string());
         }
     }
-    out
+    Some(out)
 }
 
 fn verify_password(password: &[u8], stored: &str) -> bool {
@@ -450,7 +468,7 @@ mod tests {
     #[test]
     fn authenticate_rejects_malformed_and_unsafe_credentials() {
         let mut scope = Scope::default();
-        assert!(authenticate(&scope, &request(None)).is_none());
+        assert!(authenticate(&scope, &request(None), true).is_none());
         scope.authorization.auth_type = Some("basic".into());
         for header in [
             b"Bearer abc".to_vec(),
@@ -461,12 +479,12 @@ mod tests {
             basic(b":secret"),
             basic(b"bad\nname:secret"),
         ] {
-            assert!(authenticate(&scope, &request(Some(header))).is_none());
+            assert!(authenticate(&scope, &request(Some(header)), true).is_none());
         }
         let mut oversized = b"alice:".to_vec();
         oversized.extend(std::iter::repeat_n(b'x', 4097));
-        assert!(authenticate(&scope, &request(Some(basic(&oversized)))).is_none());
-        assert!(authenticate(&scope, &request(Some(basic(b"alice:secret")))).is_none());
+        assert!(authenticate(&scope, &request(Some(basic(&oversized))), true).is_none());
+        assert!(authenticate(&scope, &request(Some(basic(b"alice:secret"))), true).is_none());
     }
 
     #[test]
@@ -484,18 +502,22 @@ mod tests {
         scope.authorization.auth_user_file = Some(users.clone());
         scope.authorization.auth_group_file = Some(groups.clone());
 
-        let identity = authenticate(&scope, &request(Some(basic(b"alice:secret")))).unwrap();
+        let identity = authenticate(&scope, &request(Some(basic(b"alice:secret"))), true).unwrap();
         assert_eq!(identity.user, "alice");
         assert_eq!(identity.groups, ["admins"]);
-        assert!(authenticate(&scope, &request(Some(basic(b"alice:wrong")))).is_none());
-        assert!(authenticate(&scope, &request(Some(basic(b"nobody:secret")))).is_none());
+        assert!(authenticate(&scope, &request(Some(basic(b"alice:wrong"))), true).is_none());
+        assert!(authenticate(&scope, &request(Some(basic(b"nobody:secret"))), true).is_none());
+
+        std::fs::write(&groups, b"admins: alice\xff\n").unwrap();
+        assert!(authenticate(&scope, &request(Some(basic(b"alice:secret"))), true).is_none());
+        std::fs::write(&groups, "admins: alice bob\n").unwrap();
 
         std::fs::write(
             &users,
             "alice:$apr1$gqijKP2Z$nBjZURLWP3/zSfPLTfhVM0\nalice:duplicate\n",
         )
         .unwrap();
-        assert!(authenticate(&scope, &request(Some(basic(b"alice:secret")))).is_none());
+        assert!(authenticate(&scope, &request(Some(basic(b"alice:secret"))), true).is_none());
         std::fs::remove_file(users).unwrap();
         std::fs::remove_file(groups).unwrap();
     }
@@ -504,8 +526,8 @@ mod tests {
     fn password_file_and_hash_error_edges_fail_closed() {
         let directory = temp_path("directory");
         std::fs::create_dir(&directory).unwrap();
-        assert!(read_small(&directory).is_none());
-        assert!(groups_for(&directory.join("missing"), "alice").is_empty());
+        assert!(read_small(&directory, true).is_none());
+        assert!(groups_for(&directory.join("missing"), "alice", true).is_none());
         std::fs::remove_dir(directory).unwrap();
         assert!(read_bounded(std::io::Cursor::new(vec![
             b'x';
@@ -531,18 +553,33 @@ mod tests {
         let fifo = temp_path("fifo");
         crate::files::make_test_fifo(&fifo).unwrap();
         let started = Instant::now();
-        assert!(read_small(&fifo).is_none());
+        assert!(read_small(&fifo, true).is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
 
         let regular = temp_path("symlink-target");
         let linked = temp_path("symlink");
         std::fs::write(&regular, "alice:hash\n").unwrap();
         std::os::unix::fs::symlink(&regular, &linked).unwrap();
-        assert!(read_small(&linked).is_none());
+        assert!(read_small(&linked, true).is_none());
 
         std::fs::remove_file(fifo).unwrap();
         std::fs::remove_file(linked).unwrap();
         std::fs::remove_file(regular).unwrap();
+    }
+
+    #[test]
+    fn authentication_files_are_strict_utf8_and_immutable_by_default() {
+        let invalid = temp_path("invalid-utf8");
+        std::fs::write(&invalid, b"alice:$apr1$x$\xff\n").unwrap();
+        assert!(read_small(&invalid, true).is_none());
+
+        let mutable = temp_path("service-owned");
+        std::fs::write(&mutable, "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n").unwrap();
+        assert!(read_small(&mutable, false).is_none());
+        assert!(read_small(&mutable, true).is_some());
+
+        std::fs::remove_file(invalid).unwrap();
+        std::fs::remove_file(mutable).unwrap();
     }
 
     #[test]

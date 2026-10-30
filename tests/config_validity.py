@@ -12,6 +12,8 @@ fails where Apache `apache2 -t` fails (H8 promoted directive drops).
 
 import argparse
 import os
+import grp
+import pwd
 import shutil
 import subprocess
 import sys
@@ -32,6 +34,8 @@ MODDIR = Path(
 BASE = Path(tempfile.mkdtemp(prefix="vapache-config-validity-"))
 DOCROOT = BASE / "www"
 PORT = 18190
+SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
+SERVICE_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
 
 MODULES = [
     "mpm_event_module",
@@ -66,6 +70,7 @@ VapacheCapability RewriteProgram On
 VapacheCapability ServerStatus On
 VapacheCapability Trace On
 VapacheCapability UnstableFastCgiPaths On
+VapacheCapability MutableAuthFiles On
 """
 
 
@@ -76,8 +81,8 @@ def prefix(port: int) -> str:
     lines += [
         f'ServerRoot "{BASE}"',
         f"Listen {port}",
-        "User www-data",
-        "Group www-data",
+        f"User {SERVICE_USER}",
+        f"Group {SERVICE_GROUP}",
         f"PidFile {BASE}/logs/httpd-{port}.pid",
         f"ErrorLog {BASE}/logs/error-{port}.log",
         "LogLevel warn",

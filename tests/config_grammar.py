@@ -73,7 +73,7 @@ DIRECTIVES = [
     ("allow", "Allow from all\n"),
     ("deny", "Deny from all\n"),
     ("satisfy", "Satisfy any\n"),
-    ("auth", "AuthType Basic\nAuthName x\nAuthUserFile /tmp/x\n"),
+    ("auth", f"AuthType Basic\nAuthName x\nAuthUserFile {BASE}/htpasswd\n"),
     ("authmerging", "AuthMerging And\n"),
     ("allowoverride", "AllowOverride All\n"),
     ("allowoverridelist", "AllowOverrideList Require\n"),
@@ -119,6 +119,7 @@ def main():
         os.chmod(DOCROOT, 0o755)
         (BASE / "logs").mkdir(exist_ok=True)
         os.chmod(BASE / "logs", 0o777)
+        (BASE / "htpasswd").write_text("alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n")
         failures = 0
 
         def compare(name, snippet):

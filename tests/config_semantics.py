@@ -30,6 +30,8 @@ import re
 import hashlib
 import http.client
 import os
+import grp
+import pwd
 import shutil
 import signal
 import socket
@@ -55,6 +57,8 @@ DOCROOT = BASE / "www"
 AP_PORT = int(os.environ.get("VAPACHE_SEM_AP_PORT", "18180"))
 VP_PORT = int(os.environ.get("VAPACHE_SEM_VP_PORT", "18181"))
 PROCS = []
+SERVICE_USER = "www-data" if os.geteuid() == 0 else pwd.getpwuid(os.geteuid()).pw_name
+SERVICE_GROUP = "www-data" if os.getegid() == 0 else grp.getgrgid(os.getegid()).gr_name
 
 APACHE_MODULES = [
     "mpm_event_module",
@@ -169,12 +173,13 @@ def base_config(port: int, apache: bool) -> str:
             "VapacheCapability ServerStatus On",
             "VapacheCapability Trace On",
             "VapacheCapability UnstableFastCgiPaths On",
+            "VapacheCapability MutableAuthFiles On",
         ]
     lines += [
         f'ServerRoot "{BASE}"',
         f"Listen {port}",
-        "User www-data",
-        "Group www-data",
+        f"User {SERVICE_USER}",
+        f"Group {SERVICE_GROUP}",
         f"PidFile {BASE}/logs/httpd-{port}.pid",
         f"ErrorLog {BASE}/logs/error-{port}.log",
         "LogLevel warn",
