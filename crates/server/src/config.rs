@@ -961,10 +961,15 @@ pub enum CompressionRule {
     ByExt(CompressionKind, Vec<String>),
 }
 
-/// Parse filter names, recording any unimplemented filter so requests fail
-/// closed instead of serving unfiltered source.
-pub(crate) fn parse_filter_tokens(scope: &mut Scope, tokens: &[String]) -> Vec<CompressionKind> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsupportedFilterRule {
+    ByType(String, Vec<String>),
+    ByExt(String, Vec<String>),
+}
+
+pub(crate) fn parse_filter_names(tokens: &[String]) -> (Vec<CompressionKind>, Vec<String>) {
     let mut kinds = Vec::new();
+    let mut unsupported = Vec::new();
     for token in tokens {
         for part in token.split(';') {
             let part = part.trim();
@@ -972,25 +977,33 @@ pub(crate) fn parse_filter_tokens(scope: &mut Scope, tokens: &[String]) -> Vec<C
                 continue;
             }
             match CompressionKind::parse_filter(part) {
-                Some(kind) => {
-                    if !kinds.contains(&kind) {
-                        kinds.push(kind);
-                    }
+                Some(kind) if !kinds.contains(&kind) => kinds.push(kind),
+                Some(_) => {}
+                None if !unsupported
+                    .iter()
+                    .any(|name: &String| name.eq_ignore_ascii_case(part)) =>
+                {
+                    unsupported.push(part.to_string());
                 }
-                None => {
-                    if !scope
-                        .mapping_policy
-                        .unsupported_filters
-                        .iter()
-                        .any(|f| f.eq_ignore_ascii_case(part))
-                    {
-                        scope
-                            .mapping_policy
-                            .unsupported_filters
-                            .push(part.to_string());
-                    }
-                }
+                None => {}
             }
+        }
+    }
+    (kinds, unsupported)
+}
+
+/// Parse filter names, recording any unimplemented filter so requests fail
+/// closed instead of serving unfiltered source.
+pub(crate) fn parse_filter_tokens(scope: &mut Scope, tokens: &[String]) -> Vec<CompressionKind> {
+    let (kinds, unsupported) = parse_filter_names(tokens);
+    for name in unsupported {
+        if !scope
+            .mapping_policy
+            .unsupported_filters
+            .iter()
+            .any(|filter| filter.eq_ignore_ascii_case(&name))
+        {
+            scope.mapping_policy.unsupported_filters.push(name);
         }
     }
     kinds
@@ -1419,6 +1432,7 @@ struct ContainerSnapshot {
     cache_disable: Vec<u64>,
     rewrite_rules: Vec<u64>,
     compression_rules: Vec<u64>,
+    unsupported_filter_rules: Vec<u64>,
     proxy_rules: Vec<u64>,
     proxy_passes: Vec<u64>,
     proxy_reverses: Vec<u64>,
@@ -1489,6 +1503,7 @@ impl Scope {
             cache_disable: hash_vec(&self.rewrite_policy.cache_disable),
             rewrite_rules: hash_vec(&self.rewrite_policy.rewrite_rules),
             compression_rules: hash_vec(&self.compression_policy.compression_rules),
+            unsupported_filter_rules: hash_vec(&self.compression_policy.unsupported_filter_rules),
             proxy_rules: hash_vec(&self.proxy_policy.proxy_rules),
             proxy_passes: hash_vec(&self.proxy_policy.proxy_passes),
             proxy_reverses: hash_vec(&self.proxy_policy.proxy_reverses),
@@ -1561,6 +1576,10 @@ impl Scope {
             cache_disable: append(&parent.cache_disable, &child.cache_disable),
             rewrite_rules: append(&parent.rewrite_rules, &child.rewrite_rules),
             compression_rules: append(&parent.compression_rules, &child.compression_rules),
+            unsupported_filter_rules: append(
+                &parent.unsupported_filter_rules,
+                &child.unsupported_filter_rules,
+            ),
             proxy_rules: append(&parent.proxy_rules, &child.proxy_rules),
             proxy_passes: append(&parent.proxy_passes, &child.proxy_passes),
             proxy_reverses: append(&parent.proxy_reverses, &child.proxy_reverses),
@@ -1951,6 +1970,17 @@ impl Scope {
                 .any(|f| f.eq_ignore_ascii_case(filter))
             {
                 self.mapping_policy.unsupported_filters.push(filter.clone());
+            }
+        }
+        for rule in &base.compression_policy.unsupported_filter_rules {
+            if !self
+                .compression_policy
+                .unsupported_filter_rules
+                .contains(rule)
+            {
+                self.compression_policy
+                    .unsupported_filter_rules
+                    .push(rule.clone());
             }
         }
     }
@@ -6174,7 +6204,7 @@ impl Compile {
                 if args.len() < 2 {
                     return;
                 }
-                let kinds = parse_filter_tokens(scope, &args[..1]);
+                let (kinds, unsupported) = parse_filter_names(&args[..1]);
                 for kind in kinds {
                     scope
                         .compression_policy
@@ -6184,12 +6214,20 @@ impl Compile {
                             args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
                         ));
                 }
+                for name in unsupported {
+                    scope.compression_policy.unsupported_filter_rules.push(
+                        UnsupportedFilterRule::ByType(
+                            name,
+                            args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
+                        ),
+                    );
+                }
             }
             "addoutputfilter" => {
                 if args.len() < 2 {
                     return;
                 }
-                let kinds = parse_filter_tokens(scope, &args[..1]);
+                let (kinds, unsupported) = parse_filter_names(&args[..1]);
                 for kind in kinds {
                     scope
                         .compression_policy
@@ -6198,6 +6236,14 @@ impl Compile {
                             kind,
                             args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
                         ));
+                }
+                for name in unsupported {
+                    scope.compression_policy.unsupported_filter_rules.push(
+                        UnsupportedFilterRule::ByExt(
+                            name,
+                            args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
+                        ),
+                    );
                 }
             }
             "setoutputfilter" => {
@@ -10692,6 +10738,15 @@ ServerName localhost\n\
             Some("application/x-httpd-php")
         );
 
+        let c = load_text(
+            "Listen 127.0.0.1:0\nAddOutputFilter INCLUDES .shtml\n",
+            false,
+        )
+        .unwrap();
+        let s = c.effective_scope(None, Path::new("/srv/x.html"), "/x.html");
+        assert!(s.mapping_policy.unsupported_filters.is_empty());
+        assert_eq!(s.compression_policy.unsupported_filter_rules.len(), 1);
+
         let cfg = concat!(
             "Listen 127.0.0.1:0\n",
             "<Directory /srv>\n",
@@ -13428,6 +13483,25 @@ Require all granted\n\
         let mut target = Scope::default();
         target.restrict_with(&url);
         assert_eq!(target.mapping_policy.unsupported_filters, vec!["INCLUDES"]);
+
+        // Extension-scoped filters also survive a rewrite so an unsupported
+        // processor cannot be bypassed by changing the target identity.
+        let mut url = Scope::default();
+        url.compression_policy
+            .unsupported_filter_rules
+            .push(UnsupportedFilterRule::ByExt(
+                "INCLUDES".into(),
+                vec![".shtml".into()],
+            ));
+        let mut target = Scope::default();
+        target.restrict_policy_with(&url);
+        assert_eq!(
+            target.compression_policy.unsupported_filter_rules,
+            vec![UnsupportedFilterRule::ByExt(
+                "INCLUDES".into(),
+                vec![".shtml".into()]
+            )]
+        );
     }
 
     #[test]

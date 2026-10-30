@@ -7,7 +7,7 @@
 //! bodies, `no-transform` responses and bodies larger than the in-memory cap;
 //! `Vary: Accept-Encoding` is still emitted for negotiable representations.
 
-use crate::config::{AlterEtag, CompressionKind, CompressionRule, Scope};
+use crate::config::{AlterEtag, CompressionKind, CompressionRule, Scope, UnsupportedFilterRule};
 use crate::http::{Body, Request, Response};
 use std::borrow::Cow;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -142,6 +142,48 @@ fn configured_kinds(scope: &Scope, media: Option<&str>, path: &[u8]) -> Vec<Comp
         }
     }
     out
+}
+
+pub(crate) fn unsupported_filters(scope: &Scope, media: Option<&str>, path: &[u8]) -> Vec<String> {
+    let ext = path
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .and_then(|name| {
+            name.iter()
+                .rposition(|byte| *byte == b'.')
+                .map(|position| &name[position + 1..])
+        })
+        .map(|value| String::from_utf8_lossy(value).to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut filters = Vec::new();
+    for rule in &scope.compression_policy.unsupported_filter_rules {
+        let (name, applies) = match rule {
+            UnsupportedFilterRule::ByType(name, types) => (
+                name,
+                media.is_some_and(|media| {
+                    types.iter().any(|configured| {
+                        let configured = configured.trim();
+                        configured == "*" || configured.eq_ignore_ascii_case(media)
+                    })
+                }),
+            ),
+            UnsupportedFilterRule::ByExt(name, extensions) => (
+                name,
+                extensions.iter().any(|configured| {
+                    let configured = configured.trim().trim_start_matches('.');
+                    !configured.is_empty() && configured.eq_ignore_ascii_case(&ext)
+                }),
+            ),
+        };
+        if applies
+            && !filters
+                .iter()
+                .any(|filter: &String| filter.eq_ignore_ascii_case(name))
+        {
+            filters.push(name.clone());
+        }
+    }
+    filters
 }
 
 fn q_value(value: &str) -> f32 {
@@ -479,7 +521,7 @@ fn finalize_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CompressionKind, CompressionRule, Scope};
+    use crate::config::{CompressionKind, CompressionRule, Scope, UnsupportedFilterRule};
     use crate::http::{Body, Headers, Request, Response, Version};
 
     fn request(accept: &str) -> Request {
@@ -563,6 +605,35 @@ mod tests {
         finalize(&scope, &request("gzip;q=0"), &mut r, b"/x.html");
         assert!(header(&r, "content-encoding").is_none());
         assert_eq!(header_str(&r, "vary").as_deref(), Some("Accept-Encoding"));
+    }
+
+    #[test]
+    fn unsupported_filters_apply_only_to_their_configured_extension_or_type() {
+        let mut scope = Scope::default();
+        scope
+            .compression_policy
+            .unsupported_filter_rules
+            .push(UnsupportedFilterRule::ByExt(
+                "INCLUDES".into(),
+                vec![".shtml".into()],
+            ));
+        scope
+            .compression_policy
+            .unsupported_filter_rules
+            .push(UnsupportedFilterRule::ByType(
+                "CUSTOM".into(),
+                vec!["application/x-custom".into()],
+            ));
+
+        assert!(unsupported_filters(&scope, Some("text/html"), b"index.html").is_empty());
+        assert_eq!(
+            unsupported_filters(&scope, Some("text/html"), b"include.shtml"),
+            vec!["INCLUDES"]
+        );
+        assert_eq!(
+            unsupported_filters(&scope, Some("application/x-custom"), b"index.html"),
+            vec!["CUSTOM"]
+        );
     }
 
     #[test]

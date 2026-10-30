@@ -3189,10 +3189,22 @@ fn dispatch_inner(
             if req.method == "OPTIONS" {
                 return options_response(cfg, scope, mime_type(cfg, scope, name));
             }
-            if !scope.mapping_policy.unsupported_filters.is_empty() {
+            let media_type = mime_type(cfg, scope, name);
+            let mut unsupported_filters = scope.mapping_policy.unsupported_filters.clone();
+            for filter in
+                crate::compression::unsupported_filters(scope, media_type.as_deref(), name)
+            {
+                if !unsupported_filters
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&filter))
+                {
+                    unsupported_filters.push(filter);
+                }
+            }
+            if !unsupported_filters.is_empty() {
                 eprintln!(
                     "vapached: unsupported output filter(s) {:?} for {}",
-                    scope.mapping_policy.unsupported_filters, url_path
+                    unsupported_filters, url_path
                 );
                 return error_response(
                     cfg,

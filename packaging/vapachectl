@@ -1,0 +1,253 @@
+#!/bin/sh
+set -eu
+
+find_configuration() {
+    if [ -n "${VAPACHE_CONFIG:-}" ]; then
+        if [ -z "${VAPACHE_CONFDIR:-}" ]; then
+            echo "vapachectl: VAPACHE_CONFDIR is required with VAPACHE_CONFIG" >&2
+            exit 1
+        fi
+        server_root=$VAPACHE_CONFDIR
+        config_file=$VAPACHE_CONFIG
+    elif [ -n "${VAPACHE_CONFDIR:-}" ]; then
+        server_root=$VAPACHE_CONFDIR
+        if [ -r "$server_root/apache2.conf" ]; then
+            config_file=$server_root/apache2.conf
+        elif [ -r "$server_root/conf/httpd.conf" ]; then
+            config_file=$server_root/conf/httpd.conf
+        else
+            echo "vapachectl: no Apache configuration below $server_root" >&2
+            exit 1
+        fi
+    elif [ -r /etc/apache2/apache2.conf ]; then
+        server_root=/etc/apache2
+        config_file=/etc/apache2/apache2.conf
+    elif [ -r /etc/httpd/conf/httpd.conf ]; then
+        server_root=/etc/httpd
+        config_file=/etc/httpd/conf/httpd.conf
+    else
+        echo "vapachectl: no Apache configuration found" >&2
+        echo "set VAPACHE_CONFDIR and VAPACHE_CONFIG to select one explicitly" >&2
+        exit 1
+    fi
+}
+
+command=${1:-start}
+case "$command" in
+    help|-h|--help)
+        cat <<'EOF'
+Usage: vapachectl [start|stop|restart|graceful|graceful-stop|status|configtest|foreground]
+
+The existing Apache configuration is selected in this order:
+  1. VAPACHE_CONFDIR and VAPACHE_CONFIG
+  2. VAPACHE_CONFDIR with apache2.conf or conf/httpd.conf below it
+  3. /etc/apache2/apache2.conf
+  4. /etc/httpd/conf/httpd.conf
+
+The packaged wrapper materializes Apache's enabled-config symlinks in a
+root-controlled snapshot under /run, then derives missing VapacheCapability
+declarations there. It never edits the Apache configuration. Set
+VAPACHE_AUTO_CAPABILITIES=0 to require declarations in the source config.
+EOF
+        exit 0
+        ;;
+esac
+
+find_configuration
+daemon=${VAPACHED:-/usr/sbin/vapached}
+snapshot_active=0
+compatibility_directives=
+if [ "$server_root" = /etc/httpd ]; then
+    # RHEL's httpd build supplies this as a compiled-in default rather than a
+    # directive in httpd.conf. Vapache's raw default follows Debian instead.
+    compatibility_directives='PidFile /run/httpd/httpd.pid'
+fi
+
+snapshot_configuration() {
+    snapshot_mode=${VAPACHE_SNAPSHOT_CONFIG:-auto}
+    case "$snapshot_mode" in
+        0) return 0 ;;
+        1) ;;
+        auto)
+            if [ ! -d "$server_root/mods-enabled" ] \
+                && [ ! -d "$server_root/conf-enabled" ] \
+                && [ ! -d "$server_root/sites-enabled" ]; then
+                return 0
+            fi
+            ;;
+        *)
+            echo "vapachectl: VAPACHE_SNAPSHOT_CONFIG must be auto, 0, or 1" >&2
+            exit 1
+            ;;
+    esac
+
+    case "$server_root" in
+        /*) ;;
+        *)
+            echo "vapachectl: VAPACHE_CONFDIR must be an absolute path" >&2
+            exit 1
+            ;;
+    esac
+    case "$config_file" in
+        /*) ;;
+        *) config_file=$server_root/$config_file ;;
+    esac
+    case "$config_file" in
+        "$server_root"/*) relative_config=${config_file#"$server_root"/} ;;
+        *)
+            echo "vapachectl: configuration must be below VAPACHE_CONFDIR" >&2
+            exit 1
+            ;;
+    esac
+
+    runtime_dir=${VAPACHE_RUNTIME_DIR:-/run/vapache}
+    case "$runtime_dir" in
+        /*) ;;
+        *)
+            echo "vapachectl: VAPACHE_RUNTIME_DIR must be an absolute path" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$runtime_dir" = / ]; then
+        echo "vapachectl: refusing to use / as VAPACHE_RUNTIME_DIR" >&2
+        exit 1
+    fi
+    install -d -m 0755 "$runtime_dir"
+
+    if [ "$(id -u)" -eq 0 ]; then
+        unsafe=$(find -L "$server_root" \( -type d -o -type f \) \
+            \( ! -user root -o -perm /022 \) -print -quit)
+        if [ -n "$unsafe" ]; then
+            echo "vapachectl: Apache configuration is not root-controlled: $unsafe" >&2
+            exit 1
+        fi
+        if ! find "$server_root" -type l -exec sh -c '
+            root=$1
+            shift
+            for link do
+                target=$(readlink -f -- "$link") || exit 1
+                case "$target" in
+                    "$root"/*) ;;
+                    *)
+                        echo "vapachectl: configuration symlink escapes $root: $link" >&2
+                        exit 1
+                        ;;
+                esac
+            done
+        ' sh "$server_root" {} +; then
+            exit 1
+        fi
+    fi
+
+    staging=$(mktemp -d "$runtime_dir/.apache-config.XXXXXX")
+    if ! cp -RL -- "$server_root/." "$staging/"; then
+        rm -rf -- "$staging"
+        exit 1
+    fi
+    chmod -R go-w "$staging"
+    if [ ! -f "$staging/$relative_config" ]; then
+        echo "vapachectl: configuration snapshot is missing $relative_config" >&2
+        rm -rf -- "$staging"
+        exit 1
+    fi
+
+    mirror=$runtime_dir/apache-config
+    previous=$runtime_dir/.apache-config.previous
+    rm -rf -- "$previous"
+    had_previous=0
+    if [ -e "$mirror" ]; then
+        mv -- "$mirror" "$previous"
+        had_previous=1
+    fi
+    if ! mv -- "$staging" "$mirror"; then
+        if [ "$had_previous" -eq 1 ]; then
+            mv -- "$previous" "$mirror"
+        fi
+        exit 1
+    fi
+    rm -rf -- "$previous"
+
+    server_root=$mirror
+    config_file=$mirror/$relative_config
+    snapshot_active=1
+}
+
+snapshot_configuration
+
+prepare_runtime_configuration() {
+    capabilities=
+    if [ "${VAPACHE_AUTO_CAPABILITIES:-1}" != 0 ]; then
+        audit_output=$(
+            "$daemon" -d "$server_root" -f "$config_file" --audit-capabilities
+        )
+        capabilities=$(
+            printf '%s\n' "$audit_output" \
+                | sed -n 's/^[[:space:]]*\(VapacheCapability [A-Za-z][A-Za-z0-9]* On\)$/\1/p' \
+                | sort -u
+        )
+    fi
+    [ -n "$capabilities$compatibility_directives" ] || return 0
+
+    case "$config_file" in
+        *\"*)
+            echo "vapachectl: Apache configuration path contains an unsupported quote" >&2
+            exit 1
+            ;;
+    esac
+
+    if [ "$snapshot_active" -eq 1 ]; then
+        generated=$server_root/.vapache-capabilities.conf
+        temporary=$(mktemp "$server_root/.vapache-capabilities.XXXXXX")
+    else
+        runtime_dir=${VAPACHE_RUNTIME_DIR:-/run/vapache}
+        install -d -m 0755 "$runtime_dir"
+        generated=$runtime_dir/apache-capabilities.conf
+        temporary=$(mktemp "$runtime_dir/.apache-capabilities.XXXXXX")
+    fi
+    if ! {
+        printf '# Generated by vapachectl; the Apache configuration is not modified.\n'
+        if [ -n "$compatibility_directives" ]; then
+            printf '%s\n' "$compatibility_directives"
+        fi
+        printf '%s\n' "$capabilities"
+        printf 'Include "%s"\n' "$config_file"
+    } >"$temporary"; then
+        rm -f -- "$temporary"
+        exit 1
+    fi
+    chmod 0644 "$temporary"
+    mv -f -- "$temporary" "$generated"
+    config_file=$generated
+
+    if [ -n "$capabilities" ]; then
+        echo "vapachectl: enabling capabilities requested by the Apache configuration:" >&2
+        printf '  %s\n' "$capabilities" >&2
+    fi
+}
+
+prepare_runtime_configuration
+
+case "$command" in
+    configtest)
+        shift || true
+        set -- -t "$@"
+        ;;
+    foreground)
+        shift || true
+        set -- -DFOREGROUND "$@"
+        ;;
+    restart)
+        # Vapache reloads configuration and listeners on SIGHUP.
+        shift || true
+        set -- -k graceful "$@"
+        ;;
+    start|stop|graceful|graceful-stop|status)
+        shift || true
+        set -- -k "$command" "$@"
+        ;;
+    *)
+        # Preserve vapached's native command-line interface.
+        ;;
+esac
+
+exec "$daemon" -d "$server_root" -f "$config_file" "$@"

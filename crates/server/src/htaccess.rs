@@ -2205,7 +2205,7 @@ fn apply_directive(
             if args.len() < 2 {
                 return Ok(());
             }
-            let kinds = parse_filter_tokens(scope, &args[..1]);
+            let (kinds, unsupported) = crate::config::parse_filter_names(&args[..1]);
             for kind in kinds {
                 scope
                     .compression_policy
@@ -2215,12 +2215,20 @@ fn apply_directive(
                         args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
                     ));
             }
+            for name in unsupported {
+                scope.compression_policy.unsupported_filter_rules.push(
+                    crate::config::UnsupportedFilterRule::ByType(
+                        name,
+                        args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
+                    ),
+                );
+            }
         }
         "addoutputfilter" => {
             if args.len() < 2 {
                 return Ok(());
             }
-            let kinds = parse_filter_tokens(scope, &args[..1]);
+            let (kinds, unsupported) = crate::config::parse_filter_names(&args[..1]);
             for kind in kinds {
                 scope
                     .compression_policy
@@ -2229,6 +2237,14 @@ fn apply_directive(
                         kind,
                         args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
                     ));
+            }
+            for name in unsupported {
+                scope.compression_policy.unsupported_filter_rules.push(
+                    crate::config::UnsupportedFilterRule::ByExt(
+                        name,
+                        args[1..].iter().map(|s| s.to_ascii_lowercase()).collect(),
+                    ),
+                );
             }
         }
         "setoutputfilter" => {

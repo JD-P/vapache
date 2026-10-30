@@ -129,18 +129,32 @@ fn open_log(
     }
     let p = PathBuf::from(path);
     let relative = !p.is_absolute();
-    let full = if !relative { p } else { server_root.join(p) };
+    let configured = if !relative { p } else { server_root.join(p) };
+    // RPM-family Apache layouts use a root-controlled `logs` symlink below
+    // ServerRoot. Resolve an existing parent once, then use only its canonical
+    // path for validation and opening. A later symlink replacement cannot
+    // redirect the descriptor open, and service-writable targets are rejected
+    // below before a privileged process creates anything.
+    let full = if relative {
+        match (configured.parent(), configured.file_name()) {
+            (Some(parent), Some(name)) => match parent.canonicalize() {
+                Ok(parent) => parent.join(name),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => configured,
+                Err(error) => return Err(error),
+            },
+            _ => configured,
+        }
+    } else {
+        configured
+    };
     if let Some(parent) = full.parent() {
         // The service account must be able to traverse the root-owned parent
         // when reopening an already-owned log after privilege drop, but it
         // must not be able to replace directory entries.
         crate::files::ensure_admin_dir(parent, 0o755)?;
-        if relative {
+        if relative && parent.starts_with(server_root) {
             let below_root = parent.strip_prefix(server_root).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "relative log target escaped ServerRoot",
-                )
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid log target")
             })?;
             let mut current = server_root.to_path_buf();
             for component in below_root.components() {
@@ -841,5 +855,34 @@ mod tests {
 
         assert!(open_log("syslog:local0", &dir, None).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_managed_relative_log_symlink_is_canonicalized() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("vapache-log-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("root");
+        let target = base.join("target");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        symlink(&target, dir.join("logs")).unwrap();
+
+        let mut log = open_log("logs/error.log", &dir, None).unwrap();
+        writeln!(log, "through canonical parent").unwrap();
+        drop(log);
+        assert!(std::fs::read_to_string(target.join("error.log"))
+            .unwrap()
+            .contains("through canonical parent"));
+        assert!(open_log(
+            "logs/rejected.log",
+            &dir,
+            Some(crate::files::effective_uid())
+        )
+        .is_err());
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

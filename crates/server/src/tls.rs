@@ -181,10 +181,12 @@ fn privileged_broker_child(
     }
 }
 
-fn set_broker_limit(
-    resource: libc::__rlimit_resource_t,
-    value: libc::rlim_t,
-) -> std::io::Result<()> {
+#[cfg(target_env = "gnu")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(not(target_env = "gnu"))]
+type RlimitResource = libc::c_int;
+
+fn set_broker_limit(resource: RlimitResource, value: libc::rlim_t) -> std::io::Result<()> {
     let limit = libc::rlimit {
         rlim_cur: value,
         rlim_max: value,

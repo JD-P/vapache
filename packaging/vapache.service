@@ -1,0 +1,20 @@
+[Unit]
+Description=Vapache HTTP Server
+Documentation=https://github.com/JD-P/vapache
+After=network.target remote-fs.target nss-lookup.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/vapache
+EnvironmentFile=-/etc/sysconfig/vapache
+ExecStartPre=/usr/sbin/vapachectl configtest
+ExecStart=/usr/sbin/vapachectl foreground
+ExecReload=/usr/sbin/vapachectl graceful
+KillMode=mixed
+PrivateTmp=true
+Restart=on-abort
+OOMPolicy=continue
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=multi-user.target

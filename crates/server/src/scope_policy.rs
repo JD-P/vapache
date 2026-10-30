@@ -901,6 +901,7 @@ mod error_rewrite_tests {
 #[derive(Debug, Clone, Default)]
 pub struct CompressionPolicy {
     pub compression_rules: Vec<crate::config::CompressionRule>,
+    pub unsupported_filter_rules: Vec<crate::config::UnsupportedFilterRule>,
     pub deflate_level: Option<u32>,
     pub brotli_quality: Option<u32>,
     pub deflate_alter_etag: Option<crate::config::AlterEtag>,
@@ -910,6 +911,10 @@ pub struct CompressionPolicy {
 impl CompressionPolicy {
     pub fn merge_child(&mut self, child: &CompressionPolicy) {
         crate::verified::append_vec(&mut self.compression_rules, &child.compression_rules);
+        crate::verified::append_vec(
+            &mut self.unsupported_filter_rules,
+            &child.unsupported_filter_rules,
+        );
         if child.deflate_level.is_some() {
             self.deflate_level = child.deflate_level;
         }

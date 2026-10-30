@@ -254,6 +254,41 @@ cargo build --release -p vapached
 
 The binary is `target/release/vapached`.
 
+### Prebuilt Linux artifacts
+
+Each push to `main`, version tag, and manual `linux-artifacts` workflow run
+uploads five x86-64 artifacts:
+
+- the compiled `vapached` binary;
+- a portable tar archive;
+- a Debian/Ubuntu `.deb` package;
+- an RPM-family `.rpm` package; and
+- `SHA256SUMS` covering all four payloads.
+
+The release target is `x86_64-unknown-linux-musl`, producing a static PIE with
+no glibc version floor. Vapache remains Linux-specific and requires Linux 5.6
+or newer for its fail-closed `openat2` path-resolution boundary.
+
+The packages install the server as `/usr/sbin/vapached` and service as
+`vapache.service`, but deliberately leave the existing Apache configuration
+and daemon state untouched. `vapachectl` selects `/etc/apache2/apache2.conf`
+on Debian-family systems or `/etc/httpd/conf/httpd.conf` on RPM-family
+systems. To validate the existing configuration and interactively switch the
+active daemon:
+
+```sh
+sudo vapache-switch
+```
+
+The helper shows which Apache service it found and asks before disabling it.
+If vapache fails to start, it restores Apache's previous active/enabled state.
+Set `VAPACHE_CONFDIR` and `VAPACHE_CONFIG` to select a nonstandard Apache
+layout. The packaged wrapper materializes enabled-config symlinks and derives
+any capability opt-ins already implied by the Apache configuration into a
+root-controlled runtime snapshot; it never edits the source configuration.
+Set `VAPACHE_AUTO_CAPABILITIES=0` to retain the raw binary's explicit opt-in
+requirement. See `packaging/README.md` for the installed file layout.
+
 ## Verify
 
 The security kernels live in `crates/verified` and are checked with Verus:
