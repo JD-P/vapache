@@ -491,10 +491,12 @@ tests/fuzz_smoke.sh                         # bounded run of every target
 FUZZ_SECONDS_PER_TARGET=900 tests/fuzz_campaign.sh
 ```
 
-The 13 targets cover individual HTTP requests, fragmented/pipelined
+The 14 targets cover individual HTTP requests, fragmented/pipelined
 connections, configuration tokenization and full compilation, `.htaccess`
 walks, rewrite expressions, CGI/FastCGI/proxy responses, HTTP/2 frames, cache
-metadata, TLS policy and OCSP DER. Dictionaries and seed corpora live beside
+metadata, TLS policy, OCSP DER and the adversarial PCRE2 differential. The
+PCRE2 fuzzer implementation is retained with the P23 artifacts and included by
+the ordinary cargo-fuzz entry point. Dictionaries and seed corpora live beside
 the targets. Property tests, Loom interleaving exploration, deterministic
 failure injection, Miri, sanitizers, mutation testing, protocol suites,
 supply-chain checks and scheduled soak/performance jobs are described in
