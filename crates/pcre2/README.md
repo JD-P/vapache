@@ -34,14 +34,17 @@ Resource policy is part of the API, not a timeout:
 - subjects and capture slots are capped;
 - every match must satisfy an overflow-free `automaton_complexity × subject`
   work ceiling before execution; finite repetition expansion and additional
-  compatibility passes are included in that structural charge.
+  compatibility passes are included in that structural charge. Variable
+  repetitions also charge their exit path and a conservative PikeVM
+  active-set factor, including when a hot lazy-DFA search falls back.
 
 The corresponding admission predicates and product-bound proof are in
 `vapache-verified`: `regex_compile_resource_admit`,
 `regex_capture_resource_admit`, `regex_match_resource_admit`, and
-`regex_match_work_is_bounded`. The counted-repetition and multipass dominance
-lemmas close P23-A's undercharge. `regex_engine_mode_admit` proves that the
-shipping mode excludes both backtracking and executable-memory JIT.
+`regex_match_work_is_bounded`. The counted-repetition, optional-path/PikeVM and
+multipass dominance lemmas close P23-A's and P24-B's undercharges.
+`regex_engine_mode_admit` proves that the shipping mode excludes both
+backtracking and executable-memory JIT.
 
 ## Conformance and fuzzing
 

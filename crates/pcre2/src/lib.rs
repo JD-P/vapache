@@ -30,6 +30,11 @@ const DEFAULT_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 const DEFAULT_NEST_LIMIT: u32 = 64;
 const KEEP_PREFIX: &str = "__vapache_pcre2_keep_";
 const HOT_TIER_AFTER_SEARCHES: u8 = 1;
+// A bounded optional repetition creates both take and skip states in the
+// PikeVM active set. Pass 24 measured this path at 4–5x the cost of an exact
+// repetition with the same old structural charge. Charge the conservative
+// active-set factor even if a later hot search can stay in the lazy DFA.
+const PIKE_VM_ACTIVE_SET_FACTOR: u64 = 4;
 
 /// Error category.  Unsupported syntax is distinct from malformed syntax so
 /// callers can report a deliberate fail-closed compatibility decision.
@@ -958,12 +963,21 @@ pub mod bytes {
                 .iter()
                 .fold(1u64, |sum, part| sum.saturating_add(hir_complexity(part))),
             HirKind::Repetition(repetition) => {
-                let copies = repetition
-                    .max
-                    .map(u64::from)
-                    .unwrap_or_else(|| u64::from(repetition.min).saturating_add(1))
-                    .max(1);
-                hir_complexity(&repetition.sub).saturating_mul(copies)
+                let min = u64::from(repetition.min);
+                let (copies, active_set_factor) = match repetition.max.map(u64::from) {
+                    // Exact counted repetitions expand to exactly `max`
+                    // copies and have no optional take/skip branch.
+                    Some(max) if max == min => (max.max(1), 1),
+                    // `{min,max}` has an additional terminal path. In
+                    // particular `{0,m}` contributes m+1 active paths, not m.
+                    Some(max) => (max.saturating_add(1).max(1), PIKE_VM_ACTIVE_SET_FACTOR),
+                    // An unbounded repetition retains one loop/exit path in
+                    // addition to its mandatory prefix.
+                    None => (min.saturating_add(1).max(1), PIKE_VM_ACTIVE_SET_FACTOR),
+                };
+                hir_complexity(&repetition.sub)
+                    .saturating_mul(copies)
+                    .saturating_mul(active_set_factor)
             }
         }
     }

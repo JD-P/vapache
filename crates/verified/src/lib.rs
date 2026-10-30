@@ -1822,6 +1822,31 @@ pub proof fn regex_expanded_charge_bounds_counted_repetition(
     );
 }
 
+/// A variable counted repetition adds an exit path to its expanded copies,
+/// and the PikeVM may visit the whole active set for each subject byte. The
+/// frontend therefore charges both the expanded path count and a calibrated
+/// active-set factor (P24-B); the ordinary match ceiling then bounds that
+/// larger execution-work model too.
+pub proof fn regex_optional_repeat_charge_bounds_pike_work(
+    atom: nat,
+    paths: nat,
+    active_set_factor: nat,
+    subject: nat,
+    charge: nat,
+    work_limit: nat,
+)
+    requires
+        charge >= atom * paths * active_set_factor,
+        charge * subject <= work_limit,
+    ensures atom * paths * active_set_factor * subject <= work_limit,
+{
+    vstd::arithmetic::mul::lemma_mul_inequality(
+        (atom * paths * active_set_factor) as int,
+        charge as int,
+        subject as int,
+    );
+}
+
 /// A compatibility lowering that performs more than one deterministic pass
 /// (the terminal-newline anchor case uses two) must include every pass in its
 /// charged complexity.

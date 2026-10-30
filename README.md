@@ -496,8 +496,10 @@ connections, configuration tokenization and full compilation, `.htaccess`
 walks, rewrite expressions, CGI/FastCGI/proxy responses, HTTP/2 frames, cache
 metadata, TLS policy, OCSP DER and the adversarial PCRE2 differential. The
 PCRE2 fuzzer implementation is retained with the P23 artifacts and included by
-the ordinary cargo-fuzz entry point. Dictionaries and seed corpora live beside
-the targets. Property tests, Loom interleaving exploration, deterministic
+the ordinary cargo-fuzz entry point. The P24 expression-parser crash is a
+permanent `rewrite_expr` seed, and that target receives 16,384 executions in
+the default smoke gate. Dictionaries and seed corpora live beside the targets.
+Property tests, Loom interleaving exploration, deterministic
 failure injection, Miri, sanitizers, mutation testing, protocol suites,
 supply-chain checks and scheduled soak/performance jobs are described in
 [`docs/quality.md`](docs/quality.md).

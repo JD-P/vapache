@@ -200,4 +200,34 @@ fn main() {
         c_jit_ns,
         v_ns / c_ns,
     );
+
+    // P24-B security case: optional counted repetitions add terminal paths
+    // and can force the PikeVM active-set path. The original 1,328-byte
+    // subject is rejected after charging that cost; the admitted boundary
+    // remains reproducibly measurable on deployment hardware.
+    let pattern = r"1(?:[[:^alpha:]]{0,3}){4208}a";
+    let admitted = vec![b'1'; 249];
+    let rejected = vec![b'1'; 1328];
+    let v_regex = v_compile(pattern);
+    assert!(v_regex.captures(&rejected).is_err());
+    let v_guard_ns = sample(
+        || assert!(v_regex.captures(black_box(&rejected)).is_err()),
+        10_000,
+    );
+    let v_cold_ns = sample(
+        || {
+            let regex = v_compile(pattern);
+            black_box(regex.captures(black_box(&admitted)).unwrap());
+        },
+        1,
+    );
+    let v_warm_ns = sample(
+        || {
+            black_box(v_regex.captures(black_box(&admitted)).unwrap());
+        },
+        1,
+    );
+    println!("nested-optional-resource,guard,{v_guard_ns:.1},,,");
+    println!("nested-optional-boundary,compile+first-captures,{v_cold_ns:.1},,,");
+    println!("nested-optional-boundary,captures,{v_warm_ns:.1},,,");
 }

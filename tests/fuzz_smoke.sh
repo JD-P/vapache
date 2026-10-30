@@ -10,6 +10,10 @@ cargo +nightly --version >/dev/null
 cargo check --manifest-path fuzz/Cargo.toml
 
 runs=${FUZZ_SMOKE_RUNS:-64}
+# The P24-A UTF-8 boundary crash took a sustained campaign to discover. Keep
+# its artifact in the corpus and give the expression parser enough mutations
+# to exercise adjacent delimiter/string shapes in the ordinary smoke gate.
+rewrite_expr_runs=${FUZZ_REWRITE_EXPR_RUNS:-16384}
 corpus_root=$(mktemp -d /tmp/vapache-fuzz-smoke.XXXXXX)
 trap 'rm -rf "$corpus_root"' EXIT INT TERM
 targets=${FUZZ_TARGETS:-"http_request http_connection config_sections config_compile htaccess_walk rewrite_expr cgi_response fastcgi_records proxy_response h2_frames cache_metadata tls_policy ocsp_der"}
@@ -20,6 +24,8 @@ for target in $targets; do
     dictionary=
     [ ! -f "fuzz/dictionaries/$target.dict" ] \
         || dictionary="-dict=fuzz/dictionaries/$target.dict"
+    target_runs=$runs
+    [ "$target" != rewrite_expr ] || target_runs=$rewrite_expr_runs
     cargo +nightly fuzz run "$target" "$corpus_root/$target" -- \
-        -runs="$runs" -timeout=5 -max_len=262144 $dictionary
+        -runs="$target_runs" -timeout=5 -max_len=262144 $dictionary
 done

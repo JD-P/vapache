@@ -1018,24 +1018,28 @@ impl<'a> Parser<'a> {
     fn string(&mut self) -> Result<String, String> {
         let quote = self.input.as_bytes()[self.pos];
         self.pos += 1;
-        let mut out = String::new();
+        // Accumulate the original UTF-8 bytes instead of widening each byte
+        // to a Unicode scalar. The latter turned `é` into `Ã©` and made an
+        // escaped non-ASCII character particularly easy to corrupt.
+        let mut out = Vec::new();
         while self.pos < self.input.len() {
             let b = self.input.as_bytes()[self.pos];
             self.pos += 1;
             if b == quote {
-                return Ok(out);
+                return String::from_utf8(out)
+                    .map_err(|_| "expression string is not valid UTF-8".to_string());
             }
             if b == b'\\' && self.pos < self.input.len() {
                 let n = self.input.as_bytes()[self.pos];
                 self.pos += 1;
                 out.push(match n {
-                    b'n' => '\n',
-                    b'r' => '\r',
-                    b't' => '\t',
-                    other => other as char,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    other => other,
                 });
             } else {
-                out.push(b as char);
+                out.push(b);
             }
         }
         Err("unterminated expression string".into())
@@ -1067,8 +1071,16 @@ impl<'a> Parser<'a> {
         let Some(delim) = self.input.as_bytes().get(self.pos).copied() else {
             return Err("expected a regex after =~".into());
         };
+        // Apache rejects non-ASCII expression-regex delimiters. Besides
+        // matching that behavior, this preserves the Parser invariant that
+        // `pos` is always a UTF-8 character boundary. Treating a UTF-8 lead
+        // byte as the delimiter used to stop on the lead byte of a later
+        // character and made the next `input[pos..]` slice panic (P24-A).
+        if !delim.is_ascii() {
+            return Err("regex delimiter must be ASCII".into());
+        }
         self.pos += 1;
-        let mut out = String::new();
+        let mut out = Vec::new();
         while self.pos < self.input.len() {
             let b = self.input.as_bytes()[self.pos];
             self.pos += 1;
@@ -1080,14 +1092,16 @@ impl<'a> Parser<'a> {
                     nocase |= self.input.as_bytes()[self.pos] == b'i';
                     self.pos += 1;
                 }
+                let out = String::from_utf8(out)
+                    .map_err(|_| "expression regex is not valid UTF-8".to_string())?;
                 return Ok((out, nocase));
             }
             if b == b'\\' && self.pos < self.input.len() {
-                out.push('\\');
-                out.push(self.input.as_bytes()[self.pos] as char);
+                out.push(b'\\');
+                out.push(self.input.as_bytes()[self.pos]);
                 self.pos += 1;
             } else {
-                out.push(b as char);
+                out.push(b);
             }
         }
         Err("unterminated expression regex".into())
@@ -1831,6 +1845,28 @@ mod tests {
         assert!(eval("'abc' =~ /bc/"));
         // Backreferences require backtracking and fail closed at load time.
         assert!(parse("'aa' =~ /(a)\\1/").is_err());
+    }
+
+    #[test]
+    fn parser_rejects_non_ascii_regex_delimiters_without_losing_utf8_boundaries() {
+        // P24-A: each of these used to leave Parser::pos in the middle of the
+        // second character and panic from Parser::and under panic=abort.
+        for expression in ["%{X} =~ éé", "%{X} !~ éé", "%{X} =~ €€"] {
+            let error = parse(expression).unwrap_err();
+            assert_eq!(error, "regex delimiter must be ASCII", "{expression}");
+        }
+
+        // Keep the exact coverage-guided artifact as a deterministic parser
+        // regression as well as a seed in the rewrite_expr fuzz corpus.
+        let crash = include_bytes!("../../../adversarial/p24/crash-input.bin");
+        let crash = std::str::from_utf8(crash).expect("P24 artifact is valid UTF-8");
+        assert!(parse(crash).is_err());
+
+        // ASCII delimiters may contain non-ASCII pattern bytes, and quoted
+        // string values retain their original UTF-8 instead of mojibake.
+        assert!(eval("'é' == 'é'"));
+        assert!(eval("'é' =~ /é/"));
+        assert!(eval("'é' == '\\é'"));
     }
 
     #[test]

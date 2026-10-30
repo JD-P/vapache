@@ -1,6 +1,6 @@
 # PCRE2 compatibility-engine benchmark
 
-Measured 2026-10-30 after the P23 remediation on Linux 6.18.55, an AMD EPYC
+Measured 2026-10-30 after the P23/P24 remediation on Linux 6.18.55, an AMD EPYC
 9V74 worker (5 available cores), Rust 1.99.1. The benchmark is single-threaded,
 uses release builds, reports the median of seven samples, and compares the same
 `captures` API because that is what vapache expressions use.
@@ -39,6 +39,9 @@ operation; lower is better.
 | `\Q…\E\Z` lowering | compile + first captures | 5,786.3 | 685.5 | 4,117.3 | 8.441 |
 | `\Q…\E\Z` lowering | captures | 61.7 | 116.5 | 77.2 | 0.530 |
 | `a{8000}` / 8,190 bytes | resource guard / captures | 10.6 | 4,547.0 | 2,284.0 | 0.002320 |
+| P24 nested optional / 1,328 bytes | resource guard | 23.6 | — | — | — |
+| P24 nested optional / admitted 249-byte boundary | compile + first captures | 49,615,790.0 | — | — | — |
+| P24 nested optional / admitted 249-byte boundary | captures | 49,039,751.0 | — | — | — |
 
 Interpretation:
 
@@ -60,6 +63,14 @@ Interpretation:
   measured roughly 350 ms. The checked-in row is a warmed median-of-seven;
   each C sample executes once while the much cheaper guard uses 10,000
   iterations per sample.
+- P24's `1(?:[[:^alpha:]]{0,3}){4208}a` shape now charges the optional
+  terminal path and a conservative PikeVM active-set factor. The original
+  1,328-byte subject is rejected at the gate in about 24 ns. The largest
+  boundary used by the checked-in benchmark (249 bytes) remains admitted and
+  takes about 49 ms cold or warm on this host, below the approximately 65 ms
+  calibration implied by the work ceiling. This replaces the pre-fix
+  262–292 ms admitted evaluation without depending on wall-clock assertions
+  in the test suite.
 
 Microbenchmarks are sensitive to CPU placement and allocator state. The
 checked-in example is the source of truth and should be rerun on deployment

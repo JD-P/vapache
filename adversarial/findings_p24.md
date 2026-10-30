@@ -1,9 +1,12 @@
 # Pass 24 — adversarial break of HEAD `8198410` (expression-parser abort DoS)
 
-> Remediation status (2026-10-30): **open in the current tree**. No product
-> source was edited in this pass. The retained additions are
-> `adversarial/p24/exploit_p24.py`, `adversarial/p24/crash-input.bin`, this
-> write-up and the `adversarial/README.md` index entries.
+> Remediation status (2026-10-30): **fixed in the current tree**. Expression
+> regex delimiters must now be ASCII, so the parser rejects the malicious
+> forms before advancing into a UTF-8 code point; string and regex bodies also
+> preserve their original UTF-8 bytes. Variable counted repetitions charge
+> their terminal path plus a conservative PikeVM active-set factor. The live
+> battery now requires four access-file `500` responses with the process still
+> alive, an ASCII `200` control, and a normal non-signal `vapached -t` failure.
 
 - **Date:** 2026-10-30
 - **Subject:** `target/release/vapached` built at HEAD `8198410`
@@ -11,9 +14,10 @@
   edited.
 - **Oracle:** Apache/2.4.69 (Debian), `mpm_event` + `mime` + `dir` +
   `authz_core` + `authz_host` + `headers`, loopback only.
-- **Harness:** `adversarial/p24/exploit_p24.py` — **7 verdicts**
-  (A1–A4 attacker-written `.htaccess` aborts, A5 ASCII control stays alive,
-  B1 main-config `-t` abort, Apache oracle 500 + alive).
+- **Harness:** `adversarial/p24/exploit_p24.py` — **7 closure verdicts**
+  (A1–A4 attacker-written `.htaccess` inputs return 500 while the process
+  stays alive, A5 ASCII control stays 200, B1 main-config `-t` fails without
+  a signal, Apache oracle 500 + alive).
 - **Retained evidence:** `/tmp/opencode/p24-harness` (fixtures, configs,
   per-variant server output), `adversarial/p24/crash-input.bin` (the
   libFuzzer artifact), `/tmp/opencode/p24-fuzz-rewrite_expr.log`.
@@ -297,3 +301,21 @@ cargo run --release --bin dosweep2 -- 30000
 
 No product source was modified; `git status` at the end of the pass shows
 only the new adversarial files and the `adversarial/README.md` index change.
+
+## 6. Remediation closure
+
+- `Parser::regex()` rejects a non-ASCII delimiter before changing `pos`,
+  preserving the parser-wide UTF-8-boundary invariant. Its pattern accumulator
+  and the quoted-string accumulator now retain bytes and validate them once,
+  eliminating the adjacent mojibake bug.
+- The unit regression covers `éé` for `=~` and `!~`, `€€`, the exact retained
+  fuzzer artifact, Unicode strings, Unicode patterns and escaped Unicode.
+  The minimal crash is also a permanent `rewrite_expr` corpus seed, and that
+  target receives 16,384 smoke executions by default.
+- Optional bounded repetitions charge `max + 1` paths and a 4× PikeVM
+  active-set factor. The original 1,328-byte P24-B subject is rejected by the
+  work gate; the admitted 249-byte boundary measures about 49 ms cold/warm on
+  the pass host, below the approximately 65 ms policy calibration.
+- `regex_optional_repeat_charge_bounds_pike_work` proves that the enlarged
+  structural charge and ordinary product ceiling also bound the modeled
+  optional-path PikeVM work.
